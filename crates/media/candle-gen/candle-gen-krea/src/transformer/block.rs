@@ -10,8 +10,9 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
+use candle_gen::modulate::{adaln, AdaLn};
 
-use super::rope::apply_interleaved_rope;
+use super::rope::KREA_ROPE;
 use crate::adapters::PhaseAdapterSelection;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::{BlockLeaf, DitPlan};
@@ -155,12 +156,64 @@ impl RmsScale {
         __model_proof_output!(rms_scale(x, &self.weight, self.eps))
     }
 
+    /// The block / final-layer AdaLN, `forward(x) · (1 + scale) + shift`, through the shared
+    /// fused AdaLN (SW-6127): one launch on CUDA, bit-identical to that op chain (which it runs
+    /// everywhere else, and for a gradient-tracked operand). `scale` / `shift` are `[b, 1, hidden]`
+    /// in `x`'s dtype.
+    pub fn modulate(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+        let spec = AdaLn::rms(self.eps).with_weight(&self.weight).norm_in_f32();
+        #[cfg(test)]
+        let spec = adaln_mutation::apply(spec);
+        __model_proof_output!(adaln(x, &spec, scale, shift))
+    }
+
+    /// This norm followed by Krea's interleaved RoPE (`cos`/`sin` `[1, s, head_dim/2]`) on a
+    /// per-head `[b, s, heads, head_dim]` q or k — the shared fused QK-RMSNorm + RoPE (SW-6128):
+    /// one launch on CUDA that writes the result into `x`'s own buffer, the `rms_scale` → RoPE
+    /// chain everywhere else (bit-identical either way). `x` must be a tensor this attention owns
+    /// (a fresh projection output): its buffer is overwritten on the fused path.
+    pub fn forward_rope_in_place(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        __model_proof_output!(candle_gen::rope::rms_norm_rope_in_place(
+            x,
+            &self.weight,
+            self.eps,
+            cos,
+            sin,
+            &KREA_ROPE,
+        ))
+    }
+
     pub(crate) fn move_to_device(
         &mut self,
         device: &candle_gen::candle_core::Device,
     ) -> Result<()> {
         self.weight = self.weight.to_device(device)?;
         Ok(())
+    }
+}
+
+/// Test-only mutation switch for the AdaLN parity proof (SW-6127): with it set on this thread,
+/// [`RmsScale::modulate`] drops the `+ 1` on the scale, which the block parity check must catch.
+#[cfg(test)]
+pub(crate) mod adaln_mutation {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DROP_ONE_PLUS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Only the CUDA block proof flips it.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_drop_one_plus(on: bool) {
+        DROP_ONE_PLUS.with(|c| c.set(on));
+    }
+
+    pub(super) fn apply(spec: candle_gen::modulate::AdaLn<'_>) -> candle_gen::modulate::AdaLn<'_> {
+        if DROP_ONE_PLUS.with(Cell::get) {
+            spec.direct_scale()
+        } else {
+            spec
+        }
     }
 }
 
@@ -317,14 +370,14 @@ impl GatedAttention {
         let v = self.v.forward_phase(x, phase)?.reshape((b, s, nkv, hd))?;
         let gate = self.gate.forward_phase(x, phase)?; // [b, s, hidden]
 
-        let q = self.norm_q.forward(&q)?;
-        let k = self.norm_k.forward(&k)?;
+        // QK-norm (+ RoPE on the single-stream blocks). q and k are this call's own projection
+        // outputs, so the fused QK-norm + RoPE may rotate them in place.
         let (q, k) = match rope {
             Some((cos, sin)) => (
-                apply_interleaved_rope(&q, cos, sin)?,
-                apply_interleaved_rope(&k, cos, sin)?,
+                self.norm_q.forward_rope_in_place(&q, cos, sin)?,
+                self.norm_k.forward_rope_in_place(&k, cos, sin)?,
             ),
-            None => (q, k),
+            None => (self.norm_q.forward(&q)?, self.norm_k.forward(&k)?),
         };
 
         let groups = nh / nkv;
@@ -789,11 +842,7 @@ impl SingleStreamBlock {
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
         let (postscale, postshift, postgate) = (&chunks[3], &chunks[4], &chunks[5]);
 
-        let pre = self
-            .prenorm
-            .forward(x)?
-            .broadcast_mul(&(prescale + 1.0)?)?
-            .broadcast_add(preshift)?;
+        let pre = self.prenorm.modulate(x, prescale, preshift)?;
         let attn = self.attn.forward_with_attention_and_phase(
             &pre,
             Some((cos, sin)),
@@ -803,11 +852,7 @@ impl SingleStreamBlock {
         )?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
-        let post = self
-            .postnorm
-            .forward(&x)?
-            .broadcast_mul(&(postscale + 1.0)?)?
-            .broadcast_add(postshift)?;
+        let post = self.postnorm.modulate(&x, postscale, postshift)?;
         let mlp = self.mlp.forward_phase(&post, phase)?;
         Ok((&x + mlp.broadcast_mul(postgate)?)?)
     }
@@ -1370,6 +1415,268 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized");
+        Ok(())
+    }
+
+    /// SW-6127 block parity: one production-geometry Krea 2 single-stream DiT block (hidden 6144,
+    /// 48Q/12KV x 128, the 1024^2 joint sequence of 512 caption + 64x64 image tokens, real RoPE
+    /// table) on synthetic weights, bf16 on CUDA, with the fused AdaLN on and off (the op chain).
+    /// Both block outputs must be **bit-identical** (the declared tolerance: the kernel is
+    /// bit-identical to the chain per call, and everything else in the block is the same
+    /// deterministic launch sequence), and the path marker must report `fused` for both
+    /// modulations with the switch on and `disabled` with it off, at B = 1 and the B = 2 CFG batch.
+    ///
+    /// Mutation: the same forward with the kernel's `+ 1` on the scale dropped
+    /// ([`adaln_mutation`]) must fail that parity.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_production_geometry_block_fused_adaln_matches_reference() -> candle_gen::Result<()> {
+        use crate::loader::Weights;
+        use crate::testfix::attn_ffn;
+        use crate::transformer::rope::RopeTables;
+        use candle_gen::candle_core::DType;
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        use std::collections::HashMap;
+
+        let dev = Device::new_cuda(0)?;
+        let cfg = crate::config::Krea2Config::turbo();
+        let (hidden, heads, kv, hd) = (
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_kv_heads,
+            cfg.attention_head_dim,
+        );
+        // The modulation is the subject; a narrow FFN keeps the synthetic block cheap.
+        let intermediate = 1024;
+        let mut draw =
+            |shape: &[usize]| Tensor::randn(0f32, 0.02f32, shape, &Device::Cpu).expect("cpu draw");
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        attn_ffn(
+            &mut draw,
+            &mut map,
+            "b",
+            hidden,
+            heads,
+            kv,
+            hd,
+            intermediate,
+        );
+        // A modulation table and raw (centered) norm scales large enough that a dropped `+ 1`
+        // or a wrong norm weight moves every element.
+        map.insert(
+            "b.scale_shift_table".into(),
+            Tensor::randn(0f32, 0.3f32, (6, hidden), &Device::Cpu)?,
+        );
+        for key in ["b.norm1.weight", "b.norm2.weight"] {
+            map.insert(
+                key.into(),
+                Tensor::randn(0f32, 0.3f32, hidden, &Device::Cpu)?,
+            );
+        }
+        let tmp = tempfile::tempdir().map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+        let path = tmp.path().join("block.safetensors");
+        candle_gen::candle_core::safetensors::save(&map, &path)?;
+        let w = Weights::from_file(&path, &dev, DType::BF16)?;
+        let block = SingleStreamBlock::load(&w, "b", heads, kv, hd, hidden, cfg.norm_eps)?;
+
+        let (cap_len, side) = (512usize, 64usize);
+        let s = cap_len + side * side;
+        let rope = RopeTables::build_t2i(
+            cap_len,
+            side,
+            side,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+            &dev,
+        )?;
+        let (cos, sin) = rope.joint();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            candle_gen::ATTN_SCORES_BUDGET as u64,
+            false,
+        ));
+        let bits = |t: &Tensor| -> candle_gen::Result<Vec<u16>> {
+            Ok(t.to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect())
+        };
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        for b in [1usize, 2] {
+            let x = Tensor::randn(0f32, 1.0, (b, s, hidden), &dev)?.to_dtype(DType::BF16)?;
+            let tvec = Tensor::randn(0f32, 0.3, (b, 1, 6 * hidden), &dev)?.to_dtype(DType::BF16)?;
+            let forward = || block.forward_with_attention_plan(&x, &tvec, &cos, &sin, plan);
+
+            ADALN_PATH.set_enabled(Some(false));
+            let start = ADALN_PATH.thread_counts();
+            let reference = forward()?;
+            let off = ADALN_PATH.thread_counts().since(&start);
+            assert_eq!(
+                (off.fused, off.reference_for("disabled")),
+                (0, 2),
+                "B={b}: {off}"
+            );
+
+            ADALN_PATH.set_enabled(Some(true));
+            let start = ADALN_PATH.thread_counts();
+            let fused = __model_proof_output!(forward())?;
+            let on = ADALN_PATH.thread_counts().since(&start);
+            assert_eq!((on.label(), on.fused), ("fused", 2), "B={b}: {on}");
+            let (want, got) = (bits(&reference)?, bits(&fused)?);
+            let mismatches = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "B={b}: the fused-AdaLN block differs from the reference block in {mismatches} \
+                 of {} elements",
+                want.len()
+            );
+
+            adaln_mutation::set_drop_one_plus(true);
+            let mutated = forward();
+            adaln_mutation::set_drop_one_plus(false);
+            let mutated = bits(&mutated?)?;
+            let caught = want.iter().zip(&mutated).filter(|(a, b)| a != b).count();
+            assert!(
+                caught * 2 > want.len(),
+                "B={b}: dropping the +1 moved only {caught} of {} elements",
+                want.len()
+            );
+            println!(
+                "krea block (B={b}, S={s}, D={hidden}, bf16): fused AdaLN bit-identical to the \
+                 reference ({} elements, path {on}); the dropped-+1 mutation differs in {caught}",
+                want.len()
+            );
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::block::tests::cuda_production_geometry_block_fused_adaln_matches_reference");
+        Ok(())
+    }
+
+    /// SW-6128: the Krea 2 gated attention at production geometry (hidden 6144, GQA 48Q/12KV x
+    /// 128, the 1024^2 joint sequence of 512 caption + 64x64 image tokens, the real t2i RoPE table)
+    /// on synthetic weights, on CUDA, with the fused in-place QK-RMSNorm + RoPE against the same
+    /// attention on the reference `rms_scale` -> RoPE chain (the kernel's switch off).
+    ///
+    /// Declared criterion: **bit identity** of the attention output in bf16 and f32 (the fused
+    /// kernel reproduces the chain operation for operation, see `media_rope.cu`; everything after
+    /// it is the same code on the same inputs). The path counters show both q and k took the
+    /// fused kernel with the switch on, and the `disabled` reference with it off; the text-fusion
+    /// form (no RoPE) never reaches the kernel.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference(
+    ) -> candle_gen::Result<()> {
+        use crate::loader::Weights;
+        use crate::testfix::attn_ffn;
+        use crate::transformer::rope::RopeTables;
+        use candle_gen::candle_core::DType;
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::RMS_NORM_ROPE_PATH;
+        use std::collections::HashMap;
+
+        let dev = Device::new_cuda(0)?;
+        let cfg = crate::config::Krea2Config::turbo();
+        let (hidden, heads, kv, hd) = (
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_kv_heads,
+            cfg.attention_head_dim,
+        );
+        let mut draw =
+            |shape: &[usize]| Tensor::randn(0f32, 0.02f32, shape, &Device::Cpu).expect("cpu draw");
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        attn_ffn(&mut draw, &mut map, "b", hidden, heads, kv, hd, 64);
+        for key in ["b.attn.norm_q.weight", "b.attn.norm_k.weight"] {
+            map.insert(key.into(), Tensor::randn(1f32, 0.3f32, hd, &Device::Cpu)?);
+        }
+        let tmp = tempfile::tempdir().map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+        let path = tmp.path().join("attn.safetensors");
+        candle_gen::candle_core::safetensors::save(&map, &path)?;
+
+        let (cap_len, side) = (512usize, 64usize);
+        let s = cap_len + side * side;
+        let rope = RopeTables::build_t2i(
+            cap_len,
+            side,
+            side,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+            &dev,
+        )?;
+        let (cos, sin) = rope.joint();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            candle_gen::ATTN_SCORES_BUDGET as u64,
+            false,
+        ));
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = RMS_NORM_ROPE_PATH.guard(Some(true));
+        let x32 = Tensor::randn(0f32, 1.0, (1, s, hidden), &dev)?;
+        for dtype in [DType::BF16, DType::F32] {
+            let w = Weights::from_file(&path, &dev, dtype)?;
+            let attn = GatedAttention::load(&w, "b.attn", heads, kv, hd, cfg.norm_eps)?;
+            let x = x32.to_dtype(dtype)?;
+            let run =
+                |rope: Option<(&Tensor, &Tensor)>| attn.forward_with_attention_plan(&x, rope, plan);
+
+            RMS_NORM_ROPE_PATH.set_enabled(Some(true));
+            let start = RMS_NORM_ROPE_PATH.thread_counts();
+            let fused = __model_proof_output!(run(Some((&cos, &sin))))?;
+            let on = RMS_NORM_ROPE_PATH.thread_counts().since(&start);
+            assert_eq!((on.fused, on.reference_total()), (2, 0), "{dtype:?}: {on}");
+
+            RMS_NORM_ROPE_PATH.set_enabled(Some(false));
+            let start = RMS_NORM_ROPE_PATH.thread_counts();
+            let reference = run(Some((&cos, &sin)))?;
+            let off = RMS_NORM_ROPE_PATH.thread_counts().since(&start);
+            assert_eq!(off.reference_for("disabled"), 2, "{dtype:?}: {off}");
+            RMS_NORM_ROPE_PATH.set_enabled(Some(true));
+
+            let (f, r) = (
+                fused
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                reference
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            let mismatches = f
+                .iter()
+                .zip(&r)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let max_abs = f
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "krea attention (S={s}, {heads}Q/{kv}KV x {hd}, {dtype:?}): fused qk-norm+rope vs \
+                 reference: {mismatches} of {} elements differ, max|d| {max_abs:e}; \
+                 on {on}, off {off}",
+                f.len()
+            );
+            assert_eq!(
+                mismatches, 0,
+                "{dtype:?}: fused attention differs from the reference"
+            );
+
+            // The text-fusion form (no RoPE) keeps the plain norm.
+            let start = RMS_NORM_ROPE_PATH.thread_counts();
+            run(None)?;
+            assert_eq!(RMS_NORM_ROPE_PATH.thread_counts().since(&start).total(), 0);
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference");
         Ok(())
     }
 }

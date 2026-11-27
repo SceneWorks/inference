@@ -49,6 +49,9 @@
 
 use serde::Deserialize;
 
+pub mod delegation;
+pub use delegation::{delegate_projections, W4A8Delegation, DELEGATED_SUFFIXES};
+
 pub mod pack;
 pub use pack::{
     decode_dense, quantize_weight, quantize_weight_with_codebook, serialize_checkpoint,

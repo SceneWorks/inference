@@ -12,7 +12,12 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use candle_gen::Result;
+
+/// The PiD backbone's RoPE: complex-interleaved pairs on `[B, H, S, D]`, half tables `[S, D/2]`,
+/// rotated in the activation dtype.
+pub const PID_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhsd).with_math(RopeMath::Native);
 
 /// A small per-decode cache retains the distinct whole-image/tile geometries a PiD render uses while
 /// bounding retained device tables. A normal whole-image decode needs three entries (image, text, pixel);
@@ -228,22 +233,15 @@ pub fn rope_1d_text(
 /// `(x[2i], x[2i+1])` as `(real, imag)` and rotates by `cos/sin[i]` — bit-equivalent to
 /// `apply_rotary_emb`'s `_rotate`. The head axis is a pure broadcast, so applying after the
 /// `[B,H,S,D]` transpose is identical to the reference's pre-transpose apply.
+///
+/// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`PID_ROPE`] on each of `q` / `k` — the
+/// fused strided kernel on CUDA, elsewhere the shared reference chain, op for op this function's former
+/// body (`rope_route_tests`).
 pub fn apply_rope(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-    let (s, half) = cos.dims2()?;
-    let cos = cos.reshape((1, 1, s, half))?;
-    let sin = sin.reshape((1, 1, s, half))?;
-    let one = |x: &Tensor| -> Result<Tensor> {
-        let (b, h, seq, hd) = x.dims4()?;
-        let x5 = x.reshape((b, h, seq, hd / 2, 2))?;
-        let real = x5.narrow(4, 0, 1)?.reshape((b, h, seq, hd / 2))?;
-        let imag = x5.narrow(4, 1, 1)?.reshape((b, h, seq, hd / 2))?;
-        // (real·cos − imag·sin, imag·cos + real·sin), then re-interleave on a new last axis.
-        let out0 = (real.broadcast_mul(&cos)? - imag.broadcast_mul(&sin)?)?;
-        let out1 = (imag.broadcast_mul(&cos)? + real.broadcast_mul(&sin)?)?;
-        let stacked = Tensor::stack(&[&out0, &out1], 4)?; // [b,h,seq,hd/2,2]
-        Ok(stacked.reshape((b, h, seq, hd))?)
-    };
-    Ok((one(q)?, one(k)?))
+    Ok((
+        candle_gen::rope::apply_rope(q, cos, sin, &PID_ROPE)?,
+        candle_gen::rope::apply_rope(k, cos, sin, &PID_ROPE)?,
+    ))
 }
 
 #[cfg(test)]
@@ -308,5 +306,100 @@ mod tests {
             Tensor::from_vec(vec![marker], (1, 1), &device)?,
             Tensor::from_vec(vec![-marker], (1, 1), &device)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::DType;
+
+    /// The pre-SW-6129 `apply_rope`, verbatim (the oracle).
+    fn former(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (s, half) = cos.dims2()?;
+        let cos = cos.reshape((1, 1, s, half))?;
+        let sin = sin.reshape((1, 1, s, half))?;
+        let one = |x: &Tensor| -> Result<Tensor> {
+            let (b, h, seq, hd) = x.dims4()?;
+            let x5 = x.reshape((b, h, seq, hd / 2, 2))?;
+            let real = x5.narrow(4, 0, 1)?.reshape((b, h, seq, hd / 2))?;
+            let imag = x5.narrow(4, 1, 1)?.reshape((b, h, seq, hd / 2))?;
+            // (real·cos − imag·sin, imag·cos + real·sin), then re-interleave on a new last axis.
+            let out0 = (real.broadcast_mul(&cos)? - imag.broadcast_mul(&sin)?)?;
+            let out1 = (imag.broadcast_mul(&cos)? + real.broadcast_mul(&sin)?)?;
+            let stacked = Tensor::stack(&[&out0, &out1], 4)?; // [b,h,seq,hd/2,2]
+            Ok(stacked.reshape((b, h, seq, hd))?)
+        };
+        Ok((one(q)?, one(k)?))
+    }
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The real 2-D NTK image table and 1-D text table.
+    fn tables(dev: &Device) -> Vec<(Tensor, Tensor)> {
+        vec![
+            rope_2d_ntk(64, 6, 5, 32, 32, 10000.0, 16.0, dev).unwrap(),
+            rope_1d_text(64, 30, 10000.0, dev).unwrap(),
+        ]
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU, f32 / bf16 /
+    /// f16 (activation and table in one dtype, as the backbone runs them).
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        for (cos, sin) in tables(&dev) {
+            let s = cos.dim(0).unwrap();
+            let q32 = Tensor::randn(0f32, 1.0, (2, 3, s, 64), &dev).unwrap();
+            let k32 = Tensor::randn(0f32, 1.0, (2, 3, s, 64), &dev).unwrap();
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (q, k) = (q32.to_dtype(dt).unwrap(), k32.to_dtype(dt).unwrap());
+                let (c, sn) = (cos.to_dtype(dt).unwrap(), sin.to_dtype(dt).unwrap());
+                let (gq, gk) = apply_rope(&q, &k, &c, &sn).unwrap();
+                let (wq, wk) = former(&q, &k, &c, &sn).unwrap();
+                assert_eq!(bits(&gq), bits(&wq), "{dt:?} q");
+                assert_eq!(bits(&gk), bits(&wk), "{dt:?} k");
+            }
+        }
+    }
+
+    /// CUDA bf16 smoke: the PiD backbone RoPE route takes the fused kernel for q and k, bit-identical
+    /// to the shared reference (switch off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        const CALLS: u64 = 2;
+        // PiD at a 64x64 latent grid, 16 heads x 64.
+        let (cos, sin) = rope_2d_ntk(64, 64, 64, 32, 32, 10000.0, 16.0, &dev).unwrap();
+        let (cos, sin) = (
+            cos.to_dtype(DType::BF16).unwrap(),
+            sin.to_dtype(DType::BF16).unwrap(),
+        );
+        let q = Tensor::randn(0f32, 1.0, (1, 16, 4096, 64), &dev).unwrap();
+        let q = q.to_dtype(DType::BF16).unwrap();
+        let k = (&q * 0.5).unwrap();
+        let cat = |(a, b): (Tensor, Tensor)| Tensor::cat(&[&a, &b], 0).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = cat(apply_rope(&q, &k, &cos, &sin).unwrap());
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (CALLS, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = cat(apply_rope(&q, &k, &cos, &sin).unwrap());
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&cat(former(&q, &k, &cos, &sin).unwrap())));
     }
 }

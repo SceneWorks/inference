@@ -29,6 +29,10 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 /// `mlx_rs::fast::layer_norm`; `w`/`b` `None` is the `elementwise_affine=False` variant (the clip-diff
 /// `FinalLayer`'s `norm_final`). Reductions and affine arithmetic run in f32, matching torch's
 /// mixed-precision LayerNorm kernel, and the result casts back to the input dtype.
+///
+/// SW-6129: the clip-diff sites run this chain through the shared fused AdaLN
+/// (`clip_diff::ln_modulate`); this copy stays as their test oracle.
+#[cfg(test)]
 pub fn layer_norm(x: &Tensor, w: Option<&Tensor>, b: Option<&Tensor>, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let x = x.to_dtype(DType::F32)?;

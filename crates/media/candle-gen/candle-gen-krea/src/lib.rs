@@ -61,6 +61,7 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 pub mod vision;
+pub mod w4a8_tier;
 
 // The candle Krea LoRA/LoKr trainer (sc-7577) + its vendored composable-op trainable DiT. Private
 // (reached through the explicit family registry by id, like the SDXL/Z-Image trainers).
@@ -1931,9 +1932,17 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
 /// Missing, while an explicit adapter-free Sequential + Deferred load can still exercise the pinned
 /// native stream path. Candle cannot replay adapters onto streamed blocks, so every adapter form —
 /// including diff-patches — stays excluded.
+///
+/// A [`ResidentOnlyNativeTier`] (native **W4A8**, SW-6135, and Kitchen **NVFP4**) is excluded
+/// too: its packed projections construct whole (`W4A8Linear` / `Nvfp4Linear`) and have no
+/// block-window materialization (the streamed trunk is limited to the baseline packed/dense path),
+/// so its DiT loads resident inside the sequential heavy phase instead. This is what keeps an
+/// ordinary adapter-free Sequential + Deferred load of either tier (the advertised
+/// `StagedResidency` rung) from being implicitly routed into a stream the loader must refuse after
+/// conditioning. The header classification runs last, so it is read only for an otherwise eligible
+/// File load.
 fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
     provider_id == KREA_2_TURBO_ID
-        && matches!(spec.weights, WeightsSource::File(_))
         && matches!(spec.offload_policy, gen_core::OffloadPolicy::Sequential)
         && matches!(
             spec.load_shape,
@@ -1941,6 +1950,68 @@ fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
         )
         && spec.quantize.is_none()
         && spec.adapters.is_empty()
+        && matches!(
+            &spec.weights,
+            WeightsSource::File(path) if resident_only_native_tier(path).is_none()
+        )
+}
+
+/// A native single-file tier whose packed projections construct whole and have no transformer
+/// block-window form, so its DiT always loads resident (the loader refuses `stream_blocks` for it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentOnlyNativeTier {
+    /// Delegated W4A8 projections served by `W4A8Linear` (SW-6135).
+    W4A8,
+    /// Kitchen NVFP4 projections served by `Nvfp4Linear` (sc-21483).
+    KitchenNvfp4,
+}
+
+impl ResidentOnlyNativeTier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::W4A8 => "W4A8",
+            Self::KitchenNvfp4 => "Kitchen NVFP4",
+        }
+    }
+}
+
+/// Classify a native single file in **one header pass** (tensor headers, the small `.comfy_quant`
+/// payloads and the file-level quantization metadata; no weight data) by the same authorities the
+/// loader uses: the shared W4A8 delegation, then the compiled codec plan's `nvfp4-v1` rows (NVFP4
+/// is a plan fact, never a dtype guess, sc-20651/sc-21482). Codec ids depend on neither residency
+/// nor declared logical shapes, so the plan is compiled dense over the base shapes. Unreadable or
+/// unplannable reads as `None` here; the loader surfaces the real error.
+fn resident_only_native_tier(path: &std::path::Path) -> Option<ResidentOnlyNativeTier> {
+    let headers = gen_core::safetensors_path_tensor_headers(path).ok()?;
+    let descriptors = gen_core::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(".comfy_quant"),
+        gen_core::w4a8_int8::MAX_DESCRIPTOR_BYTES as u64,
+    )
+    .ok()?;
+    let delegation = gen_core::w4a8_int8::delegate_projections(&headers, &descriptors).ok()?;
+    if !delegation.is_empty() {
+        return Some(ResidentOnlyNativeTier::W4A8);
+    }
+    let metadata = gen_core::safetensors_path_quantization_metadata(path).ok()?;
+    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
+    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
+        &prefix,
+        crate::native_mapping::DeclaredLogicalShapes::from_base(None),
+    );
+    let plan = gen_core::checkpoint_codec::compile_logical_weight_plan_with_metadata(
+        &headers,
+        &descriptors,
+        metadata.as_deref(),
+        &mapping,
+        candle_gen::logical_weights::baseline_codec_registry(),
+        &candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    )
+    .ok()?;
+    plan.tensors
+        .iter()
+        .any(|t| t.codec_id == gen_core::checkpoint_codec::NVFP4_CODEC.codec_id)
+        .then_some(ResidentOnlyNativeTier::KitchenNvfp4)
 }
 
 fn validate_native_file_transformer_request(
@@ -1961,6 +2032,19 @@ fn validate_native_file_transformer_request(
     }
     if !memory.stream_transformer_blocks {
         return Ok(());
+    }
+    // SW-6135: explicitly requested block streaming of a resident-only native tier (W4A8, Kitchen
+    // NVFP4) is refused here, at request admission and before any conditioning, with its own
+    // reason (the generic eligibility text below would blame the load shape).
+    if let WeightsSource::File(path) = &spec.weights {
+        if let Some(tier) = resident_only_native_tier(path) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: a native {} transformer loads resident; its packed projections \
+                 have no transformer block-streaming form (stream_transformer_blocks=true is \
+                 unsupported for this tier)",
+                tier.label()
+            )));
+        }
     }
     if !native_file_streamable(provider_id, spec) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -2616,8 +2700,34 @@ fn native_dit_plan(
         &prefix,
         crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
     );
-    candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+    // SW-6135: a native W4A8 tier's projections are delegated out of the plan exactly as the
+    // loader delegates them, so pricing and loading compile the same plan.
+    candle_gen::logical_weights::plan_logical_weights_delegating_w4a8(path, &mapping, residency)
+        .map(|(plan, _)| plan)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))
+}
+
+/// The W4A8 projections of a native single file (SW-6135): the same delegation the loader computes
+/// before planning, from the header and descriptors only.
+fn native_w4a8_delegation(
+    path: &std::path::Path,
+    headers: &[gen_core::SafetensorsTensorHeader],
+) -> gen_core::Result<gen_core::w4a8_int8::W4A8Delegation> {
+    let descriptors = gen_core::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(".comfy_quant"),
+        gen_core::w4a8_int8::MAX_DESCRIPTOR_BYTES as u64,
+    )?;
+    gen_core::w4a8_int8::delegate_projections(headers, &descriptors)
+        .map_err(|error| gen_core::Error::Msg(format!("{}: {error}", path.display())))
+}
+
+/// Whether a native single file is a Krea **W4A8 tier** (SW-6135). Unreadable reads as `false`
+/// here; the loader surfaces the real error.
+fn is_native_w4a8_file(path: &std::path::Path) -> bool {
+    gen_core::safetensors_path_tensor_headers(path)
+        .and_then(|headers| native_w4a8_delegation(path, &headers))
+        .is_ok_and(|delegation| !delegation.is_empty())
 }
 
 fn is_wide_convrot_bias(header: &gen_core::SafetensorsTensorHeader) -> bool {
@@ -2776,7 +2886,12 @@ fn native_dit_resident_bytes(
             .ok_or_else(overflow)?;
     }
     let bias_extra = retained_convrot_bias_extra(&plan, &headers, |_| DIT_WIDTH)?;
-    total.checked_add(bias_extra).ok_or_else(overflow)
+    // The delegated W4A8 projections (SW-6135) stay packed: codes plus companions, no dense shadow.
+    let w4a8 = native_w4a8_delegation(path, &headers)?.resident_bytes();
+    total
+        .checked_add(bias_extra)
+        .and_then(|total| total.checked_add(w4a8))
+        .ok_or_else(overflow)
 }
 
 /// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
@@ -3160,6 +3275,13 @@ fn krea_provable_artifact_tier(spec: &LoadSpec, provider_id: &str) -> Option<Opt
     match convrot_selector(spec, provider_id) {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return None,
+    }
+    // SW-6135: a native W4A8 tier is none of the measured bf16/q8/q4 cells either; reading it as
+    // the "no quant" (bf16) cell would publish the wrong identity.
+    if let WeightsSource::File(path) = &spec.weights {
+        if is_native_w4a8_file(path) {
+            return None;
+        }
     }
     actual_quant_tier(spec, provider_id).ok()
 }
@@ -5444,6 +5566,103 @@ mod tests {
             "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
              contract prices what the role table builds rather than what the plan priced"
         );
+    }
+
+    /// SW-6135: the memory contract plans a W4A8 tier exactly as the loader does (delegated), prices
+    /// its packed projections at their packed bytes, and publishes no measured-tier calibration
+    /// identity for it (it is none of the bf16/q8/q4 cells).
+    #[test]
+    fn native_w4a8_import_prices_its_packed_projections_and_claims_no_calibration_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, w4a8, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let headers = gen_core::safetensors_path_tensor_headers(&w4a8).unwrap();
+        let delegation = native_w4a8_delegation(&w4a8, &headers).unwrap();
+        assert_eq!(delegation.projections.len(), 1);
+        assert!(is_native_w4a8_file(&w4a8));
+        let dense = candle_gen::logical_weights::CandleCodecResidency::DENSE;
+        let priced = native_dit_resident_bytes(&w4a8, Some(&cfg), &dense).unwrap();
+        let plan = native_dit_plan(&w4a8, &headers, Some(&cfg), &dense).unwrap();
+        let planned: u64 = plan
+            .tensors
+            .iter()
+            .map(|t| t.shape.iter().product::<usize>() as u64 * DIT_WIDTH)
+            .sum();
+        assert_eq!(priced, planned + delegation.resident_bytes());
+
+        let spec = LoadSpec::new(WeightsSource::File(w4a8.clone()))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()));
+        assert_eq!(krea_provable_artifact_tier(&spec, KREA_2_TURBO_ID), None);
+        // The same base with an ordinary dense native file still proves the bf16 cell.
+        let dense_tmp = tempfile::tempdir().unwrap();
+        let (_, dense_file, _) = crate::testfix::tiny_native_transformer_fixture(&dense_tmp);
+        assert!(!is_native_w4a8_file(&dense_file));
+    }
+
+    /// SW-6135 review (PR #1526): an adapter-free Turbo File load of a resident-only native tier
+    /// (W4A8, Kitchen NVFP4) with Sequential offload and DeferredMaterialization — the advertised
+    /// `StagedResidency` shape — must NOT arm the native block loader implicitly. `build()` passes
+    /// `native_file_streamable` straight into the sequential heavy phase, so a `true` here routed
+    /// every ordinary staged W4A8/NVFP4 generation into the loader's "require resident" refusal
+    /// *after* conditioning. The DiT now loads resident inside the sequential heavy phase; only an
+    /// explicit `stream_transformer_blocks` request is refused, typed, at request admission.
+    ///
+    /// Mutation: drop the `resident_only_native_tier` arm from `native_file_streamable` and the
+    /// first assertion goes red for both tiers; drop the NVFP4 plan arm from the classifier and the
+    /// NVFP4 rows go red; drop the tier arm from `validate_native_file_transformer_request` and the
+    /// refusal-reason assertion goes red (the generic eligibility text names no tier).
+    #[test]
+    fn resident_only_native_tiers_stage_resident_not_implicitly_block_streamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, w4a8, _) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let (tiny_nvfp4, _) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
+        let kitchen_nvfp4 = tmp.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&kitchen_nvfp4);
+        let staged = |file: &Path| {
+            LoadSpec::new(WeightsSource::File(file.to_path_buf()))
+                .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root.clone()))
+                .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+                .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+        };
+        let staged_only = gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        };
+        let streamed = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        };
+
+        for (file, tier) in [
+            (&w4a8, ResidentOnlyNativeTier::W4A8),
+            (&tiny_nvfp4, ResidentOnlyNativeTier::KitchenNvfp4),
+            (&kitchen_nvfp4, ResidentOnlyNativeTier::KitchenNvfp4),
+        ] {
+            let label = tier.label();
+            assert_eq!(resident_only_native_tier(file), Some(tier), "{label}");
+            let spec = staged(file);
+            assert!(spec.adapters.is_empty() && spec.quantize.is_none());
+            assert!(
+                !native_file_streamable(KREA_2_TURBO_ID, &spec),
+                "an adapter-free staged {label} File load must load its DiT resident, not stream it"
+            );
+            // Staged residency without block streaming is admitted.
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &spec, staged_only)
+                .unwrap_or_else(|e| panic!("staged {label} residency is admitted: {e}"));
+            // Explicit block streaming is refused at admission, typed, naming the tier.
+            let error = validate_native_file_transformer_request(KREA_2_TURBO_ID, &spec, streamed)
+                .expect_err("explicit block streaming of a resident-only tier is refused");
+            assert!(matches!(error, gen_core::Error::Unsupported(_)), "{error}");
+            assert!(error.to_string().contains(label), "{error}");
+        }
+
+        // Control: the same tiny trunk without packed projections keeps the physical stream path.
+        let (_, dense_file, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        assert_eq!(resident_only_native_tier(&dense_file), None);
+        let dense = staged(&dense_file);
+        assert!(native_file_streamable(KREA_2_TURBO_ID, &dense));
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &dense, streamed)
+            .expect("an eligible dense File load still reaches the physical block streamer");
     }
 
     #[test]

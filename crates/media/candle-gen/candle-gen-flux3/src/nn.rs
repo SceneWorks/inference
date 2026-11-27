@@ -28,6 +28,7 @@ use candle_gen::candle_core::Module as _;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::rope::{RopeLayout, RopeSpec};
 use candle_gen::{CandleError as Error, Result};
 
 /// LayerNorm eps of every `layernorm_modulation` (`F.layer_norm(..., eps=1e-6)`).
@@ -834,8 +835,27 @@ pub fn layer_norm_f32(x: &Tensor) -> Result<Tensor> {
 /// created in `scale`'s dtype (torch's weak Python scalar): `1 + scale` rounds in the compute
 /// dtype, and the product with the f32 norm promotes to f32, exactly as upstream. `scale` and
 /// `shift` are `[N, hidden]` or `[1, hidden]`.
+///
+/// SW-6129: the shared fused AdaLN. [`layer_norm_f32`] is `AdaLnChain::layer(LN_EPS)` modulated in
+/// f32 op for op (its `sum_keepdim / dim` is `mean_keepdim`'s affine); the torch-rounded `1 + scale`
+/// and the shift are promoted to f32 first and enter as a direct scale, which is exactly
+/// `add(mul(norm, one_plus), shift)`. One launch on CUDA for the `[N, hidden]` token rows; the
+/// chain itself elsewhere (and for a gradient-tracked operand). Other ranks keep the chain below.
 pub fn layernorm_modulation(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
     let one_plus = (scale + 1.0)?;
+    if x.rank() == 2
+        && one_plus.rank() == 2
+        && shift.rank() == 2
+        && matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
+    {
+        let spec = candle_gen::modulate::AdaLnChain::layer(LN_EPS)
+            .modulate_in(DType::F32)
+            .direct_scale();
+        let scale = to(&one_plus, DType::F32)?.unsqueeze(0)?;
+        let shift = to(shift, DType::F32)?.unsqueeze(0)?;
+        let out = candle_gen::modulate::adaln_chain(&x.unsqueeze(0)?, &spec, &scale, &shift)?;
+        return Ok(out.squeeze(0)?);
+    }
     let norm = layer_norm_f32(x)?;
     add(&mul(&norm, &one_plus)?, shift)
 }
@@ -877,8 +897,7 @@ pub fn rmsnorm_rope_training(x: &Tensor, scale: &Tensor, rope: &Rope) -> Result<
 }
 
 fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) -> Result<Tensor> {
-    let (b, h, l, d) = x.dims4()?;
-    let pairs = d / 2;
+    x.dims4()?;
     let xf = to(x, DType::F32)?.contiguous()?;
     let normed = if training && candle_gen::train::policy::legacy_e1() {
         candle_gen::train::profile::cohort_reuse("flux3:comparison-legacy-rms");
@@ -892,17 +911,18 @@ fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) ->
     } else {
         candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS)?
     };
-    let xr = normed.reshape((b, h, l, pairs, 2))?;
-    let re = xr.narrow(4, 0, 1)?.squeeze(4)?;
-    let im = xr.narrow(4, 1, 1)?.squeeze(4)?;
-    let cos = rope.cos.reshape((1, 1, l, pairs))?;
-    let sin = rope.sin.reshape((1, 1, l, pairs))?;
-    // freqs = [[cos, −sin], [sin, cos]]: out0 = cos·x0 − sin·x1, out1 = sin·x0 + cos·x1.
-    let out_re = re.broadcast_mul(&cos)?.sub(&im.broadcast_mul(&sin)?)?;
-    let out_im = re.broadcast_mul(&sin)?.add(&im.broadcast_mul(&cos)?)?;
-    let out = Tensor::stack(&[out_re, out_im], 4)?.reshape((b, h, l, d))?;
+    // freqs = [[cos, −sin], [sin, cos]]: out0 = cos·x0 − sin·x1, out1 = sin·x0 + cos·x1, on the
+    // f32 normed q/k (the norm's f32 result is NOT rounded to `x`'s dtype before the rotation, so
+    // this is the shared apply_rope, not the shared rms_norm_rope whose chain rounds in between).
+    // SW-6129: the fused strided kernel on CUDA, and everywhere else — and for the tracked training
+    // operand — the shared reference chain, bit-identical to the narrow / mul / stack chain this
+    // used to carry.
+    let out = candle_gen::rope::apply_rope(&normed, &rope.cos, &rope.sin, &FLUX3_ROPE)?;
     to(&out, x.dtype())
 }
+
+/// FLUX.3's q/k RoPE convention: adjacent pairs on `[B, H, L, D]`, rotated in f32.
+const FLUX3_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhsd);
 
 /// `packed_attention(q, k, v, bounds)`: per-sample SDPA over `[1, H, L, D]` (samples never attend
 /// each other); returns `[L, H·D]` in token order and the compute dtype. An empty bound
@@ -1534,6 +1554,261 @@ mod tests {
         assert_eq!(
             early.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             v_lhd.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+}
+
+/// SW-6129: the rotation of `rmsnorm_rope` is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private inference `rmsnorm_rope`, verbatim.
+    fn former_rmsnorm_rope(x: &Tensor, scale: &Tensor, rope: &Rope) -> Tensor {
+        let (b, h, l, d) = x.dims4().unwrap();
+        let pairs = d / 2;
+        let xf = to(x, DType::F32).unwrap().contiguous().unwrap();
+        let normed = candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS).unwrap();
+        let xr = normed.reshape((b, h, l, pairs, 2)).unwrap();
+        let re = xr.narrow(4, 0, 1).unwrap().squeeze(4).unwrap();
+        let im = xr.narrow(4, 1, 1).unwrap().squeeze(4).unwrap();
+        let cos = rope.cos.reshape((1, 1, l, pairs)).unwrap();
+        let sin = rope.sin.reshape((1, 1, l, pairs)).unwrap();
+        let out_re = re
+            .broadcast_mul(&cos)
+            .unwrap()
+            .sub(&im.broadcast_mul(&sin).unwrap())
+            .unwrap();
+        let out_im = re
+            .broadcast_mul(&sin)
+            .unwrap()
+            .add(&im.broadcast_mul(&cos).unwrap())
+            .unwrap();
+        let out = Tensor::stack(&[out_re, out_im], 4)
+            .unwrap()
+            .reshape((b, h, l, d))
+            .unwrap();
+        to(&out, x.dtype()).unwrap()
+    }
+
+    fn ids(n: usize) -> Vec<[f32; 4]> {
+        (0..n)
+            .map(|i| [0.0, (i / 5) as f32, (i % 5) as f32, 0.0])
+            .collect()
+    }
+
+    /// The shared route equals the former inference chain bit for bit on CPU in f32 / bf16 / f16.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let rope = Rope::new(&ids(15), &[32, 32, 32, 32], 2000.0, &dev).unwrap();
+        let scale = (values(&[128], 9, &dev) * 0.1).unwrap();
+        let x32 = values(&[2, 3, 15, 128], 7, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let got = rmsnorm_rope(&x, &scale, &rope).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(
+                bits(&got),
+                bits(&former_rmsnorm_rope(&x, &scale, &rope)),
+                "{dtype:?}"
+            );
+        }
+    }
+
+    /// SW-6129 CUDA smoke: flux3 rmsnorm_rope (bf16, [1,24,4608,128]) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // 512 text + 64x64 image tokens, 24 heads x 128, bf16 q/k, f32 gain.
+        let rope = Rope::new(&ids(512 + 4096), &[32, 32, 32, 32], 2000.0, &dev).unwrap();
+        let scale = (values(&[128], 9, &dev) * 0.1).unwrap();
+        let q = values(&[1, 24, 512 + 4096, 128], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = values(&[1, 24, 512 + 4096, 128], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    rmsnorm_rope(&q, &scale, &rope).unwrap(),
+                    rmsnorm_rope(&k, &scale, &rope).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("flux3 rmsnorm_rope (bf16, [1,24,4608,128]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: `layernorm_modulation` is the shared fused composable-chain AdaLN.
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// The former `layernorm_modulation`, verbatim.
+    fn former(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Tensor {
+        let one_plus = (scale + 1.0).unwrap();
+        let norm = layer_norm_f32(x).unwrap();
+        add(&mul(&norm, &one_plus).unwrap(), shift).unwrap()
+    }
+
+    /// CPU: bit-identical to the former chain (torch weak-scalar `1 + scale` in the modulation
+    /// dtype, f32 norm, promoting multiply / add) for f32 / bf16 / f16 tokens and modulation,
+    /// per-token `[N, D]` and shared `[1, D]` rows, FLUX.3's hidden 3072.
+    #[test]
+    fn fused_layernorm_modulation_matches_the_former_chain() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let x32 = values(&[40, d], 3, 3.0, 0.4, &dev);
+        for xd in [DType::F32, DType::BF16, DType::F16] {
+            for md in [DType::F32, DType::BF16, DType::F16] {
+                for rows in [1usize, 40] {
+                    let x = x32.to_dtype(xd).unwrap();
+                    let scale = values(&[rows, d], 5, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                    let shift = values(&[rows, d], 7, 0.5, 0.0, &dev).to_dtype(md).unwrap();
+                    let got = layernorm_modulation(&x, &scale, &shift).unwrap();
+                    let want = former(&x, &scale, &shift);
+                    assert_eq!(got.dtype(), want.dtype());
+                    assert_eq!(bits(&got), bits(&want), "x {xd:?} mod {md:?} rows {rows}");
+                }
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: FLUX.3 `layernorm_modulation` on bf16 1024^2 tokens `[4608, 3072]`
+    /// with bf16 per-token and shared modulation rows is fused (2 calls) and bit-identical to the
+    /// switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let x = bf(values(&[4608, d], 11, 3.0, 0.3, &dev));
+        let per_token = (
+            bf(values(&[4608, d], 12, 0.5, 0.0, &dev)),
+            bf(values(&[4608, d], 13, 0.5, 0.0, &dev)),
+        );
+        let shared = (
+            bf(values(&[1, d], 14, 0.5, 0.0, &dev)),
+            bf(values(&[1, d], 15, 0.5, 0.0, &dev)),
+        );
+        assert_fused_and_bit_identical(
+            "flux3 layernorm_modulation (bf16 [4608,3072], per-token + shared rows)",
+            2,
+            &|| {
+                let a = layernorm_modulation(&x, &per_token.0, &per_token.1).unwrap();
+                let b = layernorm_modulation(&x, &shared.0, &shared.1).unwrap();
+                Tensor::cat(&[&a, &b], 0).unwrap()
+            },
         );
     }
 }

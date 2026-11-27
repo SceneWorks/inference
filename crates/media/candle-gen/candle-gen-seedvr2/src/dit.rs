@@ -14,6 +14,7 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Quant;
 use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{DenseLinear, QLinear};
+use candle_gen::rope::{RopeLayout, RopeSpec};
 
 use crate::config::DitConfig;
 use crate::nn;
@@ -404,7 +405,9 @@ fn txt_freq_block(freqs: &Tensor, txt_len: usize, dev: &Device) -> Result<Tensor
     Tensor::cat(&[&a, &a, &a], 1)
 }
 
-/// rotate_half on `(..., 2k)`: pairs `(x0,x1) -> (-x1, x0)`.
+/// rotate_half on `(..., 2k)`: pairs `(x0,x1) -> (-x1, x0)` (the former private RoPE's building
+/// block, kept as the test oracle).
+#[cfg(test)]
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let sh = x.dims().to_vec();
     let l = *sh.last().unwrap();
@@ -420,21 +423,19 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 }
 
 /// apply RoPE to `t` `(N, heads, head_dim)` with `freqs` `(N, rot)` (rot ≤ head_dim).
+///
+/// Adjacent pairs with one f32 angle per lane, the first `rot` lanes, f32 math cast back: the
+/// shared `candle_gen::rope::apply_rope` (SW-6129) over `t` viewed as `[1, N, heads, head_dim]` —
+/// the fused strided kernel on CUDA, and elsewhere the shared chain, bit-identical to the
+/// `x·cos + rotate_half(x)·sin` chain + untouched tail this function carried
+/// (`rope_route_tests::apply_rope_matches_the_former_private_chain` pins it).
 fn apply_rope(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
-    let (n, _heads, hd) = t.dims3()?;
+    t.dims3()?;
     let rot = freqs.dim(1)?;
-    let t_mid = t.narrow(2, 0, rot)?; // (N,heads,rot)
-    let cosf = freqs.to_dtype(DType::F32)?.cos()?.reshape((n, 1, rot))?;
-    let sinf = freqs.to_dtype(DType::F32)?.sin()?.reshape((n, 1, rot))?;
-    let mid_f = t_mid.to_dtype(DType::F32)?;
-    let rotated = (mid_f.broadcast_mul(&cosf)? + rotate_half(&mid_f)?.broadcast_mul(&sinf)?)?
-        .to_dtype(t.dtype())?;
-    if rot < hd {
-        let right = t.narrow(2, rot, hd - rot)?;
-        Tensor::cat(&[&rotated, &right], 2)
-    } else {
-        Ok(rotated)
-    }
+    let f = freqs.to_dtype(DType::F32)?;
+    let (cos, sin) = (f.cos()?, f.sin()?); // (N, rot)
+    let spec = RopeSpec::interleaved(RopeLayout::Bshd).with_rotary_dim(rot);
+    candle_gen::rope::apply_rope(&t.unsqueeze(0)?, &cos, &sin, &spec)?.squeeze(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +471,29 @@ fn emb_param(emb: &Tensor, layer_idx: usize, comp: usize) -> Result<Tensor> {
     c.unsqueeze(1) // (B,1,vid_dim)
 }
 
+/// `modulate_in(rms_plain(x, ones, eps), ...)` — the f32 RMS with the unit weight cast back to
+/// `x`'s dtype, then `· scale + shift` with the AdaSingle `emb + learned` parameters — as the shared
+/// fused AdaLN over that exact chain (SW-6129, direct-scale form): one launch on CUDA, the chain
+/// itself elsewhere.
+fn rms_modulate_in(
+    x: &Tensor,
+    ones: &Tensor,
+    eps: f64,
+    emb: &Tensor,
+    layer_idx: usize,
+    p_shift: &Tensor,
+    p_scale: &Tensor,
+) -> Result<Tensor> {
+    let shift = ada_param(emb, layer_idx, 0, p_shift)?;
+    let scale = ada_param(emb, layer_idx, 1, p_scale)?;
+    let spec = candle_gen::modulate::AdaLnChain::rms(eps)
+        .with_weight(ones)
+        .direct_scale();
+    candle_gen::modulate::adaln_chain(x, &spec, &scale, &shift)
+}
+
+/// The pre-SW-6129 modulation over an already-normalized `hidden` (the tests' oracle).
+#[cfg(test)]
 fn modulate_in(
     hidden: &Tensor,
     emb: &Tensor,
@@ -477,9 +501,20 @@ fn modulate_in(
     p_shift: &Tensor,
     p_scale: &Tensor,
 ) -> Result<Tensor> {
-    let shift = emb_param(emb, layer_idx, 0)?.broadcast_add(p_shift)?;
-    let scale = emb_param(emb, layer_idx, 1)?.broadcast_add(p_scale)?;
-    hidden.broadcast_mul(&scale)?.broadcast_add(&shift)
+    let shift = ada_param(emb, layer_idx, 0, p_shift)?;
+    let scale = ada_param(emb, layer_idx, 1, p_scale)?;
+    // `hidden · scale + shift`: the shared composable modulate, direct scale form (SW-6129).
+    candle_gen::modulate::modulate_with(
+        hidden,
+        &scale,
+        &shift,
+        candle_gen::modulate::ScaleForm::Direct,
+    )
+}
+
+/// AdaSingle parameter `emb[:, :, layer, comp] + learned` (`(B, 1, vid_dim)`).
+fn ada_param(emb: &Tensor, layer_idx: usize, comp: usize, learned: &Tensor) -> Result<Tensor> {
+    emb_param(emb, layer_idx, comp)?.broadcast_add(learned)
 }
 fn modulate_out(
     hidden: &Tensor,
@@ -487,7 +522,7 @@ fn modulate_out(
     layer_idx: usize,
     p_gate: &Tensor,
 ) -> Result<Tensor> {
-    let gate = emb_param(emb, layer_idx, 2)?.broadcast_add(p_gate)?;
+    let gate = ada_param(emb, layer_idx, 2, p_gate)?;
     hidden.broadcast_mul(&gate)
 }
 
@@ -854,8 +889,10 @@ impl Block {
         cache: &WindowCache,
     ) -> Result<(Tensor, Tensor)> {
         let av = self.ada_v();
-        let vid_attn_in = modulate_in(
-            &rms_plain(vid, &self.ones, self.eps)?,
+        let vid_attn_in = rms_modulate_in(
+            vid,
+            &self.ones,
+            self.eps,
             emb,
             0,
             &av.attn_shift,
@@ -865,8 +902,10 @@ impl Block {
             rms_plain(txt, &self.ones, self.eps)?
         } else {
             let at = self.ada_t();
-            modulate_in(
-                &rms_plain(txt, &self.ones, self.eps)?,
+            rms_modulate_in(
+                txt,
+                &self.ones,
+                self.eps,
                 emb,
                 0,
                 &at.attn_shift,
@@ -881,8 +920,10 @@ impl Block {
             (txt + modulate_out(&ta, emb, 0, &self.ada_t().attn_gate)?)?
         };
 
-        let vid_mlp_in = modulate_in(
-            &rms_plain(&vid, &self.ones, self.eps)?,
+        let vid_mlp_in = rms_modulate_in(
+            &vid,
+            &self.ones,
+            self.eps,
             emb,
             1,
             &av.mlp_shift,
@@ -894,8 +935,10 @@ impl Block {
             txt
         } else {
             let at = self.ada_t();
-            let txt_mlp_in = modulate_in(
-                &rms_plain(&txt, &self.ones, self.eps)?,
+            let txt_mlp_in = rms_modulate_in(
+                &txt,
+                &self.ones,
+                self.eps,
                 emb,
                 1,
                 &at.mlp_shift,
@@ -1151,5 +1194,238 @@ mod quant_tests {
             diff, 0.0,
             "cached-ones rms_plain must match a fresh one exactly"
         );
+    }
+}
+
+/// SW-6129 route: `apply_rope` is the shared `candle_gen::rope::apply_rope`; the former private
+/// chain is the oracle.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `apply_rope`, verbatim.
+    fn former(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
+        let (n, _heads, hd) = t.dims3()?;
+        let rot = freqs.dim(1)?;
+        let t_mid = t.narrow(2, 0, rot)?; // (N,heads,rot)
+        let cosf = freqs.to_dtype(DType::F32)?.cos()?.reshape((n, 1, rot))?;
+        let sinf = freqs.to_dtype(DType::F32)?.sin()?.reshape((n, 1, rot))?;
+        let mid_f = t_mid.to_dtype(DType::F32)?;
+        let rotated = (mid_f.broadcast_mul(&cosf)? + rotate_half(&mid_f)?.broadcast_mul(&sinf)?)?
+            .to_dtype(t.dtype())?;
+        if rot < hd {
+            let right = t.narrow(2, rot, hd - rot)?;
+            Tensor::cat(&[&rotated, &right], 2)
+        } else {
+            Ok(rotated)
+        }
+    }
+
+    /// Per-lane angles like `axial_1d` (each pair's angle repeated on both lanes).
+    fn freqs(n: usize, rot: usize, dev: &Device) -> Tensor {
+        let vals: Vec<f32> = (0..n * rot)
+            .map(|i| ((i / rot) as f32 + 0.5) * 0.13 * (((i % rot) / 2) as f32 + 1.0).recip())
+            .collect();
+        Tensor::from_vec(vals, (n, rot), dev).unwrap()
+    }
+
+    /// Bit-identical to the former chain in f32 / bf16 / f16, partial (rot < head_dim) and full
+    /// rotary, f32 and bf16 frequency tables.
+    #[test]
+    fn apply_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let n = 30;
+        for (rot, hd) in [(96usize, 128usize), (64, 64)] {
+            let t32 = spread(&[n, 3, hd], 0.5, &dev);
+            for fdt in [DType::F32, DType::BF16] {
+                let f = freqs(n, rot, &dev).to_dtype(fdt).unwrap();
+                for dtype in [DType::F32, DType::BF16, DType::F16] {
+                    let t = t32.to_dtype(dtype).unwrap();
+                    let got = apply_rope(&t, &f).unwrap();
+                    let want = former(&t, &f).unwrap();
+                    assert_eq!((got.dims(), got.dtype()), (want.dims(), dtype));
+                    assert_eq!(
+                        bits(&got),
+                        bits(&want),
+                        "{dtype:?} rot {rot}/{hd} freqs {fdt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the window RoPE of q/k (bf16, 96 of 128 lanes rotated) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let n = 4096;
+        let f = freqs(n, 96, &dev);
+        let q = spread(&[n, 24, 128], 0.5, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = spread(&[n, 24, 128], 1.5, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run =
+            || -> Vec<Tensor> { vec![apply_rope(&q, &f).unwrap(), apply_rope(&k, &f).unwrap()] };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
+    }
+}
+
+/// SW-6129: the SeedVR2 AdaSingle pre-norm modulations are the shared fused AdaLN over the exact
+/// former chain.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// `vid` `[1, L, dim]`, the f32 unit weight, the `(B, dim, 2, 3)` AdaSingle embedding and the
+    /// learned `(dim,)` shift / scale, all but the weight in `dt`.
+    #[allow(clippy::type_complexity)]
+    fn operands(dim: usize, dt: DType, dev: &Device) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+        let x = values(&[1, 300, dim], 1, 3.0, 0.2, dev)
+            .to_dtype(dt)
+            .unwrap();
+        let ones = Tensor::ones(dim, DType::F32, dev).unwrap();
+        let emb = values(&[1, dim, 2, 3], 2, 0.4, 0.0, dev)
+            .to_dtype(dt)
+            .unwrap();
+        let p_shift = values(&[dim], 3, 0.2, 0.0, dev).to_dtype(dt).unwrap();
+        let p_scale = values(&[dim], 4, 0.2, 1.0, dev).to_dtype(dt).unwrap();
+        (x, ones, emb, p_shift, p_scale)
+    }
+
+    /// CPU: bit-identical to `modulate_in(&rms_plain(x, ones, eps)?, ...)` at the 3B / 7B widths.
+    #[test]
+    fn rms_modulate_in_matches_the_former_chain() {
+        for dim in [2560usize, 3072] {
+            for dt in [DType::F32, DType::BF16, DType::F16] {
+                let (x, ones, emb, sh, sc) = operands(dim, dt, &Device::Cpu);
+                for layer in [0usize, 1] {
+                    let former =
+                        modulate_in(&rms_plain(&x, &ones, 1e-6).unwrap(), &emb, layer, &sh, &sc)
+                            .unwrap();
+                    let got = rms_modulate_in(&x, &ones, 1e-6, &emb, layer, &sh, &sc).unwrap();
+                    assert_eq!(bits(&got), bits(&former), "dim={dim} {dt:?} layer={layer}");
+                }
+            }
+        }
+    }
+
+    /// CUDA bf16: the pre-norm modulation takes the fused kernel, bit-identical to the switch-off
+    /// reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, ones, emb, sh, sc) = operands(3072, DType::BF16, &dev);
+        let run = || {
+            Tensor::cat(
+                &[
+                    rms_modulate_in(&x, &ones, 1e-6, &emb, 0, &sh, &sc).unwrap(),
+                    rms_modulate_in(&x, &ones, 1e-6, &emb, 1, &sh, &sc).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "seedvr2 adaln (bf16, dim 3072, direct scale): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

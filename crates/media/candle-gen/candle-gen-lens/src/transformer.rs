@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, LensRope};
+use candle_gen::modulate::{adaln, adaln_chain, AdaLn, AdaLnChain};
 use candle_gen::rope::GeometryCache;
 
 fn streamed_linear_detect(
@@ -115,14 +116,12 @@ impl LensDitConfig {
     }
 }
 
-/// Affine-free LayerNorm over the last axis (dtype-preserving; computed in f32).
-fn layer_norm(x: &Tensor) -> Result<Tensor> {
-    let dt = x.dtype();
-    let xf = x.to_dtype(DType::F32)?;
-    let mean = xf.mean_keepdim(D::Minus1)?;
-    let xc = xf.broadcast_sub(&mean)?;
-    let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
-    xc.broadcast_div(&(var + EPS)?.sqrt()?)?.to_dtype(dt)
+/// `NormOut`'s affine-free LayerNorm over the last axis (computed in f32, cast back) followed by
+/// `(1 + scale)·LN(x) + shift` — the shared fused AdaLN over that composable chain (SW-6129,
+/// [`AdaLnChain::layer`]): one launch on CUDA, bit-identical to the `mean_keepdim` / `sqr` /
+/// `sqrt` / `broadcast_div` chain + modulate it replaces, that chain everywhere else.
+fn layer_norm_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    adaln_chain(x, &AdaLnChain::layer(EPS), scale, shift)
 }
 
 /// Split a `[B, 3·inner]` modulation chunk into `(shift, scale, gate)`, each `[B, 1, inner]` —
@@ -139,8 +138,25 @@ fn chunk3(m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
 /// twin ([`crate::dit_train`]) reuses it verbatim.
 pub fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     let (shift, scale, gate) = chunk3(m)?;
-    let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
     Ok((out, gate))
+}
+
+/// A block's AdaLN over its affine RMSNorm — `norm(x)·(1+scale) + shift`, plus the gate: the
+/// shared fused AdaLN (SW-6129, [`AdaLn::rms`] with the norm weight), bit-identical to the
+/// `RmsNorm::forward` (candle `ops::rms_norm` on a contiguous `x`) + [`modulate`] chain, which a
+/// non-contiguous `x` (`RmsNorm`'s composable branch) still takes. Inference only: the trainable
+/// twin keeps its own composable norm and [`modulate`].
+fn rms_modulate(norm: &RmsNorm, x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
+    if !x.is_contiguous() {
+        return modulate(&norm.forward(x)?, m);
+    }
+    let (shift, scale, gate) = chunk3(m)?;
+    let spec = AdaLn::rms(norm.eps()).with_weight(norm.weight());
+    Ok((
+        __model_proof_output!(adaln(x, &spec, &scale, &shift))?,
+        gate,
+    ))
 }
 
 /// `x + gate·y`. Composable; reused by [`crate::dit_train`].
@@ -587,14 +603,8 @@ impl LensTransformerBlock {
         );
 
         // attention path
-        let (img_n, img_g1) = modulate(
-            &__model_proof_output!(self.img_norm1.forward(hidden))?,
-            &im0,
-        )?;
-        let (txt_n, txt_g1) = modulate(
-            &__model_proof_output!(self.txt_norm1.forward(encoder))?,
-            &tm0,
-        )?;
+        let (img_n, img_g1) = rms_modulate(&self.img_norm1, hidden, &im0)?;
+        let (txt_n, txt_g1) = rms_modulate(&self.txt_norm1, encoder, &tm0)?;
         let (img_attn, txt_attn) = self.attn.forward(
             &img_n,
             &txt_n,
@@ -609,15 +619,9 @@ impl LensTransformerBlock {
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
         // feed-forward path (SwiGLU)
-        let (img_n2, img_g2) = modulate(
-            &__model_proof_output!(self.img_norm2.forward(&hidden))?,
-            &im1,
-        )?;
+        let (img_n2, img_g2) = rms_modulate(&self.img_norm2, &hidden, &im1)?;
         let hidden = gated(&hidden, &img_g2, &self.img_mlp.forward(&img_n2)?)?;
-        let (txt_n2, txt_g2) = modulate(
-            &__model_proof_output!(self.txt_norm2.forward(&encoder))?,
-            &tm1,
-        )?;
+        let (txt_n2, txt_g2) = rms_modulate(&self.txt_norm2, &encoder, &tm1)?;
         let encoder = gated(&encoder, &txt_g2, &self.txt_mlp.forward(&txt_n2)?)?;
 
         Ok((encoder, hidden))
@@ -644,9 +648,7 @@ impl NormOut {
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
         let shift = p.narrow(D::Minus1, inner, inner)?.unsqueeze(1)?;
-        layer_norm(x)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)
+        layer_norm_modulate(x, &scale, &shift)
     }
 }
 
@@ -1279,5 +1281,136 @@ mod tests {
         assert_eq!(c.mlp_hidden(), 4096); // inner/3·8
         assert_eq!(c.txt_in_dim(), 11520); // 2880·4
         assert_eq!(c.axes_dims_rope.iter().sum::<usize>(), c.head_dim); // 8+28+28 = 64
+    }
+}
+
+/// SW-6129: the DiT's AdaLN sites are the shared fused AdaLN, bit-identical to the chains they
+/// replaced.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+
+    /// The former `NormOut` LayerNorm, verbatim (the oracle).
+    fn former_layer_norm(x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let mean = xf.mean_keepdim(D::Minus1)?;
+        let xc = xf.broadcast_sub(&mean)?;
+        let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
+        xc.broadcast_div(&(var + EPS)?.sqrt()?)?.to_dtype(dt)
+    }
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// One block's operands at the real width (inner 1536): `x [2, 40, D]`, a `[2, 6·D]`
+    /// modulation table, the RmsNorm weight.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, RmsNorm) {
+        let d = LensDitConfig::lens().inner_dim;
+        let x = values(&[2, 40, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let m = values(&[2, 6 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let w = values(&[d], 3, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        (x, m, RmsNorm::new(w, EPS))
+    }
+
+    /// The block `rms_modulate` and `NormOut`'s `layer_norm_modulate` equal `RmsNorm::forward` +
+    /// `modulate` and the former f32 LayerNorm + `modulate`, bit for bit (CPU: the reference).
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn fused_adaln_sites_match_the_former_chains() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, m, norm) = operands(dtype, &Device::Cpu);
+            let d = x.dim(2).unwrap();
+            let first = m.narrow(1, 0, 3 * d).unwrap();
+            let (got, gate) = __model_proof_output!(rms_modulate(&norm, &x, &first), pair).unwrap();
+            let (want, want_gate) = modulate(&norm.forward(&x).unwrap(), &first).unwrap();
+            assert_eq!(bits(&got), bits(&want), "rms {dtype:?}");
+            assert_eq!(bits(&gate), bits(&want_gate));
+            let scale = m.narrow(1, 0, d).unwrap().unsqueeze(1).unwrap();
+            let shift = m.narrow(1, d, d).unwrap().unsqueeze(1).unwrap();
+            let got = layer_norm_modulate(&x, &scale, &shift).unwrap();
+            let want =
+                candle_gen::modulate::modulate(&former_layer_norm(&x).unwrap(), &scale, &shift)
+                    .unwrap();
+            assert_eq!(bits(&got), bits(&want), "norm_out {dtype:?}");
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains");
+    }
+
+    /// CUDA bf16: both sites take the fused AdaLN (2 block modulations + `NormOut`) and are
+    /// bit-identical to the same calls with the kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 3;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, m, norm) = operands(DType::BF16, &dev);
+        let d = x.dim(2).unwrap();
+        let run = || {
+            let (a, _) = __model_proof_output!(
+                rms_modulate(&norm, &x, &m.narrow(1, 0, 3 * d).unwrap()),
+                pair
+            )
+            .unwrap();
+            let (b, _) = rms_modulate(&norm, &x, &m.narrow(1, 3 * d, 3 * d).unwrap()).unwrap();
+            let scale = m.narrow(1, 0, d).unwrap().unsqueeze(1).unwrap();
+            let shift = m.narrow(1, d, d).unwrap().unsqueeze(1).unwrap();
+            let c = layer_norm_modulate(&x, &scale, &shift).unwrap();
+            Tensor::cat(&[a, b, c], 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "lens adaln (bf16, D={d}): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

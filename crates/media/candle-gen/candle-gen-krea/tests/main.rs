@@ -72,3 +72,6 @@ mod trainer_e2e;
 
 #[path = "trainer_weights_free.rs"]
 mod trainer_weights_free;
+
+#[path = "w4a8_krea_dit_gpu.rs"]
+mod w4a8_krea_dit_gpu;

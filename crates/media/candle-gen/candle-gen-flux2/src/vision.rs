@@ -13,6 +13,7 @@ use candle_gen::candle_nn::{
     Module, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::rope::{RopeLayout, RopeSpec};
 use candle_gen::{CandleError, Result as GenResult};
 
 /// Checkpoint namespace of the Pixtral vision tower inside the multimodal `text_encoder/`
@@ -243,7 +244,13 @@ impl PixtralAttention {
     }
 }
 
-/// Non-interleaved rotate-half RoPE: `x*cos + [-x2, x1]*sin`, all in f32.
+/// Pixtral's split-half (rotate-half) RoPE layout: `x` `[heads, seq, head_dim]` as one BHSD batch.
+const PIXTRAL_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bhsd);
+
+/// Non-interleaved rotate-half RoPE: `x*cos + [-x2, x1]*sin`, all in f32 (the result is f32).
+/// The shared [`candle_gen::rope::apply_rope`] (SW-6129) on the f32 upcast with full-width
+/// `[seq, head_dim]` tables — the fused strided kernel on CUDA, the private chain this used to carry
+/// (now the shared reference) everywhere else, bit for bit.
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
     let (_heads, seq, head_dim) = x.dims3()?;
     if head_dim % 2 != 0 {
@@ -256,14 +263,8 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
             "flux2 Pixtral RoPE table shape must be [{seq}, {head_dim}]"
         )));
     }
-    let x = x.to_dtype(DType::F32)?;
-    let half = head_dim / 2;
-    let first = x.narrow(2, 0, half)?;
-    let second = x.narrow(2, half, half)?;
-    let rotated = Tensor::cat(&[&second.neg()?, &first], 2)?;
-    let cos = cos.unsqueeze(0)?;
-    let sin = sin.unsqueeze(0)?;
-    x.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?
+    let x = x.to_dtype(DType::F32)?.unsqueeze(0)?;
+    candle_gen::rope::apply_rope(&x, cos, sin, &PIXTRAL_ROPE)?.squeeze(0)
 }
 
 struct PixtralBlock {
@@ -903,5 +904,114 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::tiny_projector_loads_exact_prefix_and_returns_expected_shape");
+    }
+}
+
+/// SW-6129: Pixtral's rotate-half RoPE is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private Pixtral apply, verbatim.
+    fn former_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let (_heads, _seq, head_dim) = x.dims3().unwrap();
+        let x = x.to_dtype(DType::F32).unwrap();
+        let half = head_dim / 2;
+        let first = x.narrow(2, 0, half).unwrap();
+        let second = x.narrow(2, half, half).unwrap();
+        let rotated = Tensor::cat(&[&second.neg().unwrap(), &first], 2).unwrap();
+        let cos = cos.unsqueeze(0).unwrap();
+        let sin = sin.unsqueeze(0).unwrap();
+        (x.broadcast_mul(&cos).unwrap() + rotated.broadcast_mul(&sin).unwrap()).unwrap()
+    }
+
+    /// The shared route equals the former apply bit for bit on CPU for f32 / bf16 / f16 activations
+    /// (the result is f32 either way), at Pixtral's real 2-D tables over two images.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let grids = [(4usize, 6usize), (3, 2)];
+        let (cos, sin) = rope_2d(&grids, 64, 10_000.0, &Device::Cpu).unwrap();
+        let seq = cos.dim(0).unwrap();
+        let x32 = values(&[5, seq, 64], 7, &Device::Cpu);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let got = apply_rope(&x, &cos, &sin).unwrap();
+            assert_eq!(got.dtype(), DType::F32);
+            assert_eq!(bits(&got), bits(&former_apply(&x, &cos, &sin)), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: flux2 Pixtral apply_rope (bf16 in, f32 out, [16,4096,64]) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_pixtral_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // Pixtral at a 1024^2 reference image (64x64 patches), 16 heads x 64, bf16 activations.
+        let (cos, sin) = rope_2d(&[(64, 64)], 64, 10_000.0, &dev).unwrap();
+        let q = values(&[16, 64 * 64, 64], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = values(&[16, 64 * 64, 64], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    apply_rope(&q, &cos, &sin).unwrap(),
+                    apply_rope(&k, &cos, &sin).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("flux2 Pixtral apply_rope (bf16 in, f32 out, [16,4096,64]): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
     }
 }

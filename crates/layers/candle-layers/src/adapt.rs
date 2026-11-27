@@ -1650,6 +1650,7 @@ impl AdaptLinear {
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         if self.is_fp8()
             || self.is_convrot_int8()
+            || self.is_w4a8()
             || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
         {
             return self.push_lora_checked(a, b, scale);
@@ -1884,6 +1885,7 @@ impl AdaptLinear {
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
         if self.is_fp8()
             || self.is_convrot_int8()
+            || self.is_w4a8()
             || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
         {
             return self.push_lokr_structured_checked(factors);

@@ -605,6 +605,50 @@ KREA_TURBO_Q4_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/q4 \
 **Budget ~10 minutes per NVFP4 trunk build**: `Nvfp4Tensor::pack` runs single-threaded on the CPU, and
 Krea's DiT is ~12.5B parameters. Bench the regimes you need, not all of them.
 
+### The W4A8 tier on Krea 2 Turbo (SW-6135)
+
+The W4A8 tier (int4 codebook weights, int8 ConvRot activations, SW-6134's `W4A8Linear`, `sm_80+`)
+is a prebuilt native single file, `krea2_turbo_w4a8.safetensors`, built from the bf16 master by
+`candle-gen-krea/examples/krea-w4a8-pack.rs` (`w4a8_tier::build_w4a8_tier`) and loaded through the
+ordinary native single-file route (`WeightsSource::File` + `base_snapshot`). The loader delegates the
+W4A8 projections out of the checkpoint-codec plan
+(`gen_core::checkpoint_codec::plan_safetensors_delegating_w4a8`) and builds them through
+`W4A8Linear`. Projections pack by Krea's NVFP4 role table (`W4A8Policy::Mixed`): the 6
+normalized-input leaves of blocks 4–26 (138 projections, 6.8B parameters). Edge blocks,
+post-nonlinearity leaves, context readers, the head and unclassified embedders stay bf16/f32. Below
+`sm_80` and off CUDA the tier is refused before any weight is read (`w4a8_tier::check_w4a8_tier`,
+typed and naming the backend). LoRA/LoKr ride as checked additive residuals; a diff-patch is refused.
+
+Fixed-seed 1024², 8 steps, seed `0x56135`, fox prompt (`w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16`),
+**sm_120** (RTX PRO 6000 Blackwell Max-Q, GPU 0). Each tier loads and renders in its own scope.
+"DiT weights" is header byte accounting: floats at bf16, codes and companions as stored. For MLX q4/q8
+the figure counts the MLX triple, not the GGML sidecar. For Kitchen NVFP4 it counts the file, before
+the role table demotes its W4A16 rows to dense.
+
+| tier | image PSNR vs bf16 | s/step | device peak | DiT weights | file |
+|---|---:|---:|---:|---:|---:|
+| bf16 | — | 1.038 | 39.4 GB | 25.6 GB | — |
+| q8 (MLX) | 39.73 dB | 1.144 | 28.6 GB | 13.9 GB | — |
+| **W4A8 (mixed, shipped)** | **31.29 dB** | **1.106** | **33.9 GB** | **15.9 GB** (3.8 packed + 12.0 bf16) | 16.5 GB |
+| NVFP4 (Kitchen file) | 27.40 dB | 0.939 | 35.1 GB | 7.7 GB stored | — |
+| q4 (MLX) | 23.08 dB | 1.119 | 21.6 GB | 7.7 GB | — |
+| W4A8 (blanket, measurement arm) | 18.77 dB | 1.159 | 25.4 GB | 7.2 GB | 7.2 GB |
+
+s/step is the median inter-step interval of the 8-step denoise. Device peak is the `VramProbe` peak
+over the idle baseline across load and render, with the text encoder resident. The run had GPU 0 to
+itself: no co-tenant and no baseline wait. PSNR was identical in a second, contended run.
+
+Both W4A8 renders are coherent on inspection. The mixed render is visually indistinguishable from
+bf16; the blanket render keeps the scene but moves pose and framing. Blanket packing, which includes
+every sensitive class the role table names, falls below the q4 bar, which is why the shipped tier
+follows the role table. The test's floor is 22 dB: the q4 tier the catalog already offers beside it.
+
+**What W4A8 buys on sm_120, and what it does not.** On this Blackwell part the mixed tier is ~7%
+slower per step than bf16 (S9 measured the fused W4A8 GEMM at ~1.26x bf16 time at Krea shapes) and
+larger than q8, at lower fidelity than q8. Its role is the `sm_80`–`sm_89` compute tier, where NVFP4
+does not exist. These sm_120 numbers say nothing about sm_80–sm_89 and must not be extrapolated
+there.
+
 ## Packaging (Windows / CUDA) — sc-3676
 
 The goal is **one distributable CUDA worker that runs on every NVIDIA GPU we support, not just the

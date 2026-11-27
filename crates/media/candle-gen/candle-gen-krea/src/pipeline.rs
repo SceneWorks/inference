@@ -1028,6 +1028,60 @@ fn ensure_nvfp4_adapters_supported(native_nvfp4: bool, adapters: &[AdapterSpec])
     Ok(())
 }
 
+/// Adapter admission for a native **W4A8** tier (SW-6135): low-rank LoRA/LoKr ride as additive
+/// residuals over the packed base (the shared `AdaptLinear` W4A8 host, checked admission), exactly
+/// as on the NVFP4 and INT8-ConvRot tiers. A diff-patch is refused for the NVFP4 reason: it folds
+/// into a dense base weight, and a packed W4A8 projection has none. (A diff-patch that targets only
+/// projections the tier keeps dense would fold, but the refusal is upfront and by class, so the
+/// answer never depends on which projections a tier happened to pack.)
+fn ensure_w4a8_adapters_supported(adapters: &[AdapterSpec]) -> Result<()> {
+    if crate::adapters::any_diff_patch(adapters) {
+        return Err(CandleError::Unsupported(
+            "Krea W4A8 imports cannot apply a diff-patch (.diff/.diff_b) adapter: a diff-patch \
+             folds into the dense base weight at load, and a packed W4A8 projection has no dense \
+             form to fold into. Low-rank LoRA/LoKr adapters are supported as additive residuals."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The W4A8 tier's upfront device admission (SW-6135, epic E5): CUDA `sm_80+`, else the typed,
+/// backend-aware [`crate::w4a8_tier::W4A8TierUnavailable`] refusal as
+/// [`CandleError::Unsupported`]. Returns the probe's INT8 context so the trunk shares that one
+/// handle.
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_w4a8_floor(device: &Device) -> Result<Int8Context> {
+    if !device.is_cuda() {
+        let refusal =
+            crate::w4a8_tier::check_w4a8_tier(None, crate::w4a8_tier::backend_label(device))
+                .expect_err("a non-CUDA device never clears the W4A8 floor");
+        return Err(CandleError::Unsupported(refusal.to_string()));
+    }
+    let ctx = Int8Context::new(device)
+        .map_err(|e| CandleError::Msg(format!("krea w4a8: cublasLt probe: {e}")))?;
+    let cap = ctx
+        .handle_for(device)?
+        .compute_cap()
+        .map_err(|e| CandleError::Msg(format!("krea w4a8: compute-cap probe: {e}")))?;
+    crate::w4a8_tier::check_w4a8_tier(Some(cap), "cuda")
+        .map_err(|refusal| CandleError::Unsupported(refusal.to_string()))?;
+    Ok(ctx)
+}
+
+/// Non-CUDA build: W4A8 has no executable backend at all, so the tier is refused by type.
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn ensure_w4a8_floor(device: &Device) -> Result<Int8Context> {
+    let backend = match device {
+        Device::Cpu => "cpu",
+        Device::Metal(_) => "metal",
+        Device::Cuda(_) => "cuda (this build has no CUDA backend)",
+    };
+    let refusal = crate::w4a8_tier::check_w4a8_tier(None, backend)
+        .expect_err("no CUDA capability clears the W4A8 floor");
+    Err(CandleError::Unsupported(refusal.to_string()))
+}
+
 /// Read the DiT out of a **single-file native import** and, on the way past, publish that read's
 /// [`gen_core::CheckpointWeightFacts`] into `facts` (sc-21484 follow-up).
 ///
@@ -1054,7 +1108,7 @@ fn load_native_dit_at_dtype(
 ) -> Result<Krea2Transformer> {
     native_dit.read_unchanged(|_| {
         let cfg = Krea2Config::from_snapshot(root)?;
-        let mut dit_w = Weights::from_pinned_native_file_for(
+        let dit_w = Weights::from_pinned_native_file_for(
             native_dit,
             device,
             dit_dtype,
@@ -1063,11 +1117,39 @@ fn load_native_dit_at_dtype(
         )?;
         let fixed_source = dit_w
             .logical_plan()
-            .is_some_and(|p| p.has_encoded_weights());
+            .is_some_and(|p| p.has_encoded_weights())
+            || dit_w.is_native_w4a8();
         let native_nvfp4 = dit_w.is_native_nvfp4();
         ensure_nvfp4_adapters_supported(native_nvfp4, adapters.specs)?;
+        // SW-6135: the native W4A8 tier. Admission is upfront and typed (E5): CUDA sm_80+ only,
+        // refused before any projection is built. The floor probe's cuBLASLt handle becomes the
+        // trunk's one shared INT8 handle (E8), exactly as the INT8-ConvRot lane does.
+        let native_w4a8 = dit_w.is_native_w4a8();
+        let mut dit_w = if native_w4a8 {
+            ensure_w4a8_adapters_supported(adapters.specs)?;
+            // Backstop only: the registered build never arms implicit streaming for a W4A8 file
+            // (`native_file_streamable` excludes it, so the sequential heavy phase loads it
+            // resident), and an explicit `stream_transformer_blocks` request is refused at request
+            // admission (`validate_native_file_transformer_request`) before any conditioning.
+            if stream_blocks {
+                return Err(CandleError::Unsupported(
+                    "Krea W4A8 imports require resident transformer loading".into(),
+                ));
+            }
+            if matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
+                return Err(CandleError::Unsupported(
+                    "Krea W4A8 weights cannot be requantized as Q4/Q8".into(),
+                ));
+            }
+            let int8 = ensure_w4a8_floor(device)?;
+            dit_w.with_int8_context(int8)
+        } else {
+            dit_w
+        };
+        // Backstop only, as for W4A8 above: `native_file_streamable` never arms implicit streaming
+        // for a Kitchen NVFP4 file, and explicit streaming is refused at request admission.
         if native_nvfp4 && stream_blocks {
-            return Err(CandleError::Msg(
+            return Err(CandleError::Unsupported(
                 "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
             ));
         }
@@ -1098,7 +1180,7 @@ fn load_native_dit_at_dtype(
         if !adapters.specs.is_empty() {
             adapters.install(&mut dit, &diff.applied_by_spec)?;
         }
-        if let Some(quant) = quant.filter(|_| !native_nvfp4) {
+        if let Some(quant) = quant.filter(|_| !native_nvfp4 && !native_w4a8) {
             dit.quantize_onto(quant, device)?;
         }
 
@@ -3652,6 +3734,41 @@ mod tests {
         assert!(facts.materialized().iter().all(|row| row.representation
             == gen_core::checkpoint_facts::ExecutionRepresentation::DenseFallback));
         assert!(facts.receipt().demotions.is_empty());
+    }
+
+    /// SW-6135 (E5): a native W4A8 tier is refused upfront, by type and naming the backend, on a
+    /// device that cannot execute it — before any projection is constructed. A diff-patch is
+    /// refused by class, and a Q4/Q8 request cannot requantize the packed tier.
+    #[test]
+    fn native_w4a8_tier_is_refused_upfront_off_cuda() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, source, _) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&source).unwrap();
+        let load = |quant| {
+            load_native_dit_at_dtype(
+                &root,
+                &pinned,
+                &Device::Cpu,
+                AdapterLoad::ordinary(&[]),
+                quant,
+                false,
+                DType::F32,
+                &gen_core::CheckpointFactsSink::new(),
+            )
+            .err()
+            .expect("the W4A8 tier does not load on the CPU")
+        };
+        let err = load(None);
+        assert!(
+            matches!(&err, CandleError::Unsupported(m) if m.contains("sm_80") && m.contains("cpu")),
+            "{err:?}"
+        );
+        let err = load(Some(gen_core::Quant::Q8));
+        assert!(
+            matches!(&err, CandleError::Unsupported(m) if m.contains("requantized")),
+            "{err:?}"
+        );
+        assert!(ensure_w4a8_adapters_supported(&[]).is_ok());
     }
 
     #[test]

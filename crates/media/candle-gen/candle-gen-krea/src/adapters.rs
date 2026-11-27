@@ -1276,8 +1276,10 @@ impl AdditiveProj for AdaptLinear {
     /// projection agree, and it follows the **constructed** representation: a plan-NVFP4 row that
     /// the reader served dense (CPU, pre-`sm_120`, or an unalignable shape) is a `Base::Dense` here
     /// and deliberately stays non-strict.
+    /// A packed **W4A8** base (SW-6135) is strict for the same reason: its int4 codebook codes can
+    /// be neither folded into nor dequantized to host a mismatched factor.
     fn strict_admission(&self) -> bool {
-        self.is_nvfp4()
+        self.is_nvfp4() || self.is_w4a8()
     }
 }
 
