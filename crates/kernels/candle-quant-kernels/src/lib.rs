@@ -43,6 +43,9 @@
 //!   `candle_layers::fused`).
 //! - [`act_quant`] — the fused per-tensor fp8 / int8 activation quantizer (SW-6126): amax → scale
 //!   → cast on the device, byte-identical to the op chain it replaces, scale kept on the device.
+//! - [`adaln`] — the fused AdaLN / RMS-AdaLN modulation (SW-6127): `norm(x) · (1 + scale) + shift`
+//!   in one launch, bit-identical to the candle norm + modulate chain (public as
+//!   `candle_gen::modulate`).
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
@@ -62,6 +65,7 @@ const _: fn() = || {
 };
 
 pub mod act_quant;
+pub mod adaln;
 pub mod convrot;
 pub mod convrot_int8;
 pub mod cublaslt;
@@ -158,6 +162,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
     ACT_QUANT_SRC,
+    adaln::ADALN_SRC,
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,

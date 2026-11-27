@@ -2095,6 +2095,66 @@
       "package": "candle-quant-kernels",
       "kind": "lib",
       "target": "candle_quant_kernels",
+      "test": "adaln::cuda_tests::fused_adaln_gpu_is_bit_identical_to_the_reference_chain",
+      "source": "crates/kernels/candle-quant-kernels/src/adaln.rs",
+      "reason": "SW-6127 CUDA fused AdaLN: bit-identical to the candle norm + (scale+1) + broadcast_mul/add chain over f32/bf16/f16, RMSNorm and LayerNorm, with/without weight and bias, native and f32 norm precision, OnePlus and Direct scale, per-sample [B,1,D] and per-token [B,S,D] modulation, D in {1, 7, 96, 1027, 6144, 6151}. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "adaln::cuda_tests::fused_adaln_gpu_serves_krea_chunked_modulation_bit_identically",
+      "source": "crates/kernels/candle-quant-kernels/src/adaln.rs",
+      "reason": "SW-6127 CUDA fused AdaLN at Krea's layout: bf16 [B,300,6144] with the +1-folded f32 RMSNorm weight (norm_in_f32) and scale/shift as strided chunks of a [B,1,6*6144] table, B=1 and 2; bit-identical to the reference chain. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "adaln::cuda_tests::fused_adaln_gpu_parity_catches_a_dropped_one_plus",
+      "source": "crates/kernels/candle-quant-kernels/src/adaln.rs",
+      "reason": "SW-6127 CUDA mutation check: the fused AdaLN with the +1 dropped (Direct form) or a wrong epsilon differs from the reference chain, so the bit-identity comparison catches it. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "adaln::cuda_tests::adaln_reports_its_path",
+      "source": "crates/kernels/candle-quant-kernels/src/adaln.rs",
+      "reason": "SW-6127 CUDA path telemetry: adaln records fused on CUDA, disabled with the switch off (identical output), not_cuda for CPU tensors, autograd for a tracked operand. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
       "test": "act_quant::cuda_tests::fp8_codes_are_byte_identical_to_the_candle_chain",
       "source": "crates/kernels/candle-quant-kernels/src/act_quant.rs",
       "reason": "SW-6126 CUDA fused fp8 activation quantizer: E4M3 codes and scale bit-identical to the candle reference chain (CPU-cast) over F32/BF16/F16, tails, zeros, signed zeros, E4M3 ties, underflow, inf/NaN. cfg(cuda), Device::new_cuda(0).",

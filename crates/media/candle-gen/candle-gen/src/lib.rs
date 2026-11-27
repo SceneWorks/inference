@@ -119,6 +119,10 @@ pub use fused_attention::{
 // re-exported here for the providers; see its module docs for the recipe a new kernel follows.
 pub use candle_quant_kernels::fused_path;
 
+// The shared AdaLN modulation (SW-6127): the composable `modulate` every DiT shares, and the
+// fused `norm(x) · (1 + scale) + shift` (`adaln`) with its bit-identical reference chain.
+pub mod modulate;
+
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
 // guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.
