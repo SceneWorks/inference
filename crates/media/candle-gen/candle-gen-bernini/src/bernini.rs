@@ -44,12 +44,10 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, Result as CResult};
 use gen_core_tokenizer::TextTokenizer;
 
-use candle_gen_wan::config::{
-    TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,
-};
+use candle_gen_wan::config::{TextEncoderConfig, TransformerConfig};
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::rope::assign_source_ids;
-use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
+use candle_gen_wan::scheduler::Sampler;
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
 
@@ -68,7 +66,12 @@ use crate::forward::{
 };
 use crate::guidance::MomentumBuffer;
 use crate::latent_dims;
-use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
+use crate::mar::{
+    mar_schedule, post_process_input_embeds, sample_vit_embed_with_progress, StreamState, VitCfg,
+};
+use crate::pipeline::{
+    run_bernini_candle_stage2_driver, BerniniExpert, BerniniStage2Forward, BerniniStage2Omegas,
+};
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
@@ -79,6 +82,10 @@ use crate::vision::{VisionConfig, VisionTower};
 use crate::vit_preprocess::{
     normalized_frame, pack_patches, preprocess_image, smart_resize, smart_video_nframes, FACTOR,
     IMAGE_MEAN, IMAGE_STD, MERGE_SIZE, PATCH_SIZE, TEMPORAL_PATCH_SIZE,
+};
+use gen_core_family::bernini_plan::{
+    build_bernini_render_plan, BerniniBackendKind, BerniniEntrypoint, BerniniFullVitMode,
+    BerniniOutputContract, BerniniRenderPlan,
 };
 
 /// SceneWorks engine id — matches `mlx-gen-bernini`'s full pipeline so a consumer resolves the same
@@ -95,18 +102,11 @@ const ENC_DTYPE: DType = DType::F32;
 /// overrides `omega_txt`; the rest are fixed until the worker surfaces them.
 struct FullDefaults;
 impl FullDefaults {
-    const STEPS: usize = 40;
-    const OMEGA_VID: f32 = 1.25;
-    const OMEGA_IMG: f32 = 4.5;
-    const OMEGA_TXT: f32 = 4.0;
     const OMEGA_TGT: f32 = 0.5;
-    const OMEGA_SCALE: f32 = 0.8;
     const PLANNING_STEP: usize = 25;
     const VIT_TXT_CFG: f32 = 1.2;
     const VIT_IMG_CFG: f32 = 1.0;
     const VIT_DENOISING_STEP: usize = 5;
-    const FLOW_SHIFT: f64 = 5.0;
-    const ETA: f32 = 1.0;
     const NORM_THRESHOLD: f32 = 50.0;
     /// APG momentum for the `v2v_apg` ViT stream (reference default 0.0 — inert). Persisted across the
     /// denoise loop so a future nonzero default actually carries (F-161).
@@ -478,6 +478,7 @@ fn build_stream(
 /// Resolve the full-Bernini [`VitMode`] from the request's `video_mode` (a guidance-mode name preferred)
 /// plus the conditioning + output kind. Defaults: video source ⇒ `v2v_apg`; video+image or image-refs→
 /// video ⇒ `rv2v_wapg`; otherwise (t2i/i2i/t2v) ⇒ `vae_txt_vit_wapg`.
+#[cfg(test)]
 fn resolve_vit_mode(
     video_mode: Option<&str>,
     has_video: bool,
@@ -505,12 +506,7 @@ fn resolve_vit_mode(
     }
 }
 
-/// The canonical **task** name for the planner's system prompt ([`BerniniTemplate`] / `system_prompt`).
-/// The request's `video_mode` may be a **guidance-mode** name (e.g. `rv2v_wapg`) rather than a task name,
-/// which the template does not recognize — it would silently fall through to the generic
-/// "You are a helpful assistant." Honor an explicit task name the template recognizes; otherwise derive
-/// the task from the conditioning + output kind so a guidance-mode (or absent) `video_mode` still gets a
-/// task-specialized system prompt (F-161).
+#[cfg(test)]
 fn canonical_task(
     video_mode: Option<&str>,
     has_video: bool,
@@ -538,7 +534,7 @@ fn canonical_task(
     }
 }
 
-/// Upstream task_type → full-pipeline guidance mode (fallback when `video_mode` is a task name).
+#[cfg(test)]
 fn task_to_vit_mode(task: &str) -> Option<VitMode> {
     Some(match task {
         "t2i" | "t2v" | "i2i" => VitMode::VaeTxtVitWapg,
@@ -546,6 +542,16 @@ fn task_to_vit_mode(task: &str) -> Option<VitMode> {
         "r2v" | "rv2v" => VitMode::Rv2vWapg,
         _ => return None,
     })
+}
+
+fn vit_mode_from_plan(mode: BerniniFullVitMode) -> VitMode {
+    match mode {
+        BerniniFullVitMode::VaeTxtVit => VitMode::VaeTxtVit,
+        BerniniFullVitMode::VaeTxtVitWapg => VitMode::VaeTxtVitWapg,
+        BerniniFullVitMode::Rv2vWapg => VitMode::Rv2vWapg,
+        BerniniFullVitMode::R2vWapg => VitMode::R2vWapg,
+        BerniniFullVitMode::V2vApg => VitMode::V2vApg,
+    }
 }
 
 /// Stable identity + advertised capabilities for the full Bernini pipeline.
@@ -598,6 +604,17 @@ pub struct Bernini {
 }
 
 impl Bernini {
+    /// Build and validate the pre-load [`BerniniRenderPlan`] before loading weights (`DEC-3`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> gen_core::Result<BerniniRenderPlan> {
+        build_bernini_render_plan(
+            &self.descriptor,
+            BerniniEntrypoint::Full,
+            BerniniBackendKind::Candle,
+            self.knobs.to_plan_knobs(),
+            req,
+        )
+    }
+
     /// The cached shared renderer components — loaded once, then cloned (`Arc`) on every subsequent
     /// generate. The load lock serializes racing first-callers so two concurrent generates don't
     /// both mmap + upload ~50 GB (F-097).
@@ -688,45 +705,11 @@ impl Generator for Bernini {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.descriptor.id;
-        self.descriptor.capabilities.validate_request(id, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095: the
-        // full pipeline was missing these — a 328-px request died with an opaque shape error at denoise
-        // step 1 and `steps: Some(0)` was silently promoted to 1.
-        crate::config::validate_bernini_geometry(id, req)?;
-        validate_conditioning_video_clips(req).map_err(|e| gen_core::Error::Msg(e.to_string()))?;
-        // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
-        // them off the request and dropping them.
-        reject_unimplemented_video_clip_knobs(id, req)?;
+        self.render_plan(req)?;
         // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
         // surface share the provider but retain separate, fail-closed request identities.
         if req.frames == Some(1) || req.memory.is_some() {
             crate::memory_strategy::validate_public_request(req)?;
-        }
-        // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
-        // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
-        let has_video = req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
-        let has_image = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
-            )
-        });
-        let out_video = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1) > 1;
-        let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
-        if mode.needs_conditioning() && !(has_video || has_image) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: guidance mode {mode:?} needs source conditioning (a reference image / video \
-                 clip) but none was provided — pass conditioning or select a text/edit mode"
-            )));
         }
         Ok(())
     }
@@ -782,43 +765,33 @@ impl Bernini {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
         let dev = &self.device;
+        let render_plan = self
+            .render_plan(req)
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
 
         // The heavy renderer components (UMT5 + both experts + z16 VAE + tokenizer) are loaded once and
         // cached across generates (F-097); only the planner is reloaded per request (below).
         let comps = self.components()?;
 
         // --- Geometry + knobs ---
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1) as usize;
+        let frames = render_plan.frames;
         let out_video = frames > 1;
-        let width = req.width;
-        let height = req.height;
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(FullDefaults::STEPS)
-            .max(1);
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let width = render_plan.width;
+        let height = render_plan.height;
+        let steps = render_plan.steps;
+        let seed = render_plan.seed.unwrap_or_else(gen_core::default_seed);
         let neg = req.negative_prompt.clone().unwrap_or_default();
 
-        let has_video = req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
-        let has_image = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
-            )
-        });
-        let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
+        let mode = vit_mode_from_plan(
+            render_plan
+                .vit_mode
+                .expect("Full Bernini plan always resolves a VitMode"),
+        );
         // The planner's system prompt keys off a *task* name; map a guidance-mode / absent `video_mode`
         // to a canonical task so it doesn't fall through to the generic system prompt (F-161).
-        let task = canonical_task(req.video_mode.as_deref(), has_video, has_image, out_video);
-
-        on_progress(Progress::Step {
-            current: 0,
-            total: steps as u32,
-        });
+        let task = render_plan.canonical_task.as_str();
+        let planner_steps = FullDefaults::PLANNING_STEP as u32;
+        let folded_total = render_plan.folded_progress_total as u32;
 
         // The z16 VAE (with encoder) is resident throughout (cached component, F-097): it VAE-encodes
         // the source media into z16 conditioning latents up front and decodes the final latent at the
@@ -955,7 +928,13 @@ impl Bernini {
             )?;
 
             // MAR planning loop (disjoint field borrows: backbone/connector shared, clip_diff mutable).
-            let streams = sample_vit_embed(
+            let mut on_planner_step = |step_1_based: usize| {
+                on_progress(Progress::Step {
+                    current: step_1_based as u32,
+                    total: folded_total,
+                });
+            };
+            let streams = sample_vit_embed_with_progress(
                 &planner.backbone,
                 &planner.connector,
                 &mut planner.clip_diff,
@@ -966,6 +945,7 @@ impl Bernini {
                 &order,
                 &step_noise,
                 &req.cancel,
+                &mut on_planner_step,
                 &planner.mask_token,
             )?;
 
@@ -1019,11 +999,7 @@ impl Bernini {
         let (nv, ni) = (src_videos.len(), src_images.len());
         // ADS2V uses the trained source/reference/first-image triplet; extra images interpolate
         // across ids 1..=3, matching its admission receipt.
-        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
-            3.0
-        } else {
-            self.knobs.max_trained_src_id
-        };
+        let trained_sources = render_plan.trained_sources;
         let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Tensor, f64)> = src_videos
             .iter()
@@ -1037,11 +1013,11 @@ impl Bernini {
             .collect();
 
         let base_g = VitGuidanceParams {
-            omega_txt: req.guidance.unwrap_or(FullDefaults::OMEGA_TXT),
-            omega_img: FullDefaults::OMEGA_IMG,
-            omega_vid: FullDefaults::OMEGA_VID,
-            omega_tgt: FullDefaults::OMEGA_TGT,
-            eta: FullDefaults::ETA,
+            omega_txt: render_plan.omega_txt,
+            omega_img: render_plan.omega_img,
+            omega_vid: render_plan.omega_vid,
+            omega_tgt: render_plan.omega_tgt.unwrap_or(FullDefaults::OMEGA_TGT),
+            eta: render_plan.eta,
             norm_threshold: FullDefaults::NORM_THRESHOLD,
         };
 
@@ -1057,17 +1033,13 @@ impl Bernini {
             let high = BVitExpert::build(&comps.high, streams4)?;
             let low = BVitExpert::build(&comps.low, streams4)?;
             let pf = PackedForward::new(dit_cfg, trained_sources, self.knobs.interpolate_src_id);
-            let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
-            let shift = req
-                .scheduler_shift
-                .map(|s| s as f64)
-                .unwrap_or(FullDefaults::FLOW_SHIFT);
-            let sampler = Sampler::parse(req.sampler.as_deref());
-            let total = steps as u32;
+            let boundary_ts = render_plan.boundary_timestep;
+            let shift = render_plan.shift;
+            let sampler = Sampler::parse(Some(&render_plan.sampler));
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
+                    current: planner_steps + i as u32 + 1,
+                    total: folded_total,
                 })
             };
             denoise_bernini_wvitcfg(
@@ -1083,7 +1055,7 @@ impl Bernini {
                 &image_srcs,
                 &video_srcs,
                 &base_g,
-                FullDefaults::OMEGA_SCALE,
+                render_plan.omega_scale,
                 &req.cancel,
                 &mut on_step,
             )?
@@ -1096,19 +1068,18 @@ impl Bernini {
             vae.decode_budgeted_with_cancel_and_tile_cap(&latents, &req.cancel, decode_cap)?;
         let images_out = frames_to_images(&decoded)?;
 
-        if frames == 1 {
-            let first = images_out
-                .into_iter()
-                .next()
-                .ok_or_else(|| CandleError::Msg("bernini: VAE decode produced no frames".into()))?;
-            Ok(GenerationOutput::Images(vec![first]))
-        } else {
-            let fps = req.fps.unwrap_or(FullDefaults::FPS);
-            Ok(GenerationOutput::Video {
+        match &render_plan.output_contract {
+            BerniniOutputContract::Images { .. } => {
+                let first = images_out.into_iter().next().ok_or_else(|| {
+                    CandleError::Msg("bernini: VAE decode produced no frames".into())
+                })?;
+                Ok(GenerationOutput::Images(vec![first]))
+            }
+            BerniniOutputContract::Video { fps, .. } => Ok(GenerationOutput::Video {
                 frames: images_out,
-                fps,
+                fps: *fps,
                 audio: None,
-            })
+            }),
         }
     }
 }
@@ -1181,52 +1152,79 @@ pub fn denoise_bernini_wvitcfg(
             "eta_bits": base_g.eta.to_bits(), "norm_threshold_bits": base_g.norm_threshold.to_bits()
         }),
     );
-    let mut sched = FlowScheduler::new(sampler, steps, shift);
-    let sigmas = flow_sigmas(steps, shift);
-    let mut latent = init_noise.clone();
-    let mut switched = false;
-    let mut g = base_g.clone();
-    // APG momentum buffer(s) allocated ONCE before the loop and threaded per step, so the running
-    // average carries across steps (F-161) rather than resetting inside each `vit_one_step` call.
-    let mut mbufs: Vec<MomentumBuffer> = (0..num_vit_momentum_buffers(mode))
-        .map(|_| MomentumBuffer::new(FullDefaults::MOMENTUM))
-        .collect();
 
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..steps {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
+    struct VitStage2Forward<'a> {
+        pf: &'a PackedForward,
+        mode: VitMode,
+        low: &'a BVitExpert<'a>,
+        high: &'a BVitExpert<'a>,
+        images: &'a [(Tensor, f64)],
+        videos: &'a [(Tensor, f64)],
+        base_g: &'a VitGuidanceParams,
+    }
+
+    impl BerniniStage2Forward for VitStage2Forward<'_> {
+        fn predict_step_velocity(
+            &self,
+            expert: BerniniExpert,
+            latent: &Tensor,
+            _step: usize,
+            timestep: f64,
+            sigma: f32,
+            omegas: BerniniStage2Omegas,
+            _switched_to_low: bool,
+            mbufs: &mut [MomentumBuffer],
+        ) -> CResult<Tensor> {
+            let expert_ref = match expert {
+                BerniniExpert::High => self.high,
+                BerniniExpert::Low => self.low,
+            };
+            let g = omegas.to_vit(self.base_g);
+            vit_one_step(
+                self.pf,
+                expert_ref.transformer,
+                self.mode,
+                latent,
+                self.images,
+                self.videos,
+                timestep,
+                sigma,
+                &expert_ref.streams(),
+                &g,
+                mbufs,
+            )
         }
-        on_step(i);
-        let t = sched.timestep(i);
-        let expert = if t >= boundary_ts {
-            high
-        } else {
-            if !switched {
-                switched = true;
-                g.omega_txt *= omega_scale;
-                g.omega_img *= omega_scale;
-                g.omega_vid *= omega_scale;
-                g.omega_tgt *= omega_scale;
-            }
-            low
-        };
-        let v = vit_one_step(
+    }
+
+    let mut progress_adapter = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize - 1);
+        }
+    };
+    run_bernini_candle_stage2_driver(
+        "bernini_candle_vit_stage2_driver",
+        sampler,
+        boundary_ts,
+        steps,
+        shift,
+        init_noise,
+        BerniniStage2Omegas::from_vit(base_g),
+        omega_scale,
+        num_vit_momentum_buffers(mode),
+        FullDefaults::MOMENTUM,
+        0,
+        cancel,
+        &mut progress_adapter,
+        VitStage2Forward {
             pf,
-            expert.transformer,
             mode,
-            &latent,
+            low,
+            high,
             images,
             videos,
-            t,
-            sigmas[i],
-            &expert.streams(),
-            &g,
-            &mut mbufs,
-        )?;
-        latent = sched.step(&v, &latent)?;
-    }
-    Ok(latent)
+            base_g,
+        },
+    )
 }
 
 /// UMT5-encode `prompt` → **unpadded** `[1, S, 4096]` f32 (the `concat_with_zero_init` prepend expects
@@ -1253,6 +1251,7 @@ fn umt5_encode(
 
 /// Reject empty / non-`1+4k` conditioning video clips before the pipeline dereferences `frames[0]`
 /// (mirrors the renderer's `encode_videoclip` guard). Free fn so it is unit-testable without weights.
+#[cfg(test)]
 fn validate_conditioning_video_clips(req: &GenerationRequest) -> CResult<()> {
     for c in &req.conditioning {
         if let Conditioning::VideoClip { frames, .. } = c {
@@ -1293,6 +1292,7 @@ fn validate_conditioning_video_clips(req: &GenerationRequest) -> CResult<()> {
 /// (`pipeline.rs`). Byte-for-byte the MLX sibling's `reject_unimplemented_video_clip_knobs`. Typed
 /// [`gen_core::Error::Unsupported`], not `Msg`: the worker classifies `Unsupported` as a user-facing
 /// invalid-payload refusal and `Msg` as an opaque internal engine failure.
+#[cfg(test)]
 pub(crate) fn reject_unimplemented_video_clip_knobs(
     id: &str,
     req: &GenerationRequest,
@@ -1392,6 +1392,7 @@ fn seeded_step_noise(
 mod tests {
     use super::*;
     use crate::testfix::{tiny_cfg, tiny_dit};
+    use candle_gen_wan::config::NUM_TRAIN_TIMESTEPS;
 
     /// The full `bernini` engine registers + resolves via the gen_core registry (lazy load succeeds for
     /// a missing dir; the descriptor identity is what we pin).
@@ -1913,5 +1914,234 @@ mod execution_identity_tests {
         assert_ne!(draws[0].purpose, draws[1].purpose);
         assert!(scheme.contains("numpy_mt19937"));
         assert!(scheme.contains("torch_mt19937"));
+    }
+}
+
+#[cfg(test)]
+mod render_plan_tests {
+    use super::*;
+    use gen_core_family::bernini_plan::{
+        build_bernini_render_plan, BerniniCanonicalBranch, BerniniPlanKnobs, BerniniStageSpec,
+    };
+
+    #[test]
+    fn bernini_candle_full_pre_load_plan_pins_mar_stages_branches_mt19937_seeds_and_outputs() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("lazy load bernini");
+
+        let dummy_img = || Image {
+            width: 64,
+            height: 64,
+            pixels: vec![0u8; 64 * 64 * 3],
+        };
+        let dummy_clip = || Conditioning::VideoClip {
+            frames: vec![dummy_img(); 5],
+            frame_idx: 0,
+            strength: 1.0,
+        };
+
+        let img_req = GenerationRequest {
+            prompt: "a portrait in warm sunlight".into(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            video_mode: Some("t2i".into()),
+            steps: Some(12),
+            sampler: Some("uni_pc".into()),
+            seed: Some(77),
+            ..Default::default()
+        };
+        assert!(g.validate(&img_req).is_ok());
+
+        // `build_bernini_render_plan` also resolves omitted `video_mode` with `frames == 1` to `T2i`
+        // while `Generator::validate` retains `memory_strategy`'s explicit still-route requirement.
+        let omitted_mode_img_req = GenerationRequest {
+            video_mode: None,
+            ..img_req.clone()
+        };
+        assert!(g.validate(&omitted_mode_img_req).is_err());
+
+        let img_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Full,
+            BerniniBackendKind::Candle,
+            BerniniPlanKnobs::default(),
+            &img_req,
+        )
+        .expect("t2i full plan");
+        let round_trip: BerniniRenderPlan =
+            serde_json::from_str(&serde_json::to_string(&img_plan).unwrap()).unwrap();
+        assert_eq!(round_trip, img_plan);
+        assert_eq!(img_plan.branch, BerniniCanonicalBranch::T2i);
+        assert_eq!(img_plan.canonical_task, "t2i");
+        assert_eq!(img_plan.vit_mode, Some(BerniniFullVitMode::VaeTxtVitWapg));
+        assert_eq!(img_plan.folded_progress_total, 25 + 12);
+        assert_eq!(
+            img_plan.output_contract,
+            BerniniOutputContract::Images { expected_count: 1 }
+        );
+        assert_eq!(
+            img_plan.seed_scheme.permutation_scheme,
+            "bernini_numpy_mt19937_shuffle_v1"
+        );
+        assert_eq!(
+            img_plan.seed_scheme.planner_step_noise_scheme,
+            "bernini_torch_mt19937_normal_v1"
+        );
+        assert_eq!(
+            img_plan.stages,
+            vec![
+                BerniniStageSpec::MarPlannerLoop {
+                    planning_steps: 25,
+                    vit_denoising_steps: 5,
+                    vit_txt_cfg: 1.2,
+                    vit_img_cfg: 1.0,
+                    input_streams: ["cond".into(), "uncond".into(), "imgcond".into()],
+                    handoff_streams: [
+                        "wtxt_wvit".into(),
+                        "wtxt_wovit".into(),
+                        "wotxt_wvit".into(),
+                        "wotxt_wovit".into(),
+                    ],
+                },
+                BerniniStageSpec::DropPlanner {
+                    flush_device_cache: false,
+                },
+                BerniniStageSpec::DualWan22A14bExpertsHighToLow {
+                    boundary_timestep: 875.0,
+                    switch_dit_boundary: 0.875,
+                    num_train_timesteps: 1000,
+                    omega_scale_once_on_low: 0.8,
+                    steps: 12,
+                    shift: 5.0,
+                },
+                BerniniStageSpec::VaeDecode {
+                    output: BerniniOutputContract::Images { expected_count: 1 },
+                },
+            ]
+        );
+
+        let vid_req = GenerationRequest {
+            prompt: "a sailboat gliding over emerald waves".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            steps: Some(10),
+            fps: Some(24),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        let vid_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Full,
+            BerniniBackendKind::Candle,
+            BerniniPlanKnobs::default(),
+            &vid_req,
+        )
+        .expect("t2v full plan");
+        assert_eq!(vid_plan.branch, BerniniCanonicalBranch::T2v);
+        assert_eq!(
+            vid_plan.output_contract,
+            BerniniOutputContract::Video {
+                fps: 24,
+                latent_frames: 5,
+            }
+        );
+
+        let ads2v_req = GenerationRequest {
+            prompt: "drive product reveal".into(),
+            width: 256,
+            height: 256,
+            frames: Some(5),
+            video_mode: Some("ads2v".into()),
+            conditioning: vec![
+                dummy_clip(),
+                Conditioning::Reference {
+                    image: dummy_img(),
+                    strength: Some(1.0),
+                },
+            ],
+            ..Default::default()
+        };
+        let ads2v_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Full,
+            BerniniBackendKind::Candle,
+            BerniniPlanKnobs::default(),
+            &ads2v_req,
+        )
+        .expect("ads2v plan");
+        assert_eq!(ads2v_plan.branch, BerniniCanonicalBranch::Ads2v);
+        assert_eq!(ads2v_plan.trained_sources, 3.0);
+        assert_eq!(ads2v_plan.vit_mode, Some(BerniniFullVitMode::V2vApg));
+
+        // Invalid combos refused pre-load by validate():
+        for bad in [
+            GenerationRequest {
+                prompt: "".into(),
+                width: 256,
+                height: 256,
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "missing cond".into(),
+                width: 256,
+                height: 256,
+                video_mode: Some("rv2v_wapg".into()),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "bad grid".into(),
+                width: 256,
+                height: 256,
+                frames: Some(6),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "zero steps".into(),
+                width: 256,
+                height: 256,
+                steps: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(g.validate(&bad).is_err(), "expected pre-load refusal");
+        }
+    }
+
+    #[test]
+    fn bernini_candle_mt19937_seed_schemes_and_step_noise_remain_bit_exact() {
+        let low_seed = 42u64;
+        let high_seed = (1u64 << 40) + 42;
+        assert_eq!(
+            seeded_permutation(12, low_seed),
+            crate::rng::numpy_shuffle(12, low_seed as u32)
+        );
+        assert_eq!(
+            seeded_permutation(12, high_seed),
+            seeded_permutation(12, low_seed),
+            "Candle MT19937 reduces u64 seed to low 32 bits"
+        );
+
+        let order = seeded_permutation(6, low_seed);
+        let planning_step = 25usize;
+        let channels = 8usize;
+        let schedule = mar_schedule(6, planning_step, &order);
+        let expected = crate::rng::torch_step_noise(&schedule, channels, low_seed as u32);
+        let got = seeded_step_noise(6, planning_step, &order, channels, low_seed, &Device::Cpu)
+            .expect("step noise");
+        assert_eq!(got.len(), planning_step);
+        for (s, (revealed, tensor)) in schedule.iter().zip(got.iter()).enumerate() {
+            let flat = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            if expected[s].is_empty() {
+                assert_eq!(flat.len(), revealed.len().max(1) * channels);
+                assert!(flat.iter().all(|&x| x == 0.0));
+            } else {
+                assert_eq!(flat, expected[s], "step {s} MT19937 noise parity");
+            }
+        }
     }
 }

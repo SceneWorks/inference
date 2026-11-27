@@ -19,6 +19,9 @@ use std::thread::ThreadId;
 
 use serde::{Deserialize, Serialize};
 
+use crate::multistream::{
+    MultiStreamStepInfo, ResolvedSchedule, StreamId, StreamStepSigma, StreamTransition,
+};
 use crate::{BoundaryState, CancelFlag, Error, Progress, RenderRun, Result};
 
 /// Distinguishes ordinary trajectory evaluations from read-only boundary estimates (`PIPE-3`/`4`).
@@ -267,6 +270,15 @@ impl DriverStepInfo {
             total: self.total_outer_steps.max(1) as u32,
         }
     }
+
+    /// Pair this scalar step metadata with explicit per-stream `(StreamId, sigma, next_sigma)`
+    /// coordinates (`PIPE-6`).
+    pub fn with_stream_sigmas(self, stream_sigmas: Vec<StreamStepSigma>) -> MultiStreamStepInfo {
+        MultiStreamStepInfo {
+            step: self,
+            stream_sigmas,
+        }
+    }
 }
 
 /// Typed entry contract for one [`FamilyDriver::run_slice`] invocation (`PIPE-7`).
@@ -415,6 +427,7 @@ pub struct DriverRunState {
     owner_thread: ThreadId,
     history: Option<Box<dyn Any>>,
     cache: Option<Box<dyn Any>>,
+    stream_sigma_trace: Vec<MultiStreamStepInfo>,
     _owner_local: PhantomData<Rc<()>>,
 }
 
@@ -438,6 +451,7 @@ impl DriverRunState {
             owner_thread: std::thread::current().id(),
             history: None,
             cache: None,
+            stream_sigma_trace: Vec::new(),
             _owner_local: PhantomData,
         }
     }
@@ -578,10 +592,36 @@ impl DriverRunState {
     pub fn finish_slice(&mut self, span_end: usize) {
         self.last_span_end = Some(span_end);
     }
+
+    /// Record explicit per-stream sigma coordinates for a trajectory step (`PIPE-6`).
+    pub fn record_stream_step(
+        &mut self,
+        info: &DriverStepInfo,
+        stream_sigmas: Vec<StreamStepSigma>,
+    ) {
+        if !info.kind.is_read_only_boundary() {
+            self.stream_sigma_trace
+                .push(info.with_stream_sigmas(stream_sigmas));
+        }
+    }
+
+    /// Inspect recorded per-stream sigma steps from multi-stream driver execution (`PIPE-6`).
+    pub fn stream_sigma_trace(&self) -> &[MultiStreamStepInfo] {
+        &self.stream_sigma_trace
+    }
+
+    /// Per-stream sigmas recorded at the most recent trajectory step, if any.
+    pub fn last_stream_sigmas(&self) -> Option<&[StreamStepSigma]> {
+        self.stream_sigma_trace
+            .last()
+            .map(|entry| entry.stream_sigmas.as_slice())
+    }
 }
 
 /// Callback type for per-step latent observation (`StepHooks::on_observe`).
 pub type ObserveHook<'a, L> = &'a mut dyn FnMut(&DriverStepInfo, &L) -> Result<()>;
+/// Callback type for per-step multi-stream σ observation (`StepHooks::on_stream_observe`).
+pub type StreamObserveHook<'a, L> = &'a mut dyn FnMut(&MultiStreamStepInfo, &L) -> Result<()>;
 /// Callback type for per-step post-step latent transforms (`StepHooks::on_post_step`).
 pub type PostStepHook<'a, L> = &'a mut dyn FnMut(&DriverStepInfo, L) -> Result<L>;
 /// Callback type for per-step materialization/quantum barriers (`StepHooks::on_materialize`).
@@ -595,6 +635,8 @@ pub struct StepHooks<'a, L> {
     pub on_progress: &'a mut dyn FnMut(Progress),
     /// Optional per-step latent observation hook (e.g. preview emission, diagnostics).
     pub on_observe: Option<ObserveHook<'a, L>>,
+    /// Optional per-step multi-stream σ observation hook (`PIPE-6`).
+    pub on_stream_observe: Option<StreamObserveHook<'a, L>>,
     /// Optional post-step latent transform (e.g. inpaint mask blend, I2V pin, H3 row freeze).
     pub on_post_step: Option<PostStepHook<'a, L>>,
     /// Optional per-step materialization / quantum barrier (e.g. MLX `eval` + iOS quantum).
@@ -607,6 +649,7 @@ impl<'a, L> StepHooks<'a, L> {
         Self {
             on_progress,
             on_observe: None,
+            on_stream_observe: None,
             on_post_step: None,
             on_materialize: None,
         }
@@ -622,6 +665,26 @@ impl<'a, L> StepHooks<'a, L> {
     /// Invoke `on_observe` when present and not a read-only boundary estimate.
     pub fn observe(&mut self, info: &DriverStepInfo, latent: &L) -> Result<()> {
         if !info.kind.is_read_only_boundary() {
+            if let Some(hook) = self.on_observe.as_deref_mut() {
+                hook(info, latent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Invoke `on_stream_observe` (with explicit per-stream sigmas) AND `on_observe` when
+    /// present and not a read-only boundary estimate (`PIPE-6`).
+    pub fn observe_streams(
+        &mut self,
+        info: &DriverStepInfo,
+        stream_sigmas: &[StreamStepSigma],
+        latent: &L,
+    ) -> Result<()> {
+        if !info.kind.is_read_only_boundary() {
+            if let Some(hook) = self.on_stream_observe.as_deref_mut() {
+                let multi = info.with_stream_sigmas(stream_sigmas.to_vec());
+                hook(&multi, latent)?;
+            }
             if let Some(hook) = self.on_observe.as_deref_mut() {
                 hook(info, latent)?;
             }
@@ -1595,6 +1658,174 @@ pub mod conformance {
             verified_cancellation: true,
         })
     }
+
+    /// Configuration for [`verify_multistream_driver_conformance`] (`PIPE-4`, `PIPE-6`, `DEC-3`).
+    pub struct MultiStreamConformanceCase<L, MakeDriver, MakeInitial, LatentsEqual>
+    where
+        MakeDriver: FnMut() -> Box<dyn FamilyDriver<L>>,
+        MakeInitial: FnMut() -> L,
+        LatentsEqual: Fn(&L, &L) -> bool,
+    {
+        pub base: ConformanceCase<L, MakeDriver, MakeInitial, LatentsEqual>,
+        /// Expected resolved schedule table per active stream across `0..base.total_steps`.
+        pub expected_stream_schedules: Vec<(StreamId, ResolvedSchedule)>,
+        /// Optional stream-targeted transition checked for double-noise refusal (`BoundaryState::XSigma`).
+        pub boundary_transition: Option<StreamTransition>,
+    }
+
+    /// Summary returned by [`verify_multistream_driver_conformance`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MultiStreamConformanceReport {
+        pub base: ConformanceReport,
+        pub verified_streams: Vec<StreamId>,
+        pub verified_transition_guard: bool,
+    }
+
+    /// Verify both standard [`verify_driver_conformance`] AND multi-stream explicit-table /
+    /// per-stream sigma / targeted-transition contracts (`PIPE-4`, `PIPE-6`, `DEC-3`).
+    pub fn verify_multistream_driver_conformance<L, MakeDriver, MakeInitial, LatentsEqual>(
+        mut case: MultiStreamConformanceCase<L, MakeDriver, MakeInitial, LatentsEqual>,
+    ) -> Result<MultiStreamConformanceReport>
+    where
+        L: Clone,
+        MakeDriver: FnMut() -> Box<dyn FamilyDriver<L>>,
+        MakeInitial: FnMut() -> L,
+        LatentsEqual: Fn(&L, &L) -> bool,
+    {
+        if case.expected_stream_schedules.is_empty() {
+            return Err(Error::Unsupported(
+                "verify_multistream_driver_conformance requires at least one expected stream schedule"
+                    .into(),
+            ));
+        }
+        for (stream, schedule) in &case.expected_stream_schedules {
+            if schedule.num_steps() != case.base.total_steps {
+                return Err(Error::Unsupported(format!(
+                    "expected schedule '{}' for stream '{stream}' has {} steps, expected total_steps={}",
+                    schedule.table_id,
+                    schedule.num_steps(),
+                    case.base.total_steps
+                )));
+            }
+        }
+
+        // First trace per-stream sigmas on a dedicated trajectory (using factories before moving base).
+        let cancel = CancelFlag::default();
+        let driver = (case.base.make_driver)();
+        let driver_id = driver.support().driver_id;
+        let initial = (case.base.make_initial)();
+        let mut trace_state = DriverRunState::new();
+        let mut observed_streams = Vec::new();
+        let mut progress = Vec::new();
+        {
+            let mut on_progress = |p: Progress| progress.push(p);
+            let mut on_stream = |multi: &MultiStreamStepInfo, _latent: &L| {
+                observed_streams.push(multi.clone());
+                Ok(())
+            };
+            let mut hooks = StepHooks::new(&mut on_progress);
+            hooks.on_stream_observe = Some(&mut on_stream);
+            let input = SliceInput::full_trajectory(
+                initial.clone(),
+                case.base.total_steps,
+                case.base.seed,
+                &cancel,
+            )
+            .with_geometry(case.base.base_geometry.0, case.base.base_geometry.1);
+            let _ = driver.run_slice(input, &mut trace_state, &mut hooks)?;
+        }
+
+        if observed_streams.len() != case.base.total_steps {
+            return Err(Error::Msg(format!(
+                "{driver_id}: expected {} multi-stream step observations, got {}",
+                case.base.total_steps,
+                observed_streams.len()
+            )));
+        }
+        if trace_state.stream_sigma_trace().len() != case.base.total_steps {
+            return Err(Error::Msg(format!(
+                "{driver_id}: expected {} recorded DriverRunState multi-stream steps, got {}",
+                case.base.total_steps,
+                trace_state.stream_sigma_trace().len()
+            )));
+        }
+        for (step, (obs, recorded)) in observed_streams
+            .iter()
+            .zip(trace_state.stream_sigma_trace().iter())
+            .enumerate()
+        {
+            if obs != recorded {
+                return Err(Error::Msg(format!(
+                    "{driver_id}: step {step} stream_observe ({obs:?}) disagreed with DriverRunState trace ({recorded:?})"
+                )));
+            }
+            for (stream, schedule) in &case.expected_stream_schedules {
+                let (want_s, want_next) = schedule.step_window(step).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{driver_id}: missing expected step {step} in schedule"
+                    ))
+                })?;
+                let Some((got_s, got_next)) = obs.sigma_for(stream) else {
+                    return Err(Error::Msg(format!(
+                        "{driver_id}: step {step} omitted active stream '{stream}' from stream_sigmas"
+                    )));
+                };
+                if got_s.to_bits() != want_s.to_bits() || got_next.to_bits() != want_next.to_bits()
+                {
+                    return Err(Error::Msg(format!(
+                        "{driver_id}: step {step} stream '{stream}' sigma mismatch: got ({got_s}, {got_next}), expected ({want_s}, {want_next})"
+                    )));
+                }
+            }
+        }
+
+        let mut verified_transition_guard = false;
+        if let Some(ref transition) = case.boundary_transition {
+            let first_target = transition
+                .targets
+                .first()
+                .ok_or_else(|| Error::Unsupported("transition must declare a target".into()))?
+                .clone();
+            let noisy = BoundaryState::XSigma(initial.clone());
+            let clean = BoundaryState::CleanEstimate {
+                latent: initial,
+                source: crate::EstimateSource::EndpointEvaluation,
+            };
+            let err = transition
+                .validate_boundary_states(&[(first_target.clone(), &noisy)])
+                .expect_err("noisy XSigma state must be refused at Renoise/Resample transition");
+            if !matches!(err, Error::Unsupported(_)) {
+                return Err(Error::Msg(format!(
+                    "{driver_id}: double-noise transition refusal must be Error::Unsupported, got {err:?}"
+                )));
+            }
+            if matches!(
+                transition
+                    .kind
+                    .boundary_semantics(&transition.transition_id)?,
+                (
+                    crate::multistream::StreamBoundarySemantics::CleanEstimate,
+                    _
+                )
+            ) {
+                transition.validate_boundary_states(&[(first_target, &clean)])?;
+            }
+            verified_transition_guard = true;
+        }
+
+        // Now run the full standard driver conformance battery.
+        let base = verify_driver_conformance(case.base)?;
+        let verified_streams = case
+            .expected_stream_schedules
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        Ok(MultiStreamConformanceReport {
+            base,
+            verified_streams,
+            verified_transition_guard,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2146,5 +2377,210 @@ mod tests {
                 "expected error mentioning {expected_fragment:?}, got {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn multistream_conformance_verifies_explicit_schedules_per_stream_sigmas_and_transition_guard()
+    {
+        use super::conformance::{
+            verify_multistream_driver_conformance, MultiStreamConformanceCase,
+        };
+        use crate::multistream::{LearnedUpsamplerComponent, ScheduleSource, StreamTransitionKind};
+
+        struct MultiDriver {
+            support: DriverSupport,
+            video_sigmas: ResolvedSchedule,
+            audio_sigmas: ResolvedSchedule,
+            emit_wrong_audio_sigma: bool,
+        }
+
+        impl FamilyDriver<Vec<f32>> for MultiDriver {
+            fn support(&self) -> &DriverSupport {
+                &self.support
+            }
+
+            fn run_slice(
+                &self,
+                input: SliceInput<'_, Vec<f32>>,
+                state: &mut DriverRunState,
+                hooks: &mut StepHooks<'_, Vec<f32>>,
+            ) -> Result<BoundaryState<Vec<f32>>> {
+                self.support.validate_slice(&input, state)?;
+                state.enter_slice(&input)?;
+                let mut latent = match input.state {
+                    BoundaryState::XSigma(x)
+                    | BoundaryState::CleanEstimate { latent: x, .. }
+                    | BoundaryState::RouteSpecific { state: x, .. } => x,
+                };
+                for step in input.span.clone() {
+                    if input.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    let (vs, vnext) = self.video_sigmas.step_window(step).unwrap();
+                    let (mut asig, mut anext) = self.audio_sigmas.step_window(step).unwrap();
+                    if self.emit_wrong_audio_sigma {
+                        asig = 0.12345;
+                        anext = 0.0;
+                    }
+                    let info = DriverStepInfo {
+                        pass: input.pass,
+                        phase: input.phase,
+                        outer_step: step,
+                        total_outer_steps: input.total_steps,
+                        eval_in_step: 0,
+                        kind: DriverEvaluationKind::Trajectory,
+                        sigma: vs,
+                        next_sigma: vnext,
+                    };
+                    let stream_sigmas = vec![
+                        StreamStepSigma {
+                            stream: StreamId::Video,
+                            sigma: vs,
+                            next_sigma: vnext,
+                        },
+                        StreamStepSigma {
+                            stream: StreamId::Audio,
+                            sigma: asig,
+                            next_sigma: anext,
+                        },
+                    ];
+                    hooks.observe_streams(&info, &stream_sigmas, &latent)?;
+                    state.record_stream_step(&info, stream_sigmas);
+                    state.record_evaluation(DriverEvaluationKind::Trajectory);
+                    for x in &mut latent {
+                        *x = *x * 0.5 + vs * 0.1;
+                    }
+                    latent = hooks.post_step(&info, latent)?;
+                    hooks.materialize(&info, &latent)?;
+                    state.record_outer_step(step);
+                    hooks.emit_progress(&info);
+                }
+                state.finish_slice(input.span.end);
+                Ok(BoundaryState::XSigma(latent))
+            }
+        }
+
+        let v_sched = ScheduleSource::ExplicitTable {
+            table_id: "video_sched".into(),
+            sigmas: vec![1.0, 0.725, 0.421_875, 0.0],
+        }
+        .resolve()
+        .unwrap();
+        let a_sched = ScheduleSource::ExplicitTable {
+            table_id: "audio_sched".into(),
+            sigmas: vec![0.95, 0.65, 0.35, 0.0],
+        }
+        .resolve()
+        .unwrap();
+        let support = DriverSupport {
+            driver_id: "synthetic_multistream",
+            arbitrary_slice: true,
+            carry_history: false,
+            reset_history: true,
+            renoise_from_clean: true,
+            geometry_change: true,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons::default(),
+        };
+        let transition = StreamTransition::new(
+            "stage1_to_stage2",
+            vec![StreamId::Video],
+            StreamTransitionKind::Composed(vec![
+                StreamTransitionKind::LatentResample {
+                    upsampler: Some(LearnedUpsamplerComponent {
+                        name: "spatial_upsampler".into(),
+                        normalization: "vae".into(),
+                        workspace_bytes: 1024,
+                    }),
+                    spatial_factor: (2, 2),
+                    temporal_factor: 1,
+                },
+                StreamTransitionKind::Renoise { sigma: 0.909_375 },
+            ]),
+        )
+        .unwrap();
+
+        let ok_report = verify_multistream_driver_conformance(MultiStreamConformanceCase {
+            base: ConformanceCase {
+                total_steps: 3,
+                split_at: 1,
+                seed: 7,
+                base_geometry: (256, 256),
+                alt_geometry: (512, 512),
+                make_driver: {
+                    let support = support.clone();
+                    let v_sched = v_sched.clone();
+                    let a_sched = a_sched.clone();
+                    move || {
+                        Box::new(MultiDriver {
+                            support: support.clone(),
+                            video_sigmas: v_sched.clone(),
+                            audio_sigmas: a_sched.clone(),
+                            emit_wrong_audio_sigma: false,
+                        })
+                    }
+                },
+                make_initial: || vec![1.0, -0.5],
+                latents_equal: |a, b| {
+                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+                },
+            },
+            expected_stream_schedules: vec![
+                (StreamId::Video, v_sched.clone()),
+                (StreamId::Audio, a_sched.clone()),
+            ],
+            boundary_transition: Some(transition.clone()),
+        })
+        .expect("matching multi-stream driver passes conformance");
+        assert!(ok_report.verified_transition_guard);
+        assert_eq!(
+            ok_report.verified_streams,
+            vec![StreamId::Video, StreamId::Audio]
+        );
+
+        let err = verify_multistream_driver_conformance(MultiStreamConformanceCase {
+            base: ConformanceCase {
+                total_steps: 3,
+                split_at: 1,
+                seed: 7,
+                base_geometry: (256, 256),
+                alt_geometry: (512, 512),
+                make_driver: move || {
+                    Box::new(MultiDriver {
+                        support: support.clone(),
+                        video_sigmas: v_sched.clone(),
+                        audio_sigmas: a_sched.clone(),
+                        emit_wrong_audio_sigma: true,
+                    })
+                },
+                make_initial: || vec![1.0, -0.5],
+                latents_equal: |a, b| a == b,
+            },
+            expected_stream_schedules: vec![
+                (
+                    StreamId::Video,
+                    ScheduleSource::ExplicitTable {
+                        table_id: "v".into(),
+                        sigmas: vec![1.0, 0.725, 0.421_875, 0.0],
+                    }
+                    .resolve()
+                    .unwrap(),
+                ),
+                (
+                    StreamId::Audio,
+                    ScheduleSource::ExplicitTable {
+                        table_id: "a".into(),
+                        sigmas: vec![0.95, 0.65, 0.35, 0.0],
+                    }
+                    .resolve()
+                    .unwrap(),
+                ),
+            ],
+            boundary_transition: Some(transition),
+        })
+        .expect_err("wrong audio sigma must fail multi-stream conformance");
+        assert!(err.to_string().contains("sigma mismatch"));
     }
 }

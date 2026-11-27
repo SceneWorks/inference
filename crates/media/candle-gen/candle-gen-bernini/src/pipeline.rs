@@ -23,28 +23,35 @@
 //! f32); APG runs f32. `backend = "candle"`, `mac_only = false`. Q4/Q8 is a **packed tier** (the two
 //! experts load through the sc-10025 packed-detect seam), streamed one expert at a time.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::driver::{
+    run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverSupport, FamilyDriver, SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, BoundaryState, CancelFlag, Capabilities, Conditioning, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
+    Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
-use candle_gen_wan::config::{
-    TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
-    NUM_TRAIN_TIMESTEPS,
-};
+use candle_gen_wan::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
-use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
+use candle_gen_wan::scheduler::{flow_sigmas, Sampler, WanNativeDriver};
+use gen_core_family::bernini_plan::{
+    build_bernini_render_plan, BerniniBackendKind, BerniniEntrypoint, BerniniOutputContract,
+    BerniniPlanKnobs, BerniniRenderPlan, BerniniRendererGuidanceMode,
+};
 
 use crate::components::RendererComponents;
-use crate::config::{
-    check_mode_conditioning, resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults,
+use crate::config::{BerniniKnobs, Defaults, Mode};
+use crate::forward::{
+    guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward, VitGuidanceParams,
 };
-use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward};
 use crate::guidance::MomentumBuffer;
 use crate::latent_dims;
 use crate::preprocess::{encode_image, encode_videoclip};
@@ -115,7 +122,438 @@ pub struct BerniniRenderer {
     loaded_spec: LoadSpec,
 }
 
+impl BerniniKnobs {
+    pub(crate) fn to_plan_knobs(&self) -> BerniniPlanKnobs {
+        BerniniPlanKnobs {
+            switch_dit_boundary: self.switch_dit_boundary,
+            shift: self.shift,
+            max_trained_src_id: self.max_trained_src_id,
+            interpolate_src_id: self.interpolate_src_id,
+            max_sequence_length: self.max_sequence_length,
+        }
+    }
+}
+
+fn renderer_mode_from_plan(mode: BerniniRendererGuidanceMode) -> Mode {
+    match mode {
+        BerniniRendererGuidanceMode::T2v => Mode::T2v,
+        BerniniRendererGuidanceMode::T2vApg => Mode::T2vApg,
+        BerniniRendererGuidanceMode::V2v => Mode::V2v,
+        BerniniRendererGuidanceMode::V2vChain => Mode::V2vChain,
+        BerniniRendererGuidanceMode::V2vApg => Mode::V2vApg,
+        BerniniRendererGuidanceMode::R2vApg => Mode::R2vApg,
+        BerniniRendererGuidanceMode::Rv2v => Mode::Rv2v,
+    }
+}
+
+/// Active dual-expert branch for Bernini Stage 2 DiT denoising (`High` for `t >= boundary_ts`,
+/// `Low` below it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BerniniExpert {
+    High,
+    Low,
+}
+
+/// Unified guidance weights carried across the Stage 2 `high -> low` boundary switch where all
+/// active omegas are multiplied once by `omega_scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BerniniStage2Omegas {
+    pub omega_vid: f32,
+    pub omega_img: f32,
+    pub omega_txt: f32,
+    pub omega_tgt: Option<f32>,
+}
+
+impl BerniniStage2Omegas {
+    pub fn from_vit(g: &VitGuidanceParams) -> Self {
+        Self {
+            omega_vid: g.omega_vid,
+            omega_img: g.omega_img,
+            omega_txt: g.omega_txt,
+            omega_tgt: Some(g.omega_tgt),
+        }
+    }
+
+    pub fn to_guidance(&self, base: &GuidanceParams) -> GuidanceParams {
+        GuidanceParams {
+            omega_vid: self.omega_vid,
+            omega_img: self.omega_img,
+            omega_txt: self.omega_txt,
+            eta: base.eta,
+            norm_threshold: base.norm_threshold,
+        }
+    }
+
+    pub fn to_vit(&self, base: &VitGuidanceParams) -> VitGuidanceParams {
+        VitGuidanceParams {
+            omega_txt: self.omega_txt,
+            omega_img: self.omega_img,
+            omega_vid: self.omega_vid,
+            omega_tgt: self.omega_tgt.unwrap_or(base.omega_tgt),
+            eta: base.eta,
+            norm_threshold: base.norm_threshold,
+        }
+    }
+
+    fn scale_once(&mut self, factor: f32) {
+        self.omega_vid *= factor;
+        self.omega_img *= factor;
+        self.omega_txt *= factor;
+        if let Some(tgt) = &mut self.omega_tgt {
+            *tgt *= factor;
+        }
+    }
+
+    fn bits(self) -> [u32; 4] {
+        [
+            self.omega_vid.to_bits(),
+            self.omega_img.to_bits(),
+            self.omega_txt.to_bits(),
+            self.omega_tgt.map_or(0, f32::to_bits),
+        ]
+    }
+}
+
+/// Forward-evaluation seam for [`BerniniDualExpertDriver`] (`PIPE-7`, `DEC-13`).
+pub trait BerniniStage2Forward {
+    /// Compute the guided Stage 2 velocity at `step` for `expert`, using the boundary-scaled
+    /// `omegas` and persistent APG `mbufs`.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_step_velocity(
+        &self,
+        expert: BerniniExpert,
+        latent: &Tensor,
+        step: usize,
+        timestep: f64,
+        sigma: f32,
+        omegas: BerniniStage2Omegas,
+        switched_to_low: bool,
+        mbufs: &mut [MomentumBuffer],
+    ) -> CResult<Tensor>;
+}
+
+struct BerniniStage2History {
+    sampler: Sampler,
+    total_steps: usize,
+    boundary_ts_bits: u64,
+    omega_scale_bits: u32,
+    shift_bits: u64,
+    base_omegas_bits: [u32; 4],
+    num_momentum_buffers: usize,
+    momentum_bits: u32,
+    switched: bool,
+    active_omegas: BerniniStage2Omegas,
+    mbufs: Vec<MomentumBuffer>,
+    expected_next_step: usize,
+    wan_state: DriverRunState,
+}
+
+struct ActiveStage2State {
+    switched: bool,
+    active_omegas: BerniniStage2Omegas,
+    mbufs: Vec<MomentumBuffer>,
+}
+
+/// Typed [`FamilyDriver`] for Candle Bernini Stage 2 dual-expert flow denoising across both
+/// `bernini_renderer` (`Mode`) and full `bernini` (`VitMode`) (`PIPE-7`, `DEC-13`).
+///
+/// Delegates solver integration (`UniPC` / `Dpmpp2m` / `Euler`) to [`WanNativeDriver`] while
+/// persisting the one-time `omega_scale` boundary latch and APG momentum buffers inside
+/// [`DriverRunState`].
+pub struct BerniniDualExpertDriver<F> {
+    sampler: Sampler,
+    boundary_ts: f64,
+    steps: usize,
+    shift: f64,
+    sigmas: Vec<f32>,
+    base_omegas: BerniniStage2Omegas,
+    omega_scale: f32,
+    num_momentum_buffers: usize,
+    momentum: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: BerniniStage2Forward> BerniniDualExpertDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native Candle Bernini Stage 2 driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native Candle Bernini Stage 2 driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native Candle Bernini Stage 2 driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        driver_id: &'static str,
+        sampler: Sampler,
+        boundary_ts: f64,
+        steps: usize,
+        shift: f64,
+        base_omegas: BerniniStage2Omegas,
+        omega_scale: f32,
+        num_momentum_buffers: usize,
+        momentum: f32,
+        forward: F,
+    ) -> CResult<Self> {
+        if steps == 0 {
+            return Err(CandleError::Msg(format!(
+                "{driver_id}: Stage 2 steps must be >= 1"
+            )));
+        }
+        let sigmas = flow_sigmas(steps, shift);
+        Ok(Self {
+            sampler,
+            boundary_ts,
+            steps,
+            shift,
+            sigmas,
+            base_omegas,
+            omega_scale,
+            num_momentum_buffers,
+            momentum,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+}
+
+impl<F: BerniniStage2Forward> FamilyDriver<Tensor> for BerniniDualExpertDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Tensor>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Tensor>,
+    ) -> candle_gen::gen_core::Result<BoundaryState<Tensor>> {
+        self.support.validate_slice(&input, state)?;
+        if input.total_steps != self.steps || input.span.end > self.steps {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with Bernini Stage 2 steps {}",
+                self.support.driver_id, input.span, input.total_steps, self.steps
+            )));
+        }
+
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<BerniniStage2History>() else {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Bernini Stage 2 history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.sampler != self.sampler
+                || existing.total_steps != input.total_steps
+                || existing.boundary_ts_bits != self.boundary_ts.to_bits()
+                || existing.omega_scale_bits != self.omega_scale.to_bits()
+                || existing.shift_bits != self.shift.to_bits()
+                || existing.base_omegas_bits != self.base_omegas.bits()
+                || existing.num_momentum_buffers != self.num_momentum_buffers
+                || existing.momentum_bits != self.momentum.to_bits()
+            {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Bernini Stage 2 schedule or guidance settings",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous step {} (expected {})",
+                    self.support.driver_id, input.span.start, existing.expected_next_step
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        let mut stage2 = if carrying {
+            state
+                .take_history::<BerniniStage2History>()
+                .expect("validated BerniniStage2History")
+        } else {
+            BerniniStage2History {
+                sampler: self.sampler,
+                total_steps: input.total_steps,
+                boundary_ts_bits: self.boundary_ts.to_bits(),
+                omega_scale_bits: self.omega_scale.to_bits(),
+                shift_bits: self.shift.to_bits(),
+                base_omegas_bits: self.base_omegas.bits(),
+                num_momentum_buffers: self.num_momentum_buffers,
+                momentum_bits: self.momentum.to_bits(),
+                switched: false,
+                active_omegas: self.base_omegas,
+                mbufs: (0..self.num_momentum_buffers)
+                    .map(|_| MomentumBuffer::new(self.momentum))
+                    .collect(),
+                expected_next_step: input.span.start,
+                wan_state: DriverRunState::new(),
+            }
+        };
+
+        let prev_evals = stage2.wan_state.internal_evaluations;
+        let prev_end = stage2.expected_next_step;
+        let active_cell = RefCell::new(ActiveStage2State {
+            switched: stage2.switched,
+            active_omegas: stage2.active_omegas,
+            mbufs: std::mem::take(&mut stage2.mbufs),
+        });
+
+        let wan_res = {
+            let wan_driver = WanNativeDriver::new(
+                self.support.driver_id,
+                self.sampler,
+                self.steps,
+                self.shift,
+                |latent: &Tensor, step: usize, t: f64| {
+                    let mut st = active_cell.borrow_mut();
+                    let expert = if t >= self.boundary_ts {
+                        BerniniExpert::High
+                    } else {
+                        if !st.switched {
+                            st.switched = true;
+                            st.active_omegas.scale_once(self.omega_scale);
+                        }
+                        BerniniExpert::Low
+                    };
+                    let switched = st.switched;
+                    let omegas = st.active_omegas;
+                    let sigma = self.sigmas[step];
+                    self.forward.predict_step_velocity(
+                        expert,
+                        latent,
+                        step,
+                        t,
+                        sigma,
+                        omegas,
+                        switched,
+                        &mut st.mbufs,
+                    )
+                },
+            );
+            wan_driver.run_slice(
+                SliceInput {
+                    pass: input.pass,
+                    phase: input.phase,
+                    span: input.span.clone(),
+                    total_steps: input.total_steps,
+                    state: input.state,
+                    transition: input.transition,
+                    history: input.history,
+                    geometry: input.geometry,
+                    seed: input.seed,
+                    cancel: input.cancel,
+                    request_boundary_estimate: input.request_boundary_estimate,
+                },
+                &mut stage2.wan_state,
+                hooks,
+            )
+        };
+
+        let active = active_cell.into_inner();
+        stage2.switched = active.switched;
+        stage2.active_omegas = active.active_omegas;
+        stage2.mbufs = active.mbufs;
+
+        let delta_evals = stage2.wan_state.internal_evaluations - prev_evals;
+        for _ in 0..delta_evals {
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+        }
+        let new_end = stage2.wan_state.last_span_end.unwrap_or(prev_end);
+        for completed_step in prev_end..new_end {
+            state.record_outer_step(completed_step);
+        }
+        stage2.expected_next_step = new_end;
+        state.set_history(stage2);
+
+        let out = wan_res?;
+        state.finish_slice(input.span.end);
+        Ok(out)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_bernini_candle_stage2_driver<F: BerniniStage2Forward>(
+    driver_id: &'static str,
+    sampler: Sampler,
+    boundary_ts: f64,
+    steps: usize,
+    shift: f64,
+    init_noise: &Tensor,
+    base_omegas: BerniniStage2Omegas,
+    omega_scale: f32,
+    num_momentum_buffers: usize,
+    momentum: f32,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    forward: F,
+) -> CResult<Tensor> {
+    let driver = BerniniDualExpertDriver::new(
+        driver_id,
+        sampler,
+        boundary_ts,
+        steps,
+        shift,
+        base_omegas,
+        omega_scale,
+        num_momentum_buffers,
+        momentum,
+        forward,
+    )?;
+    let mut state = DriverRunState::new();
+    let mut hooks = StepHooks::new(on_progress);
+    let out = run_candle_driver_slices(
+        &driver,
+        [SliceSpec::full(steps)],
+        BoundaryState::XSigma(init_noise.clone()),
+        steps,
+        seed,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    let BoundaryState::XSigma(latent) = out else {
+        unreachable!("BerniniDualExpertDriver always emits BoundaryState::XSigma");
+    };
+    Ok(latent)
+}
+
 impl BerniniRenderer {
+    /// Build and validate the pre-load [`BerniniRenderPlan`] before loading weights (`DEC-3`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> gen_core::Result<BerniniRenderPlan> {
+        build_bernini_render_plan(
+            &self.descriptor,
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Candle,
+            self.knobs.to_plan_knobs(),
+            req,
+        )
+    }
+
     fn components(&self) -> CResult<Arc<RendererComponents>> {
         candle_gen::cached(&self.components, || {
             if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
@@ -178,37 +616,21 @@ impl BerniniRenderer {
         comps: &RendererComponents,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1);
-        let width = req.width;
-        let height = req.height;
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(Defaults::STEPS)
-            .max(1);
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let fps = req.fps.unwrap_or(Defaults::FPS);
-        let sampler = Sampler::parse(req.sampler.as_deref());
-        // The reference builds the scheduler with `flow_shift = config.shift` (the Bernini knob).
-        let shift = req
-            .scheduler_shift
-            .map(|s| s as f64)
-            .unwrap_or(self.knobs.shift as f64);
-
-        // Conditioning split (mirrors mlx): VideoClip → videos, Reference/MultiReference → images. The
-        // presence of each drives `resolve_mode`, which picks the guidance [`Mode`] (text-only ⇒
-        // `t2v_apg`, images ⇒ `v2v`, video ⇒ `v2v_apg`, both ⇒ `rv2v`, overridable via `video_mode`).
-        let has_video = req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
-        let has_image = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
-            )
-        });
-        let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
+        let render_plan = self
+            .render_plan(req)
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        let frames = render_plan.frames as u32;
+        let width = render_plan.width;
+        let height = render_plan.height;
+        let steps = render_plan.steps;
+        let seed = render_plan.seed.unwrap_or_else(gen_core::default_seed);
+        let sampler = Sampler::parse(Some(&render_plan.sampler));
+        let shift = render_plan.shift;
+        let mode = renderer_mode_from_plan(
+            render_plan
+                .renderer_mode
+                .expect("Renderer plan always resolves a guidance mode"),
+        );
 
         // VAE-encode the source media → z16 conditioning latents (each `[1, 16, T, H8, W8]`). VideoClips
         // become `videos`; Reference / MultiReference images become `images`. The packed forward assigns
@@ -270,79 +692,111 @@ impl BerniniRenderer {
         let (t_lat, h_lat, w_lat) = latent_dims(frames, width, height);
         let dit_cfg = TransformerConfig::t2v_14b();
 
-        let mut latents = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
-        let mut sched = FlowScheduler::new(sampler, steps, shift);
-        // The APG x-space conversion needs this step's flow sigma; the schedule matches the scheduler's.
-        let sigmas = flow_sigmas(steps, shift);
-        let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
-        let total = steps as u32;
+        let init_noise = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let boundary_ts = render_plan.boundary_timestep;
 
-        // The packed-forward engine drives **every** mode uniformly: the target (and each conditioning
-        // source) is patch-embedded with its source-id RoPE, packed on the token axis, run through one
-        // `forward_packed`, and the target tokens sliced back out. For the text-only modes the source set
-        // is empty and this reduces to the plain per-expert forward (byte-identical to sc-10994's path).
         let pf = PackedForward::new(
             dit_cfg,
-            self.knobs.max_trained_src_id,
+            render_plan.trained_sources,
             self.knobs.interpolate_src_id,
         );
-        // APG momentum buffers persist across steps (0 for the plain modes, 1 for the single-cond `*_apg`
-        // modes, 2 for the chained `r2v_apg`).
-        let mut mbufs: Vec<MomentumBuffer> = (0..num_momentum_buffers(mode))
-            .map(|_| MomentumBuffer::new(Defaults::MOMENTUM))
-            .collect();
-        let mut switched = false;
-        let mut omega_txt = req.guidance.unwrap_or(Defaults::OMEGA_TXT);
-        let mut omega_vid = Defaults::OMEGA_VID;
-        let mut omega_img = Defaults::OMEGA_IMG;
+        let base_omegas = BerniniStage2Omegas {
+            omega_vid: render_plan.omega_vid,
+            omega_img: render_plan.omega_img,
+            omega_txt: render_plan.omega_txt,
+            omega_tgt: None,
+        };
+        let base_guidance = GuidanceParams {
+            omega_vid: render_plan.omega_vid,
+            omega_img: render_plan.omega_img,
+            omega_txt: render_plan.omega_txt,
+            eta: render_plan.eta,
+            norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
+        };
 
-        // `i` drives the scheduler timestep, the progress counter, AND the flow-sigma lookup (the *_apg
-        // modes' x-space conversion) — not a plain element walk over one slice, so the range loop is correct.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let t = sched.timestep(i);
-            // MoE: high-noise expert at/above the boundary timestep, low-noise below — switching the
-            // transformer AND its per-expert text contexts together. `select_expert` scales omega_txt once
-            // on the first low-noise step (its own unit test); scale the video/image omegas the same way.
-            let prev = switched;
-            let (expert, ctx_pos, ctx_neg) =
-                match select_expert(t, boundary_ts, &mut switched, &mut omega_txt) {
-                    Expert::High => (&comps.high, &high_pos, &high_neg),
-                    Expert::Low => (&comps.low, &low_pos, &low_neg),
-                };
-            if switched && !prev {
-                omega_vid *= Defaults::OMEGA_SCALE;
-                omega_img *= Defaults::OMEGA_SCALE;
-            }
-            let g = GuidanceParams {
-                omega_vid,
-                omega_img,
-                omega_txt,
-                eta: Defaults::ETA,
-                norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
-            };
-            candle_gen::execution::policy(
-                "bernini_renderer_guidance",
-                serde_json::json!({
-                    "mode": format!("{mode:?}"), "low_expert": switched,
-                    "omega_txt_bits": omega_txt.to_bits(), "omega_img_bits": omega_img.to_bits(),
-                    "omega_vid_bits": omega_vid.to_bits(), "eta_bits": g.eta.to_bits(),
-                    "norm_threshold_bits": g.norm_threshold.map(f32::to_bits)
-                }),
-            );
-            let v = guided_velocity(
-                &pf, mode, expert, &latents, &videos, &images, t, sigmas[i], ctx_pos, ctx_neg, &g,
-                &mut mbufs,
-            )?;
-            latents = sched.step(&v, &latents)?; // 16-channel latent (out_dim 16)
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
+        struct RendererStage2Forward<'a> {
+            pf: &'a PackedForward,
+            mode: Mode,
+            comps: &'a RendererComponents,
+            high_pos: &'a Tensor,
+            high_neg: &'a Tensor,
+            low_pos: &'a Tensor,
+            low_neg: &'a Tensor,
+            videos: &'a [Tensor],
+            images: &'a [Tensor],
+            base_guidance: &'a GuidanceParams,
         }
+
+        impl BerniniStage2Forward for RendererStage2Forward<'_> {
+            fn predict_step_velocity(
+                &self,
+                expert: BerniniExpert,
+                latent: &Tensor,
+                _step: usize,
+                timestep: f64,
+                sigma: f32,
+                omegas: BerniniStage2Omegas,
+                switched_to_low: bool,
+                mbufs: &mut [MomentumBuffer],
+            ) -> CResult<Tensor> {
+                let (dit, ctx_pos, ctx_neg) = match expert {
+                    BerniniExpert::High => (&self.comps.high, self.high_pos, self.high_neg),
+                    BerniniExpert::Low => (&self.comps.low, self.low_pos, self.low_neg),
+                };
+                let g = omegas.to_guidance(self.base_guidance);
+                candle_gen::execution::policy(
+                    "bernini_renderer_guidance",
+                    serde_json::json!({
+                        "mode": format!("{:?}", self.mode), "low_expert": switched_to_low,
+                        "omega_txt_bits": g.omega_txt.to_bits(), "omega_img_bits": g.omega_img.to_bits(),
+                        "omega_vid_bits": g.omega_vid.to_bits(), "eta_bits": g.eta.to_bits(),
+                        "norm_threshold_bits": g.norm_threshold.map(f32::to_bits)
+                    }),
+                );
+                guided_velocity(
+                    self.pf,
+                    self.mode,
+                    dit,
+                    latent,
+                    self.videos,
+                    self.images,
+                    timestep,
+                    sigma,
+                    ctx_pos,
+                    ctx_neg,
+                    &g,
+                    mbufs,
+                )
+            }
+        }
+
+        let latents = run_bernini_candle_stage2_driver(
+            "bernini_candle_renderer_stage2_driver",
+            sampler,
+            boundary_ts,
+            steps,
+            shift,
+            &init_noise,
+            base_omegas,
+            render_plan.omega_scale,
+            num_momentum_buffers(mode),
+            Defaults::MOMENTUM,
+            seed,
+            &req.cancel,
+            on_progress,
+            RendererStage2Forward {
+                pf: &pf,
+                mode,
+                comps,
+                high_pos: &high_pos,
+                high_neg: &high_neg,
+                low_pos: &low_pos,
+                low_neg: &low_neg,
+                videos: &videos,
+                images: &images,
+                base_guidance: &base_guidance,
+            },
+        )?;
 
         on_progress(Progress::Decoding);
         let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
@@ -353,40 +807,26 @@ impl BerniniRenderer {
         )?;
         let out_images = frames_to_images(&decoded)?;
 
-        // num_frames == 1 ⇒ a still image (t2i). A single latent frame still decodes to one VAE
-        // temporal chunk; the still image is the first frame, matching the reference's single-frame PNG.
-        if frames == 1 {
-            let first = out_images.into_iter().next().ok_or_else(|| {
-                CandleError::Msg("bernini_renderer: VAE decode produced no frames".into())
-            })?;
-            Ok(GenerationOutput::Images(vec![first]))
-        } else {
-            Ok(GenerationOutput::Video {
+        match render_plan.output_contract {
+            BerniniOutputContract::Images { .. } => {
+                let first = out_images.into_iter().next().ok_or_else(|| {
+                    CandleError::Msg("bernini_renderer: VAE decode produced no frames".into())
+                })?;
+                Ok(GenerationOutput::Images(vec![first]))
+            }
+            BerniniOutputContract::Video { fps, .. } => Ok(GenerationOutput::Video {
                 frames: out_images,
                 fps,
                 audio: None,
-            })
+            }),
         }
     }
 }
 
-/// Which dual-expert transformer a denoise step routes through: **high-noise** at/above the boundary
-/// timestep (`transformer/`), **low-noise** below (`transformer_2/`) — the diffusers WanPipeline
-/// convention used by the shared renderer components.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Expert {
-    High,
-    Low,
-}
+#[cfg(test)]
+type Expert = BerniniExpert;
 
-/// Pure dual-expert selection for one denoise step (sc-10994) — Bernini's most model-specific renderer
-/// delta, factored out of [`BerniniRenderer::render`] so it is unit-testable without GPU weights.
-///
-/// High-noise expert while the integer timestep `t ≥ boundary_ts`, low-noise below. On the FIRST
-/// low-noise step (the high→low transition) all omegas are scaled once by [`Defaults::OMEGA_SCALE`] (the
-/// reference's `omega_scale`) via the `switched` latch, and never again on subsequent low steps.
-/// `render` maps the returned [`Expert`] onto the resident experts + per-expert text contexts, so this
-/// stays behaviorally identical to the previous inline switch.
+#[cfg(test)]
 fn select_expert(t: f64, boundary_ts: f64, switched: &mut bool, omega: &mut f32) -> Expert {
     if t >= boundary_ts {
         Expert::High
@@ -463,33 +903,7 @@ impl Generator for BerniniRenderer {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.descriptor.id;
-        self.descriptor.capabilities.validate_request(id, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095.
-        validate_bernini_geometry(id, req)?;
-        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
-        // same conditioning through the same encode path, so they must give the same answer.
-        crate::bernini::reject_unimplemented_video_clip_knobs(id, req)?;
-        // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
-        // mode with no source silently renders text-only; a text-only mode with a source drops it.
-        let has_video = req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
-        let has_image = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
-            )
-        });
-        let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
-        check_mode_conditioning(id, mode, has_video || has_image)?;
-        Ok(())
+        self.render_plan(req).map(|_| ())
     }
 
     fn generate_with_execution_report(
@@ -540,6 +954,8 @@ impl Generator for BerniniRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen_wan::config::NUM_TRAIN_TIMESTEPS;
+    use candle_gen_wan::scheduler::FlowScheduler;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
@@ -774,5 +1190,339 @@ mod tests {
         let boundary_ts =
             BerniniKnobs::default().switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
         assert!((boundary_ts - 875.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use candle_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+    use candle_gen::sampler::CandleLatentOps;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Stage2Log =
+        Rc<RefCell<Vec<(usize, BerniniExpert, f64, BerniniStage2Omegas, bool, usize)>>>;
+
+    struct MockCandleStage2Forward {
+        log: Stage2Log,
+    }
+
+    impl BerniniStage2Forward for MockCandleStage2Forward {
+        fn predict_step_velocity(
+            &self,
+            expert: BerniniExpert,
+            latent: &Tensor,
+            step: usize,
+            timestep: f64,
+            sigma: f32,
+            omegas: BerniniStage2Omegas,
+            switched_to_low: bool,
+            mbufs: &mut [MomentumBuffer],
+        ) -> CResult<Tensor> {
+            let mut non_empty_mbufs = 0usize;
+            for buf in mbufs.iter_mut() {
+                let diff = latent.affine(0.05, 0.0)?;
+                let _ = buf.update(&CandleLatentOps, &diff)?;
+                if !buf.is_empty() {
+                    non_empty_mbufs += 1;
+                }
+            }
+            self.log.borrow_mut().push((
+                step,
+                expert,
+                timestep,
+                omegas,
+                switched_to_low,
+                non_empty_mbufs,
+            ));
+            let expert_gain = match expert {
+                BerniniExpert::High => -0.6,
+                BerniniExpert::Low => -0.35,
+            };
+            let omega_sum = omegas.omega_txt
+                + omegas.omega_img
+                + omegas.omega_vid
+                + omegas.omega_tgt.unwrap_or(0.0);
+            Ok(latent.affine(
+                expert_gain - 0.05 * sigma as f64,
+                0.002 * omega_sum as f64 + 0.0001 * timestep,
+            )?)
+        }
+    }
+
+    fn tensor_f32_bit_equal(a: &Tensor, b: &Tensor) -> bool {
+        if a.dims() != b.dims() {
+            return false;
+        }
+        let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vb = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn bernini_candle_dual_expert_driver_passes_conformance_across_boundary() {
+        let dev = Device::Cpu;
+        let init = Tensor::from_vec(vec![0.5f32, -0.4, 0.8, -0.2], (4,), &dev).unwrap();
+        let renderer_omegas = BerniniStage2Omegas {
+            omega_vid: Defaults::OMEGA_VID,
+            omega_img: Defaults::OMEGA_IMG,
+            omega_txt: Defaults::OMEGA_TXT,
+            omega_tgt: None,
+        };
+        let vit_omegas = BerniniStage2Omegas {
+            omega_vid: Defaults::OMEGA_VID,
+            omega_img: Defaults::OMEGA_IMG,
+            omega_txt: Defaults::OMEGA_TXT,
+            omega_tgt: Some(0.5),
+        };
+
+        for (name, sampler, omegas, n_bufs, momentum) in [
+            (
+                "bernini_candle_stage2_unipc_apg",
+                Sampler::UniPC,
+                renderer_omegas,
+                2usize,
+                0.5f32,
+            ),
+            (
+                "bernini_candle_stage2_euler_vit",
+                Sampler::Euler,
+                vit_omegas,
+                0usize,
+                0.0f32,
+            ),
+        ] {
+            let report = verify_driver_conformance(ConformanceCase {
+                total_steps: 6,
+                split_at: 3,
+                seed: 42,
+                base_geometry: (256, 256),
+                alt_geometry: (512, 512),
+                make_driver: || {
+                    Box::new(
+                        BerniniDualExpertDriver::new(
+                            name,
+                            sampler,
+                            875.0,
+                            6,
+                            5.0,
+                            omegas,
+                            Defaults::OMEGA_SCALE,
+                            n_bufs,
+                            momentum,
+                            MockCandleStage2Forward {
+                                log: Rc::new(RefCell::new(Vec::new())),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                },
+                make_initial: || init.clone(),
+                latents_equal: tensor_f32_bit_equal,
+            })
+            .unwrap_or_else(|err| panic!("{name} conformance failed: {err}"));
+            assert_eq!(report.total_steps, 6);
+            assert!(report.verified_inert_split);
+            assert!(report.verified_cancellation);
+        }
+    }
+
+    #[test]
+    fn bernini_candle_stage2_switches_once_at_boundary_and_carries_apg_across_split() {
+        let dev = Device::Cpu;
+        let boundary_ts = 875.0f64;
+        let base_omegas = BerniniStage2Omegas {
+            omega_vid: 1.25,
+            omega_img: 4.5,
+            omega_txt: 4.0,
+            omega_tgt: Some(0.5),
+        };
+        let init = Tensor::from_vec(vec![0.5f32, -0.4, 0.8, -0.2], (4,), &dev).unwrap();
+        let cancel = CancelFlag::default();
+
+        let log_unsplit: Stage2Log = Rc::new(RefCell::new(Vec::new()));
+        let drv_unsplit = BerniniDualExpertDriver::new(
+            "bernini_candle_boundary_unsplit",
+            Sampler::UniPC,
+            boundary_ts,
+            6,
+            5.0,
+            base_omegas,
+            Defaults::OMEGA_SCALE,
+            2,
+            0.5,
+            MockCandleStage2Forward {
+                log: log_unsplit.clone(),
+            },
+        )
+        .unwrap();
+        let mut st_u = DriverRunState::new();
+        let mut noop = |_: Progress| {};
+        let mut hooks_u = StepHooks::new(&mut noop);
+        let unsplit = run_candle_driver_slices(
+            &drv_unsplit,
+            [SliceSpec::full(6)],
+            BoundaryState::XSigma(init.clone()),
+            6,
+            0,
+            &cancel,
+            None,
+            &mut st_u,
+            &mut hooks_u,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+
+        let log_split: Stage2Log = Rc::new(RefCell::new(Vec::new()));
+        let drv_split = BerniniDualExpertDriver::new(
+            "bernini_candle_boundary_split",
+            Sampler::UniPC,
+            boundary_ts,
+            6,
+            5.0,
+            base_omegas,
+            Defaults::OMEGA_SCALE,
+            2,
+            0.5,
+            MockCandleStage2Forward {
+                log: log_split.clone(),
+            },
+        )
+        .unwrap();
+        let mut st_s = DriverRunState::new();
+        let mut noop_s = |_: Progress| {};
+        let mut hooks_s = StepHooks::new(&mut noop_s);
+        let split_out = run_candle_driver_slices(
+            &drv_split,
+            [
+                SliceSpec {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..3,
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((256, 256)),
+                    request_boundary_estimate: false,
+                },
+                SliceSpec {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..6,
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((256, 256)),
+                    request_boundary_estimate: false,
+                },
+            ],
+            BoundaryState::XSigma(init),
+            6,
+            0,
+            &cancel,
+            None,
+            &mut st_s,
+            &mut hooks_s,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+
+        let (BoundaryState::XSigma(a), BoundaryState::XSigma(b)) = (unsplit, split_out) else {
+            panic!("expected XSigma");
+        };
+        assert!(tensor_f32_bit_equal(&a, &b));
+
+        let entries = log_split.borrow();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(log_unsplit.borrow().as_slice(), entries.as_slice());
+        for &(step, expert, t, omegas, switched, non_empty_bufs) in entries.iter() {
+            assert_eq!(non_empty_bufs, 2);
+            if t >= boundary_ts {
+                assert_eq!(expert, BerniniExpert::High, "step {step} >= boundary");
+                assert!(!switched);
+                assert_eq!(omegas, base_omegas);
+            } else {
+                assert_eq!(expert, BerniniExpert::Low, "step {step} < boundary");
+                assert!(switched);
+                assert_eq!(
+                    omegas.omega_vid,
+                    base_omegas.omega_vid * Defaults::OMEGA_SCALE
+                );
+                assert_eq!(
+                    omegas.omega_img,
+                    base_omegas.omega_img * Defaults::OMEGA_SCALE
+                );
+                assert_eq!(
+                    omegas.omega_txt,
+                    base_omegas.omega_txt * Defaults::OMEGA_SCALE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bernini_candle_renderer_pre_load_plan_validates_output_contracts_and_refusals() {
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+
+        let still_req = GenerationRequest {
+            prompt: "a red panda in dappled sunlight".into(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            steps: Some(10),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        g.validate(&still_req).unwrap();
+        let still_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Candle,
+            BerniniKnobs::default().to_plan_knobs(),
+            &still_req,
+        )
+        .unwrap();
+        assert_eq!(
+            still_plan.output_contract,
+            BerniniOutputContract::Images { expected_count: 1 }
+        );
+
+        let video_req = GenerationRequest {
+            prompt: "ripples on a pond".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            fps: Some(16),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        g.validate(&video_req).unwrap();
+        let video_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Candle,
+            BerniniKnobs::default().to_plan_knobs(),
+            &video_req,
+        )
+        .unwrap();
+        assert_eq!(
+            video_plan.output_contract,
+            BerniniOutputContract::Video {
+                fps: 16,
+                latent_frames: 5
+            }
+        );
+
+        assert!(g
+            .validate(&GenerationRequest {
+                scheduler_shift: Some(0.0),
+                ..still_req
+            })
+            .is_err());
     }
 }

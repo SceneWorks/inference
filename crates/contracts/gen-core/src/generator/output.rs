@@ -31,6 +31,12 @@ pub enum GenerationOutput {
         audio: Option<AudioTrack>,
     },
     Audio(AudioTrack),
+    /// Ordered text segments with inline `<image>` placeholders paired with their realized RGB
+    /// images (SenseNova-U1 / Document Studio interleaved generation, `PIPE-12`).
+    Interleaved {
+        text: String,
+        images: Vec<Image>,
+    },
 }
 
 /// The caption-overflow policy ([`GenerationRequest::caption_overflow`], epic sc-25678): what a

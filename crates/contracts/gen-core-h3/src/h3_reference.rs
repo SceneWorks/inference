@@ -681,6 +681,45 @@ impl Ref2VaReference {
     }
 }
 
+/// Borrowed view of a single `ref2va` reference, allowing metadata validation and planning
+/// without cloning decoded video frames, images, or audio waveforms.
+#[derive(Debug, Clone, Copy)]
+pub enum Ref2VaReferenceRef<'a> {
+    Image(&'a Image),
+    Video {
+        frames: &'a [Image],
+        fps: f64,
+        audio: Option<&'a AudioTrack>,
+    },
+    Audio(&'a AudioTrack),
+}
+
+impl<'a> Ref2VaReferenceRef<'a> {
+    /// Which modality bucket this borrowed reference counts against.
+    pub fn kind(&self) -> ReferenceKind {
+        match self {
+            Self::Image(_) => ReferenceKind::Image,
+            Self::Video { .. } => ReferenceKind::Video,
+            Self::Audio(_) => ReferenceKind::Audio,
+        }
+    }
+}
+
+impl Ref2VaReference {
+    /// Borrow this reference without cloning its underlying pixel or waveform buffers.
+    pub fn as_ref_view(&self) -> Ref2VaReferenceRef<'_> {
+        match self {
+            Self::Image(img) => Ref2VaReferenceRef::Image(img),
+            Self::Video(v) => Ref2VaReferenceRef::Video {
+                frames: &v.frames,
+                fps: v.fps,
+                audio: v.audio.as_ref(),
+            },
+            Self::Audio(a) => Ref2VaReferenceRef::Audio(&a.audio),
+        }
+    }
+}
+
 /// A **validated**, ordered `ref2va` reference list.
 ///
 /// The only constructor is [`Ref2VaReferences::new`], so a value of this type has already passed
@@ -693,29 +732,12 @@ pub struct Ref2VaReferences {
 }
 
 impl Ref2VaReferences {
-    /// Validate an ordered reference list against every `ref2va` rule, at the **engine boundary**.
+    /// Validate an ordered borrowed reference slice against every `ref2va` rule without cloning
+    /// any image, video-frame, or audio buffers.
     ///
-    /// This is the gate the story requires to exist here and not only at the API: a request that
-    /// reaches the engine over-cap must be refused with a message that names the cap, rather than
-    /// rendering a plausible clip that silently ignored the twelfth reference.
-    ///
-    /// The rules, in the order they are checked:
-    ///
-    /// 1. **At least one reference.** An empty list is `t2va`, a different task on a different
-    ///    checkpoint — routing it here would load the wrong 66 GB partition.
-    /// 2. **Each per-modality cap** — [`MAX_IMAGE_REFERENCES`], [`MAX_VIDEO_REFERENCES`],
-    ///    [`MAX_AUDIO_REFERENCES`].
-    /// 3. **The combined cap** — [`MAX_TOTAL_REFERENCES`]. Checked separately because
-    ///    `9 + 3 + 3 = 15 > 12`: a request can satisfy all three per-modality caps and still be
-    ///    over budget, which is exactly the 15-file case the epic's R2 calls out.
-    /// 4. **Audio references are never alone.** An audio reference has to be paired with at least
-    ///    one image or video reference. A waveform never reaches the conditioner, so an
-    ///    audio-only request would leave the text encoder with nothing but labels and the visual
-    ///    stream wholly unconditioned — the model was not trained on that shape.
-    /// 5. **Non-degenerate media** — an empty video reference, an empty waveform, a zero-extent
-    ///    image and a non-finite or non-positive frame rate are all refused rather than
-    ///    propagated into a shape error 50 layers deep.
-    pub fn new(references: Vec<Ref2VaReference>) -> Result<Self> {
+    /// Rules checked in order match [`Ref2VaReferences::new`]: non-empty, per-modality caps,
+    /// combined cap, no audio-only requests, and non-degenerate media extents/rates.
+    pub fn validate_borrowed(references: &[Ref2VaReferenceRef<'_>]) -> Result<()> {
         if references.is_empty() {
             return Err(Error::Msg(
                 "minimax-h3 ref2va: needs at least one reference; a text-only request is t2va, \
@@ -757,32 +779,62 @@ impl Ref2VaReferences {
 
         for (i, r) in references.iter().enumerate() {
             match r {
-                Ref2VaReference::Image(img) => Self::check_image(i, img)?,
-                Ref2VaReference::Video(v) => {
-                    if v.frames.is_empty() {
+                Ref2VaReferenceRef::Image(img) => Self::check_image(i, img)?,
+                Ref2VaReferenceRef::Video { frames, fps, audio } => {
+                    if frames.is_empty() {
                         return Err(Error::Msg(format!(
                             "minimax-h3 ref2va: reference {i} is a video with no frames"
                         )));
                     }
-                    if !v.fps.is_finite() || v.fps <= 0.0 {
+                    if !fps.is_finite() || *fps <= 0.0 {
                         return Err(Error::Msg(format!(
-                            "minimax-h3 ref2va: reference {i} declares a frame rate of {}; a \
+                            "minimax-h3 ref2va: reference {i} declares a frame rate of {fps}; a \
                              reference is resampled onto 24 fps from the rate it carries, so the \
-                             rate must be a positive finite number",
-                            v.fps
+                             rate must be a positive finite number"
                         )));
                     }
-                    for f in &v.frames {
+                    for f in *frames {
                         Self::check_image(i, f)?;
                     }
-                    if let Some(a) = &v.audio {
+                    if let Some(a) = audio {
                         Self::check_audio(i, a)?;
                     }
                 }
-                Ref2VaReference::Audio(a) => Self::check_audio(i, &a.audio)?,
+                Ref2VaReferenceRef::Audio(a) => Self::check_audio(i, a)?,
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate an ordered reference list against every `ref2va` rule, at the **engine boundary**.
+    ///
+    /// This is the gate the story requires to exist here and not only at the API: a request that
+    /// reaches the engine over-cap must be refused with a message that names the cap, rather than
+    /// rendering a plausible clip that silently ignored the twelfth reference.
+    ///
+    /// The rules, in the order they are checked:
+    ///
+    /// 1. **At least one reference.** An empty list is `t2va`, a different task on a different
+    ///    checkpoint — routing it here would load the wrong 66 GB partition.
+    /// 2. **Each per-modality cap** — [`MAX_IMAGE_REFERENCES`], [`MAX_VIDEO_REFERENCES`],
+    ///    [`MAX_AUDIO_REFERENCES`].
+    /// 3. **The combined cap** — [`MAX_TOTAL_REFERENCES`]. Checked separately because
+    ///    `9 + 3 + 3 = 15 > 12`: a request can satisfy all three per-modality caps and still be
+    ///    over budget, which is exactly the 15-file case the epic's R2 calls out.
+    /// 4. **Audio references are never alone.** An audio reference has to be paired with at least
+    ///    one image or video reference. A waveform never reaches the conditioner, so an
+    ///    audio-only request would leave the text encoder with nothing but labels and the visual
+    ///    stream wholly unconditioned — the model was not trained on that shape.
+    /// 5. **Non-degenerate media** — an empty video reference, an empty waveform, a zero-extent
+    ///    image and a non-finite or non-positive frame rate are all refused rather than
+    ///    propagated into a shape error 50 layers deep.
+    pub fn new(references: Vec<Ref2VaReference>) -> Result<Self> {
+        let views: Vec<Ref2VaReferenceRef<'_>> = references
+            .iter()
+            .map(Ref2VaReference::as_ref_view)
+            .collect();
+        Self::validate_borrowed(&views)?;
         Ok(Self { references })
     }
 

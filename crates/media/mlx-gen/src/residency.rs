@@ -18,6 +18,13 @@ impl gen_core::ResidencyRuntime for MlxResidencyRuntime {
         matches!(error, Error::ProcessPoisoned(_))
     }
 
+    fn suppresses_cleanup(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            Error::ProviderPoisoned(_) | Error::ProcessPoisoned(_)
+        )
+    }
+
     fn after_component_drop() {
         drain_allocator_cache();
     }
@@ -358,5 +365,53 @@ mod tests {
         assert!(matches!(output, Err(Error::Msg(ref message)) if message == "encode failed"));
         assert_eq!(stub::release_points(), 1);
         assert_eq!(stub::sweeps(), SWEEPS_PER_RELEASE);
+    }
+
+    #[test]
+    fn provider_poisoned_suppresses_allocator_drain_without_misclassifying_as_process_poisoned() {
+        use gen_core::ResidencyRuntime;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let provider = Error::ProviderPoisoned("stale rope cache".into());
+        assert!(!MlxResidencyRuntime::is_process_poisoned(&provider));
+        assert!(MlxResidencyRuntime::suppresses_cleanup(&provider));
+        let process = Error::ProcessPoisoned("metal context lost".into());
+        assert!(MlxResidencyRuntime::is_process_poisoned(&process));
+        assert!(MlxResidencyRuntime::suppresses_cleanup(&process));
+        assert!(!MlxResidencyRuntime::suppresses_cleanup(&Error::Msg(
+            "ordinary".into()
+        )));
+
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let _stub = reset_counters();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let drops_text = Arc::clone(&drops);
+        let residency = Residency::<DropWitness, u8>::request_scoped(
+            move |_| Ok(DropWitness(Arc::clone(&drops_text))),
+            |_, _| Ok(3),
+        );
+        let output: Result<()> = residency.run_request_scoped(
+            true,
+            false,
+            &CancelFlag::new(),
+            false,
+            &mut |_| {},
+            |_| Err::<u8, _>(Error::ProviderPoisoned("provider wedged".into())),
+            |_| Ok(()),
+            |_, _, _| Ok(()),
+        );
+        assert!(
+            matches!(output, Err(Error::ProviderPoisoned(ref message)) if message == "provider wedged")
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(stub::release_points(), 0);
+        assert_eq!(stub::sweeps(), 0);
     }
 }

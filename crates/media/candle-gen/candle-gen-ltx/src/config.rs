@@ -97,18 +97,16 @@ pub fn max_latent_tokens() -> usize {
 /// σ goes 1.0 → 0.0). Its denoised latent is VAE-denormalized, transformed by the learned 2×
 /// upsampler, re-normalized and freshly re-noised for [`STAGE2_SIGMAS`] at full resolution. The
 /// distilled model bakes guidance in → **no CFG**.
-pub const STAGE1_SIGMAS: [f32; 9] = [
-    1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
-];
+pub const STAGE1_SIGMAS: [f32; 9] = gen_core_ltx::LTX_STAGE1_SIGMAS;
 
 /// The learned-upsampled full-resolution refinement schedule.  It is intentionally
 /// separate from `NATIVE_STEPS`: the public distilled stage-one contract remains
 /// eight steps while an Eros render executes 8 + 3 learned refinement steps.
-pub const STAGE2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
+pub const STAGE2_SIGMAS: [f32; 4] = gen_core_ltx::LTX_STAGE2_SIGMAS;
 
 /// DFR temporal-round sigmas (`dfr_pipeline`'s `DISTILLED_SIGMAS[4:]`, 4 denoise steps).
 /// `TEMPORAL_SIGMAS[0]` doubles as the tile-entry re-noise scale (sc-18789).
-pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909375, 0.725, 0.421875, 0.0];
+pub const TEMPORAL_SIGMAS: [f32; 5] = gen_core_ltx::LTX_TEMPORAL_SIGMAS;
 
 /// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`). This is
 /// the ONLY step count the distilled model supports — the σ waypoints are baked into training, so an

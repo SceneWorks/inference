@@ -417,7 +417,7 @@ impl SenseNova {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn run_interleave(
+    pub fn run_interleave_with_conditional_plan(
         &self,
         context: &gen_core::MemoryRunContext,
         mut request: GenerationRequest,
@@ -430,13 +430,43 @@ impl SenseNova {
         max_new_tokens: usize,
         max_images: usize,
         init_noises: Option<&[Array]>,
+        precompiled_plan: Option<(
+            &gen_core::render::conditional::ConditionalInput,
+            &gen_core::render::conditional::ConditionalPlan,
+        )>,
+        ceilings: Option<gen_core::render::conditional::ConditionalCeilings>,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<crate::t2i::InterleaveOutput> {
+    ) -> Result<(
+        crate::t2i::InterleaveOutput,
+        gen_core::render::conditional::ConditionalReceipt,
+    )> {
+        let width_u32 = u32::try_from(width).map_err(|_| {
+            Error::Msg(format!(
+                "sensenova: interleave width must be non-negative, got {width}"
+            ))
+        })?;
+        let height_u32 = u32::try_from(height).map_err(|_| {
+            Error::Msg(format!(
+                "sensenova: interleave height must be non-negative, got {height}"
+            ))
+        })?;
+        if let Some(precompiled) = precompiled_plan {
+            crate::t2i::validate_precompiled_interleave_request(
+                self.descriptor.id,
+                width_u32,
+                height_u32,
+                options.seed,
+                input_images.len(),
+                max_new_tokens,
+                max_images,
+                options.num_steps,
+                precompiled,
+                ceilings.as_ref(),
+            )?;
+        }
         validate_interleave_count(&request, max_images)?;
-        if i64::from(request.width) != i64::from(width)
-            || i64::from(request.height) != i64::from(height)
-        {
+        if request.width != width_u32 || request.height != height_u32 {
             return Err(Error::Msg(format!(
                 "sensenova: interleave execution {width}x{height} does not match request {}x{}",
                 request.width, request.height
@@ -452,7 +482,8 @@ impl SenseNova {
         Self::run_direct_scope(&mut *scope, &mut request, |request| {
             Self::apply_request_memory(request, &mut options);
             self.with_runtime(|model, tokenizer| {
-                model.interleave_gen(
+                model.interleave_gen_for_provider_with_conditional_receipt(
+                    self.descriptor.id,
                     tokenizer,
                     prompt,
                     input_images,
@@ -463,11 +494,50 @@ impl SenseNova {
                     max_new_tokens,
                     max_images,
                     init_noises,
+                    precompiled_plan,
+                    ceilings,
                     cancel,
                     on_progress,
                 )
             })
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<crate::t2i::InterleaveOutput> {
+        self.run_interleave_with_conditional_plan(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            init_noises,
+            None,
+            None,
+            cancel,
+            on_progress,
+        )
+        .map(|(out, _receipt)| out)
     }
 
     pub fn memory_contract(&self) -> &gen_core::MemoryProviderContract {

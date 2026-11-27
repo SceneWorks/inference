@@ -42,7 +42,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
-use mlx_gen::gen_core::h3_image::{sampler_step, H3ImageSampler, SamplerStep, REFERENCE_NOISE_AUG};
+use mlx_gen::gen_core::h3_image::{H3ImageSampler, REFERENCE_NOISE_AUG};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -57,7 +57,6 @@ use crate::dit::model::UnverifiedSources;
 use crate::dit::refiner::TokenRefiner;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::h3_image::layout::ImageLayout;
-use crate::h3_image::sampler::MlxStepOps;
 use crate::tensor::slice_axis;
 
 /// The published component directory the image DiT loads from. `transformer/` is the native
@@ -1007,7 +1006,7 @@ impl ImageDenoiser {
     }
 
     /// One step of `sampler` (SW-7106): the velocity at step `step` through head `step`, then
-    /// gen-core's [`sampler_step`] over the generated rows, in float32. The sigmas are the ones
+    /// gen-core's [`mlx_gen::gen_core::h3_image::sampler_step`] over the generated rows, in float32. The sigmas are the ones
     /// [`velocity_euler_delta`] steps between (`1 - t`, the terminal one 0), so
     /// [`H3ImageSampler::Euler`] is exactly [`Self::step`]. `image_seed` seeds the LCM noise
     /// ([`mlx_gen::gen_core::h3_image::lcm_noise_seed`]); Euler ignores it.
@@ -1028,7 +1027,7 @@ impl ImageDenoiser {
     ///
     /// When `pag` yields `step_scale > 0.0` at `(step, num_steps)`, executes a 2-pass step (`cond`
     /// then `perturbed`) through the identical `pdd_proj_out.{step}` head, combines the generated
-    /// velocity via [`mlx_gen::gen_core::pag_apply`], and advances [`sampler_step`] once (so LCM's
+    /// velocity via [`mlx_gen::gen_core::pag_apply`], and advances [`mlx_gen::gen_core::h3_image::sampler_step`] once (so LCM's
     /// RNG draw count is identical to the 1-pass baseline). When `pag` is `None` or
     /// `step_scale == 0.0`, runs a single conditional pass identically to [`Self::step_with`].
     pub fn step_with_pag(
@@ -1039,56 +1038,10 @@ impl ImageDenoiser {
         step: usize,
         image_rows: &Array,
     ) -> Result<Array> {
-        let num_steps = self.num_steps();
-        let timesteps = self.schedule.timesteps();
-        velocity_euler_delta(timesteps, step)?;
-        let step_pag_scale = pag.map_or(0.0, |p| p.step_scale(step, num_steps));
-        let refs = self.layout.num_reference_rows();
-        let all = self.layout.num_packed_image_rows();
-
-        let v_cond = self.velocity(step, image_rows)?;
-        let v_cond_gen = slice_axis(&v_cond.as_dtype(Dtype::Float32)?, 1, refs, all)?;
-        let v_gen = if step_pag_scale > 0.0 {
-            let layers = pag.map_or(&[][..], |p| p.step_layers(step, num_steps));
-            // Materialize Pass 1's generated velocity and release its 50-block lazy activation
-            // graph before building Pass 2 on resident loads.
-            mlx_rs::transforms::eval([&v_cond_gen])?;
-            drop(v_cond);
-            let v_perturbed = self.velocity_perturbed(step, image_rows, layers)?;
-            let v_perturbed_gen = slice_axis(&v_perturbed.as_dtype(Dtype::Float32)?, 1, refs, all)?;
-            mlx_gen::gen_core::pag_apply(
-                &mlx_gen::MlxLatentOps,
-                &v_cond_gen,
-                &v_cond_gen,
-                &v_perturbed_gen,
-                step_pag_scale,
-            )?
-        } else {
-            v_cond_gen
-        };
-
-        let sigma = |i: usize| timesteps.get(i).map_or(0.0, |&t| 1.0 - t);
-        let x = image_rows.as_dtype(Dtype::Float32)?;
-        let generated = sampler_step(
-            &mut MlxStepOps,
-            sampler,
-            SamplerStep {
-                step,
-                num_steps,
-                sigma: sigma(step),
-                sigma_next: sigma(step + 1),
-                image_seed,
-            },
-            &slice_axis(&x, 1, refs, all)?,
-            &v_gen,
-        )?;
-        if refs == 0 {
-            return Ok(generated);
-        }
-        Ok(concatenate_axis(
-            &[slice_axis(&x, 1, 0, refs)?, generated],
-            1,
-        )?)
+        let mut model = self;
+        crate::drivers::step_packed_image_rows(
+            &mut model, sampler, pag, image_seed, step, image_rows, None,
+        )
     }
 
     /// The generated rows of a packed `[1, num_packed_image_rows, ·]` image stream.
@@ -1134,16 +1087,38 @@ impl ImageDenoiser {
         cancel: &mlx_gen::CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
-        let mut x = noise_rows.as_dtype(Dtype::Float32)?;
-        for step in 0..self.num_steps() {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
+        let num_steps = self.num_steps();
+        let driver = crate::drivers::MlxH3ImageDriver::new(
+            "mlx_h3_image",
+            self,
+            *sampler,
+            pag.map(std::borrow::Cow::Borrowed),
+            image_seed,
+        )?;
+        let mut state = mlx_gen::driver::DriverRunState::new();
+        let mut progress = |event: mlx_gen::gen_core::Progress| {
+            if let mlx_gen::gen_core::Progress::Step { current, .. } = event {
+                on_step(current as usize);
             }
-            x = self.step_with_pag(sampler, pag, image_seed, step, &x)?;
-            mlx_rs::transforms::eval([&x])?;
-            on_step(step + 1);
+        };
+        let mut hooks = mlx_gen::driver::StepHooks::new(&mut progress);
+        let out = mlx_gen::run_mlx_driver_slices(
+            &driver,
+            [mlx_gen::driver::SliceSpec::full(num_steps)],
+            mlx_gen::gen_core::BoundaryState::XSigma(noise_rows.as_dtype(Dtype::Float32)?),
+            num_steps,
+            image_seed,
+            cancel,
+            None,
+            &mut state,
+            &mut hooks,
+            |_, s, _| Ok(s),
+        )?;
+        match out {
+            mlx_gen::gen_core::BoundaryState::XSigma(x)
+            | mlx_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+            | mlx_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => Ok(x),
         }
-        Ok(x)
     }
 }
 

@@ -19,6 +19,7 @@ mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 # bernini_renderer.json knob sidecar reading.
 serde_json = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
 sha2 = { workspace = true }
 # Source-media decode (i2i/v2v/r2v/rv2v conditioning). PNG + JPEG cover the still inputs.
 image = { workspace = true }
@@ -45,4 +46,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-wan/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-wan/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof"]

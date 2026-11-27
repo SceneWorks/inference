@@ -22,7 +22,7 @@
 //! guidance-distilled — and step `i` projects through `pdd_proj_out.{i}`.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::h3_image::{sampler_step, H3ImageSampler, SamplerStep};
+use candle_gen::gen_core::h3_image::H3ImageSampler;
 use candle_gen::gen_core::{CancelFlag, Image};
 use candle_gen::seed::seeded_normal_vec;
 use candle_gen::{CandleError, Result};
@@ -34,7 +34,6 @@ use crate::denoise::{TEXT_TAG, VIDEO_TAG};
 use crate::dit::positions::{
     frame_grid, reference_block_position_ids, text_position_ids, ReferenceLatentGeometry,
 };
-use crate::image_sampler::CandleStepOps;
 use crate::pipeline::{patchify_video_latents, unpatchify_video_rows, PIXEL_MEAN, PIXEL_STD};
 
 /// The modality tag an image row carries — `gen_core::h3_image::IMAGE_TAG`, MiniMax-H3's video
@@ -425,8 +424,42 @@ pub trait ImageVelocity {
     }
 }
 
+impl<T: ImageVelocity + ?Sized> ImageVelocity for &mut T {
+    fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
+        (**self).forward(step, image_rows)
+    }
+
+    fn forward_perturbed(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        (**self).forward_perturbed(step, image_rows, perturbed_layers)
+    }
+
+    fn forward_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+    ) -> Result<Tensor> {
+        (**self).forward_heads(step, heads, image_rows)
+    }
+
+    fn forward_perturbed_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        (**self).forward_perturbed_heads(step, heads, image_rows, perturbed_layers)
+    }
+}
+
 /// **The six-step loop**: one forward per step, then gen-core's shared
-/// [`sampler_step`] in float32 — under
+/// `sampler_step` in float32 — under
 /// [`H3ImageSampler::Euler`] `x ← x + (σᵢ − σᵢ₊₁) · v`, under
 /// [`H3ImageSampler::Lcm`] (the request default) ComfyUI's re-noised LCM step with noise seeded from `image_seed`
 /// ([`crate::image_sampler`]). Both rungs (resident and streamed) run through this one loop.
@@ -469,7 +502,7 @@ pub fn denoise_image(
 /// When `pag` is active at step `i` (`pag.scale_at_step(i, num_steps) > 0.0`), executes two
 /// conditional passes (`cond` then `perturbed`) through the identical step `i` `pdd_proj_out.{i}`
 /// head, combines generated velocities via `pag_apply` (`v_cond + pag_scale * (v_cond - v_pert)`),
-/// and invokes [`sampler_step`] once so stochastic LCM RNG consumption stays one draw per step.
+/// and invokes `sampler_step` once so stochastic LCM RNG consumption stays one draw per step.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_image_with_pag(
     model: &mut dyn ImageVelocity,
@@ -490,10 +523,14 @@ pub fn denoise_image_with_pag(
              generated row"
         )));
     }
-    let condition = initial_rows
-        .narrow(1, 0, num_reference_rows)?
-        .to_dtype(DType::F32)?;
-    let mut x = initial_rows
+    let condition = (num_reference_rows > 0)
+        .then(|| {
+            initial_rows
+                .narrow(1, 0, num_reference_rows)?
+                .to_dtype(DType::F32)
+        })
+        .transpose()?;
+    let x = initial_rows
         .narrow(1, num_reference_rows, total - num_reference_rows)?
         .to_dtype(DType::F32)?;
     let num_steps = schedule.num_evals();
@@ -532,79 +569,41 @@ pub fn denoise_image_with_pag(
             }),
         );
     }
-    let mut ops = CandleStepOps { device };
-    for step in 0..num_steps {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
+
+    let driver = crate::drivers::CandleH3ImageDriver::new(
+        "candle_h3_image",
+        model,
+        std::borrow::Cow::Borrowed(schedule),
+        *sampler,
+        pag.map(std::borrow::Cow::Borrowed),
+        image_seed,
+        condition,
+        device.clone(),
+    )?;
+    let mut state = candle_gen::driver::DriverRunState::new();
+    let mut progress = |event: candle_gen::gen_core::Progress| {
+        if let candle_gen::gen_core::Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-        // Checks the step against the grid, as the Euler coefficient always has.
-        schedule
-            .velocity_delta(step)
-            .map_err(|e| CandleError::Msg(e.to_string()))?;
-        let packed = if num_reference_rows == 0 {
-            x.clone()
-        } else {
-            Tensor::cat(&[&condition, &x], 1)?
-        };
-        // The step's output heads: head `step` on the published grid, ComfyUI's dt-weighted mix of
-        // the spanned heads when a scheduler's step crosses grid points (SW-7224).
-        let heads = candle_gen::gen_core::h3_image::pdd_head_mix(schedule.sigmas(), step)
-            .map_err(|e| CandleError::Msg(e.to_string()))?;
-        let velocity_cond = model.forward_heads(step, &heads, &packed)?;
-        if velocity_cond.dims() != packed.dims() {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3-image denoise: step {step} returned a {:?} velocity for {:?} rows",
-                velocity_cond.dims(),
-                packed.dims()
-            )));
-        }
-        let v_cond_gen = velocity_cond
-            .narrow(1, num_reference_rows, x.dims()[1])?
-            .to_dtype(DType::F32)?;
-        let step_pag_scale = pag.map_or(0.0, |p| p.step_scale(step, num_steps));
-        let velocity = if step_pag_scale > 0.0 {
-            let layers = pag.map_or(&[][..], |p| p.step_layers(step, num_steps));
-            let velocity_pert = model.forward_perturbed_heads(step, &heads, &packed, layers)?;
-            if velocity_pert.dims() != packed.dims() {
-                return Err(CandleError::Msg(format!(
-                    "minimax-h3-image denoise: step {step} perturbed pass returned a {:?} \
-                     velocity for {:?} rows",
-                    velocity_pert.dims(),
-                    packed.dims()
-                )));
-            }
-            let v_pert_gen = velocity_pert
-                .narrow(1, num_reference_rows, x.dims()[1])?
-                .to_dtype(DType::F32)?;
-            candle_gen::gen_core::pag_apply(
-                &candle_gen::CandleLatentOps,
-                &v_cond_gen,
-                &v_cond_gen,
-                &v_pert_gen,
-                step_pag_scale,
-            )
-            .map_err(|e| CandleError::Msg(e.to_string()))?
-        } else {
-            v_cond_gen
-        };
-        let sigmas = schedule.sigmas();
-        x = sampler_step(
-            &mut ops,
-            sampler,
-            SamplerStep {
-                step,
-                num_steps,
-                sigma: sigmas[step],
-                sigma_next: sigmas[step + 1],
-                image_seed,
-            },
-            &x,
-            &velocity,
-        )?;
-        device.synchronize()?;
-        on_step(step + 1);
+    };
+    let mut hooks = candle_gen::driver::StepHooks::new(&mut progress);
+    let out = candle_gen::run_candle_driver_slices(
+        &driver,
+        [candle_gen::driver::SliceSpec::full(num_steps)],
+        candle_gen::gen_core::BoundaryState::XSigma(x),
+        num_steps,
+        image_seed,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    match out {
+        candle_gen::gen_core::BoundaryState::XSigma(x)
+        | candle_gen::gen_core::BoundaryState::CleanEstimate { latent: x, .. }
+        | candle_gen::gen_core::BoundaryState::RouteSpecific { state: x, .. } => Ok(x),
     }
-    Ok(x)
 }
 
 /// The decoded, ImageNet-normalized `[1, 3, H, W]` RGB to the delivered image, the released

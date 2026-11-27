@@ -6,14 +6,13 @@
 //! (`seed → draws → materialization`), preventing concurrent cross-thread RNG interleaving while
 //! remaining reentrant on the currently owning thread.
 
-use mlx_rs::Array;
-
 pub use gen_core::driver::{
     conformance, run_driver_slices, DriverEvaluationKind, DriverHistoryPolicy,
     DriverRefusalReasons, DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver,
     GlobalRngTrajectoryGate, GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition,
-    StepHooks,
+    StepHooks, StreamObserveHook,
 };
+pub use gen_core::multistream::{MultiStreamStepInfo, StreamId, StreamStepSigma};
 
 use crate::{CancelFlag, Result};
 
@@ -35,26 +34,26 @@ pub fn with_global_rng_trajectory<T>(body: impl FnOnce() -> T) -> T {
     MLX_GLOBAL_RNG_TRAJECTORY_GATE.run_trajectory(body)
 }
 
-/// Drive an MLX [`FamilyDriver<Array>`] across one or more planned slices, automatically holding
+/// Drive an MLX [`FamilyDriver<L>`] across one or more planned slices, automatically holding
 /// the process-wide global-RNG gate via [`with_global_rng_trajectory`] when
 /// `driver.support().uses_global_rng` is `true` (`B3`).
 #[allow(clippy::too_many_arguments)]
-pub fn run_mlx_driver_slices<D: FamilyDriver<Array> + ?Sized>(
+pub fn run_mlx_driver_slices<L, D: FamilyDriver<L> + ?Sized>(
     driver: &D,
     slices: impl IntoIterator<Item = SliceSpec>,
-    initial_state: gen_core::BoundaryState<Array>,
+    initial_state: gen_core::BoundaryState<L>,
     total_steps: usize,
     seed: u64,
     cancel: &CancelFlag,
     run: Option<&gen_core::RenderRun<'_, '_>>,
     state: &mut DriverRunState,
-    hooks: &mut StepHooks<'_, Array>,
+    hooks: &mut StepHooks<'_, L>,
     on_boundary: impl FnMut(
         usize,
-        gen_core::BoundaryState<Array>,
+        gen_core::BoundaryState<L>,
         &mut DriverRunState,
-    ) -> gen_core::Result<gen_core::BoundaryState<Array>>,
-) -> Result<gen_core::BoundaryState<Array>> {
+    ) -> gen_core::Result<gen_core::BoundaryState<L>>,
+) -> Result<gen_core::BoundaryState<L>> {
     let execute = || {
         run_driver_slices(
             driver,

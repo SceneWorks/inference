@@ -41,6 +41,9 @@ use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
+use gen_core_family::mage_plan::{
+    build_mage_render_plan, MageBackendKind, MageBatchSemantics, MageRenderPlan,
+};
 use sha2::{Digest, Sha256};
 
 fn cancel_aware<T>(
@@ -214,6 +217,11 @@ pub struct MageEditGenerator {
 }
 
 impl MageEditGenerator {
+    /// Build and validate the pre-load [`MageRenderPlan`] before loading weights (`DEC-3`, `PIPE-13`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> gen_core::Result<MageRenderPlan> {
+        build_mage_render_plan(&self.descriptor, MageBackendKind::Candle, req, true)
+    }
+
     fn components(&self) -> gen_core::Result<Arc<MageEdit>> {
         candle_gen::cached(&self.components, || {
             verify_edit_checkpoint(&self.root, self.variant)?;
@@ -385,44 +393,8 @@ impl Generator for MageEditGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        let guidance = req.guidance.unwrap_or(self.variant.defaults().1);
-        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
-        if guidance == 1.0
-            && req
-                .negative_prompt
-                .as_ref()
-                .is_some_and(|text| !text.trim().is_empty())
-        {
-            return Err(gen_core::Error::Msg(
-                "mage edit: a negative prompt requires guidance != 1.0".into(),
-            ));
-        }
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg(
-                "mage edit: instruction must not be empty".into(),
-            ));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg("mage edit: steps must be >= 1".into()));
-        }
-        if req.strength.is_some() {
-            return Err(gen_core::Error::Unsupported(
-                "mage edit uses full reference-token conditioning and does not support request \
-                 strength"
-                    .into(),
-            ));
-        }
-        if !req.width.is_multiple_of(config::SIZE_MULTIPLE)
-            || !req.height.is_multiple_of(config::SIZE_MULTIPLE)
-        {
-            return Err(gen_core::Error::Msg(format!(
-                "mage edit: dimensions must be multiples of {}",
-                config::SIZE_MULTIPLE
-            )));
-        }
+        let plan = self.render_plan(req)?;
+        candle_gen::execution::policy("mage/lib/guidance", format!("{:?}", plan.guidance).into());
         resolve_edit_references(req)?;
         Ok(())
     }
@@ -433,6 +405,7 @@ impl Generator for MageEditGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let render_plan = self.render_plan(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
@@ -456,20 +429,29 @@ impl Generator for MageEditGenerator {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let (default_steps, default_guidance) = self.variant.defaults();
-        let base_seed = req.seed.unwrap_or(0);
-        let steps = req.steps.map_or(default_steps, |steps| steps as usize);
-        let guidance = req.guidance.unwrap_or(default_guidance);
+        let sample_seeds = match &render_plan.batch_semantics {
+            MageBatchSemantics::SequentialSingleSample { sample_seeds, .. } => {
+                sample_seeds.as_slice()
+            }
+            other => {
+                return Err(gen_core::Error::Msg(format!(
+                    "mage edit expected SequentialSingleSample plan, got {other:?}"
+                )))
+            }
+        };
+        assert!(
+            render_plan.watermark.mandatory,
+            "mage edit requires Gaussian-Shading watermarked noise"
+        );
+        let base_seed = render_plan.base_seed;
+        let steps = render_plan.steps;
+        let guidance = render_plan.guidance;
         candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         let mut render_resident = || -> gen_core::Result<Vec<gen_core::Image>> {
             let components = self.components()?;
-            let mut images = Vec::with_capacity(req.count as usize);
-            for index in 0..req.count {
-                candle_gen::execution::draw(
-                    "image_initial_noise",
-                    base_seed.wrapping_add(index as u64),
-                    index as usize,
-                );
+            let mut images = Vec::with_capacity(sample_seeds.len());
+            for (index, &sample_seed) in sample_seeds.iter().enumerate() {
+                candle_gen::execution::draw("image_initial_noise", sample_seed, index);
                 let result = components.edit_with_memory(
                     &req.prompt,
                     req.negative_prompt.as_deref().unwrap_or(" "),
@@ -478,8 +460,8 @@ impl Generator for MageEditGenerator {
                     req.height,
                     steps,
                     guidance,
-                    base_seed.wrapping_add(index as u64),
-                    req.scheduler_shift,
+                    sample_seed,
+                    render_plan.scheduler_shift,
                     req.memory,
                     &req.cancel,
                     on_progress,
@@ -609,6 +591,12 @@ fn resolve_edit_references(
 }
 
 impl MageGenerator {
+    /// Build and validate the pre-load [`MageRenderPlan`] before loading weights (`DEC-3`, `PIPE-13`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> gen_core::Result<MageRenderPlan> {
+        let _ = (self.default_steps, self.default_guidance);
+        build_mage_render_plan(&self.descriptor, MageBackendKind::Candle, req, true)
+    }
+
     fn components(&self) -> gen_core::Result<Arc<MagePipeline>> {
         candle_gen::cached(&self.components, || {
             MagePipeline::load_components(
@@ -688,37 +676,8 @@ impl Generator for MageGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        let guidance = req.guidance.unwrap_or(self.default_guidance);
-        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
-        if guidance == 1.0
-            && req
-                .negative_prompt
-                .as_ref()
-                .is_some_and(|text| !text.trim().is_empty())
-        {
-            return Err(gen_core::Error::Msg(
-                "mage_flow: a negative prompt requires guidance != 1.0".into(),
-            ));
-        }
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg(
-                "mage_flow: prompt must not be empty".into(),
-            ));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg("mage_flow: steps must be >= 1".into()));
-        }
-        if !req.width.is_multiple_of(config::SIZE_MULTIPLE)
-            || !req.height.is_multiple_of(config::SIZE_MULTIPLE)
-        {
-            return Err(gen_core::Error::Msg(format!(
-                "mage_flow: dimensions must be multiples of {}",
-                config::SIZE_MULTIPLE
-            )));
-        }
+        let plan = self.render_plan(req)?;
+        candle_gen::execution::policy("mage/lib/guidance", format!("{:?}", plan.guidance).into());
         Ok(())
     }
 
@@ -728,6 +687,7 @@ impl Generator for MageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let render_plan = self.render_plan(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
@@ -747,19 +707,29 @@ impl Generator for MageGenerator {
                 self.descriptor.id
             )));
         }
-        let base_seed = req.seed.unwrap_or(0);
-        let steps = req.steps.unwrap_or(self.default_steps) as usize;
-        let guidance = req.guidance.unwrap_or(self.default_guidance);
+        let sample_seeds = match &render_plan.batch_semantics {
+            MageBatchSemantics::SequentialSingleSample { sample_seeds, .. } => {
+                sample_seeds.as_slice()
+            }
+            other => {
+                return Err(gen_core::Error::Msg(format!(
+                    "mage_flow expected SequentialSingleSample plan, got {other:?}"
+                )))
+            }
+        };
+        assert!(
+            render_plan.watermark.mandatory,
+            "mage_flow requires Gaussian-Shading watermarked noise"
+        );
+        let base_seed = render_plan.base_seed;
+        let steps = render_plan.steps;
+        let guidance = render_plan.guidance;
         candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         let images = if !stage_residency {
             let components = self.components()?;
-            let mut images = Vec::with_capacity(req.count as usize);
-            for index in 0..req.count {
-                candle_gen::execution::draw(
-                    "image_initial_noise",
-                    base_seed.wrapping_add(index as u64),
-                    index as usize,
-                );
+            let mut images = Vec::with_capacity(sample_seeds.len());
+            for (index, &sample_seed) in sample_seeds.iter().enumerate() {
+                candle_gen::execution::draw("image_initial_noise", sample_seed, index);
                 if req.cancel.is_cancelled() {
                     return Err(gen_core::Error::Canceled);
                 }
@@ -770,8 +740,8 @@ impl Generator for MageGenerator {
                     req.height,
                     steps,
                     guidance,
-                    base_seed.wrapping_add(index as u64),
-                    req.scheduler_shift,
+                    sample_seed,
+                    render_plan.scheduler_shift,
                     req.memory,
                     &req.cancel,
                     on_progress,
@@ -1728,5 +1698,105 @@ mod registry_tests {
             cancel_aware(decoded.map(|_| ()), &cancel),
             Err(candle_gen::CandleError::Canceled)
         ));
+    }
+}
+
+#[cfg(test)]
+mod render_plan_tests {
+    use super::*;
+    use gen_core_family::mage_plan::{MageSeedDerivation, MAGE_STATIC_SHIFT};
+
+    #[test]
+    fn mage_candle_pre_load_plan_matches_pipe13_sequential_semantics_and_refusals() {
+        let registry = provider_registry().unwrap();
+        let req = GenerationRequest {
+            prompt: "a portrait under tungsten studio light".into(),
+            width: 512,
+            height: 768,
+            count: 3,
+            seed: Some(50),
+            ..Default::default()
+        };
+        let gen = registry
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        gen.validate(&req).unwrap();
+
+        let plan =
+            build_mage_render_plan(gen.descriptor(), MageBackendKind::Candle, &req, true).unwrap();
+        assert_eq!(plan.static_shift, MAGE_STATIC_SHIFT);
+        assert!(plan.watermark.mandatory);
+        assert_eq!(plan.watermark.scheme, "mage-pcg-watermark-v1");
+        match &plan.batch_semantics {
+            MageBatchSemantics::SequentialSingleSample {
+                count,
+                seed_derivation,
+                sample_seeds,
+                stage_residency_requires_count_one,
+            } => {
+                assert_eq!(*count, 3);
+                assert_eq!(*seed_derivation, MageSeedDerivation::WrappingU64Offset);
+                assert_eq!(sample_seeds, &[50, 51, 52]);
+                assert!(*stage_residency_requires_count_one);
+            }
+            other => panic!("expected SequentialSingleSample, got {other:?}"),
+        }
+        let decoded: MageRenderPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+
+        // Turbo defaults to 4 steps and CFG 1.0 (use_neg=false).
+        let turbo_gen = registry
+            .load(
+                config::TURBO_MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let turbo_plan =
+            build_mage_render_plan(turbo_gen.descriptor(), MageBackendKind::Candle, &req, true)
+                .unwrap();
+        assert!(turbo_plan.is_turbo);
+        assert_eq!(turbo_plan.steps, 4);
+        assert!(!turbo_plan.use_neg);
+
+        // Edit requires references, sets target-first clean-ref sequence, and refuses strength.
+        let edit_gen = registry
+            .load(
+                config::EDIT_MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        assert!(edit_gen.validate(&req).is_err());
+        let edit_req = GenerationRequest {
+            prompt: "make it twilight".into(),
+            width: 512,
+            height: 512,
+            count: 2,
+            seed: Some(9),
+            conditioning: vec![Conditioning::Reference {
+                image: gen_core::Image {
+                    width: 4,
+                    height: 4,
+                    pixels: vec![0; 48],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        edit_gen.validate(&edit_req).unwrap();
+        let edit_plan = build_mage_render_plan(
+            edit_gen.descriptor(),
+            MageBackendKind::Candle,
+            &edit_req,
+            true,
+        )
+        .unwrap();
+        let seq_plan = edit_plan.edit_sequence.unwrap();
+        assert_eq!(seq_plan.sequence_order, "[noisy_target, ref_1..ref_N]");
+        assert_eq!(seq_plan.target_frame_index, 0);
+        assert_eq!(seq_plan.reference_frame_indices, vec![1]);
     }
 }

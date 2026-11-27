@@ -5,37 +5,36 @@
 //! Sana Sprint SCM, Boogu/MOSS DMD, Iris FlowDPM, Ideogram, Supra2) run under one typed slice
 //! runner with request-owned [`DriverRunState`] and [`StepHooks`].
 
-use candle_core::Tensor;
-
 pub use gen_core::driver::{
     conformance, run_driver_slices, DriverEvaluationKind, DriverHistoryPolicy,
     DriverRefusalReasons, DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver,
     GlobalRngTrajectoryGate, GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition,
-    StepHooks,
+    StepHooks, StreamObserveHook,
 };
+pub use gen_core::multistream::{MultiStreamStepInfo, StreamId, StreamStepSigma};
 
 use crate::Result;
 use gen_core::CancelFlag;
 
-/// Drive a Candle [`FamilyDriver<Tensor>`] across one or more planned slices, binding optional
+/// Drive a Candle [`FamilyDriver<L>`] across one or more planned slices, binding optional
 /// [`gen_core::RenderRun`] phase scopes, cancellation, and owner-thread verification.
 #[allow(clippy::too_many_arguments)]
-pub fn run_candle_driver_slices<D: FamilyDriver<Tensor> + ?Sized>(
+pub fn run_candle_driver_slices<L, D: FamilyDriver<L> + ?Sized>(
     driver: &D,
     slices: impl IntoIterator<Item = SliceSpec>,
-    initial_state: gen_core::BoundaryState<Tensor>,
+    initial_state: gen_core::BoundaryState<L>,
     total_steps: usize,
     seed: u64,
     cancel: &CancelFlag,
     run: Option<&gen_core::RenderRun<'_, '_>>,
     state: &mut DriverRunState,
-    hooks: &mut StepHooks<'_, Tensor>,
+    hooks: &mut StepHooks<'_, L>,
     on_boundary: impl FnMut(
         usize,
-        gen_core::BoundaryState<Tensor>,
+        gen_core::BoundaryState<L>,
         &mut DriverRunState,
-    ) -> gen_core::Result<gen_core::BoundaryState<Tensor>>,
-) -> Result<gen_core::BoundaryState<Tensor>> {
+    ) -> gen_core::Result<gen_core::BoundaryState<L>>,
+) -> Result<gen_core::BoundaryState<L>> {
     run_driver_slices(
         driver,
         slices,
@@ -54,7 +53,7 @@ pub fn run_candle_driver_slices<D: FamilyDriver<Tensor> + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, Tensor};
 
     struct EchoDriver {
         support: DriverSupport,
