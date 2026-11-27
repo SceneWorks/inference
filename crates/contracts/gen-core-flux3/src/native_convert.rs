@@ -9,7 +9,8 @@
 //!   replaced by the backend's packed tensors, every other tensor is copied byte-for-byte;
 //! * `config.json` — the source config with only its `quantization` marker replaced;
 //! * `LICENSE.md` / `NOTICE.md` — copied from the source;
-//! * the unchanged text encoder and autoencoder are EXTERNAL components: full-hash recorded and
+//! * the unchanged text encoder and autoencoder are EXTERNAL components: full-hash recorded (through
+//!   the artifact seal, so the later load-time check of the same files reuses the proven digest) and
 //!   verified again where a load reads them, never copied or re-encoded.
 //!
 //! The only backend-specific step is `pack`: one source target in, its exact packed tensors out.
@@ -18,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use super::artifacts::NativeDitStorage;
 use super::conversion::{
-    hash_file, hash_source_file, publish_conversion, ComponentInventory, ComponentPlacement,
-    ComponentRole, ConversionReceipt, OutputFile,
+    hash_file, hash_source_file, pinned_source_file, publish_conversion, ComponentInventory,
+    ComponentPlacement, ComponentRole, ConversionReceipt, OutputFile,
 };
 use super::quantization::DitFormat;
 use super::safetensors_stream::{
@@ -78,7 +79,7 @@ fn hash_tree(root: &Path, rel: &str) -> Result<BTreeMap<String, OutputFile>> {
                     .to_str()
                     .ok_or_else(|| invalid("non-UTF8 source path"))?
                     .replace('\\', "/");
-                out.insert(name, hash_source_file(&path)?);
+                out.insert(name, pinned_source_file(&path)?);
             }
         }
     }
@@ -187,7 +188,7 @@ pub fn convert_native(
     )]);
     let ae_files = BTreeMap::from([(
         config.vae.path.clone(),
-        hash_source_file(&root.join(&config.vae.path))?,
+        pinned_source_file(&root.join(&config.vae.path))?,
     )]);
     let te_files = hash_tree(root, &config.text_encoder.path)?;
     let mut source_artifacts = dit_artifacts.clone();

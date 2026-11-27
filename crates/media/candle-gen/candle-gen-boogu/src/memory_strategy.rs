@@ -103,7 +103,7 @@ impl ArtifactReceipt {
             } else {
                 gen_core::PinnedWeightsFile::pin(&path)?
             };
-            let digest = gen_core::snapshot_inventory::hex_lower(pin.content_sha256());
+            let digest = gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest());
             inventory.push((path, pin, digest));
         }
         let receipt = Self {

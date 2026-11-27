@@ -31,7 +31,8 @@ pub(crate) struct PinnedArtifact {
 impl PinnedArtifact {
     fn verify_file(path: &Path) -> CoreResult<Self> {
         let seal = ArtifactSeal::pin(path)?;
-        let digest = seal.content_sha256_hex();
+        let digest =
+            mlx_gen::gen_core::snapshot_inventory::hex_lower(&seal.content_or_identity_digest());
         Ok(Self { seal, digest })
     }
 

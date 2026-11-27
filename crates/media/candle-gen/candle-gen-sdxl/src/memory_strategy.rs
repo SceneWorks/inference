@@ -487,7 +487,7 @@ impl SdxlArtifactSeal {
                 let pin = gen_core::PinnedWeightsFile::pin(path)?;
                 receipt.update((path.as_os_str().len() as u64).to_le_bytes());
                 receipt.update(path.as_os_str().as_encoded_bytes());
-                receipt.update(pin.content_sha256());
+                receipt.update(pin.content_or_identity_digest());
                 files.push(SealedFile { pin });
             }
             roots.push((absolute, inventory));

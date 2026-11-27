@@ -344,7 +344,10 @@ fn external_components_are_verified_in_the_source_root_not_the_output() {
     assert!(!target.join("ae.safetensors").exists(), "nothing copied");
     assert_eq!(open_conversion(&target).unwrap(), r);
     r.verify_external(&source).unwrap();
-    fs::write(source.join("ae.safetensors"), b"zz").unwrap();
+    // A different length, not a same-size rewrite: the external check now goes through the
+    // artifact seal's identity memo, and a same-size rewrite inside one filesystem timestamp tick
+    // of the earlier pin would make this assertion depend on timing rather than on the check.
+    fs::write(source.join("ae.safetensors"), b"changed").unwrap();
     assert!(
         r.verify_external(&source).is_err(),
         "a changed source AE is refused"
@@ -355,4 +358,115 @@ fn external_components_are_verified_in_the_source_root_not_the_output() {
     let mut json = r.to_json().unwrap();
     json["components"][0]["placement"] = serde_json::json!("copied");
     assert!(ConversionReceipt::from_json(&json).is_err());
+}
+
+fn hashed_bytes() -> u64 {
+    HASHED_BYTES.with(std::cell::Cell::get)
+}
+
+fn reset_hashed_bytes() {
+    HASHED_BYTES.with(|hashed| hashed.set(0));
+}
+
+/// Publication full-hashes the owned outputs once and records a produced identity for each; every
+/// later open reads ZERO bytes of them, and a same-size rewrite of an owned output is still
+/// refused (its identity no longer matches, so it is hashed and the checksum disagrees).
+///
+/// *Mutations that red this:* trusting a recorded identity without `matches` (the rewrite opens);
+/// not recording identities at publish (the reopen hashes every byte).
+#[test]
+fn a_published_conversion_reopens_without_rehashing_its_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("converted");
+    publish_conversion(&target, |dir| {
+        populate(dir)?;
+        Ok(receipt())
+    })
+    .unwrap();
+    let value: Value =
+        serde_json::from_slice(&fs::read(target.join(RECEIPT_FILE)).unwrap()).unwrap();
+    let identities = produced_identities(&value);
+    let owned: BTreeSet<String> = receipt().files().map(|(p, _)| p.clone()).collect();
+    assert_eq!(identities.keys().cloned().collect::<BTreeSet<_>>(), owned);
+    assert!(identities
+        .values()
+        .all(ProducedFileIdentity::is_trustworthy));
+
+    for _ in 0..2 {
+        reset_hashed_bytes();
+        assert_eq!(open_conversion(&target).unwrap(), receipt());
+        assert_eq!(hashed_bytes(), 0, "a sealed open re-hashed an owned output");
+    }
+
+    let model = target.join("model.safetensors");
+    let mut bytes = fs::read(&model).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&model, &bytes).unwrap();
+    let refusal = open_conversion(&target).unwrap_err().to_string();
+    assert!(
+        refusal.contains("output size or checksum mismatch"),
+        "{refusal}"
+    );
+    assert!(hashed_bytes() > 0, "the changed output was not hashed");
+}
+
+/// A receipt written before produced identities existed opens exactly as before: every owned
+/// output full-hashed, a changed one refused.
+#[test]
+fn a_receipt_without_identities_still_verifies_by_hash() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("converted");
+    publish_conversion(&target, |dir| {
+        populate(dir)?;
+        Ok(receipt())
+    })
+    .unwrap();
+    let path = target.join(RECEIPT_FILE);
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(value
+        .as_object_mut()
+        .unwrap()
+        .remove(PRODUCED_IDENTITIES)
+        .is_some());
+    assert_eq!(
+        value,
+        receipt().to_json().unwrap(),
+        "the pre-identity receipt"
+    );
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let total: u64 = receipt().files().map(|(_, f)| f.bytes).sum();
+    reset_hashed_bytes();
+    assert_eq!(open_conversion(&target).unwrap(), receipt());
+    assert_eq!(hashed_bytes(), total, "every owned output is hashed");
+    fs::write(target.join("NOTICE.md"), b"[]").unwrap();
+    assert!(open_conversion(&target).is_err());
+}
+
+/// External source files are checked through the artifact seal, never the raw per-load hash, and a
+/// changed source file is still refused.
+#[test]
+fn external_files_are_checked_through_the_artifact_seal() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    populate(&source).unwrap();
+    let mut r = receipt();
+    for component in &mut r.components {
+        if component.role != ComponentRole::Dit {
+            component.placement = ComponentPlacement::External;
+        }
+    }
+    reset_hashed_bytes();
+    r.verify_external(&source).unwrap();
+    r.verify_external(&source).unwrap();
+    assert_eq!(hashed_bytes(), 0, "an external file took the raw hash");
+    // A different size, so the refusal never depends on the file-time tick a same-size rewrite
+    // lands in (the seal's memo key is the file's stat identity).
+    fs::write(source.join("text_encoder/model.safetensors"), b"tef").unwrap();
+    let refusal = r.verify_external(&source).unwrap_err().to_string();
+    assert!(
+        refusal.contains("does not match the recorded source checksum"),
+        "{refusal}"
+    );
 }

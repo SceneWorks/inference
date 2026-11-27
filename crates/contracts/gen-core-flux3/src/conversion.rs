@@ -3,6 +3,17 @@
 //! No downloads or managed-cache derivation occur here. A converter fills a NEW
 //! sibling directory, and publication follows complete inventory/checksum checks.
 //! This module never sweeps a sibling/previous owner's files or replaces an install.
+//!
+//! # Owned outputs are hashed once
+//!
+//! [`publish_conversion`] full-hashes every owned output against the receipt once, before the
+//! publish. It then seals each one ([`ProducedFileIdentity::seal_written`]) and records the
+//! identities in the receipt's optional `produced_identities` map (output path → identity). A later
+//! [`open_conversion`] skips the content read of an owned output whose identity still matches and
+//! full-hashes any other one against its recorded checksum, so a changed file is refused exactly
+//! as before; a receipt without identities (an older conversion) is hashed in full, as before.
+//! External source files are downloads, not outputs: they are checked through
+//! [`gen_core::ArtifactSeal::pin`], whose proven-digest memo makes a repeat check free.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -13,11 +24,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use gen_core::{Error, Result};
+use gen_core::{ArtifactSeal, Error, ProducedFileIdentity, Result};
 
 pub const RECEIPT_FILE: &str = "flux3-conversion-receipt.json";
+/// The receipt's optional map of owned output path → [`ProducedFileIdentity`], recorded at
+/// publication once each output was final. Absent from receipts written before it existed.
+pub const PRODUCED_IDENTITIES: &str = "produced_identities";
 const RECEIPT_VERSION: u64 = 1;
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`hash_file`] read on this thread (tests assert a sealed open reads none).
+    pub(crate) static HASHED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 conversion: {detail}"))
@@ -58,7 +78,7 @@ pub struct OutputFile {
 
 /// Where a component's runtime files live. A converted package owns its rewritten DiT;
 /// an UNCHANGED encoder/AE/PUP may stay in the original immutable source root instead of being
-/// copied. External files are full-hash verified against that root by
+/// copied. External files are content-verified against that root by
 /// [`ConversionReceipt::verify_external`]; they are never part of the owned output inventory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentPlacement {
@@ -331,10 +351,10 @@ impl ConversionReceipt {
         )
     }
 
-    /// Full-byte verification of every EXTERNAL component against `source_root` (the original
-    /// immutable package the conversion read). Run at install/open alongside
-    /// [`Self::verify_outputs`]; a mismatch means the external files are not the converted
-    /// source and the package must not load.
+    /// Content verification of every EXTERNAL component against `source_root` (the original
+    /// immutable package the conversion read), through [`pinned_source_file`]. Run at
+    /// install/open alongside [`Self::verify_outputs`]; a mismatch means the external files are
+    /// not the converted source and the package must not load.
     pub fn verify_external(&self, source_root: &Path) -> Result<()> {
         self.verify_external_with(|_, path| Ok(source_root.join(path)))
     }
@@ -353,7 +373,7 @@ impl ConversionReceipt {
             .filter(|c| c.placement == ComponentPlacement::External)
         {
             for (path, want) in &component.files {
-                let got = hash_source_file(&resolve(component.role, path)?)?;
+                let got = pinned_source_file(&resolve(component.role, path)?)?;
                 if &got != want {
                     return Err(invalid(format!(
                         "external {} file {path} does not match the recorded source checksum",
@@ -373,9 +393,21 @@ impl ConversionReceipt {
             .any(|c| c.placement == ComponentPlacement::External)
     }
 
-    /// Full-byte integrity verification occurs at conversion/install/open, not on
-    /// every admission/cache poll. A receipt is not proof without this check.
+    /// Full-byte integrity verification of every owned output (the complete inventory, every
+    /// size and checksum, every shard index). A receipt is not proof without this check.
     pub fn verify_outputs(&self, root: &Path) -> Result<()> {
+        self.verify_outputs_sealed(root, &BTreeMap::new())
+    }
+
+    /// [`Self::verify_outputs`], except that an owned output whose recorded produced `identities`
+    /// entry still matches (same size as its receipt record, same file, unchanged since it was
+    /// sealed) is not read: its bytes were full-hashed against this receipt at publication. Every
+    /// other output is full-hashed, so a changed one is refused exactly as by `verify_outputs`.
+    fn verify_outputs_sealed(
+        &self,
+        root: &Path,
+        identities: &BTreeMap<String, ProducedFileIdentity>,
+    ) -> Result<()> {
         self.validate()?;
         if !fs::symlink_metadata(root)?.file_type().is_dir() {
             return Err(invalid("conversion root must be an owned real directory"));
@@ -389,9 +421,12 @@ impl ConversionReceipt {
                 "output file inventory is incomplete or contains unlisted files",
             ));
         }
-        for (path, want) in self.files() {
-            let path = root.join(path);
-            if &hash_file(&path)? != want {
+        for (name, want) in self.files() {
+            let path = root.join(name);
+            let sealed = identities.get(name).is_some_and(|identity| {
+                identity.size_bytes == want.bytes && identity.matches(&path)
+            });
+            if !sealed && &hash_file(&path)? != want {
                 return Err(invalid(format!(
                     "{}: output size or checksum mismatch",
                     path.display()
@@ -419,6 +454,23 @@ pub fn hash_source_file(path: &Path) -> Result<OutputFile> {
     hash_file(&real)
 }
 
+/// Size + SHA-256 of a downloaded SOURCE file through [`ArtifactSeal::pin`]: the seal follows a
+/// snapshot link to its blob and reads it at most once per file identity (the process memo, and
+/// the persisted digest memo when the host configured one), so a repeat check costs no read.
+/// Whenever the seal cannot be taken or carries no content digest, this is exactly
+/// [`hash_source_file`], refusals included.
+pub fn pinned_source_file(path: &Path) -> Result<OutputFile> {
+    if let Ok(seal) = ArtifactSeal::pin(path) {
+        if let Some(sha256) = seal.content_sha256_hex() {
+            return Ok(OutputFile {
+                bytes: seal.target_fingerprint().size,
+                sha256,
+            });
+        }
+    }
+    hash_source_file(path)
+}
+
 /// Full-file size + SHA-256 of `path` (a regular file, never a symlink).
 pub fn hash_file(path: &Path) -> Result<OutputFile> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
@@ -436,6 +488,8 @@ pub fn hash_file(path: &Path) -> Result<OutputFile> {
         bytes += n as u64;
         hash.update(&buf[..n]);
     }
+    #[cfg(test)]
+    HASHED_BYTES.with(|hashed| hashed.set(hashed.get() + bytes));
     Ok(OutputFile {
         bytes,
         sha256: format!("{:x}", hash.finalize()),
@@ -713,21 +767,34 @@ pub fn publish_conversion(
         ));
     }
     let receipt = write(&owned.stage)?;
+    // The one full-byte check of the owned outputs: every later open trusts the identities below.
     receipt.verify_outputs(&owned.stage)?;
+    let mut identities = BTreeMap::new();
+    for (path, _) in receipt.files() {
+        let output = owned.stage.join(path);
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&output)?
+            .sync_all()?;
+        // Sealed after its last write and sync (renaming the stage directory below leaves its
+        // children's identities unchanged). Best-effort: an output that cannot be sealed is
+        // recorded without an identity and is full-hashed on every open, as before.
+        if let Ok(identity) = ProducedFileIdentity::seal_written(&output) {
+            identities.insert(path.clone(), identity);
+        }
+    }
+    let mut receipt_json = receipt.to_json()?;
+    if !identities.is_empty() {
+        receipt_json[PRODUCED_IDENTITIES] = serde_json::to_value(&identities).map_err(invalid)?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(owned.stage.join(RECEIPT_FILE))?;
-    file.write_all(&serde_json::to_vec_pretty(&receipt.to_json()?).map_err(invalid)?)?;
+    file.write_all(&serde_json::to_vec_pretty(&receipt_json).map_err(invalid)?)?;
     file.sync_all()?;
     drop(file);
-    for (path, _) in receipt.files() {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(owned.stage.join(path))?
-            .sync_all()?;
-    }
     if final_dir.exists() {
         return Err(invalid(
             "destination appeared during conversion; refusing replacement",
@@ -750,14 +817,24 @@ pub fn open_conversion(dir: &Path) -> Result<ConversionReceipt> {
     if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
         return Err(invalid("invalid conversion receipt file"));
     }
-    let value = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
+    let value: Value = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
     let receipt = ConversionReceipt::from_json(&value)?;
     let config = super::resolve_checkpoint(dir)?;
     receipt.validate_checkpoint_mode(&config)?;
     // Reject a mislabeled role from bounded metadata before hashing large owned outputs.
-    // Successful opens still authenticate every owned output; loaders separately verify external bytes.
-    receipt.verify_outputs(dir)?;
+    // Successful opens still authenticate every owned output (by its unchanged produced identity,
+    // else by full hash); loaders separately verify external bytes.
+    receipt.verify_outputs_sealed(dir, &produced_identities(&value))?;
     Ok(receipt)
+}
+
+/// The receipt's recorded produced identities. Absent (an older receipt) or malformed, there are
+/// none, and every owned output is full-hashed.
+fn produced_identities(receipt: &Value) -> BTreeMap<String, ProducedFileIdentity> {
+    receipt
+        .get(PRODUCED_IDENTITIES)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -347,14 +347,14 @@ pub use registry::{
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     with_prompt_encoding, AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactDigestAttestation,
-    ArtifactSeal, CancelFlag, FileStatFingerprint, HdrFrameSink, HdrOutputFrame, IdentityWeights,
-    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
-    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
-    ResolvedFileIdentity, SingleFlight, SingleFlightGuard, WeightsSource, Yue2ArMode,
-    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
-    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
-    VAE_COMPONENT,
+    ArtifactIdentityAttestation, ArtifactSeal, CancelFlag, FileStatFingerprint, HdrFrameSink,
+    HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec,
+    MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins,
+    PreviewFrame, PreviewSink, ProducedFileIdentity, Progress, PromptEnhancementOutcome,
+    PromptEnhancementReport, PromptEnhancementSink, Quant, ResolvedFileIdentity, SingleFlight,
+    SingleFlightGuard, WeightsSource, Yue2ArMode, Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
