@@ -18,7 +18,7 @@
 //! | # | knob | type | demanded by |
 //! |---|------|------|-------------|
 //! | 1 | per-head vs full-dim QK-norm, post- vs pre-head-split | [`QkNormPlacement`] | LTX (full-dim, pre-split), Wan, SANA vs everyone else |
-//! | 2 | interleaved/adjacent-pair vs half-split rotation | [`RopeStyle`] | Lens/Mage/PID/Boogu/Mochi vs Ideogram/Anima vs LTX |
+//! | 2 | interleaved/adjacent-pair vs half-split rotation | [`RopeStyle`] | Lens/Mage/PID/Boogu/Mochi vs Ideogram/Anima vs LTX; full-width interleaved SAM3/SeedVR2/PuLID |
 //! | 3 | RoPE optional | [`RopeStyle::None`] per call | Anima DiT cross-attention, LTX text cross-attention, Krea |
 //! | 4 | RoPE partial (leading `rot` channels, tail passthrough) | [`RopeSpec::rot_dims`] | SeedVR2 |
 //! | 5 | RoPE on one stream only | [`RopeSpec::q`]/[`RopeSpec::k`] independently `None` | Mage (image only), Mochi |
@@ -28,7 +28,7 @@
 //! | 9 | fused vs separate QKV | [`QkvSource`] / [`FusedQkvProjection`] | Lens/Ideogram/PID fused; Mage/SD3/Chroma/Boogu separate |
 //! | 10 | GQA ratio, repeat-KV placed **after** RoPE | [`AttnPrepSpec::kv_heads`] | Boogu (28/7), Krea |
 //! | 11 | stream order `[img,txt]` vs `[txt,img]` | [`StreamOrder`] | Lens/Ideogram (`[img,txt]`) vs Mage/Chroma/PID (`[txt,img]`) |
-//! | 12 | dtype handed to SDPA after the rotation | [`RopeDtype`] | Ideogram/Anima/PID (promotion stands ⇒ f32 SDPA) vs Lens/Boogu/Mage/LTX (restored ⇒ bf16 SDPA) |
+//! | 12 | dtype handed to SDPA after the rotation | [`RopeDtype`] | Ideogram/Anima/PID (promotion stands ⇒ f32 SDPA) vs Lens/Boogu/Mage/LTX (restored ⇒ bf16 SDPA) vs MiniMax-H3/PID Gemma-2 (tables narrowed to the stream) |
 //!
 //! Knob 12 was **not** in the original survey. It surfaced when the per-family fixtures were run at
 //! each family's real dtype rather than in f32: every family builds f32 `(cos, sin)` tables, so the
@@ -40,6 +40,18 @@
 //! [`NormDtype`]'s precision policies. Both rotations and RMSNorm act on the last axis and broadcast
 //! over the head axis, so the two axis orders are numerically identical — but keeping each family's
 //! *own* order means the migration is provably a no-op rather than "should be a no-op".
+//!
+//! ## One rotation, three entry points (SW-6140)
+//!
+//! [`apply_rope`] is the cos/sin route whose pair rotation joins the compiled elementwise glue;
+//! [`apply_rope_eager`] is the identical route pinned eager, for the families whose private copy
+//! was eager (so their numerics stay byte-identical inside any `CompileGlueGuard` scope); and
+//! [`apply_rope_1d`] adds MLX's fused `fast::rope` kernel for the one layout it reproduces — a
+//! contiguous 1-D position sequence over a single frequency schedule ([`Rope1d`]) — behind the
+//! opt-in [`set_fused_rope`], with [`plan_fused_rope`] deriving the pairing convention from the
+//! style and refusing everything else. The per-crate route table is
+//! `crates/media/mlx-gen/rope_modulate_routes.json`, enforced by
+//! `scripts/check_mlx_rope_modulate_routes.py`.
 //!
 //! ## Fusion is opt-in
 //!
@@ -116,6 +128,17 @@ pub enum RopeStyle {
     /// `split → negate → concat → mul → mul → add`, so collapsing the two arms would make the LTX
     /// migration a *numerically-should-match* rather than a bit-exact no-op.
     HalvesPaired,
+    /// **Adjacent-pair, full-width table** — `x·cos + rotate_pairwise(x)·sin`, where
+    /// [`rotate_pairwise`](crate::nn::rotate_pairwise) maps lanes `(x[2i], x[2i+1]) → (−x[2i+1],
+    /// x[2i])` and the `cos`/`sin` tables are the **full** `head_dim` wide, each angle repeated for
+    /// both lanes of its pair (`repeat_interleave(2)`). SAM3 (vision + tracker), SeedVR2, PuLID's
+    /// EVA-CLIP (SW-6140).
+    ///
+    /// The *same rotation* as [`RopeStyle::AdjacentPair`] fed the de-interleaved half table, and
+    /// per element the same IEEE operations (`a − b` is `a + (−b)`), but kept as its own arm for the
+    /// [`RopeStyle::HalvesPaired`] reason: the families ship the full-width table, and re-expressing
+    /// them through the half-width arm would add a table rewrite to every migrated call.
+    InterleavedFull,
 }
 
 /// Knob 1 — where the QK-norm sits relative to the head split, and over which axis it reduces.
@@ -302,6 +325,11 @@ pub enum RopeDtype {
     /// dtype — the reference `x.float() … .type_as(x)` idiom. Lens (`.as_dtype(x.dtype())`), Boogu
     /// (`rope.rs`), Mage (`mage_layers.py:15-21`), LTX (`rope::apply_split_rotary_emb`).
     RestoreInput,
+    /// **Narrow the tables to the stream's dtype** before the multiply-add, so the rotation itself
+    /// runs (and rounds) in the stream dtype and nothing promotes: the reference
+    /// `cos.to(hidden_states.dtype)` idiom. MiniMax-H3 (DiT `MmRope::apply` and the VAE
+    /// `Rope::apply`), PID's Gemma-2 text encoder (SW-6140). On an f32 stream it is the identity.
+    Stream,
 }
 
 /// The whole prologue spec: geometry plus every knob.
@@ -474,6 +502,11 @@ fn qk_rms(x: &Array, weight: &Array, eps: f32, dtype: NormDtype) -> Result<Array
 /// the head axis and indexed by the token axis. Exposed publicly because knob 8
 /// ("concat-then-RoPE", Chroma) needs to rotate a stream that has *already* been joined, which is a
 /// call-order choice rather than a parameter.
+///
+/// The pair rotation of the [`RopeStyle::AdjacentPair`] / [`RopeStyle::HalvesPaired`] arms goes
+/// through [`rope_rotate`], i.e. it joins the compiled elementwise glue when this thread's
+/// [`compile_glue`](crate::nn::compile_glue) is on. A family whose rotation was eager runs
+/// [`apply_rope_eager`] instead, which is the identical op sequence that never compiles.
 pub fn apply_rope(
     x: &Array,
     tables: RopeTables<'_>,
@@ -481,6 +514,56 @@ pub fn apply_rope(
     axes: RotationAxes,
     rot_dims: Option<i32>,
     dtype: RopeDtype,
+) -> Result<Array> {
+    rotate(x, tables, style, axes, rot_dims, dtype, PairGlue::Shared)
+}
+
+/// [`apply_rope`] with the pair rotation pinned **eager** ([`crate::nn::rope_rotate_eager`]): the
+/// same arms, table checks and dtype policies, but never routed through `mx.compile` and recording
+/// no glue diagnostics, whatever this thread's compile-glue setting. The shared cos/sin route for
+/// every family whose private rotation was eager (SW-6140), so its numerics stay byte-identical
+/// even when it runs inside another stage's `CompileGlueGuard` scope.
+pub fn apply_rope_eager(
+    x: &Array,
+    tables: RopeTables<'_>,
+    style: RopeStyle,
+    axes: RotationAxes,
+    rot_dims: Option<i32>,
+    dtype: RopeDtype,
+) -> Result<Array> {
+    rotate(x, tables, style, axes, rot_dims, dtype, PairGlue::Eager)
+}
+
+/// Which pair-rotation kernel the cos/sin route runs — see [`apply_rope`] / [`apply_rope_eager`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairGlue {
+    /// [`rope_rotate`]: one fused kernel when the compile glue is on, eager otherwise.
+    Shared,
+    /// [`crate::nn::rope_rotate_eager`]: always the eager six-op chain.
+    Eager,
+}
+
+fn pair_rotate(
+    glue: PairGlue,
+    real: &Array,
+    imag: &Array,
+    cos: &Array,
+    sin: &Array,
+) -> Result<(Array, Array)> {
+    match glue {
+        PairGlue::Shared => rope_rotate(real, imag, cos, sin),
+        PairGlue::Eager => crate::nn::rope_rotate_eager(real, imag, cos, sin),
+    }
+}
+
+fn rotate(
+    x: &Array,
+    tables: RopeTables<'_>,
+    style: RopeStyle,
+    axes: RotationAxes,
+    rot_dims: Option<i32>,
+    dtype: RopeDtype,
+    glue: PairGlue,
 ) -> Result<Array> {
     if style == RopeStyle::None {
         return Ok(x.clone());
@@ -506,7 +589,7 @@ pub fn apply_rope(
             let mut parts = split_sections(x, &[rot], 3)?;
             let tail = parts.swap_remove(1);
             let head = parts.swap_remove(0);
-            let rotated = apply_rope(&head, tables, style, axes, None, dtype)?;
+            let rotated = rotate(&head, tables, style, axes, None, dtype, glue)?;
             // The tail must match the rotated head's dtype — the rotation can widen the head.
             let tail = if tail.dtype() == rotated.dtype() {
                 tail
@@ -531,11 +614,17 @@ pub fn apply_rope(
     };
     let sh = x.shape();
     let (d0, d1, d2) = (sh[0], sh[1], sh[2]);
+    // The dtype each table is brought to before the multiply-add: f32 under `RestoreInput`, the
+    // stream's own dtype under `Stream`, untouched under `Promoted`.
+    let table_dtype = match dtype {
+        RopeDtype::Promoted => None,
+        RopeDtype::RestoreInput => Some(Dtype::Float32),
+        RopeDtype::Stream => Some(in_dtype),
+    };
     let widen = |t: &Array| -> Result<Array> {
-        Ok(if promote && t.dtype() != Dtype::Float32 {
-            t.as_dtype(Dtype::Float32)?
-        } else {
-            t.clone()
+        Ok(match table_dtype {
+            Some(want) if t.dtype() != want => t.as_dtype(want)?,
+            _ => t.clone(),
         })
     };
     // Reshape both tables to the rank-4 broadcast shape this stream needs.
@@ -562,8 +651,8 @@ pub fn apply_rope(
             let real = lanes[0].reshape(&[d0, d1, d2, half])?;
             let imag = lanes[1].reshape(&[d0, d1, d2, half])?;
             // The shared compiled-glue kernel (`nn::rope_rotate`) — one fused op with glue on,
-            // the identical six eager ops with it off.
-            let (out_real, out_imag) = rope_rotate(&real, &imag, &cos, &sin)?;
+            // the identical six eager ops with it off (or always eager via `apply_rope_eager`).
+            let (out_real, out_imag) = pair_rotate(glue, &real, &imag, &cos, &sin)?;
             stack_axis(&[out_real, out_imag], 4)?.reshape(&[d0, d1, d2, head_dim])?
         }
         RopeStyle::RotateHalf => {
@@ -575,14 +664,19 @@ pub fn apply_rope(
         RopeStyle::HalvesPaired => {
             let (cos, sin) = tables_for(head_dim / 2)?;
             let halves = split(&x, 2, 3)?;
-            let (first, second) = rope_rotate(&halves[0], &halves[1], &cos, &sin)?;
+            let (first, second) = pair_rotate(glue, &halves[0], &halves[1], &cos, &sin)?;
             concatenate_axis(&[&first, &second], 3)?
+        }
+        RopeStyle::InterleavedFull => {
+            let (cos, sin) = tables_for(head_dim)?;
+            let rotated = crate::nn::rotate_pairwise(&x)?;
+            add(&multiply(&x, &cos)?, &multiply(&rotated, &sin)?)?
         }
     };
     // The one line that separates the two families of families. Under `Promoted` the promotion
-    // reaches SDPA; under `RestoreInput` it stops here.
+    // reaches SDPA; under `RestoreInput` it stops here; under `Stream` nothing was promoted.
     Ok(match dtype {
-        RopeDtype::Promoted => out,
+        RopeDtype::Promoted | RopeDtype::Stream => out,
         RopeDtype::RestoreInput if out.dtype() == in_dtype => out,
         RopeDtype::RestoreInput => out.as_dtype(in_dtype)?,
     })
@@ -689,6 +783,263 @@ fn expect_table(
             ));
         }
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The fused `fast::rope` route (SW-6140)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Diagnostics toggle recorded each time [`apply_rope_1d`] actually ran MLX's fused
+/// `mlx_rs::fast::rope` kernel.
+pub const FUSED_ROPE_TOGGLE: &str = "fused_rope";
+/// Diagnostics site under which [`apply_rope_1d`] records every downgrade to the shared cos/sin
+/// route, with the [`FusedRopeRefusal::label`] as the stable reason.
+pub const FUSED_ROPE_SITE: &str = "mlx_gen::qkv::apply_rope_1d";
+
+thread_local! {
+    /// Request/thread-scoped like `FUSED_QKV` and the compile glue.
+    ///
+    /// **Defaults to `false` — the fused route is opt-in.** MLX's `fast::rope` derives its angles
+    /// on the device (`exp2`-based inverse frequencies, `metal::fast::cos/sin`, one rounding of the
+    /// rotation) where every family here builds its `(cos, sin)` tables from host or precise device
+    /// trig, so the two routes agree only to a tolerance, never bit-for-bit (the same reason
+    /// `mlx-llm`'s rope keeps the table form). Turning it on is a per-render measured decision;
+    /// with it off every adopting family runs its exact pre-SW-6140 cos/sin numerics.
+    static FUSED_ROPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable the fused `fast::rope` route of [`apply_rope_1d`] on this thread.
+pub fn set_fused_rope(on: bool) {
+    FUSED_ROPE.set(on);
+}
+
+/// Whether [`apply_rope_1d`] may take the fused `fast::rope` route on this thread (`false` unless
+/// a caller opted in — see [`set_fused_rope`]).
+pub fn fused_rope() -> bool {
+    FUSED_ROPE.get()
+}
+
+/// RAII guard setting [`fused_rope`] for its lifetime and restoring the prior value on drop.
+#[must_use = "dropping the guard restores the prior fused-RoPE setting"]
+pub struct FusedRopeGuard {
+    prev: bool,
+}
+
+impl FusedRopeGuard {
+    pub fn set(on: bool) -> Self {
+        Self {
+            prev: FUSED_ROPE.replace(on),
+        }
+    }
+}
+
+impl Drop for FusedRopeGuard {
+    fn drop(&mut self) {
+        FUSED_ROPE.set(self.prev);
+    }
+}
+
+/// How a 1-D RoPE's per-pair angular frequencies are defined, in the terms `fast::rope` takes.
+#[derive(Clone, Copy, Debug)]
+pub enum RopeFrequencies<'a> {
+    /// The standard schedule `inv_freq[i] = base^(−2i / rotated_dims)` (HF `rope_theta`).
+    Base(f32),
+    /// Explicit per-pair **periods** `freqs[i] = 1 / inv_freq[i]`, `[rotated_dims / 2]` (MLX's
+    /// `freqs` argument) — for a schedule that is not a plain power of a base.
+    Periods(&'a Array),
+}
+
+/// A **contiguous 1-D** position layout: token `t` of the rotated axis sits at angle
+/// `scale · (offset + t) · inv_freq[i]`. This — and nothing else — is what `fast::rope` expresses:
+/// one position per token along the sequence axis, a single frequency schedule, no per-axis
+/// sections. Multi-axis image/video RoPE, explicit position-id lists (left padding, M-RoPE), and
+/// amplitude-scaled tables (YaRN `mscale`) are not 1-D layouts and must stay on the cos/sin route.
+#[derive(Clone, Copy, Debug)]
+pub struct Rope1d<'a> {
+    pub frequencies: RopeFrequencies<'a>,
+    pub scale: f32,
+    pub offset: i32,
+}
+
+impl Rope1d<'_> {
+    /// The standard layout: positions `offset..offset + L`, base-`base` schedule, unit scale.
+    pub fn standard(base: f32, offset: i32) -> Self {
+        Self {
+            frequencies: RopeFrequencies::Base(base),
+            scale: 1.0,
+            offset,
+        }
+    }
+}
+
+/// Why [`apply_rope_1d`] did not take the fused route. Every refusal falls back to the shared
+/// cos/sin route (which is the parity reference), and is recorded under [`FUSED_ROPE_SITE`] with
+/// [`label`](Self::label) as the reason, so a downgrade is never silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FusedRopeRefusal {
+    /// The fused route is switched off on this thread — the default ([`set_fused_rope`]).
+    Disabled,
+    /// [`RopeStyle::None`], or zero rotated dims: there is no rotation to fuse.
+    NoRotation,
+    /// The stream is not rank-4 (`[B, S, H, D]` / `[B, H, S, D]`).
+    Rank(usize),
+    /// `rot_dims` is outside `[0, head_dim]` or odd — `fast::rope` rotates whole pairs.
+    RotatedDims { rot: i32, head_dim: i32 },
+    /// The stream is not a floating-point dtype.
+    StreamDtype(Dtype),
+    /// [`RopeDtype::Promoted`] over tables wider than the stream: the reference hands SDPA the
+    /// *promoted* dtype, while `fast::rope` returns the stream's dtype, so taking the fused route
+    /// would silently change what precision the attention runs in.
+    PromotionWouldBeLost { stream: Dtype, table: Dtype },
+}
+
+impl FusedRopeRefusal {
+    /// Stable diagnostics reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            FusedRopeRefusal::Disabled => "fused_rope_disabled",
+            FusedRopeRefusal::NoRotation => "no_rotation",
+            FusedRopeRefusal::Rank(_) => "stream_not_rank4",
+            FusedRopeRefusal::RotatedDims { .. } => "rotated_dims_not_whole_pairs",
+            FusedRopeRefusal::StreamDtype(_) => "stream_dtype_not_float",
+            FusedRopeRefusal::PromotionWouldBeLost { .. } => "promotion_would_be_lost",
+        }
+    }
+}
+
+/// The resolved `fast::rope` call for one stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FusedRopePlan {
+    /// `fast::rope`'s `dims`: the rotated leading channels (the tail passes through, exactly as
+    /// [`RopeSpec::rot_dims`] does on the cos/sin route).
+    pub dims: i32,
+    /// `fast::rope`'s `traditional`: `true` rotates adjacent pairs `(2i, 2i+1)`
+    /// ([`RopeStyle::AdjacentPair`] / [`RopeStyle::InterleavedFull`]); `false` rotates lane `i`
+    /// with `i + dims/2` ([`RopeStyle::RotateHalf`] / [`RopeStyle::HalvesPaired`]). Getting this
+    /// wrong renders garbage without any error, so it is derived from the style, never passed in.
+    pub traditional: bool,
+    /// `fast::rope` rotates along axis −2, so a token-major `[B, S, H, D]` stream is transposed
+    /// to `[B, H, S, D]` around the call.
+    pub transpose: bool,
+}
+
+/// The pure, CPU-testable admission check for the fused route: shape/dtype/style constraints are
+/// validated **before** any launch. `table` is the dtype of the cos/sin tables the reference route
+/// would read (it decides [`RopeDtype::Promoted`]'s output dtype).
+pub fn plan_fused_rope(
+    shape: &[i32],
+    stream: Dtype,
+    table: Dtype,
+    style: RopeStyle,
+    axes: RotationAxes,
+    rot_dims: Option<i32>,
+    dtype: RopeDtype,
+) -> std::result::Result<FusedRopePlan, FusedRopeRefusal> {
+    let traditional = match style {
+        RopeStyle::None => return Err(FusedRopeRefusal::NoRotation),
+        RopeStyle::AdjacentPair | RopeStyle::InterleavedFull => true,
+        RopeStyle::RotateHalf | RopeStyle::HalvesPaired => false,
+    };
+    if shape.len() != 4 {
+        return Err(FusedRopeRefusal::Rank(shape.len()));
+    }
+    let head_dim = shape[3];
+    let rot = rot_dims.unwrap_or(head_dim);
+    if rot == 0 {
+        return Err(FusedRopeRefusal::NoRotation);
+    }
+    if rot < 0 || rot > head_dim || rot % 2 != 0 {
+        return Err(FusedRopeRefusal::RotatedDims { rot, head_dim });
+    }
+    let is_float = |d: Dtype| matches!(d, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16);
+    if !is_float(stream) {
+        return Err(FusedRopeRefusal::StreamDtype(stream));
+    }
+    // `fast::rope` returns the stream's dtype. `RestoreInput` and `Stream` hand SDPA that dtype
+    // too; `Promoted` does only when the tables cannot widen the stream.
+    if dtype == RopeDtype::Promoted && table != stream && stream != Dtype::Float32 {
+        return Err(FusedRopeRefusal::PromotionWouldBeLost { stream, table });
+    }
+    Ok(FusedRopePlan {
+        dims: rot,
+        traditional,
+        transpose: axes == RotationAxes::TokenMajor,
+    })
+}
+
+/// Run one admitted [`FusedRopePlan`] through MLX's fused `fast::rope` kernel.
+fn fused_rope_call(x: &Array, plan: FusedRopePlan, layout: Rope1d<'_>) -> Result<Array> {
+    let xt = if plan.transpose {
+        transpose_heads(x)?
+    } else {
+        x.clone()
+    };
+    let (base, freqs): (Option<f32>, Option<&Array>) = match layout.frequencies {
+        RopeFrequencies::Base(base) => (Some(base), None),
+        RopeFrequencies::Periods(periods) => (None, Some(periods)),
+    };
+    let out = mlx_rs::fast::rope(
+        &xt,
+        plan.dims,
+        plan.traditional,
+        base,
+        layout.scale,
+        layout.offset,
+        freqs,
+    )?;
+    if plan.transpose {
+        transpose_heads(&out)
+    } else {
+        Ok(out)
+    }
+}
+
+/// **The shared 1-D RoPE helper with a fused route.** For a family whose positions form a
+/// contiguous [`Rope1d`] layout, this takes MLX's fused `fast::rope` kernel when the thread has
+/// opted in ([`set_fused_rope`]) and [`plan_fused_rope`] admits the stream; otherwise it runs the
+/// shared cos/sin route [`apply_rope_eager`] over the caller's `tables` — which is also the parity
+/// reference the fused route is tested against. Which route ran is recorded in diagnostics:
+/// [`FUSED_ROPE_TOGGLE`] `Applied` for the fused kernel, a [`FUSED_ROPE_SITE`] fallback with the
+/// refusal label otherwise.
+///
+/// The caller asserts that `tables` *are* `layout`'s angles (`cos/sin(scale·(offset+t)·inv_freq)`,
+/// laid out for `style`); the cos/sin route reads the tables and the fused route reads the layout,
+/// so a caller whose tables do not match its layout gets two different models. Only families whose
+/// table builder is exactly this schedule adopt it — see the SW-6140 route table.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rope_1d(
+    x: &Array,
+    tables: RopeTables<'_>,
+    layout: Rope1d<'_>,
+    style: RopeStyle,
+    axes: RotationAxes,
+    rot_dims: Option<i32>,
+    dtype: RopeDtype,
+) -> Result<Array> {
+    let refusal = if fused_rope() {
+        match plan_fused_rope(
+            x.shape(),
+            x.dtype(),
+            tables.cos.dtype(),
+            style,
+            axes,
+            rot_dims,
+            dtype,
+        ) {
+            Ok(plan) => {
+                crate::diagnostics::record_toggle(
+                    FUSED_ROPE_TOGGLE,
+                    crate::diagnostics::ToggleDisposition::Applied,
+                );
+                return fused_rope_call(x, plan, layout);
+            }
+            Err(refusal) => refusal,
+        }
+    } else {
+        FusedRopeRefusal::Disabled
+    };
+    crate::diagnostics::record_fallback(FUSED_ROPE_SITE, refusal.label());
+    apply_rope_eager(x, tables, style, axes, rot_dims, dtype)
 }
 
 /// **The primitive.** Runs one stream's full prologue and returns q/k/v in **BHSD**.
@@ -1665,5 +2016,7 @@ pub const EXEMPTIONS: &[Exemption] = &[
     },
 ];
 
+#[cfg(test)]
+mod rope_route_tests;
 #[cfg(test)]
 mod tests;

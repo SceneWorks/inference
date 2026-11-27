@@ -116,11 +116,13 @@ pub use fused_decode::{
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
 };
 pub use gated_delta::{
-    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing,
-    GatedDeltaState, GATED_DELTA_MAX_KEY_DIM, GATED_DELTA_SRC,
+    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step,
+    gated_delta_unavailable_label, GatedDeltaRing, GatedDeltaState, GATED_DELTA_MAX_KEY_DIM,
+    GATED_DELTA_SRC,
 };
 pub use gdn_prep::{
-    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_qkv, gdn_qkv_serves_key_dim, GDN_PREP_SRC,
+    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_prep_unavailable_label, gdn_qkv,
+    gdn_qkv_serves_key_dim, GDN_PREP_SRC,
 };
 pub use moe_gemv::{
     ggml_kernel, indexed_workspace_bytes, IndexedExperts, IndexedFormat, MoeGemvError,

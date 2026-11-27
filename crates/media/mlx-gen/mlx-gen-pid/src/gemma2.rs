@@ -18,7 +18,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_tanh, rotate_half, TokenEmbedding};
+use mlx_gen::nn::{gelu_tanh, TokenEmbedding};
 use mlx_gen::qkv::{repeat_kv, RotationAxes};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -101,14 +101,26 @@ fn rope_tables(head_dim: i32, seq: i32, theta: f32) -> (Array, Array) {
     )
 }
 
-/// `q·cos + rotate_half(q)·sin` with `cos`/`sin` `[L, D]` broadcast over `[B,H,L,D]`.
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let (l, d) = (cos.shape()[0], cos.shape()[1]);
-    let cos = cos.reshape(&[1, 1, l, d])?;
-    let sin = sin.reshape(&[1, 1, l, d])?;
-    let xc = multiply(x, &cos.as_dtype(x.dtype())?)?;
-    let xs = multiply(&rotate_half(x)?, &sin.as_dtype(x.dtype())?)?;
-    Ok(add(&xc, &xs)?)
+/// `q·cos + rotate_half(q)·sin` with `cos`/`sin` `[L, D]` broadcast over `[B,H,L,D]`, the tables
+/// narrowed to the stream's dtype first.
+///
+/// The shared 1-D RoPE helper [`mlx_gen::qkv::apply_rope_1d`] (SW-6140). Gemma-2's positions are
+/// the contiguous `0..L` of a plain base-`rope_theta` schedule over the whole head — exactly what
+/// [`rope_tables`] builds — so it is a fused-route family: with the opt-in
+/// [`mlx_gen::qkv::set_fused_rope`] on, this is MLX's `fast::rope` (non-traditional, `dims =
+/// head_dim`); with it off (the default) it is the shared cos/sin route under
+/// `RopeDtype::Stream`, the same `x·cos + rotate_half(x)·sin` chain over the same narrowed tables as
+/// this crate's private copy.
+fn apply_rope(x: &Array, cos: &Array, sin: &Array, theta: f32) -> Result<Array> {
+    mlx_gen::qkv::apply_rope_1d(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::Rope1d::standard(theta, 0),
+        mlx_gen::qkv::RopeStyle::RotateHalf,
+        RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Stream,
+    )
 }
 
 struct Attention {
@@ -121,6 +133,8 @@ struct Attention {
     head_dim: i32,
     scale: f32,
     softcap: f32,
+    /// The RoPE base, for the fused `fast::rope` route of [`apply_rope`].
+    rope_theta: f32,
 }
 
 impl Attention {
@@ -135,6 +149,7 @@ impl Attention {
             head_dim: cfg.head_dim,
             scale: cfg.query_pre_attn_scalar.powf(-0.5),
             softcap: cfg.attn_softcap,
+            rope_theta: cfg.rope_theta,
         })
     }
 
@@ -146,8 +161,19 @@ impl Attention {
         let to_heads = |a: Array, nh: i32| -> Result<Array> {
             Ok(a.reshape(&[b, l, nh, hd])?.transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = apply_rope(&to_heads(self.q.forward(x)?, self.num_heads)?, cos, sin)?;
-        let k = apply_rope(&to_heads(self.k.forward(x)?, self.num_kv_heads)?, cos, sin)?;
+        let theta = self.rope_theta;
+        let q = apply_rope(
+            &to_heads(self.q.forward(x)?, self.num_heads)?,
+            cos,
+            sin,
+            theta,
+        )?;
+        let k = apply_rope(
+            &to_heads(self.k.forward(x)?, self.num_kv_heads)?,
+            cos,
+            sin,
+            theta,
+        )?;
         let v = to_heads(self.v.forward(x)?, self.num_kv_heads)?;
         let n_rep = self.num_heads / self.num_kv_heads;
         let k = repeat_kv(&k, n_rep, RotationAxes::HeadMajor)?;

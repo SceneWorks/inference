@@ -26,7 +26,7 @@ use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
 #[cfg(test)]
 use mlx_rs::ops;
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, sigmoid, stack_axis, subtract};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, sigmoid};
 use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d_general, gelu_exact, linear};
@@ -333,17 +333,20 @@ fn axial_rope_tables_repeated(
 
 /// Apply interleaved axial RoPE to `x` `[b, heads, tokens, head_dim]`; `cos`/`sin` are
 /// `[tokens, head_dim/2]` (broadcast over batch/heads). Matches `apply_rope` (even/odd interleave).
+///
+/// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] (SW-6140): the same
+/// `even·cos − odd·sin`, `odd·cos + even·sin` per-element chain (IEEE addition commutes, so the
+/// private copy's `even·sin + odd·cos` order is the same bits) over the same `[1, 1, tokens,
+/// head_dim/2]` broadcast, no casts. SAM2's axial table is 2-D, so there is no fused route.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let (b, h, n, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let pair = x.reshape(&[b, h, n, d / 2, 2])?;
-    let even = pair.take_axis(Array::from_int(0), 4)?; // [b,h,n,d/2]
-    let odd = pair.take_axis(Array::from_int(1), 4)?;
-    let cos = cos.reshape(&[1, 1, n, d / 2])?;
-    let sin = sin.reshape(&[1, 1, n, d / 2])?;
-    let out_even = subtract(&multiply(&even, &cos)?, &multiply(&odd, &sin)?)?;
-    let out_odd = add(&multiply(&even, &sin)?, &multiply(&odd, &cos)?)?;
-    Ok(stack_axis(&[&out_even, &out_odd], 4)?.reshape(&[b, h, n, d])?)
+    mlx_gen::qkv::apply_rope_eager(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )
 }
 
 /// `x[:, :, start..end, :]` over the token axis (axis 2).
@@ -555,7 +558,7 @@ impl MemoryAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{abs, max};
+    use mlx_rs::ops::{abs, max, subtract};
 
     fn maxabs(a: &Array) -> f32 {
         max(abs(a).unwrap(), None).unwrap().item::<f32>()
