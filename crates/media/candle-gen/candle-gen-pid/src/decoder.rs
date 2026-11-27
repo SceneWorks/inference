@@ -427,7 +427,7 @@ mod tests {
                 MemoryPhase::Denoise => "enter_Denoise",
                 MemoryPhase::Decode => "enter_Decode",
             };
-            self.events.lock().unwrap().push(label);
+            candle_gen::lock_recover(&self.events).push(label);
             if self.fail_enter_decode && phase == MemoryPhase::Decode {
                 return Err(gen_core::Error::Unsupported("decode scope refused".into()));
             }
@@ -439,7 +439,7 @@ mod tests {
                 MemoryPhase::Denoise => "leave_Denoise",
                 MemoryPhase::Decode => "leave_Decode",
             };
-            self.events.lock().unwrap().push(label);
+            candle_gen::lock_recover(&self.events).push(label);
             Ok(())
         }
         fn configure_decode(
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(decoder.test_draw_calls(), 1);
         assert_eq!(steps_seen.load(Ordering::SeqCst), 4);
         assert_eq!(
-            *good_scope.events.lock().unwrap(),
+            *candle_gen::lock_recover(&good_scope.events),
             vec!["enter_Decode", "leave_Decode"]
         );
     }
