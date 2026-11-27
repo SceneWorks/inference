@@ -344,7 +344,10 @@ fn external_components_are_verified_in_the_source_root_not_the_output() {
     assert!(!target.join("ae.safetensors").exists(), "nothing copied");
     assert_eq!(open_conversion(&target).unwrap(), r);
     r.verify_external(&source).unwrap();
-    fs::write(source.join("ae.safetensors"), b"zz").unwrap();
+    // A different length, not a same-size rewrite: the external check now goes through the
+    // artifact seal's identity memo, and a same-size rewrite inside one filesystem timestamp tick
+    // of the earlier pin would make this assertion depend on timing rather than on the check.
+    fs::write(source.join("ae.safetensors"), b"changed").unwrap();
     assert!(
         r.verify_external(&source).is_err(),
         "a changed source AE is refused"
