@@ -18,9 +18,8 @@
 //! peak) come from candle-gen-wan's `fused_norm_silu_pad_gate` model proof.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::fused_path::Attempt;
 use candle_gen::vae_norm_silu_pad::{
-    norm_silu_pad, norm_silu_pad_reference, ConvInputLayout, TemporalPad, VaeNorm,
+    norm_silu_pad_or_reference, norm_silu_pad_reference, ConvInputLayout, TemporalPad, VaeNorm,
     VAE_NORM_SILU_PAD_PATH,
 };
 
@@ -103,17 +102,15 @@ fn norm(i: &Inputs) -> VaeNorm<'_> {
     }
 }
 
+/// Through the recording dispatch, so the harness can verify the fused kernel served the window.
 fn fused_input(i: &Inputs) -> Result<Tensor> {
-    match norm_silu_pad(
+    norm_silu_pad_or_reference(
         &i.x,
         &norm(i),
         i.cache.as_ref(),
         i.pad,
         ConvInputLayout::FrameMajor,
-    )? {
-        Attempt::Fused(t) => Ok(t),
-        Attempt::Reference(r) => candle_gen::candle_core::bail!("the fused kernel declined: {r}"),
-    }
+    )
 }
 
 fn reference_input(i: &Inputs) -> Result<Tensor> {
@@ -184,9 +181,9 @@ pub fn rows(bench: &Bench) -> Result<Vec<Row>> {
                 norm_silu_pad_reference(&x, &norm, None, pad, ConvInputLayout::ChannelMajor)
                     .map(drop)
             },
-            || match norm_silu_pad(&x, &norm, None, pad, ConvInputLayout::FrameMajor)? {
-                Attempt::Fused(_) => Ok(()),
-                Attempt::Reference(r) => candle_gen::candle_core::bail!("declined: {r}"),
+            || {
+                norm_silu_pad_or_reference(&x, &norm, None, pad, ConvInputLayout::FrameMajor)
+                    .map(drop)
             },
         )?);
     }
