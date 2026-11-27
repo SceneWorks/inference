@@ -2574,7 +2574,10 @@ mod explicit_registry_tests {
             height: 512,
             steps: Some(4),
             seed: Some(42),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -3791,12 +3794,16 @@ mod tests {
             height: 1024,
             steps: Some(8),
             sampler: Some("euler".into()),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.5,
-                start: Some(0.0),
-                stop: Some(0.625),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.5,
+                    start: Some(0.0),
+                    stop: Some(0.625),
+                    ..Default::default()
+                }),
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
                 ..Default::default()
-            }), low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            },
             ..Default::default()
         };
         let plan = compile_base_plan(Flux2Variant::Klein9b, &req).unwrap();

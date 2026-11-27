@@ -934,7 +934,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

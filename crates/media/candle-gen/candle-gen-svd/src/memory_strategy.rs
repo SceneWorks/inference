@@ -948,7 +948,13 @@ mod tests {
                 },
                 strength: None,
             }],
-            extensions: candle_gen::gen_core::FamilyExtensions { svd: Some(candle_gen::gen_core::SvdExtension { decode_chunk_size: Some(64), ..Default::default() }), ..Default::default() },
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                svd: Some(candle_gen::gen_core::SvdExtension {
+                    decode_chunk_size: Some(64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -1226,7 +1232,16 @@ mod tests {
             frames: Some(25),
             fps: Some(7),
             video_mode: Some("image_to_video".into()),
-            extensions: candle_gen::gen_core::FamilyExtensions { svd: Some(candle_gen::gen_core::SvdExtension { conditioning_fps: Some(7), motion_bucket_id: Some(127.0), noise_aug_strength: Some(0.02), decode_chunk_size: Some(8), ..Default::default() }), ..Default::default() },
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                svd: Some(candle_gen::gen_core::SvdExtension {
+                    conditioning_fps: Some(7),
+                    motion_bucket_id: Some(127.0),
+                    noise_aug_strength: Some(0.02),
+                    decode_chunk_size: Some(8),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

@@ -29,7 +29,11 @@ fn enhancement_is_off_by_default() {
         !req.enhance_prompt,
         "enhancement must default off (passthrough)"
     );
-    assert!(!req.extensions.ltx.as_ref().is_some_and(|e| e.use_uncensored_enhancer));
+    assert!(!req
+        .extensions
+        .ltx
+        .as_ref()
+        .is_some_and(|e| e.use_uncensored_enhancer));
     assert!(req.enhance_max_tokens.is_none());
     assert!(req.enhance_temperature.is_none());
 }

@@ -34,9 +34,9 @@ use std::path::Path;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
@@ -101,7 +101,8 @@ pub(crate) fn route_base() -> mlx_gen::gen_core::RouteRecord {
                 // DC-AE-encoded init latent (`ui.img2img` in the catalog).
                 kinds: vec![ConditioningKind::Reference],
                 control_kinds: None,
-                pass0_requirement: mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                pass0_requirement:
+                    mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
                 ..Default::default()
@@ -240,9 +241,7 @@ pub(crate) fn route_sprint() -> mlx_gen::gen_core::RouteRecord {
     .with_memory_registration(SPRINT_MEMORY_REGISTRATION)
     .with_memory_fixture(
         mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-        |spec| {
-            crate::memory_strategy::weights_free_memory_strategy_contract(SPRINT_MODEL_ID, spec)
-        },
+        |spec| crate::memory_strategy::weights_free_memory_strategy_contract(SPRINT_MODEL_ID, spec),
     )
     .with_memory_behavior_registration(SPRINT_MEMORY_BEHAVIOR_REGISTRATION);
     route

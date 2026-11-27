@@ -61,19 +61,18 @@ pub(crate) fn route_qwen_image_edit() -> gen_core::RouteRecord {
     route.structure.denoiser = gen_core::ModelBinding::family_model(
         gen_core::FamilyModelSpec::new("qwen_image_mmdit_edit").with_pag(pag_capability()),
     );
-    route.bindings = gen_core::RouteBindings::generator(descriptor, |spec| {
-        load(spec).map_err(Into::into)
-    })
-    .with_footprint(crate::model::edit_component_footprint)
-    .with_render_plan(compile_render_plan)
-    .with_memory_registration(MEMORY_REGISTRATION)
-    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
-        crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
-    })
-    .with_memory_surface_resolver(|surface| {
-        crate::memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
-    })
-    .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::edit_component_footprint)
+            .with_render_plan(compile_render_plan)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_surface_resolver(|surface| {
+                crate::memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
     route
 }
 

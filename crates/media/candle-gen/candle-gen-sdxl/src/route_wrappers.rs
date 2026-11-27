@@ -20,9 +20,7 @@ use crate::{MODEL_ID, SIZE_MULTIPLE};
 
 fn require_vae(components: &SdxlComponents, route_id: &str) -> gen_core::Result<WeightsSource> {
     components.vae_fp16_fix.clone().ok_or_else(|| {
-        gen_core::Error::Msg(format!(
-            "{route_id} requires the `vae_fp16_fix` component"
-        ))
+        gen_core::Error::Msg(format!("{route_id} requires the `vae_fp16_fix` component"))
     })
 }
 
@@ -66,10 +64,7 @@ fn extract_edit_inputs(
     let mut mask = None;
     for cond in &request.conditioning {
         match cond {
-            Conditioning::Reference {
-                image,
-                strength: s,
-            } => {
+            Conditioning::Reference { image, strength: s } => {
                 if source.replace(image).is_some() {
                     return Err(gen_core::Error::Unsupported(
                         "sdxl_edit accepts at most one Reference conditioning image".into(),
@@ -165,7 +160,10 @@ impl Generator for SdxlEditGenerator {
                 preview: request.preview.clone(),
             };
             let image = match mask {
-                Some(mask_img) => self.model.generate_masked(&edit_req, source, mask_img, on_progress),
+                Some(mask_img) => {
+                    self.model
+                        .generate_masked(&edit_req, source, mask_img, on_progress)
+                }
                 None => self.model.generate(&edit_req, source, on_progress),
             }
             .map_err(gen_core::Error::from)?;
@@ -239,10 +237,7 @@ fn extract_detail_inputs(
     let mut control_scale = None;
     for cond in &request.conditioning {
         match cond {
-            Conditioning::Reference {
-                image,
-                strength: s,
-            } => {
+            Conditioning::Reference { image, strength: s } => {
                 if source.replace(image).is_some() {
                     return Err(gen_core::Error::Unsupported(
                         "sdxl_detail accepts at most one Reference conditioning image".into(),
@@ -571,13 +566,9 @@ pub(crate) fn load_ip_adapter(spec: &LoadSpec) -> gen_core::Result<Box<dyn Gener
         "CLIP-bigG tokenizer",
     )?
     .clone();
-    let vae_fp16_fix = gen_core::require_component(
-        spec,
-        "sdxl_ip_adapter",
-        "vae_fp16_fix",
-        "fp16-fix SDXL VAE",
-    )?
-    .clone();
+    let vae_fp16_fix =
+        gen_core::require_component(spec, "sdxl_ip_adapter", "vae_fp16_fix", "fp16-fix SDXL VAE")?
+            .clone();
     let ip_adapter = match &spec.ip_adapter {
         Some(WeightsSource::File(path) | WeightsSource::Dir(path)) => path.clone(),
         None => {

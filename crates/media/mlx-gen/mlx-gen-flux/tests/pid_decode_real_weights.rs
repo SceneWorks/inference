@@ -111,7 +111,10 @@ fn flux_dev_pid_decode_vs_vae() {
 
     // --- PiD path (same request + use_pid) ---
     let pid_req = GenerationRequest {
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();
@@ -185,7 +188,10 @@ fn flux_dev_pid_from_ldm_early_stop() {
         count: 1,
         seed: Some(7),
         steps: Some(steps as u32),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

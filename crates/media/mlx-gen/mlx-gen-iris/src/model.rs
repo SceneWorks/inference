@@ -199,9 +199,7 @@ pub fn route_depth() -> RouteRecord {
         defaults: RouteDefaults::default(),
         bindings: RouteBindings::default()
             .with_composed_memory_registration(crate::memory_strategy::DEPTH_MEMORY_REGISTRATION)
-            .with_memory_fixture_registration(
-                crate::memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE,
-            )
+            .with_memory_fixture_registration(crate::memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
             .with_memory_behavior_registration(
                 crate::memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION,
             ),
@@ -1028,8 +1026,6 @@ impl Iris3b {
         Ok(report)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

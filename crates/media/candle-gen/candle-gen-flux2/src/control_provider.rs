@@ -138,7 +138,8 @@ pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
     let mut route = crate::route_base(Flux2Variant::Dev);
     route.route_id = crate::config::FLUX2_DEV_CONTROL_ID;
     route.structure.conditioning.kinds = vec![candle_gen::gen_core::ConditioningKind::Control];
-    route.structure.conditioning.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Any);
+    route.structure.conditioning.control_kinds =
+        Some(candle_gen::gen_core::AcceptedControlKinds::Any);
     route.structure.conditioning.pass0_requirement =
         candle_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
     route.structure.conditioning.modules = vec!["flux2_controlnet_union"];
@@ -147,15 +148,10 @@ pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
         candle_gen::gen_core::FamilyModelSpec::new("flux2_mmdit")
             .with_pag(Flux2Variant::Dev.pag_capability()),
     );
-    route.bindings = candle_gen::gen_core::RouteBindings::generator(
-        control_report_descriptor,
-        load_control,
-    )
-    .with_feature_route(
-        Some(crate::config::FLUX2_DEV_ID),
-        control_report_descriptor,
-    )
-    .with_render_plan(compile_control_feature_route);
+    route.bindings =
+        candle_gen::gen_core::RouteBindings::generator(control_report_descriptor, load_control)
+            .with_feature_route(Some(crate::config::FLUX2_DEV_ID), control_report_descriptor)
+            .with_render_plan(compile_control_feature_route);
     route
 }
 
@@ -244,10 +240,7 @@ pub(crate) fn load_control(
 ) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
     spec.validate_prepared_file_pins()?;
     candle_gen::gen_core::reject_unknown_components(spec, &[], control_report_descriptor().id)?;
-    if !spec.extra_controls.is_empty()
-        || spec.identity.is_some()
-        || spec.ip_adapter.is_some()
-    {
+    if !spec.extra_controls.is_empty() || spec.identity.is_some() || spec.ip_adapter.is_some() {
         return Err(candle_gen::gen_core::Error::Unsupported(
             "flux2_dev_control does not accept extra control, identity, or IP-Adapter overlays"
                 .into(),
@@ -277,9 +270,13 @@ pub(crate) fn load_control(
         control,
         adapters: spec.adapters.clone(),
     };
-    let mut model =
-        Flux2Control::load_with_memory_spec(&paths, spec.quantize, spec, GenerationMemory::default())
-            .map_err(candle_gen::gen_core::Error::from)?;
+    let mut model = Flux2Control::load_with_memory_spec(
+        &paths,
+        spec.quantize,
+        spec,
+        GenerationMemory::default(),
+    )
+    .map_err(candle_gen::gen_core::Error::from)?;
     if let Some(pid) = &spec.pid {
         model = model
             .with_pid(pid)

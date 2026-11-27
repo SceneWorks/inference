@@ -689,10 +689,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 1.5,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 1.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         let resolved = desc
@@ -707,10 +710,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 0.0,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -720,10 +726,13 @@ mod tests {
 
         let bad_scale = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 15.5,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 15.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(desc

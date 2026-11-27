@@ -81,11 +81,14 @@ mod explicit_registry_tests {
                 },
                 strength: Some(1.0),
             }],
-            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![GenerationPhase {
-                steps: 4,
-                guidance: Some(4.0),
-                adapters: vec![],
-            }]), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(vec![GenerationPhase {
+                    steps: 4,
+                    guidance: Some(4.0),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(

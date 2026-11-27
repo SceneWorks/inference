@@ -14,7 +14,9 @@ use core_llm::{
     Role, Sampling, StarVectorFinishReason, StarVectorProvider, StarVectorRequest,
     StarVectorStreamEvent, TextLlm, TextLlmRegistry, TextLlmRequest,
 };
-use gen_core::generator::{CompletedGeneration, ExecutionFact, ExecutionIdentity, GenerationReport};
+use gen_core::generator::{
+    CompletedGeneration, ExecutionFact, ExecutionIdentity, GenerationReport,
+};
 use gen_core::vector::{
     build_vector_output, VectorSanitizeOptions, DEFAULT_PREVIEW_DIMENSION, MAX_PREVIEW_DIMENSION,
     MAX_SVG_BYTES,
@@ -236,9 +238,7 @@ pub fn load_from_text_registry(
         )));
     }
     let source = match &spec.weights {
-        WeightsSource::Dir(path) | WeightsSource::File(path) => {
-            path.to_string_lossy().into_owned()
-        }
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path.to_string_lossy().into_owned(),
     };
     let quantize = match spec.quantize {
         None => None,
@@ -289,7 +289,10 @@ impl StarVectorGenerator {
             .expect("StarVectorGenerator validated StarVectorProvider at construction")
     }
 
-    fn build_svg_request(&self, request: &GenerationRequest) -> gen_core::Result<StarVectorRequest> {
+    fn build_svg_request(
+        &self,
+        request: &GenerationRequest,
+    ) -> gen_core::Result<StarVectorRequest> {
         if !request.prompt.trim().is_empty() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{} im2svg is image-conditioned and does not accept free-form text prompts",
@@ -685,8 +688,7 @@ mod tests {
 
     #[test]
     fn starvector_generator_sanitizes_svg_renders_preview_and_forwards_execution_identity() {
-        let raw_svg =
-            r##"<svg width="40" height="40"><rect x="4" y="4" width="32" height="32" fill="#0080ff"/></svg>"##;
+        let raw_svg = r##"<svg width="40" height="40"><rect x="4" y="4" width="32" height="32" fill="#0080ff"/></svg>"##;
         let provider = MockStarVectorProvider {
             text_desc: starvector_8b::text_descriptor(MLX_STARVECTOR_8B_LLM_ID, "mlx"),
             sv_desc: starvector_8b::starvector_descriptor(),
@@ -715,7 +717,10 @@ mod tests {
             .expect("StarVector generation succeeds");
 
         assert!(saw_step, "expected token progress step");
-        assert!(saw_decoding, "expected Decoding progress before sanitize/preview");
+        assert!(
+            saw_decoding,
+            "expected Decoding progress before sanitize/preview"
+        );
 
         let resolved = completed
             .execution
@@ -793,7 +798,12 @@ mod tests {
         assert!(gen.validate(&bad_req).is_err());
 
         let mut limit_req = mock_request();
-        limit_req.extensions.vector.as_mut().unwrap().allow_non_publishable = true;
+        limit_req
+            .extensions
+            .vector
+            .as_mut()
+            .unwrap()
+            .allow_non_publishable = true;
         let GenerationOutput::Vector(vec_out) = gen
             .generate(&limit_req, &mut |_| {})
             .expect("token limit returns typed VectorOutput when allow_non_publishable=true")
@@ -829,7 +839,11 @@ mod tests {
 
         for bad_dim in [0, MAX_PREVIEW_DIMENSION + 1] {
             let mut req = mock_request();
-            req.extensions.vector.as_mut().unwrap().preview_max_dimension = Some(bad_dim);
+            req.extensions
+                .vector
+                .as_mut()
+                .unwrap()
+                .preview_max_dimension = Some(bad_dim);
             let err = gen.validate(&req).unwrap_err();
             assert!(
                 err.to_string().contains("preview_max_dimension"),

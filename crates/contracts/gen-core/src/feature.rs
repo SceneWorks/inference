@@ -336,7 +336,9 @@ impl LowResStartSpec {
         let pass0_conditioning = classify_descriptor_pass0_conditioning(descriptor);
         let is_plain_single_reference_img2img = pass0_conditioning
             == Pass0ConditioningRequirement::NoiseStartSupported
-            && descriptor.capabilities.allows_low_res_start_single_ref_img2img
+            && descriptor
+                .capabilities
+                .allows_low_res_start_single_ref_img2img
             && req.source_image.is_none()
             && req.conditioning.len() == 1
             && matches!(req.conditioning[0], Conditioning::Reference { .. });
@@ -2756,7 +2758,8 @@ fn probe_dimension(descriptor: &ModelDescriptor, stride: u32) -> u32 {
 fn classify_descriptor_pass0_conditioning(
     descriptor: &ModelDescriptor,
 ) -> Pass0ConditioningRequirement {
-    if descriptor.capabilities.pass0_requirement != Pass0ConditioningRequirement::NoiseStartSupported
+    if descriptor.capabilities.pass0_requirement
+        != Pass0ConditioningRequirement::NoiseStartSupported
     {
         descriptor.capabilities.pass0_requirement
     } else if descriptor.control_kinds.is_some()
@@ -6821,7 +6824,9 @@ mod tests {
         flux1_desc.family = "flux";
         flux1_desc.capabilities.conditioning = vec![ConditioningKind::Reference];
         flux1_desc.capabilities.supports_low_res_start = true;
-        flux1_desc.capabilities.allows_low_res_start_single_ref_img2img = false;
+        flux1_desc
+            .capabilities
+            .allows_low_res_start_single_ref_img2img = false;
         assert!(req
             .features
             .low_res_start

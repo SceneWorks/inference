@@ -409,11 +409,7 @@ pub fn route_turbo() -> RouteRecord {
                         true,
                     ),
                     ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["krea2_dit"], false),
-                    ResidencyPhaseNode::new(
-                        ResidencyPhaseKind::Decode,
-                        ["qwen_image_vae"],
-                        false,
-                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["qwen_image_vae"], false),
                 ],
                 supports_sequential_offload: true,
                 ..Default::default()
@@ -462,15 +458,12 @@ pub fn route_turbo() -> RouteRecord {
             .with_render_plan(compile_turbo_render_plan)
             .with_activation_memory(crate::TURBO_ACTIVATION_MEMORY_REGISTRATION.anchor)
             .with_memory_registration(TURBO_MEMORY_REGISTRATION)
-            .with_memory_fixture(
-                gen_core::mlx_memory_contract_surface_specs,
-                |spec| {
-                    crate::block_memory_strategy::weights_free_memory_strategy_contract(
-                        KREA_2_TURBO_ID,
-                        spec,
-                    )
-                },
-            )
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::block_memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_TURBO_ID,
+                    spec,
+                )
+            })
             .with_memory_surface_resolver(|surface| {
                 crate::block_memory_strategy::weights_free_memory_strategy_surface_contract(
                     KREA_2_TURBO_ID,
@@ -2618,7 +2611,6 @@ memory_registration!(
     KREA_2_TURBO_EDIT_ID
 );
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2827,18 +2819,21 @@ mod tests {
             width: 256,
             height: 256,
             sampler: Some("heun".into()),
-            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![
-                gen_core::GenerationPhase {
-                    steps: 1,
-                    guidance: Some(0.0),
-                    ..Default::default()
-                },
-                gen_core::GenerationPhase {
-                    steps: 2,
-                    guidance: Some(2.5),
-                    ..Default::default()
-                },
-            ]), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(vec![
+                    gen_core::GenerationPhase {
+                        steps: 1,
+                        guidance: Some(0.0),
+                        ..Default::default()
+                    },
+                    gen_core::GenerationPhase {
+                        steps: 2,
+                        guidance: Some(2.5),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = compile_raw_render_plan(&spec, &request).unwrap().unwrap();
@@ -3807,7 +3802,12 @@ mod tests {
         let steps = full.len() - 1; // 8-step flow-match schedule (len = steps + 1).
         let start_of = |strength: f32| init_time_step(steps, Some(strength)).min(full.len() - 1);
         let capture_req = |ceiling: f32| GenerationRequest {
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(ceiling) }), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams {
+                    capture_sigma: Some(ceiling),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -4600,7 +4600,10 @@ mod tests {
 
     fn phase_req(phases: Vec<mlx_gen::GenerationPhase>) -> GenerationRequest {
         GenerationRequest {
-            features: mlx_gen::gen_core::FeatureParams { phases: Some(phases), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(phases),
+                ..Default::default()
+            },
             ..req(1024, 1024)
         }
     }

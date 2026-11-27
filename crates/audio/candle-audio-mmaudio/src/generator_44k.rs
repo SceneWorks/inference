@@ -84,7 +84,10 @@ pub fn route() -> gen_core::RouteRecord {
         mac_only: false,
         structure: gen_core::RouteStructure {
             text_encoders: gen_core::TextEncoderSurface {
-                encoders: vec![gen_core::TextEncoderDeclaration::new("dfn5b_clip", Some(77))],
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "dfn5b_clip",
+                    Some(77),
+                )],
                 ..Default::default()
             },
             conditioning: gen_core::ConditioningSurface {

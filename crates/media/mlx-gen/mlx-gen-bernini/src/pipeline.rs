@@ -294,8 +294,6 @@ pub(crate) fn component_footprint(
     )
 }
 
-
-
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).
 struct BExpert<'a> {

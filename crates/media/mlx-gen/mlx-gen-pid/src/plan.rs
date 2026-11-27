@@ -6,9 +6,9 @@
 
 use mlx_gen::gen_core::{
     Error as CoreError, FamilyModelSpec, GenerationRequest, Modality, ModelBinding,
-    ModelDescriptor, ProductLimits, RenderPlan, Result as CoreResult, RouteBindings,
-    RouteDefaults, RouteRecord, RouteStructure, SeedAndBatchSemantics, SeedScheme, SizeFloor,
-    StepSupport, TextEncoderDeclaration, TextEncoderSurface,
+    ModelDescriptor, ProductLimits, RenderPlan, Result as CoreResult, RouteBindings, RouteDefaults,
+    RouteRecord, RouteStructure, SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport,
+    TextEncoderDeclaration, TextEncoderSurface,
 };
 use mlx_gen::{Error, Result};
 
@@ -412,7 +412,12 @@ mod tests {
             width: 512,
             height: 512,
             count: 2,
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.25) }), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.25),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = PidDecodePlan::compile(
@@ -452,7 +457,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(
@@ -477,7 +485,10 @@ mod tests {
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tiled = PidDecodePlan::compile(
@@ -497,7 +508,10 @@ mod tests {
         let huge = GenerationRequest {
             width: 2048,
             height: 2048,
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(
@@ -516,7 +530,10 @@ mod tests {
             &GenerationRequest {
                 width: 512,
                 height: 512,
-                features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             f32::NAN,
@@ -537,7 +554,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(

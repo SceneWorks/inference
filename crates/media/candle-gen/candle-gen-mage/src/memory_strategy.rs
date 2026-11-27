@@ -2039,7 +2039,9 @@ mod tests {
             assert!(admission.consume_for_generate(&request).is_err());
         };
 
-        assert_mutation_rejected(|request| request.features.pid = Some(candle_gen::gen_core::PidParams::enabled()));
+        assert_mutation_rejected(|request| {
+            request.features.pid = Some(candle_gen::gen_core::PidParams::enabled())
+        });
         assert_mutation_rejected(|request| {
             request.features.phases = Some(vec![gen_core::GenerationPhase {
                 steps: 1,

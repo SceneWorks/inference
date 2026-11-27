@@ -1389,7 +1389,10 @@ mod tests {
             assert_eq!(params.prompt, caption);
             assert_eq!(params.seed, prompt_seed(&caption));
             assert_eq!(
-                req.extensions.flux3.as_ref().and_then(|f| f.layout.as_ref()),
+                req.extensions
+                    .flux3
+                    .as_ref()
+                    .and_then(|f| f.layout.as_ref()),
                 Some(&original)
             );
         }

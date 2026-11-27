@@ -150,9 +150,7 @@ pub fn sanitize_svg_with_options(
         )));
     }
     if input.contains(&0) {
-        return Err(Error::Msg(
-            "vector SVG contains forbidden NUL bytes".into(),
-        ));
+        return Err(Error::Msg("vector SVG contains forbidden NUL bytes".into()));
     }
     let text = std::str::from_utf8(input)
         .map_err(|err| Error::Msg(format!("vector SVG is not valid UTF-8: {err}")))?;
@@ -1098,9 +1096,7 @@ fn parse_xml_declaration(cursor: &mut XmlCursor<'_>) -> Result<()> {
     // Only allow a single standard `<?xml ...?>` declaration where `xml` is immediately followed
     // by ASCII whitespace. Reject `<?xml-stylesheet ...?>`, `<?xml-model ...?>`, and all other PIs.
     let bytes = rem.as_bytes();
-    if !(rem.starts_with("<?xml")
-        && bytes.get(5).is_some_and(u8::is_ascii_whitespace))
-    {
+    if !(rem.starts_with("<?xml") && bytes.get(5).is_some_and(u8::is_ascii_whitespace)) {
         return Err(Error::Msg(
             "vector SVG processing instructions are forbidden (only standard <?xml ...?> declaration is permitted)"
                 .into(),
@@ -1378,7 +1374,8 @@ fn compute_expansion_cost(
         path_numbers: nodes[node].path_numbers,
     };
     for &child in &nodes[node].children {
-        cost = cost.checked_add(compute_expansion_cost(child, nodes, ids, visiting, memo)?.nested()?)?;
+        cost =
+            cost.checked_add(compute_expansion_cost(child, nodes, ids, visiting, memo)?.nested()?)?;
     }
     if let Some(target) = &nodes[node].href_target {
         let target_node = *ids.get(target).ok_or_else(|| {
@@ -1416,8 +1413,9 @@ fn compute_expansion_cost(
                 "vector SVG href target '#{target}' has an unsupported resource type"
             )));
         }
-        cost = cost
-            .checked_add(compute_expansion_cost(target_node, nodes, ids, visiting, memo)?.nested()?)?;
+        cost = cost.checked_add(
+            compute_expansion_cost(target_node, nodes, ids, visiting, memo)?.nested()?,
+        )?;
     }
     visiting.remove(&node);
     memo.insert(node, cost);
@@ -1582,7 +1580,9 @@ fn validate_element_attributes(
             clean_attrs.push((key, value));
             continue;
         }
-        if key.starts_with("xmlns:") || (key.contains(':') && !matches!(key.as_str(), "xml:space" | "xlink:href")) {
+        if key.starts_with("xmlns:")
+            || (key.contains(':') && !matches!(key.as_str(), "xml:space" | "xlink:href"))
+        {
             return Err(Error::Msg(format!(
                 "vector SVG namespaced attribute '{key}' is forbidden"
             )));
@@ -1606,7 +1606,10 @@ fn validate_element_attributes(
             }
             "display" => {
                 let v = value.trim();
-                if !matches!(v, "inline" | "block" | "none" | "inherit" | "initial" | "unset") {
+                if !matches!(
+                    v,
+                    "inline" | "block" | "none" | "inherit" | "initial" | "unset"
+                ) {
                     return Err(Error::Msg(format!(
                         "vector SVG display value {value:?} is unsupported"
                     )));
@@ -1618,8 +1621,10 @@ fn validate_element_attributes(
             }
             "visibility" => {
                 let v = value.trim();
-                if !matches!(v, "visible" | "hidden" | "collapse" | "inherit" | "initial" | "unset")
-                {
+                if !matches!(
+                    v,
+                    "visible" | "hidden" | "collapse" | "inherit" | "initial" | "unset"
+                ) {
                     return Err(Error::Msg(format!(
                         "vector SVG visibility value {value:?} is unsupported"
                     )));
@@ -1889,10 +1894,8 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             };
             if parent.node.name == "style" {
                 parent.style_text.push_str(&decoded);
-            } else if matches!(
-                parent.node.name.as_str(),
-                "title" | "desc" | "metadata"
-            ) || parent.hidden
+            } else if matches!(parent.node.name.as_str(), "title" | "desc" | "metadata")
+                || parent.hidden
             {
                 if !decoded.trim().is_empty()
                     && matches!(parent.node.name.as_str(), "title" | "desc")
@@ -2033,16 +2036,16 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             path_cmds,
             path_nums,
         } = validate_element_attributes(
-                &name,
-                raw_attrs,
-                is_root,
-                node_idx,
-                &mut hidden,
-                &mut root_xlink_bound,
-                &mut xlink_href_seen,
-                &mut counters,
-                &mut typed_refs,
-            )?;
+            &name,
+            raw_attrs,
+            is_root,
+            node_idx,
+            &mut hidden,
+            &mut root_xlink_bound,
+            &mut xlink_href_seen,
+            &mut counters,
+            &mut typed_refs,
+        )?;
 
         if is_root && hidden {
             return Err(Error::Msg(
@@ -2152,8 +2155,7 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             unclosed.node.name
         )));
     }
-    let root = root_idx
-        .ok_or_else(|| Error::Msg("vector SVG has no root <svg> element".into()))?;
+    let root = root_idx.ok_or_else(|| Error::Msg("vector SVG has no root <svg> element".into()))?;
     if xlink_href_seen && !root_xlink_bound {
         return Err(Error::Msg(
             "vector SVG xlink:href requires root xmlns:xlink=\"http://www.w3.org/1999/xlink\""
@@ -2164,9 +2166,7 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
         .iter()
         .any(|node| node.name == "use" && !node.children.is_empty())
     {
-        return Err(Error::Msg(
-            "vector SVG <use> element must be empty".into(),
-        ));
+        return Err(Error::Msg("vector SVG <use> element must be empty".into()));
     }
 
     // Build combined reference graph (containment + href + typed CSS/attribute url(#id)),
@@ -3028,7 +3028,9 @@ mod tests {
         assert!(sanitize_svg(unresolved).is_err());
 
         // Billion-laughs <use> exponential amplification (2^12 = 4096 > MAX_SVG_ELEMENTS = 2000)
-        let mut laughs = String::from(r##"<svg width="64" height="64"><defs><rect id="u0" width="1" height="1"/>"##);
+        let mut laughs = String::from(
+            r##"<svg width="64" height="64"><defs><rect id="u0" width="1" height="1"/>"##,
+        );
         for level in 1..=12 {
             let prev = level - 1;
             laughs.push_str(&format!(
@@ -3046,13 +3048,16 @@ mod tests {
         assert!(sanitize_svg(huge_blur).is_err());
 
         // Filter primitive count > MAX_SVG_FILTER_PRIMITIVES (64)
-        let mut many_prims = String::from(r##"<svg width="64" height="64"><defs><filter id="f1">"##);
+        let mut many_prims =
+            String::from(r##"<svg width="64" height="64"><defs><filter id="f1">"##);
         for i in 0..=MAX_SVG_FILTER_PRIMITIVES {
             many_prims.push_str(&format!(
                 r##"<feGaussianBlur in="SourceGraphic" stdDeviation="1" result="r{i}"/>"##
             ));
         }
-        many_prims.push_str(r##"</filter></defs><rect width="10" height="10" filter="url(#f1)"/></svg>"##);
+        many_prims.push_str(
+            r##"</filter></defs><rect width="10" height="10" filter="url(#f1)"/></svg>"##,
+        );
         assert!(sanitize_svg(&many_prims).is_err());
 
         // Filter primitive outside <filter>
@@ -3111,7 +3116,10 @@ mod tests {
         assert_eq!(out.generated_tokens, 42);
         assert_eq!(out.prompt_tokens, Some(259));
         assert!(out.preview.is_some());
-        assert_eq!(out.terminal.sanitizer_id.as_deref(), Some(VECTOR_SANITIZER_VERSION));
+        assert_eq!(
+            out.terminal.sanitizer_id.as_deref(),
+            Some(VECTOR_SANITIZER_VERSION)
+        );
         assert_eq!(out.terminal.viewport, Some([32, 32]));
         assert_eq!(out.terminal.element_count, Some(2));
         assert_eq!(
@@ -3119,7 +3127,10 @@ mod tests {
             Some("complete_root")
         );
         assert_eq!(out.terminal.generated_bytes, Some(raw.len()));
-        assert_eq!(out.terminal.provider_id.as_deref(), Some("mlx-starvector-1b"));
+        assert_eq!(
+            out.terminal.provider_id.as_deref(),
+            Some("mlx-starvector-1b")
+        );
         assert!(out.terminal.svg_sha256.is_some());
 
         // Token limit refuses by default, or returns typed truncated metadata when opted in.

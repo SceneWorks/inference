@@ -160,7 +160,10 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
             image: reference.clone(),
             strength: Some(strength),
         }],
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

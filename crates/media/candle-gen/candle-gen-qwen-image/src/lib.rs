@@ -1373,9 +1373,10 @@ pub(crate) fn route_edit() -> gen_core::RouteRecord {
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresEdit;
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings = gen_core::RouteBindings::generator(edit_descriptor, route_wrappers::load_edit)
-        .with_feature_route(Some(MODEL_ID), edit_descriptor)
-        .with_render_plan(compile_edit_render_plan);
+    let mut bindings =
+        gen_core::RouteBindings::generator(edit_descriptor, route_wrappers::load_edit)
+            .with_feature_route(Some(MODEL_ID), edit_descriptor)
+            .with_render_plan(compile_edit_render_plan);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
@@ -1601,8 +1602,8 @@ pub fn pag_capability() -> gen_core::PagCapability {
 /// Primary typed route declaration for Candle Qwen-Image (`REG-1`, `AP5`).
 pub(crate) fn route_base() -> gen_core::RouteRecord {
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings = gen_core::RouteBindings::generator(descriptor, load)
-        .with_render_plan(compile_render_plan);
+    let mut bindings =
+        gen_core::RouteBindings::generator(descriptor, load).with_render_plan(compile_render_plan);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
@@ -2882,11 +2883,14 @@ mod execution_policy_tests {
 
         let zero_req = GenerationRequest {
             prompt: "a fox".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![30]),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(candle_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![30]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(desc
@@ -2903,11 +2907,14 @@ mod execution_policy_tests {
 
         let oob_req = GenerationRequest {
             prompt: "a fox".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![60]),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(candle_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![60]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(desc
@@ -2984,7 +2991,10 @@ mod execution_policy_tests {
             height: 1024,
             steps: Some(20),
             seed: Some(42),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(7, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry

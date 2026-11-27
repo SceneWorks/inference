@@ -3165,10 +3165,8 @@ mod tests {
             .conditioning
             .low_res_start_forbids_reference_conditioning = true;
         route.structure.weight_plan.supports_ar_load_controls = true;
-        route.structure.supported_family_extensions = vec![
-            FamilyExtensionKind::Flux3,
-            FamilyExtensionKind::MossImage,
-        ];
+        route.structure.supported_family_extensions =
+            vec![FamilyExtensionKind::Flux3, FamilyExtensionKind::MossImage];
 
         let exported_route = ExportedRouteV2::from_route_record(&route, None, false);
         assert_eq!(exported_route.capabilities.max_enhance_tokens, Some(4096));

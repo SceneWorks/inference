@@ -351,22 +351,27 @@ impl LatentCodecDeclaration {
         self.pixel_stride
             .or_else(|| size_floor.explicit_size_multiple())
             .or_else(|| {
-                self.output_latent_space.map(|space| match space.patch_layout {
-                    LatentPatchLayout::Packed { patch_width, .. } => {
-                        u32::from(space.spatial_compression.width) * u32::from(patch_width.max(1))
-                    }
-                    LatentPatchLayout::Unpacked => u32::from(space.spatial_compression.width) * 2,
-                })
+                self.output_latent_space
+                    .map(|space| match space.patch_layout {
+                        LatentPatchLayout::Packed { patch_width, .. } => {
+                            u32::from(space.spatial_compression.width)
+                                * u32::from(patch_width.max(1))
+                        }
+                        LatentPatchLayout::Unpacked => {
+                            u32::from(space.spatial_compression.width) * 2
+                        }
+                    })
             })
     }
 
     /// Resolve the effective packed token width from explicit declaration or packed `LatentSpace`.
     pub fn effective_token_width(&self) -> Option<u32> {
         self.token_width.or_else(|| {
-            self.output_latent_space.and_then(|space| match space.patch_layout {
-                LatentPatchLayout::Packed { .. } => Some(u32::from(space.channels)),
-                LatentPatchLayout::Unpacked => None,
-            })
+            self.output_latent_space
+                .and_then(|space| match space.patch_layout {
+                    LatentPatchLayout::Packed { .. } => Some(u32::from(space.channels)),
+                    LatentPatchLayout::Unpacked => None,
+                })
         })
     }
 
@@ -402,12 +407,10 @@ impl LatentCodecDeclaration {
                 let Some(width) = self.token_width else {
                     return false;
                 };
-                stride >= vae_scale
-                    && stride.is_multiple_of(vae_scale)
-                    && {
-                        let ratio = stride / vae_scale;
-                        width == ch || width == ch * ratio * ratio
-                    }
+                stride >= vae_scale && stride.is_multiple_of(vae_scale) && {
+                    let ratio = stride / vae_scale;
+                    width == ch || width == ch * ratio * ratio
+                }
             }
         }
     }
@@ -783,17 +786,9 @@ pub type MemoryValidFixturesFn =
     fn(&LoadSpec, &MemoryProviderContract, MemoryStrategy) -> Result<Vec<MemoryBehaviorFixture>>;
 
 /// Bound memory contract entry `(optional_explicit_provider_id, contract, safety_check)`.
-pub type RouteMemoryContractEntry = (
-    Option<&'static str>,
-    MemoryContractFn,
-    MemorySafetyCheckFn,
-);
+pub type RouteMemoryContractEntry = (Option<&'static str>, MemoryContractFn, MemorySafetyCheckFn);
 /// Bound memory fixture / resident-only entry `(optional_explicit_provider_id, surface_specs, contract)`.
-pub type RouteMemoryFixtureEntry = (
-    Option<&'static str>,
-    MemorySurfaceSpecsFn,
-    MemoryContractFn,
-);
+pub type RouteMemoryFixtureEntry = (Option<&'static str>, MemorySurfaceSpecsFn, MemoryContractFn);
 /// Bound selector-aware memory surface resolver entry `(optional_explicit_provider_id, resolver)`.
 pub type RouteMemoryResolverEntry = (Option<&'static str>, MemorySurfaceResolverFn);
 /// Bound memory behavior entry `(optional_explicit_provider_id, valid_fixtures, begin_request)`.
@@ -868,7 +863,10 @@ impl std::fmt::Debug for RouteBindings {
             .field("encoder_contract_parent", &self.encoder_contract_parent)
             .field("memory", &self.memory)
             .field("activation_memory", &self.activation_memory)
-            .field("has_reference_workspace", &self.reference_workspace.is_some())
+            .field(
+                "has_reference_workspace",
+                &self.reference_workspace.is_some(),
+            )
             .finish()
     }
 }

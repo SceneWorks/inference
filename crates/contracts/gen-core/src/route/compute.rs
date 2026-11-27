@@ -19,9 +19,11 @@ impl RouteRecord {
         let supports_low_res_start = self.modality == Modality::Image
             && s.denoiser.supports_low_res_transition()
             && s.latent_codec.supports_spatial_unpack_repack()
-            && s.conditioning.pass0_requirement == Pass0ConditioningRequirement::NoiseStartSupported;
+            && s.conditioning.pass0_requirement
+                == Pass0ConditioningRequirement::NoiseStartSupported;
         let allows_low_res_start_single_ref_img2img = supports_low_res_start
-            && s.conditioning.pass0_requirement == Pass0ConditioningRequirement::NoiseStartSupported
+            && s.conditioning.pass0_requirement
+                == Pass0ConditioningRequirement::NoiseStartSupported
             && s.conditioning.kinds.contains(&ConditioningKind::Reference)
             && !s.conditioning.low_res_start_forbids_reference_conditioning;
         let mut supported_family_extensions = s.supported_family_extensions.clone();

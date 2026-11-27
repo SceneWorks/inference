@@ -51,7 +51,8 @@ pub fn route_dev_control() -> gen_core::RouteRecord {
     route.route_id = FLUX2_DEV_CONTROL_ID;
     route.structure.text_encoders.encoder_contract = Some(crate::config::DEV_ENCODER_CONTRACT);
     route.structure.text_encoders.supports_prompt_enhancement = false;
-    route.structure.conditioning.kinds = vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.kinds =
+        vec![ConditioningKind::Control, ConditioningKind::Reference];
     route.structure.conditioning.control_kinds = Some(mlx_gen::AcceptedControlKinds::Any);
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresControl;

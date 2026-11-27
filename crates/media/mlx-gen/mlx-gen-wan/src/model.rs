@@ -22,8 +22,8 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterApplyReport, AdapterSpec, CancelFlag, Conditioning, ConditioningKind,
-    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality,
+    AdapterApplyReport, AdapterSpec, CancelFlag, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality,
     ModelDescriptor, MoeExpert, OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;

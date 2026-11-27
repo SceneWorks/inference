@@ -5174,7 +5174,10 @@ mod fingerprint_pin_tests {
                 height: 1024,
                 steps: Some(4),
                 seed: Some(91),
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

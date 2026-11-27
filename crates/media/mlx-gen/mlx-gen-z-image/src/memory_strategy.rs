@@ -3001,7 +3001,10 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 count: 1,
-                features: mlx_gen::gen_core::FeatureParams { pid: (admitted_pid).then(mlx_gen::gen_core::PidParams::enabled), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    pid: (admitted_pid).then(mlx_gen::gen_core::PidParams::enabled),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             // The admitted route configures fine...

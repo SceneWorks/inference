@@ -13,8 +13,8 @@ use mlx_gen::gen_core::{
     PerComponentBytes, SizeFloor,
 };
 use mlx_gen::{
-    CancelFlag, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Result,
+    CancelFlag, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, Result,
 };
 use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use mlx_rs::Array;
@@ -1214,9 +1214,10 @@ impl Generator for MossImage {
             .is_some();
         if is_edit_req {
             // Clear both receipts even if edit validation rejects before execution starts.
-            let mut state = self.state.lock().map_err(|_| {
-                gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into())
-            })?;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into()))?;
             let mut edit_report = self.edit_report.lock().map_err(|_| {
                 gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
             })?;
@@ -1593,12 +1594,11 @@ mod cpu_tests {
         };
         let make_edit_req = || {
             let mut req = GenerationRequest::default();
-            req.extensions.moss_image_mut().edit = Some(
-                gen_core::moss_image_edit::MossImageEditRequest {
+            req.extensions.moss_image_mut().edit =
+                Some(gen_core::moss_image_edit::MossImageEditRequest {
                     references: vec![reference.clone()],
                     ..Default::default()
-                },
-            );
+                });
             req
         };
 
@@ -1638,15 +1638,11 @@ mod cpu_tests {
             acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
             ..Default::default()
         });
-        let err = MossImage::validate_generator_request_policy(
-            MossImageVariant::Sft,
-            &spec,
-            &dmd_edit,
-        )
-        .unwrap_err();
+        let err =
+            MossImage::validate_generator_request_policy(MossImageVariant::Sft, &spec, &dmd_edit)
+                .unwrap_err();
         assert!(
-            matches!(err, gen_core::Error::Unsupported(_))
-                && err.to_string().contains("edit+DMD"),
+            matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("edit+DMD"),
             "expected Unsupported edit+DMD refusal, got {err}"
         );
 
@@ -1661,12 +1657,9 @@ mod cpu_tests {
             }),
             ..Default::default()
         });
-        let err = MossImage::validate_generator_request_policy(
-            MossImageVariant::Sft,
-            &spec,
-            &slg_edit,
-        )
-        .unwrap_err();
+        let err =
+            MossImage::validate_generator_request_policy(MossImageVariant::Sft, &spec, &slg_edit)
+                .unwrap_err();
         assert!(
             matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("SLG"),
             "expected Unsupported edit+SLG refusal, got {err}"
@@ -1678,12 +1671,9 @@ mod cpu_tests {
             uncond_skip_layers: Some(vec![20]),
             ..Default::default()
         });
-        let err = MossImage::validate_generator_request_policy(
-            MossImageVariant::Sft,
-            &spec,
-            &skip_edit,
-        )
-        .unwrap_err();
+        let err =
+            MossImage::validate_generator_request_policy(MossImageVariant::Sft, &spec, &skip_edit)
+                .unwrap_err();
         assert!(
             matches!(err, gen_core::Error::Unsupported(_))
                 && err.to_string().contains("full-layer CFG"),
@@ -1698,12 +1688,9 @@ mod cpu_tests {
                 image: reference,
                 strength: None,
             });
-        let err = MossImage::validate_generator_request_policy(
-            MossImageVariant::Sft,
-            &spec,
-            &cond_edit,
-        )
-        .unwrap_err();
+        let err =
+            MossImage::validate_generator_request_policy(MossImageVariant::Sft, &spec, &cond_edit)
+                .unwrap_err();
         assert!(
             matches!(err, gen_core::Error::Unsupported(_))
                 && err.to_string().contains("typed edit inputs"),

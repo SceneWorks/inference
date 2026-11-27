@@ -18,8 +18,8 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    CancelFlag, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Result, WeightsSource,
+    CancelFlag, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::text_encoder::{T5Geometry, T5TextEncoder};
 use mlx_gen_sdxl::config::VaeConfig;
@@ -139,9 +139,9 @@ pub(crate) fn route_supra2() -> gen_core::RouteRecord {
             ..Default::default()
         },
         bindings: gen_core::RouteBindings::generator(descriptor, load)
-        .with_footprint(footprint)
-        .with_memory_registration(MEMORY)
-        .with_memory_fixture(memory_strategy::surface_specs, memory_strategy::fixture),
+            .with_footprint(footprint)
+            .with_memory_registration(MEMORY)
+            .with_memory_fixture(memory_strategy::surface_specs, memory_strategy::fixture),
     }
 }
 

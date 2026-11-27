@@ -521,27 +521,31 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             scale_bits: spec.scale.map(f32::to_bits),
             estimate_source: spec.estimate_source,
         });
-        let adapter_phases = req.features.phases.as_ref().map(|phases| AdapterPhaseInputs {
-            authored: phases
-                .iter()
-                .map(|phase| AuthoredAdapterPhase {
-                    steps: phase.steps,
-                    guidance_bits: phase.guidance.map(f32::to_bits),
-                    adapters: phase
-                        .adapters
-                        .iter()
-                        .map(|adapter| (adapter.adapter, adapter.weight.map(f32::to_bits)))
-                        .collect(),
-                })
-                .collect(),
-            pag: req.features.pag.clone(),
-            text_style_gain_bits: req
-                .extensions
-                .krea
-                .and_then(|k| k.text_style_gain)
-                .map(f32::to_bits),
-            output_rgba: req.output_channels == crate::OutputChannels::Rgba,
-        });
+        let adapter_phases = req
+            .features
+            .phases
+            .as_ref()
+            .map(|phases| AdapterPhaseInputs {
+                authored: phases
+                    .iter()
+                    .map(|phase| AuthoredAdapterPhase {
+                        steps: phase.steps,
+                        guidance_bits: phase.guidance.map(f32::to_bits),
+                        adapters: phase
+                            .adapters
+                            .iter()
+                            .map(|adapter| (adapter.adapter, adapter.weight.map(f32::to_bits)))
+                            .collect(),
+                    })
+                    .collect(),
+                pag: req.features.pag.clone(),
+                text_style_gain_bits: req
+                    .extensions
+                    .krea
+                    .and_then(|k| k.text_style_gain)
+                    .map(f32::to_bits),
+                output_rgba: req.output_channels == crate::OutputChannels::Rgba,
+            });
         Ok(Self {
             prompt_sha256: Sha256::digest(req.prompt.as_bytes()).into(),
             negative_prompt: req.negative_prompt.clone(),
@@ -564,10 +568,7 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             guidance_method: req.guidance_method.as_deref().map(str::to_owned),
             true_cfg_bits: req.true_cfg.map(f32::to_bits),
             image_guidance_bits: req.image_guidance.map(f32::to_bits),
-            timestep_to_start_cfg: req
-                .extensions
-                .pulid
-                .and_then(|p| p.timestep_to_start_cfg),
+            timestep_to_start_cfg: req.extensions.pulid.and_then(|p| p.timestep_to_start_cfg),
             use_pid: req.use_pid(),
             pid_capture_sigma: req.pid_capture_sigma(),
             enhance_prompt: req.enhance_prompt,

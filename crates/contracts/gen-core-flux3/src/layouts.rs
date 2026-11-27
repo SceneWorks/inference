@@ -153,9 +153,7 @@ pub fn compile_request(req: &gen_core::GenerationRequest) -> Result<Option<Compi
     };
     let plan = references::image_request_plan(req)?;
     let fallback;
-    let layout_bindings = flux3
-        .map(|f| f.layout_bindings.as_slice())
-        .unwrap_or(&[]);
+    let layout_bindings = flux3.map(|f| f.layout_bindings.as_slice()).unwrap_or(&[]);
     let bindings: &[ReferenceBinding] = if layout_bindings.is_empty() {
         for row in layout.to_json()["boxes"]
             .as_array()

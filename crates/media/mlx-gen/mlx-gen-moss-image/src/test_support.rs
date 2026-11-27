@@ -219,7 +219,10 @@ impl Generator for CpuGenerator {
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         with_cpu(|| self.0.generate_with_execution_report(req, progress))
     }
-    fn request_memory_peak(&self, req: &gen_core::GenerationRequest) -> gen_core::Result<Option<u64>> {
+    fn request_memory_peak(
+        &self,
+        req: &gen_core::GenerationRequest,
+    ) -> gen_core::Result<Option<u64>> {
         with_cpu(|| self.0.request_memory_peak(req))
     }
     fn retained_weight_bytes(&self) -> Option<u64> {

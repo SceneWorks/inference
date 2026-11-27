@@ -89,9 +89,9 @@ mod explicit_registry_tests {
         assert!(registry.route_conformance_errors().is_empty());
         assert!(registry.descriptor_conformance_errors().is_empty());
 
-        let surface_registry = super::register_memory_contract_surfaces(
-            super::register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()),
-        )
+        let surface_registry = super::register_memory_contract_surfaces(super::register_providers(
+            candle_gen::gen_core::ProviderRegistryBuilder::new(),
+        ))
         .build()
         .unwrap();
         assert!(surface_registry

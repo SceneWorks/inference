@@ -109,8 +109,14 @@ pub struct MossImageAdvancedRequest {
 impl MossImageAdvancedRequest {
     pub fn as_borrowed(&self) -> MossImageAdvancedInputs<'_> {
         MossImageAdvancedInputs {
-            positive: self.positive.as_ref().map(MossImageOwnedEmbeddings::as_borrowed),
-            negative: self.negative.as_ref().map(MossImageOwnedEmbeddings::as_borrowed),
+            positive: self
+                .positive
+                .as_ref()
+                .map(MossImageOwnedEmbeddings::as_borrowed),
+            negative: self
+                .negative
+                .as_ref()
+                .map(MossImageOwnedEmbeddings::as_borrowed),
             negative_prompts: self.negative_prompts.as_deref(),
             noise: self.noise.as_deref(),
             output: self.output,

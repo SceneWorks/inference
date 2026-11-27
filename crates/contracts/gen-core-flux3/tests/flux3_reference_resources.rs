@@ -131,8 +131,16 @@ fn full_guard_rejects_forged_tokens_shapes_order_and_missing_facts_before_delega
     assert_eq!(accepted.seed, original.seed);
     assert_eq!(accepted.count, original.count);
     assert_eq!(
-        accepted.extensions.flux3.as_ref().and_then(|f| f.reference_output),
-        original.extensions.flux3.as_ref().and_then(|f| f.reference_output)
+        accepted
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output),
+        original
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output)
     );
     assert_eq!(accepted.conditioning.len(), 2);
 }
@@ -169,7 +177,11 @@ fn legacy_guard_and_standalone_auto_intent_remain_usable() {
         vec![(2032, 64)]
     );
     assert_eq!(
-        standalone.extensions.flux3.as_ref().and_then(|f| f.reference_output),
+        standalone
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output),
         Some(ReferenceOutputSize::default())
     );
     let mut none = GenerationRequest::default();

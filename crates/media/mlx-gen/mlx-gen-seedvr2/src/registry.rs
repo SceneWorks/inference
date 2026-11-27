@@ -18,9 +18,8 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;

@@ -1405,7 +1405,6 @@ pub const BASE_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
         },
     };
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

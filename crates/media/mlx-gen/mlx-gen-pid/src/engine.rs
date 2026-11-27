@@ -657,7 +657,10 @@ mod tests {
         // not `Debug`, so match rather than `.expect_err()`.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "some_model"));
@@ -671,7 +674,12 @@ mod tests {
         // surfaced before any load. The flow-match qwenimage sites use resolve_pid_decoder_at_sigma.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(0.2) }), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.2),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "flux"));
@@ -721,7 +729,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_default = err_string(resolve_pid_decoder_at_sigma(
@@ -744,7 +755,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_routes = err_string(resolve_pid_decoder_with_routes(
@@ -768,7 +782,10 @@ mod tests {
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_missing_engine = err_string(resolve_pid_decoder_with_routes(
@@ -795,7 +812,10 @@ mod selected_tiling_tests {
         GenerationRequest {
             prompt: "a fox".to_owned(),
             memory,
-            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

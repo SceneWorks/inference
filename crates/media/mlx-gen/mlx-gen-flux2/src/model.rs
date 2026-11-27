@@ -5169,12 +5169,16 @@ mod execution_policy_tests {
             height: 1024,
             steps: Some(8),
             sampler: Some("euler".into()),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 1.5,
-                start: Some(0.0),
-                stop: Some(0.625),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 1.5,
+                    start: Some(0.0),
+                    stop: Some(0.625),
+                    ..Default::default()
+                }),
+                low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))),
                 ..Default::default()
-            }), low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            },
             ..Default::default()
         };
         let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req).unwrap();

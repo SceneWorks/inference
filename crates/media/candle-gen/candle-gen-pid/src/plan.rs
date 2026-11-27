@@ -397,7 +397,12 @@ mod tests {
             width: 512,
             height: 512,
             count: 2,
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams { capture_sigma: Some(0.25) }), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.25),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = PidDecodePlan::compile(
@@ -436,7 +441,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(
@@ -460,7 +468,10 @@ mod tests {
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tiled = PidDecodePlan::compile(
@@ -479,7 +490,10 @@ mod tests {
         let huge = GenerationRequest {
             width: 2048,
             height: 2048,
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(
@@ -495,7 +509,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(PidDecodePlan::compile(

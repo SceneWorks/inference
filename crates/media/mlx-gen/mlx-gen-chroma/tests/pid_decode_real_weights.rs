@@ -99,7 +99,10 @@ fn chroma_flash_pid_decode_vs_vae() {
 
     // --- PiD path (same request + use_pid) ---
     let pid_req = GenerationRequest {
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();

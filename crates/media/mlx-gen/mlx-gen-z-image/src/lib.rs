@@ -661,7 +661,10 @@ mod explicit_registry_tests {
                 prompt: "a red fox in snow".into(),
                 width: 1024,
                 height: 1024,
-                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(k, Some(0.5))), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(k, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry
@@ -689,7 +692,10 @@ mod explicit_registry_tests {
                     image: ref_img,
                     strength: Some(0.5),
                 }],
-                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let img2img_plan = registry
@@ -756,7 +762,10 @@ mod explicit_registry_tests {
                     kind: ControlKind::Pose,
                     scale: Some(0.8),
                 }],
-                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let ctrl_spec = spec

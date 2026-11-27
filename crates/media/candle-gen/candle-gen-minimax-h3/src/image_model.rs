@@ -121,9 +121,7 @@ pub(crate) fn route_image() -> gen_core::RouteRecord {
             .with_memory_fixture_registration(
                 crate::image_memory_strategy::IMAGE_MEMORY_CONTRACT_FIXTURE,
             )
-            .with_memory_behavior_registration(
-                crate::image_memory_strategy::IMAGE_MEMORY_BEHAVIOR,
-            );
+            .with_memory_behavior_registration(crate::image_memory_strategy::IMAGE_MEMORY_BEHAVIOR);
     }
 
     gen_core::RouteRecord {

@@ -211,15 +211,17 @@ pub fn route_base() -> RouteRecord {
     );
     r.defaults.steps = Some(gen_core_flux3::BASE_DEFAULT_STEPS);
     r.defaults.guidance = Some(gen_core_flux3::BASE_DEFAULT_GUIDANCE);
-    r.bindings = RouteBindings::generator(descriptor_base, |spec| {
-        load_base(spec).map_err(Into::into)
-    })
-    .with_reference_workspace(
-        crate::memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION.reference_workspace_bytes,
-    )
-    .with_memory_registration(crate::memory_strategy::BASE_MEMORY_REGISTRATION)
-    .with_memory_fixture_registration(crate::memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
-    .with_memory_behavior_registration(crate::memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION);
+    r.bindings =
+        RouteBindings::generator(descriptor_base, |spec| load_base(spec).map_err(Into::into))
+            .with_reference_workspace(
+                crate::memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION
+                    .reference_workspace_bytes,
+            )
+            .with_memory_registration(crate::memory_strategy::BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                crate::memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION,
+            );
     r
 }
 
@@ -1047,8 +1049,6 @@ impl Flux3Klein {
         Ok(report)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

@@ -229,7 +229,9 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
     }
     if let Some(guidance) = defaults.guidance {
         if !guidance.is_finite() {
-            errs.push(format!("{ctx}: defaults.guidance ({guidance}) must be finite"));
+            errs.push(format!(
+                "{ctx}: defaults.guidance ({guidance}) must be finite"
+            ));
         }
         if !s.sampling.supports_guidance {
             errs.push(format!(

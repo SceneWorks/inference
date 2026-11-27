@@ -7861,17 +7861,23 @@ mod tests {
             (
                 descriptor(),
                 GenerationRequest {
-                    features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+                    features: candle_gen::gen_core::FeatureParams {
+                        pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                        ..Default::default()
+                    },
                     ..staged()
                 },
             ),
             (
                 raw_descriptor(),
                 GenerationRequest {
-                    features: candle_gen::gen_core::FeatureParams { phases: Some(vec![gen_core::GenerationPhase {
-                        steps: 1,
+                    features: candle_gen::gen_core::FeatureParams {
+                        phases: Some(vec![gen_core::GenerationPhase {
+                            steps: 1,
+                            ..Default::default()
+                        }]),
                         ..Default::default()
-                    }]), ..Default::default() },
+                    },
                     ..staged()
                 },
             ),
@@ -8368,7 +8374,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             prompt: "a red apple on a wooden table".into(),
             width: 1024,
             height: 1024,
-            features: candle_gen::gen_core::FeatureParams { phases: Some(phases), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(phases),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -8864,7 +8873,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 width: 512,
                 height: 512,
                 cancel: cancel.clone(),
-                features: candle_gen::gen_core::FeatureParams { pid: (spec.pid.is_some()).then(candle_gen::gen_core::PidParams::enabled), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    pid: (spec.pid.is_some()).then(candle_gen::gen_core::PidParams::enabled),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let generator = registry.load(KREA_2_TURBO_ID, &spec).unwrap();
@@ -9099,10 +9111,13 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 kind: gen_core::ControlKind::Pose,
                 scale: Some(1.0),
             }],
-            features: candle_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.2,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(matches!(
@@ -9250,10 +9265,13 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 height: 1024,
                 guidance: Some(0.0),
                 negative_prompt: None,
-                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                    scale: 1.5,
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 1.5,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }), ..Default::default() },
+                },
                 ..Default::default()
             };
             if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
@@ -9289,10 +9307,13 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 height: 1024,
                 guidance: Some(1.0),
                 negative_prompt: None,
-                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                    scale: 1.5,
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 1.5,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }), ..Default::default() },
+                },
                 ..Default::default()
             };
             if id == KREA_2_EDIT_ID {
@@ -9314,7 +9335,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             height: 1024,
             guidance: Some(0.0),
             negative_prompt: Some("blurry".into()),
-            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![phase(20, Some(0.0)), phase(8, None)]), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![phase(20, Some(0.0)), phase(8, None)]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(
@@ -9327,7 +9351,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         };
         assert!(raw_g.validate(&all_cfg_off_no_neg).is_ok());
         let mixed_cfg = GenerationRequest {
-            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]),
+                ..Default::default()
+            },
             ..all_cfg_off
         };
         assert!(raw_g.validate(&mixed_cfg).is_ok());

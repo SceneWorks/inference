@@ -223,7 +223,9 @@ impl Generator for InstantIdGenerator {
     }
 }
 
-fn resolve_instantid_paths(spec: &LoadSpec) -> gen_core::Result<(InstantIdPaths, std::path::PathBuf)> {
+fn resolve_instantid_paths(
+    spec: &LoadSpec,
+) -> gen_core::Result<(InstantIdPaths, std::path::PathBuf)> {
     spec.validate_prepared_file_pins()?;
     gen_core::reject_unknown_components(spec, &[], "instantid")?;
     if !spec.extra_controls.is_empty() {
@@ -261,7 +263,8 @@ fn resolve_instantid_paths(spec: &LoadSpec) -> gen_core::Result<(InstantIdPaths,
         Some(WeightsSource::Dir(p) | WeightsSource::File(p)) => p.clone(),
         None => {
             return Err(gen_core::Error::Msg(
-                "instantid requires spec.identity.face_dir (face analysis weights directory)".into(),
+                "instantid requires spec.identity.face_dir (face analysis weights directory)"
+                    .into(),
             ));
         }
     };
@@ -315,7 +318,9 @@ mod tests {
     fn load_instantid_rejects_missing_face_dir_before_loading_weights() {
         let mut no_identity = base_spec();
         no_identity.identity = None;
-        let err = load_instantid(&no_identity).err().expect("must fail closed");
+        let err = load_instantid(&no_identity)
+            .err()
+            .expect("must fail closed");
         assert!(
             err.to_string().contains("face_dir"),
             "expected face_dir diagnostic, got: {err}"
@@ -327,7 +332,9 @@ mod tests {
             eva: None,
             face_dir: None,
         });
-        let err = load_instantid(&no_face_dir).err().expect("must fail closed");
+        let err = load_instantid(&no_face_dir)
+            .err()
+            .expect("must fail closed");
         assert!(
             err.to_string().contains("face_dir"),
             "expected face_dir diagnostic, got: {err}"
@@ -339,7 +346,9 @@ mod tests {
         let mut spec = base_spec();
         spec.extra_controls
             .push(WeightsSource::Dir("/tmp/openpose".into()));
-        let err = load_instantid(&spec).err().expect("must reject extra_controls");
+        let err = load_instantid(&spec)
+            .err()
+            .expect("must reject extra_controls");
         assert!(
             matches!(err, gen_core::Error::Unsupported(_))
                 && err.to_string().contains("extra_controls"),

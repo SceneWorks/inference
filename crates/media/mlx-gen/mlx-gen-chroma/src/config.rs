@@ -17,9 +17,7 @@ use mlx_gen::gen_core::{
     TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
     FLUX1_LATENT_SPACE,
 };
-use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Modality, ModelDescriptor, Quant,
-};
+use mlx_gen::{curated_sampler_names, curated_scheduler_names, Modality, ModelDescriptor, Quant};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";

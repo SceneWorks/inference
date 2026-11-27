@@ -510,7 +510,10 @@ mod tests {
                 pixels: vec![90u8; 1200 * 700 * 3],
             }),
             strength: Some(0.4),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(candle_gen::gen_core::LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(candle_gen::gen_core::LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan =

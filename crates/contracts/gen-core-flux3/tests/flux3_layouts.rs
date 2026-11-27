@@ -11,7 +11,9 @@ fn output() -> references::OutputGeometry {
 
 #[test]
 fn request_layout_defaults_absent_and_is_scoped_to_flux3() {
-    use gen_core::{Capabilities, FamilyExtensionKind, FamilyExtensions, Flux3Extension, GenerationRequest};
+    use gen_core::{
+        Capabilities, FamilyExtensionKind, FamilyExtensions, Flux3Extension, GenerationRequest,
+    };
     let mut request = GenerationRequest::default();
     assert!(request.extensions.flux3.is_none());
     let caps = Capabilities {
@@ -326,7 +328,10 @@ fn live_request_locks_layout_before_prompt_seed_for_both_reference_modes() {
             Some(compiled.rows_json().as_str())
         );
         assert_eq!(
-            req.extensions.flux3.as_ref().and_then(|f| f.layout.as_ref()),
+            req.extensions
+                .flux3
+                .as_ref()
+                .and_then(|f| f.layout.as_ref()),
             Some(&original)
         );
     }

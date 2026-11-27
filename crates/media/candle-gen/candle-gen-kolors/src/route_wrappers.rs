@@ -289,10 +289,7 @@ impl Generator for KolorsControlGenerator {
 pub(crate) fn load_control(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     spec.validate_prepared_file_pins()?;
     gen_core::reject_unknown_components(spec, &[], control_descriptor().id)?;
-    if !spec.extra_controls.is_empty()
-        || spec.identity.is_some()
-        || spec.ip_adapter.is_some()
-    {
+    if !spec.extra_controls.is_empty() || spec.identity.is_some() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "kolors_control does not accept extra control, identity, or IP-Adapter overlays".into(),
         ));

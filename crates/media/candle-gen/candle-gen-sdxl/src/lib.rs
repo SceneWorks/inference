@@ -2202,7 +2202,10 @@ mod tests {
             guidance: Some(7.0),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -2229,7 +2232,10 @@ mod tests {
                 pixels: vec![128; 64 * 64 * 3],
             }),
             strength: Some(0.5),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         let img2img_plan = registry
@@ -2353,7 +2359,10 @@ mod tests {
                 pixels: vec![128; 64 * 64 * 3],
             }),
             strength: Some(1.5),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         assert!(matches!(
@@ -2374,7 +2383,10 @@ mod tests {
                 pixels: vec![128; 64 * 64 * 3],
             }),
             strength: Some(1.0),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         assert!(matches!(
@@ -2391,27 +2403,42 @@ mod tests {
         // or phase-0 dimensions below `min_size`).
         for bad_low_res_req in [
             GenerationRequest {
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
                 width: 544,
                 height: 544,
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
                 width: 256,
                 height: 256,
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
         ] {

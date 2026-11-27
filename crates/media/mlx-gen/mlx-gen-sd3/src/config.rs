@@ -15,8 +15,8 @@
 //! real 8.1B Large model and a tiny parity fixture, so the converter / validator run against both.
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, ConditioningKind, Modality, ModelDescriptor,
+    Quant,
 };
 
 pub const SD3_5_LARGE_ID: &str = "sd3_5_large";

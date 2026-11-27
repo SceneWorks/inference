@@ -258,7 +258,9 @@ impl LtxRenderPlanInput {
     ) -> Self {
         let ltx = req.extensions.ltx.as_ref();
         let generated_slots = ltx.and_then(|ext| ext.num_generated_keyframes).unwrap_or(0);
-        let temporal_rounds = ltx.and_then(|ext| ext.temporal_upsample_rounds).unwrap_or(0);
+        let temporal_rounds = ltx
+            .and_then(|ext| ext.temporal_upsample_rounds)
+            .unwrap_or(0);
         let uses_dfr = generated_slots > 0 || temporal_rounds > 0;
         let clip_count = req.video_clips().len() + usize::from(req.control_clip().is_some());
         let keyframe_count = req

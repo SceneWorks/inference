@@ -1210,7 +1210,10 @@ mod tests {
                     height: 768,
                     steps: Some(steps as u32),
                     seed: Some(1234),
-                    features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+                    features: candle_gen::gen_core::FeatureParams {
+                        low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if via_source_image {

@@ -247,7 +247,10 @@ mod explicit_registry_tests {
             height: 512,
             steps: Some(4),
             seed: Some(42),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -270,7 +273,10 @@ mod explicit_registry_tests {
                 image: src_img.clone(),
                 strength: Some(0.6),
             }],
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         let img2img_plan = registry
@@ -375,7 +381,10 @@ mod explicit_registry_tests {
                     height: 768,
                     steps: Some(steps as u32),
                     seed: Some(77),
-                    features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+                    features: mlx_gen::gen_core::FeatureParams {
+                        low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if via_source_image {
@@ -500,7 +509,10 @@ mod explicit_registry_tests {
                 image: source_1200x700,
                 strength: Some(0.4),
             }],
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let dev_plan = registry

@@ -1872,8 +1872,6 @@ pub(crate) fn footprint_with_source_qualification(
     Ok((components, encoded))
 }
 
-
-
 /// The weights-free memory-strategy registration (SC-15521) — the shared registry conformance
 /// suite's entry point into this provider's declaration.
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =

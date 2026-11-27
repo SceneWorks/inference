@@ -2175,7 +2175,8 @@ mod tests {
                 "ordinary control request with posture-only context must pass configure_request",
             );
         let mut low_res_control_req = control_fixture.request.clone();
-        low_res_control_req.features.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        low_res_control_req.features.low_res_start =
+            Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
         let control_err = control_scope
             .configure_request(&mut low_res_control_req)
             .expect_err(

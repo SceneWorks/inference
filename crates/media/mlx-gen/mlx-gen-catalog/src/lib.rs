@@ -1761,7 +1761,8 @@ mod tests {
             .map(|fixture| {
                 assert_eq!(fixture.context.overlay, None, "{provider_id}");
                 assert_eq!(
-                    fixture.request.use_pid(), fixture.context.use_pid,
+                    fixture.request.use_pid(),
+                    fixture.context.use_pid,
                     "{provider_id}"
                 );
                 assert_eq!(

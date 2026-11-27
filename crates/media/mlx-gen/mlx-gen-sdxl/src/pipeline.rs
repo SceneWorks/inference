@@ -2677,7 +2677,10 @@ mod tests {
             seed: Some(42),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));

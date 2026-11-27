@@ -2091,7 +2091,10 @@ mod tests {
                 stage_residency: true,
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let error = generator.generate(&req, &mut |_| {}).unwrap_err();
@@ -2209,10 +2212,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 0.0,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         desc.capabilities.validate_request(MODEL_ID, &noop).unwrap();
@@ -2223,10 +2229,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 1.2,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         let resolved = desc
@@ -2241,11 +2250,14 @@ mod tests {
 
         let oob = GenerationRequest {
             prompt: "a test".into(),
-            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                scale: 1.0,
-                layers: Some(vec![30]),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 1.0,
+                    layers: Some(vec![30]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(desc.capabilities.validate_request(MODEL_ID, &oob).is_err());
@@ -2311,7 +2323,10 @@ mod explicit_registry_tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for id in ["z_image_turbo", "z_image"] {
@@ -2341,7 +2356,10 @@ mod explicit_registry_tests {
                 },
                 strength: Some(0.5),
             }],
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(1, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry

@@ -95,7 +95,10 @@ fn render_pid() -> Image {
         count: 1,
         seed: Some(333_941_069),
         steps: Some(8),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let t = Instant::now();

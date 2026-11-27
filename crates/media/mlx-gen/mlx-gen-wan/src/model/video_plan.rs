@@ -1,9 +1,7 @@
 //! The padded shape shared by native execution and pre-load curated video admission.
 
 use super::*;
-use mlx_gen::gen_core::{
-    self, VideoPhaseLayout, VideoPlanLayout, VideoReferenceLayout,
-};
+use mlx_gen::gen_core::{self, VideoPhaseLayout, VideoPlanLayout, VideoReferenceLayout};
 
 pub(super) struct VideoDimensions {
     pub(super) frames: usize,

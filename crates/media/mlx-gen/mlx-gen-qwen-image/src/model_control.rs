@@ -65,16 +65,15 @@ pub(crate) fn route_qwen_image_control() -> gen_core::RouteRecord {
     route.structure.adapters.install_policy = gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
     route.structure.weight_plan.requires_control_overlay = true;
     route.structure.output.preview = gen_core::PreviewSupport::Unsupported;
-    route.bindings = gen_core::RouteBindings::generator(descriptor, |spec| {
-        load(spec).map_err(Into::into)
-    })
-    .with_footprint(crate::model::control_component_footprint)
-    .with_render_plan(compile_render_plan)
-    .with_memory_registration(MEMORY_REGISTRATION)
-    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
-        crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
-    })
-    .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::control_component_footprint)
+            .with_render_plan(compile_render_plan)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
     route
 }
 

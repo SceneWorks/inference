@@ -115,7 +115,10 @@ fn z_image_turbo_pid_decode_vs_vae() {
 
     // --- PiD path (same request + use_pid) ---
     let pid_req = GenerationRequest {
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();
@@ -164,7 +167,10 @@ fn use_pid_without_loaded_pid_errors() {
         width: 512,
         height: 512,
         seed: Some(1),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let err = model

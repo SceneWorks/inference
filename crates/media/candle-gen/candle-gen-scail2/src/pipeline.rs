@@ -151,7 +151,8 @@ pub(crate) fn route() -> candle_gen::gen_core::RouteRecord {
                     ConditioningKind::Mask,
                     ConditioningKind::ControlClip,
                 ],
-                pass0_requirement: candle_gen::gen_core::Pass0ConditioningRequirement::RequiresReference,
+                pass0_requirement:
+                    candle_gen::gen_core::Pass0ConditioningRequirement::RequiresReference,
                 supports_negative_prompt: true,
                 modules: vec!["scail_clip"],
                 ..Default::default()
@@ -686,7 +687,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         components: Mutex::new(None),
     }))
 }
-
 
 fn capture_scail2_execution(
     descriptor: &ModelDescriptor,

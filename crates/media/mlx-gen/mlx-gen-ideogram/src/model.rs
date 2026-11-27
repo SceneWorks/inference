@@ -157,7 +157,9 @@ pub fn route_quality() -> RouteRecord {
             .with_memory_registration(QUALITY_MEMORY_REGISTRATION)
             .with_memory_fixture(
                 mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-                |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+                |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+                },
             )
             .with_memory_behavior_registration(QUALITY_MEMORY_BEHAVIOR),
     }
@@ -174,20 +176,16 @@ pub fn route_turbo() -> RouteRecord {
     route.structure.residency.lifetime_graph[1].components = vec!["ideogram4_cond_dit"];
     route.defaults.steps = Some(DEFAULT_TURBO_STEPS);
     route.defaults.guidance = None;
-    route.bindings =
-        RouteBindings::generator(descriptor_turbo, |spec| load_turbo(spec).map_err(Into::into))
-            .with_footprint(component_footprint)
-            .with_memory_registration(TURBO_MEMORY_REGISTRATION)
-            .with_memory_fixture(
-                mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-                |spec| {
-                    crate::memory_strategy::weights_free_memory_strategy_contract(
-                        MODEL_ID_TURBO,
-                        spec,
-                    )
-                },
-            )
-            .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    route.bindings = RouteBindings::generator(descriptor_turbo, |spec| {
+        load_turbo(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_TURBO, spec),
+    )
+    .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
     route
 }
 
@@ -739,8 +737,6 @@ pub(crate) fn component_footprint(
         &["vae"],
     )
 }
-
-
 
 /// Memory-strategy + weights-free behavior registrations (sc-22732), one pair per route.
 pub(crate) const QUALITY_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =

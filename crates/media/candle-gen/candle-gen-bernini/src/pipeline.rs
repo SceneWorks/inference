@@ -85,10 +85,7 @@ pub(crate) fn route_renderer() -> gen_core::RouteRecord {
         mac_only: false,
         structure: gen_core::RouteStructure {
             text_encoders: gen_core::TextEncoderSurface {
-                encoders: vec![gen_core::TextEncoderDeclaration::new(
-                    "umt5_xxl",
-                    Some(512),
-                )],
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
                 ..Default::default()
             },
             conditioning: gen_core::ConditioningSurface {

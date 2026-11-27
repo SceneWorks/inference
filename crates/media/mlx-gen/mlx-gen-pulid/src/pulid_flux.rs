@@ -25,9 +25,9 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag,
-    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_face::{Detection, FaceAnalysis};
 use mlx_gen_flux::config::FluxVariant;
@@ -184,9 +184,8 @@ pub(crate) fn route_pulid_flux() -> gen_core::RouteRecord {
 pub(crate) fn route_flux1_dev_pulid() -> gen_core::RouteRecord {
     let mut route = route_pulid_flux();
     route.route_id = "flux1_dev_pulid";
-    route.bindings =
-        gen_core::RouteBindings::feature_route(Some("flux1_dev"), descriptor)
-            .with_render_plan(compile_plan);
+    route.bindings = gen_core::RouteBindings::feature_route(Some("flux1_dev"), descriptor)
+        .with_render_plan(compile_plan);
     route
 }
 
@@ -1584,10 +1583,13 @@ mod tests {
                 image: img(),
                 strength: None,
             }],
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.5,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         let resolved = desc

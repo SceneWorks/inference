@@ -169,12 +169,11 @@ pub fn route_25() -> RouteRecord {
         supports_generated_keyframes: true,
     };
     out.limits.supported_steps = StepSupport::Exact(vec![crate::pipeline::NATIVE_STEPS, 30]);
-    out.bindings = RouteBindings::generator(descriptor_25, |spec| {
-        load_25(spec).map_err(Into::into)
-    })
-    .with_memory_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_REGISTRATION)
-    .with_memory_fixture_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_FIXTURE)
-    .with_memory_behavior_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_BEHAVIOR);
+    out.bindings =
+        RouteBindings::generator(descriptor_25, |spec| load_25(spec).map_err(Into::into))
+            .with_memory_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_FIXTURE)
+            .with_memory_behavior_registration(crate::memory_strategy_2_5::LTX_2_5_MEMORY_BEHAVIOR);
     out
 }
 

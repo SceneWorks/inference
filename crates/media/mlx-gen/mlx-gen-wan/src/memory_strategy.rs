@@ -2528,7 +2528,9 @@ mod tests {
         }
         mutation!(strength = Some(0.5));
         mutation!(control_scale = Some(1.0));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.krea_mut().text_style_gain = Some(1.0));
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.krea_mut().text_style_gain = Some(1.0)
+        );
         mutation!(image_guidance = Some(1.0));
         mutation!(audio = Some(AudioParams::default()));
         mutation_fn!(|r: &mut GenerationRequest| {
@@ -2538,19 +2540,34 @@ mod tests {
             }]);
         });
         mutation!(video_mode = Some("variant".into()));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.wan_mut().trim_first_frames = Some(1));
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.wan_mut().trim_first_frames = Some(1)
+        );
         mutation!(duration = Some(1.0));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().motion_bucket_id = Some(1.0));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().noise_aug_strength = Some(0.1));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().decode_chunk_size = Some(1));
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.svd_mut().conditioning_fps = Some(24));
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.svd_mut().motion_bucket_id = Some(1.0)
+        );
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.svd_mut().noise_aug_strength = Some(0.1)
+        );
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.svd_mut().decode_chunk_size = Some(1)
+        );
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.svd_mut().conditioning_fps = Some(24)
+        );
         mutation_fn!(|r: &mut GenerationRequest| r.extensions.seedvr2_mut().softness = Some(0.1));
         mutation!(enhance_prompt = true);
-        mutation_fn!(|r: &mut GenerationRequest| r.extensions.ltx_mut().use_uncensored_enhancer = true);
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.extensions.ltx_mut().use_uncensored_enhancer = true
+        );
         mutation!(enhance_max_tokens = Some(1));
         mutation!(enhance_temperature = Some(0.1));
-        mutation_fn!(|r: &mut GenerationRequest| r.features.pid = Some(gen_core::PidParams::enabled()));
-        mutation_fn!(|r: &mut GenerationRequest| r.features.pid = Some(gen_core::PidParams::with_capture_sigma(0.5)));
+        mutation_fn!(
+            |r: &mut GenerationRequest| r.features.pid = Some(gen_core::PidParams::enabled())
+        );
+        mutation_fn!(|r: &mut GenerationRequest| r.features.pid =
+            Some(gen_core::PidParams::with_capture_sigma(0.5)));
         for request in mutations {
             assert_scope_rejects(&spec, &contract, &fixture, request);
         }

@@ -324,18 +324,21 @@ mod pricing_tests {
             weight: Some(value),
         };
         let request = GenerationRequest {
-            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![
-                GenerationPhase {
-                    steps: 1,
-                    adapters: vec![strength(0.5), strength(0.5), strength(0.7)],
-                    ..Default::default()
-                },
-                GenerationPhase {
-                    steps: 1,
-                    adapters: vec![strength(0.8)],
-                    ..Default::default()
-                },
-            ]), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(vec![
+                    GenerationPhase {
+                        steps: 1,
+                        adapters: vec![strength(0.5), strength(0.5), strength(0.7)],
+                        ..Default::default()
+                    },
+                    GenerationPhase {
+                        steps: 1,
+                        adapters: vec![strength(0.8)],
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         // One raw source + one ordinary BF16 3x5 delta + two distinct phase deltas.

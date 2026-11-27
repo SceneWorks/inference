@@ -431,7 +431,10 @@ fn full_ladder_composes_with_the_pid_decode_domain() {
         steps: Some(1),
         seed: Some(7),
         memory: Some(memory),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let GenerationOutput::Images(images) = generator

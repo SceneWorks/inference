@@ -81,16 +81,15 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
     route.defaults.steps = Some(DEFAULT_STEPS);
     route.defaults.guidance = Some(DEFAULT_GUIDANCE);
     route.defaults.shift = Some(SCHEDULE_SHIFT);
-    route.bindings = gen_core::RouteBindings::generator(descriptor, |spec| {
-        load(spec).map_err(Into::into)
-    })
-    .with_footprint(crate::model::component_footprint)
-    .with_render_plan(crate::model::compile_base)
-    .with_memory_registration(MEMORY_REGISTRATION)
-    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
-        crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
-    })
-    .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::component_footprint)
+            .with_render_plan(crate::model::compile_base)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
     route
 }
 
@@ -609,10 +608,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.5,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
@@ -625,10 +627,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 0.0,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());

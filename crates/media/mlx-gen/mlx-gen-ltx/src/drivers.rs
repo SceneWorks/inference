@@ -1399,7 +1399,14 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(17),
-            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    num_generated_keyframes: Some(1),
+                    temporal_upsample_rounds: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let built = render_plan_for_request(
@@ -1418,7 +1425,13 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(17),
-            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    temporal_upsample_rounds: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(

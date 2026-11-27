@@ -3920,35 +3920,38 @@ mod tests {
             count: 1,
             seed: Some(0x5eed),
             guidance: Some(0.0),
-            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![PhaseAdapter {
-                        adapter: 0,
-                        weight: None,
-                    }],
-                },
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![
-                        PhaseAdapter {
-                            adapter: 1,
-                            weight: Some(0.75),
-                        },
-                        PhaseAdapter {
-                            adapter: 1,
-                            weight: Some(-0.25),
-                        },
-                    ],
-                },
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![],
-                },
-            ]), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![PhaseAdapter {
+                            adapter: 0,
+                            weight: None,
+                        }],
+                    },
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![
+                            PhaseAdapter {
+                                adapter: 1,
+                                weight: Some(0.75),
+                            },
+                            PhaseAdapter {
+                                adapter: 1,
+                                weight: Some(-0.25),
+                            },
+                        ],
+                    },
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![],
+                    },
+                ]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan =
@@ -4500,7 +4503,10 @@ mod tests {
             prompt: "make it autumn".into(),
             width: 512,
             height: 512,
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         // (`PidDecoder` is not `Debug`, so match the seam result rather than `unwrap_err`.)
@@ -4520,7 +4526,10 @@ mod tests {
             prompt: "make it autumn".into(),
             width: 512,
             height: 512,
-            features: candle_gen::gen_core::FeatureParams { pid: None, ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved =

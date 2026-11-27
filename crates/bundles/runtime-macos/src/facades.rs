@@ -101,9 +101,7 @@ pub mod converters {
         pub use mlx_gen_catalog::providers::scail2::{convert, has_diff_patch_keys};
     }
     pub mod sd3 {
-        pub use mlx_gen_catalog::providers::sd3::{
-            convert, quantize_sd3_dir, Sd3Arch, Sd3Variant,
-        };
+        pub use mlx_gen_catalog::providers::sd3::{convert, quantize_sd3_dir, Sd3Arch, Sd3Variant};
     }
     pub mod sdxl {
         pub use mlx_gen_catalog::providers::sdxl::convert;
@@ -225,8 +223,8 @@ pub mod memory_helpers {
 pub mod calibration {
     pub mod instantid {
         pub use mlx_gen_catalog::providers::instantid::{
-            memory_strategy, InstantId, InstantIdPaths, InstantIdRequest,
-            DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE, DEFAULT_OPENPOSE_SCALE,
+            memory_strategy, InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE,
+            DEFAULT_IP_SCALE, DEFAULT_OPENPOSE_SCALE,
         };
     }
     pub mod pulid {

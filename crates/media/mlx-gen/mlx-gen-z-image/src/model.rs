@@ -1785,10 +1785,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.2,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
@@ -1802,10 +1805,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 0.0,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());
@@ -1813,11 +1819,14 @@ mod tests {
 
         let bad_layer = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
-                scale: 1.0,
-                layers: Some(vec![30]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.0,
+                    layers: Some(vec![30]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &bad_layer).is_err());

@@ -147,11 +147,14 @@ mod explicit_registry_tests {
             prompt: "a phased test".into(),
             width: 512,
             height: 512,
-            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            }]), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(vec![GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for id in ["flux1_schnell", "flux1_dev"] {
@@ -222,15 +225,24 @@ mod explicit_registry_tests {
         assert_eq!(schnell.family, "flux");
         assert_eq!(schnell.backend, "mlx");
         assert_eq!(schnell.modality, Modality::Image);
-        assert_eq!(schnell.denoiser_output_latent_space, Some(&FLUX1_LATENT_SPACE));
+        assert_eq!(
+            schnell.denoiser_output_latent_space,
+            Some(&FLUX1_LATENT_SPACE)
+        );
         assert!(schnell.encoder_contract.is_none());
         assert!(schnell.control_kinds.is_none());
         assert!(schnell.required_components.is_empty());
         assert!(!schnell.capabilities.supports_negative_prompt);
         assert!(!schnell.capabilities.supports_guidance);
         assert!(!schnell.capabilities.supports_true_cfg);
-        assert_eq!(schnell.capabilities.conditioning, vec![ConditioningKind::Reference]);
-        assert_eq!(schnell.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            schnell.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        assert_eq!(
+            schnell.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
         assert!(schnell.capabilities.supports_lora);
         assert!(schnell.capabilities.supports_lokr);
         assert!(schnell.capabilities.samplers.contains(&"flow_match"));
@@ -240,21 +252,30 @@ mod explicit_registry_tests {
         assert_eq!(schnell.capabilities.max_size, 2048);
         assert_eq!(schnell.capabilities.max_count, 8);
         assert_eq!(schnell.capabilities.size_floor, SizeFloor::RangeChecked);
-        assert_eq!(schnell.capabilities.supported_steps, StepSupport::Unconstrained);
+        assert_eq!(
+            schnell.capabilities.supported_steps,
+            StepSupport::Unconstrained
+        );
         assert!(schnell.capabilities.mac_only);
         assert!(!schnell.capabilities.requires_sigma_shift);
         assert!(schnell.capabilities.supports_sequential_offload);
         assert!(schnell.capabilities.supports_preview);
         assert!(schnell.capabilities.supports_low_res_start);
         assert!(!schnell.capabilities.supports_phases);
-        assert_eq!(schnell.capabilities.pag, Some(super::FluxVariant::Schnell.pag_capability()));
+        assert_eq!(
+            schnell.capabilities.pag,
+            Some(super::FluxVariant::Schnell.pag_capability())
+        );
 
         let dev = registry.generator_descriptor("flux1_dev").unwrap();
         assert!(dev.capabilities.supports_guidance);
         assert!(dev.capabilities.requires_sigma_shift);
         assert!(dev.capabilities.samplers.contains(&"hyper"));
         assert!(dev.capabilities.supports_low_res_start);
-        assert_eq!(dev.capabilities.pag, Some(super::FluxVariant::Dev.pag_capability()));
+        assert_eq!(
+            dev.capabilities.pag,
+            Some(super::FluxVariant::Dev.pag_capability())
+        );
         assert_eq!(
             registry.activation_memory_bytes_1024("flux1_dev").unwrap(),
             Some(15_096_810_046)
@@ -264,7 +285,10 @@ mod explicit_registry_tests {
         assert_eq!(dev_route.defaults.guidance, Some(3.5));
 
         let ctrl = registry.generator_descriptor("flux1_dev_control").unwrap();
-        assert_eq!(ctrl.capabilities.conditioning, vec![ConditioningKind::Control]);
+        assert_eq!(
+            ctrl.capabilities.conditioning,
+            vec![ConditioningKind::Control]
+        );
         assert_eq!(
             ctrl.control_kinds,
             Some(AcceptedControlKinds::Only(vec![

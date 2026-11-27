@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterApplyReport, AdapterSpec, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
+    AdapterApplyReport, AdapterSpec, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};

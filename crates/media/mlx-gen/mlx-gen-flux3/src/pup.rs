@@ -236,7 +236,12 @@ mod tests {
         let mut req = GenerationRequest {
             prompt: "remove cat".into(),
             conditioning: vec![gen_core::Conditioning::Reference {
-                image: gen_core::Image { width: 64, height: 64, pixels: vec![23; 64*64*3] }, strength: None,
+                image: gen_core::Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![23; 64 * 64 * 3],
+                },
+                strength: None,
             }],
             ..Default::default()
         };
@@ -283,7 +288,10 @@ mod tests {
             assert_eq!(params.prompt, caption);
             assert_eq!(params.seed, gen_core_flux3::prompt_seed(&caption));
             assert_eq!(
-                req.extensions.flux3.as_ref().and_then(|f| f.layout.as_ref()),
+                req.extensions
+                    .flux3
+                    .as_ref()
+                    .and_then(|f| f.layout.as_ref()),
                 Some(&layout)
             );
         }

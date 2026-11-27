@@ -64,7 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[B] PiD (expect {}x{})…", w * 4, h * 4);
     let preq = GenerationRequest {
-        features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: candle_gen::gen_core::FeatureParams {
+            pid: Some(candle_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..req
     };
     let GenerationOutput::Images(mut i) = gen.generate(&preq, &mut op)? else {

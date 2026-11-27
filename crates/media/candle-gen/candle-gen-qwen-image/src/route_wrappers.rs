@@ -15,7 +15,10 @@ use crate::{DEFAULT_GUIDANCE, MODEL_ID, SIZE_MULTIPLE};
 const LIGHTNING_DEFAULT_STEPS: usize = 4;
 const LIGHTNING_DEFAULT_GUIDANCE: f32 = 1.0;
 
-fn extract_edit_references(request: &GenerationRequest, route_id: &str) -> gen_core::Result<Vec<Image>> {
+fn extract_edit_references(
+    request: &GenerationRequest,
+    route_id: &str,
+) -> gen_core::Result<Vec<Image>> {
     let mut refs = Vec::new();
     for cond in &request.conditioning {
         match cond {

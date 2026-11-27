@@ -1600,7 +1600,8 @@ pub(crate) fn mage_driver_support(driver_id: &'static str) -> DriverSupport {
         previous_estimate_capture: false,
         uses_global_rng: false,
         refusal_reasons: DriverRefusalReasons {
-            renoise_from_clean: "native MLX Mage flow driver does not re-noise from clean estimates",
+            renoise_from_clean:
+                "native MLX Mage flow driver does not re-noise from clean estimates",
             geometry_change:
                 "native MLX Mage flow driver does not support geometry-changing phase boundaries",
             read_only_boundary_estimate:

@@ -116,10 +116,7 @@ fn load_control_variant(
 ) -> gen_core::Result<Box<dyn Generator>> {
     spec.validate_prepared_file_pins()?;
     gen_core::reject_unknown_components(spec, &[], descriptor.id)?;
-    if !spec.extra_controls.is_empty()
-        || spec.identity.is_some()
-        || spec.ip_adapter.is_some()
-    {
+    if !spec.extra_controls.is_empty() || spec.identity.is_some() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{} does not accept extra control, identity, or IP-Adapter overlays",
             descriptor.id
@@ -150,9 +147,8 @@ fn load_control_variant(
         adapters: spec.adapters.clone(),
         base,
     };
-    let mut model =
-        ZImageControl::load_with_memory_spec(&paths, spec, GenerationMemory::default())
-            .map_err(gen_core::Error::from)?;
+    let mut model = ZImageControl::load_with_memory_spec(&paths, spec, GenerationMemory::default())
+        .map_err(gen_core::Error::from)?;
     if let Some(pid) = &spec.pid {
         model = model.with_pid(pid).map_err(gen_core::Error::from)?;
     }

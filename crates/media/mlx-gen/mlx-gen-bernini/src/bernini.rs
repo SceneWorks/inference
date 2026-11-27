@@ -42,13 +42,13 @@ use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::block_residency::BlockPlan;
-use mlx_gen::media::Image;
-use mlx_gen::tiling::TilingConfig;
-use mlx_gen::weights::Weights;
 use mlx_gen::gen_core::{
     FamilyDriverSpec, ModelBinding, ResidencyPhaseKind, ResidencyPhaseNode, RouteBindings,
     RouteRecord, TextEncoderDeclaration,
 };
+use mlx_gen::media::Image;
+use mlx_gen::tiling::TilingConfig;
+use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, Error, GenerationOutput, GenerationRequest, Generator, LoadPhase, LoadSpec,
     Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
@@ -634,7 +634,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-
 
 // Hand-written for the same reason as `BerniniRenderer`'s (sc-18609): `mlx_gen::impl_generator!`
 // emits no memory-strategy hooks, so the declared ladder would stay unreachable through the loaded

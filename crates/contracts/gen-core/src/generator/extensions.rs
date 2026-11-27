@@ -218,9 +218,7 @@ pub struct Flux3Extension {
 
 impl Flux3Extension {
     pub fn is_empty(&self) -> bool {
-        self.reference_output.is_none()
-            && self.layout.is_none()
-            && self.layout_bindings.is_empty()
+        self.reference_output.is_none() && self.layout.is_none() && self.layout_bindings.is_empty()
     }
 
     pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {

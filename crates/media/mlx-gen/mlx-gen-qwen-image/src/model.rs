@@ -1329,11 +1329,14 @@ mod tests {
         let caps = &base.capabilities;
         let zero_req = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![30]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![30]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, caps, &zero_req).is_ok());
@@ -1347,11 +1350,14 @@ mod tests {
 
         let oob_req = GenerationRequest {
             prompt: "a fox".into(),
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![60]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![60]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, caps, &oob_req).is_err());
@@ -1387,10 +1393,13 @@ mod tests {
             seed: Some(42),
             steps: Some(4),
             sampler: Some("euler".into()),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
-                LowResStartSpec::new(2, Some(0.5))
-                    .with_estimate_source(EstimateSource::PreviousEvaluation),
-            ), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5))
+                        .with_estimate_source(EstimateSource::PreviousEvaluation),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1456,7 +1465,10 @@ mod tests {
             height: 1024,
             steps: Some(20),
             seed: Some(42),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(7, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -1481,7 +1493,10 @@ mod tests {
                 },
                 strength: Some(0.5),
             }],
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let img2img_plan = registry

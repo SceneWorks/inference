@@ -805,7 +805,10 @@ fn schedules_use_actual_transition_count_strength_and_nonzero_terminal() {
     req.scheduler = Some("normal".into());
     req.steps = Some(4);
     req.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
-    req.features.pid.get_or_insert_with(mlx_gen::gen_core::PidParams::enabled).capture_sigma = Some(0.9);
+    req.features
+        .pid
+        .get_or_insert_with(mlx_gen::gen_core::PidParams::enabled)
+        .capture_sigma = Some(0.9);
     let resolved = ResolvedSampling::resolve(&req).unwrap();
     let full = resolved.curated_full_sigmas(&alpha()).unwrap();
     let plan = vp_capture_plan(&full, req.pid_capture_sigma()).unwrap();

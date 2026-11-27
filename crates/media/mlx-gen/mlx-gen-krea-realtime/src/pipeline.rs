@@ -300,7 +300,6 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
 // The registration constant the platform catalog composes (explicit, not linker-discovered); bridges
 // the crate `Result` into backend-neutral `gen_core::Result`.
 
-
 impl KreaRealtime {
     fn generate_execution_attempt(
         &self,

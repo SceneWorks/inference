@@ -218,7 +218,9 @@ pub fn route() -> RouteRecord {
         },
         bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
             .with_memory_registration(crate::h3_image::memory::IMAGE_MEMORY_REGISTRATION)
-            .with_memory_fixture_registration(crate::h3_image::memory::IMAGE_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_fixture_registration(
+                crate::h3_image::memory::IMAGE_MEMORY_CONTRACT_FIXTURE,
+            )
             .with_memory_behavior_registration(crate::h3_image::memory::IMAGE_MEMORY_BEHAVIOR),
     }
 }
@@ -1192,7 +1194,9 @@ mod tests {
                 sampler: Some("euler".into()),
                 extensions: mlx_gen::gen_core::FamilyExtensions {
                     h3: Some(mlx_gen::gen_core::H3Extension {
-                        image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm_default()),
+                        image_sampler: Some(
+                            mlx_gen::gen_core::h3_image::H3ImageSampler::lcm_default(),
+                        ),
                         ..Default::default()
                     }),
                     ..Default::default()

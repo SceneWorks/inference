@@ -548,7 +548,8 @@ fn completed_entrypoints_never_reuse_a_previous_receipt_after_rejection_or_cance
     // Edit validation fails before loading a renderer or accessing model tensors.
     candle_gen::lock_recover(&g.state).report = Some(synthetic_report());
     let mut empty_edit = GenerationRequest::default();
-    empty_edit.extensions.moss_image_mut().edit = Some(gen_core::moss_image_edit::MossImageEditRequest::default());
+    empty_edit.extensions.moss_image_mut().edit =
+        Some(gen_core::moss_image_edit::MossImageEditRequest::default());
     assert!(g
         .generate_with_execution_report(&empty_edit, &mut |_| {})
         .is_err());
@@ -1141,7 +1142,8 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
     }
     assert!(generator.retained_weight_bytes().unwrap() > 0);
     let mut empty_edit_req = GenerationRequest::default();
-    empty_edit_req.extensions.moss_image_mut().edit = Some(gen_core::moss_image_edit::MossImageEditRequest::default());
+    empty_edit_req.extensions.moss_image_mut().edit =
+        Some(gen_core::moss_image_edit::MossImageEditRequest::default());
     assert!(generator.generate(&empty_edit_req, &mut |_| {}).is_err());
     assert!(generator.last_edit_execution_report().is_none());
     assert!(generator.last_execution_report().is_none());
@@ -1196,12 +1198,11 @@ fn validate_agrees_with_generate_on_edit_requests() {
     };
     let make_edit_req = || {
         let mut req = GenerationRequest::default();
-        req.extensions.moss_image_mut().edit = Some(
-            gen_core::moss_image_edit::MossImageEditRequest {
+        req.extensions.moss_image_mut().edit =
+            Some(gen_core::moss_image_edit::MossImageEditRequest {
                 references: vec![reference.clone()],
                 ..Default::default()
-            },
-        );
+            });
         req
     };
 
@@ -1220,8 +1221,7 @@ fn validate_agrees_with_generate_on_edit_requests() {
         .output = MossImageOutputKind::Latents;
     let err = generator.validate(&latent_edit).unwrap_err();
     assert!(
-        matches!(err, gen_core::Error::Unsupported(_))
-            && err.to_string().contains("image output"),
+        matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("image output"),
         "expected Unsupported image output refusal, got {err}"
     );
 
@@ -1233,8 +1233,7 @@ fn validate_agrees_with_generate_on_edit_requests() {
     });
     let err = generator.validate(&dmd_edit).unwrap_err();
     assert!(
-        matches!(err, gen_core::Error::Unsupported(_))
-            && err.to_string().contains("edit+DMD"),
+        matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("edit+DMD"),
         "expected Unsupported edit+DMD refusal, got {err}"
     );
 
@@ -1270,10 +1269,12 @@ fn validate_agrees_with_generate_on_edit_requests() {
 
     // Edit + conditioning is rejected by validate.
     let mut cond_edit = make_edit_req();
-    cond_edit.conditioning.push(gen_core::Conditioning::Reference {
-        image: reference,
-        strength: None,
-    });
+    cond_edit
+        .conditioning
+        .push(gen_core::Conditioning::Reference {
+            image: reference,
+            strength: None,
+        });
     let err = generator.validate(&cond_edit).unwrap_err();
     assert!(
         matches!(err, gen_core::Error::Unsupported(_))

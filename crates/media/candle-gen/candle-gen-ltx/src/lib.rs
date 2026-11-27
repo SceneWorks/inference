@@ -2016,8 +2016,8 @@ impl Generator for LtxGenerator {
 /// Primary typed route declaration for Candle LTX-2.3 distilled (`SW-6979`, `REG-1`).
 pub(crate) fn route_ltx_2_3() -> gen_core::RouteRecord {
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings = gen_core::RouteBindings::generator(descriptor, load)
-        .with_footprint(component_footprint);
+    let mut bindings =
+        gen_core::RouteBindings::generator(descriptor, load).with_footprint(component_footprint);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
@@ -3260,12 +3260,24 @@ mod tests {
             },
             GenerationRequest {
                 sampler: Some("heun".into()),
-                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    ltx: Some(candle_gen::gen_core::LtxExtension {
+                        num_generated_keyframes: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..base_25.clone()
             },
             GenerationRequest {
                 sampler: Some("heun".into()),
-                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    ltx: Some(candle_gen::gen_core::LtxExtension {
+                        temporal_upsample_rounds: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..base_25.clone()
             },
             GenerationRequest {
@@ -3274,17 +3286,35 @@ mod tests {
                     frame_idx: 0,
                     strength: 1.0,
                 }],
-                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    ltx: Some(candle_gen::gen_core::LtxExtension {
+                        num_generated_keyframes: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..base_25.clone()
             },
             GenerationRequest {
                 frames: Some(1),
-                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    ltx: Some(candle_gen::gen_core::LtxExtension {
+                        num_generated_keyframes: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..base_25.clone()
             },
             GenerationRequest {
                 frames: Some(1),
-                extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
+                extensions: candle_gen::gen_core::FamilyExtensions {
+                    ltx: Some(candle_gen::gen_core::LtxExtension {
+                        temporal_upsample_rounds: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..base_25.clone()
             },
             GenerationRequest {
@@ -3347,10 +3377,17 @@ mod tests {
         // curated non-Euler samplers are still refused pre-load.
         let auto_dfr = GenerationRequest {
             frames: None,
-            extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { auto_duration: Some(gen_core::duration_head::AutoDurationRange {
-                min_seconds: 1.0,
-                max_seconds: 2.0,
-            }), num_generated_keyframes: Some(1), ..Default::default() }), ..Default::default() },
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                ltx: Some(candle_gen::gen_core::LtxExtension {
+                    auto_duration: Some(gen_core::duration_head::AutoDurationRange {
+                        min_seconds: 1.0,
+                        max_seconds: 2.0,
+                    }),
+                    num_generated_keyframes: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..base_25.clone()
         };
         assert!(Generator::validate(&distilled, &auto_dfr).is_ok());
@@ -4099,14 +4136,26 @@ mod tests {
             (
                 "num_generated_keyframes",
                 GenerationRequest {
-                    extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(3), ..Default::default() }), ..Default::default() },
+                    extensions: candle_gen::gen_core::FamilyExtensions {
+                        ltx: Some(candle_gen::gen_core::LtxExtension {
+                            num_generated_keyframes: Some(3),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
                     ..base.clone()
                 },
             ),
             (
                 "temporal_upsample_rounds",
                 GenerationRequest {
-                    extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { temporal_upsample_rounds: Some(1), ..Default::default() }), ..Default::default() },
+                    extensions: candle_gen::gen_core::FamilyExtensions {
+                        ltx: Some(candle_gen::gen_core::LtxExtension {
+                            temporal_upsample_rounds: Some(1),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
                     ..base.clone()
                 },
             ),
@@ -4119,7 +4168,14 @@ mod tests {
             assert!(err.to_string().contains("2.5"), "{label}: {err}");
         }
         let off = GenerationRequest {
-            extensions: candle_gen::gen_core::FamilyExtensions { ltx: Some(candle_gen::gen_core::LtxExtension { num_generated_keyframes: Some(0), temporal_upsample_rounds: Some(0), ..Default::default() }), ..Default::default() },
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                ltx: Some(candle_gen::gen_core::LtxExtension {
+                    num_generated_keyframes: Some(0),
+                    temporal_upsample_rounds: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..base
         };
         model.validate(&off).expect("0 is off");

@@ -1468,7 +1468,10 @@ mod tests {
             height: 1024,
             count: 1,
             steps: Some(8),
-            features: gen_core::FeatureParams { low_res_start: Some(crate::gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            features: gen_core::FeatureParams {
+                low_res_start: Some(crate::gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = crate::gen_core::RenderPlan::base_image(

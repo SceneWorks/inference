@@ -997,7 +997,10 @@ mod tests {
                 height: 512,
                 steps: Some(6),
                 seed: Some(77),
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

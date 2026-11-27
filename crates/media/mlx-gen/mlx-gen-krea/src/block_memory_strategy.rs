@@ -1554,7 +1554,8 @@ mod tests {
                     |error| panic!("{provider_id} fixture is not executable: {error}"),
                 );
                 assert_eq!(
-                    fixture.request.use_pid(), fixture.context.use_pid,
+                    fixture.request.use_pid(),
+                    fixture.context.use_pid,
                     "{provider_id}"
                 );
                 assert_eq!(

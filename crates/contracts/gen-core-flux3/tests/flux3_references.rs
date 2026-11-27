@@ -58,7 +58,13 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
             image: image(2032, 64, 17),
             strength: None,
         }],
-        extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert_eq!((request.width, request.height), (1024, 1024));
@@ -101,14 +107,22 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
     assert_eq!(seen.get(), 1);
     assert_eq!((correct.width, correct.height), (2032, 64));
     assert_eq!(
-        correct.extensions.flux3.as_ref().and_then(|f| f.reference_output),
+        correct
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output),
         Some(ReferenceOutputSize::default())
     );
     // A caller can accidentally drop BOTH the images and their output intent after admission.
     // Matching numeric dimensions must not let that request silently become a T2I render.
     let mut dropped = correct.clone();
     dropped.conditioning.clear();
-    dropped.extensions.flux3.get_or_insert_with(Default::default).reference_output = None;
+    dropped
+        .extensions
+        .flux3
+        .get_or_insert_with(Default::default)
+        .reference_output = None;
     let mut scope = guard_memory_scope(
         Box::new(Scope {
             admitted,
@@ -142,7 +156,14 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
     );
     scope.configure_request(&mut legacy).unwrap();
     assert_eq!((legacy.width, legacy.height), (1024, 1024));
-    assert_eq!(legacy.extensions.flux3.as_ref().and_then(|f| f.reference_output), None);
+    assert_eq!(
+        legacy
+            .extensions
+            .flux3
+            .as_ref()
+            .and_then(|f| f.reference_output),
+        None
+    );
 }
 
 #[test]
@@ -155,7 +176,13 @@ fn multi_reference_auto_canvas_uses_the_positive_token_grid_not_the_single_paddi
         conditioning: vec![Conditioning::MultiReference {
             images: vec![image(48, 64, 7), image(64, 64, 13)],
         }],
-        extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let plan = request_plan(&request).unwrap().unwrap();
@@ -177,7 +204,11 @@ fn multi_reference_auto_canvas_uses_the_positive_token_grid_not_the_single_paddi
     validate_request_with_resolved_output(&caps, "flux3_klein", &request).unwrap();
     let mut plain = request.clone();
     plain.conditioning.clear();
-    plain.extensions.flux3.get_or_insert_with(Default::default).reference_output = None;
+    plain
+        .extensions
+        .flux3
+        .get_or_insert_with(Default::default)
+        .reference_output = None;
     assert!(validate_request_with_resolved_output(&caps, "flux3_klein", &plain).is_err());
     assert_eq!(
         gen_core_flux3::references::plan(&[(16, 64), (64, 64)], ReferenceOutputSize::default())
@@ -226,7 +257,13 @@ fn encoded_png_modes_match_frozen_ae_and_pup_forks() {
         }
         let req = GenerationRequest {
             conditioning: vec![decoded],
-            extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+            extensions: gen_core::FamilyExtensions {
+                flux3: Some(gen_core::Flux3Extension {
+                    reference_output: Some(ReferenceOutputSize::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ae = request_images(&req).unwrap();
@@ -294,7 +331,13 @@ fn owned_file_exif_precedes_ae_rgb_and_pup_white_forks_for_one_and_ten() {
     for count in [1, 10] {
         let req = GenerationRequest {
             conditioning: vec![decoded.clone(); count],
-            extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+            extensions: gen_core::FamilyExtensions {
+                flux3: Some(gen_core::Flux3Extension {
+                    reference_output: Some(ReferenceOutputSize::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ae = request_images(&req).unwrap();
@@ -341,7 +384,13 @@ fn rgba_forks_before_ae_dropalpha_and_pup_white_composite_without_reordering() {
     use gen_core::{Conditioning, GenerationRequest, RgbaImage};
     use gen_core_flux3::references::{request_images, request_plan, upsampler_input};
     let mut req = GenerationRequest {
-        extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     for n in 0..10 {
@@ -502,7 +551,10 @@ fn typed_output_intent_and_unsupported_strength_are_not_silently_ignored() {
         (1024, 1024)
     );
     assert_eq!(request_plan(&req).unwrap().unwrap().output.crop, None);
-    req.extensions.flux3.get_or_insert_with(Default::default).reference_output = Some(ReferenceOutputSize::default());
+    req.extensions
+        .flux3
+        .get_or_insert_with(Default::default)
+        .reference_output = Some(ReferenceOutputSize::default());
     let auto = request_plan(&req).unwrap().unwrap();
     assert_eq!(auto.output.canvas, (96, 80));
     assert_eq!(auto.output.crop, Some([6, 6, 89, 73]));
@@ -538,7 +590,10 @@ fn typed_output_intent_and_unsupported_strength_are_not_silently_ignored() {
             height: Some(128),
         },
     ] {
-        req.extensions.flux3.get_or_insert_with(Default::default).reference_output = Some(explicit);
+        req.extensions
+            .flux3
+            .get_or_insert_with(Default::default)
+            .reference_output = Some(explicit);
         let p = request_plan(&req).unwrap().unwrap();
         assert_eq!(
             p.output.canvas,
@@ -559,7 +614,10 @@ fn typed_output_intent_and_unsupported_strength_are_not_silently_ignored() {
     assert!(request_images(&req).is_err());
     req.conditioning.clear();
     assert!(request_plan(&req).is_err());
-    req.extensions.flux3.get_or_insert_with(Default::default).reference_output = None;
+    req.extensions
+        .flux3
+        .get_or_insert_with(Default::default)
+        .reference_output = None;
     assert!(request_plan(&req).unwrap().is_none());
 }
 
@@ -577,7 +635,13 @@ fn memory_route_requires_matching_reference_count_and_rejects_other_family_inten
     }
     assert!(validate_memory_route(&MemoryMode::TextToImage, 0).is_ok());
     let req = GenerationRequest {
-        extensions: gen_core::FamilyExtensions { flux3: Some(gen_core::Flux3Extension { reference_output: Some(ReferenceOutputSize::default()), ..Default::default() }), ..Default::default() },
+        extensions: gen_core::FamilyExtensions {
+            flux3: Some(gen_core::Flux3Extension {
+                reference_output: Some(ReferenceOutputSize::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let caps = Capabilities {

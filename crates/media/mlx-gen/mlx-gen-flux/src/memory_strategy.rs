@@ -1039,7 +1039,10 @@ pub(crate) fn registered_valid_fixture(
     let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(context);
     fixture.request.prompt = "weights-free FLUX.1 memory behavior".to_owned();
     fixture.request.features.phases = None;
-    fixture.request.features.pid = spec.pid.is_some().then(mlx_gen::gen_core::PidParams::enabled);
+    fixture.request.features.pid = spec
+        .pid
+        .is_some()
+        .then(mlx_gen::gen_core::PidParams::enabled);
     let reference = || mlx_gen::media::Image {
         width: 1,
         height: 1,
@@ -2586,7 +2589,8 @@ mod tests {
         fixture.request.width = 1024;
         fixture.request.height = 1024;
         fixture.request.steps = Some(8);
-        fixture.request.features.low_res_start = Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
+        fixture.request.features.low_res_start =
+            Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
 
         let plan = crate::model::compile_trajectory_for(
             crate::config::FluxVariant::Dev,

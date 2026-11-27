@@ -354,23 +354,22 @@ pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
         max_cells: u32::MAX,
     };
     route.structure.conditioning.kinds = vec![candle_gen::gen_core::ConditioningKind::Control];
-    route.structure.conditioning.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
-        ControlKind::Pose,
-        ControlKind::Canny,
-        ControlKind::Depth,
-    ]));
+    route.structure.conditioning.control_kinds =
+        Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
+            ControlKind::Pose,
+            ControlKind::Canny,
+            ControlKind::Depth,
+        ]));
     route.structure.conditioning.pass0_requirement =
         candle_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
     route.structure.conditioning.modules = vec!["flux_controlnet_union"];
     route.structure.weight_plan.requires_control_overlay = true;
     route.seed_and_batch.max_count = 1;
     route.defaults.strength = Some(DEFAULT_CONTROL_SCALE);
-    route.bindings = candle_gen::gen_core::RouteBindings::generator(
-        control_descriptor,
-        load_control,
-    )
-    .with_feature_route(Some(crate::FLUX1_DEV_ID), control_descriptor)
-    .with_render_plan(compile_control_feature_route);
+    route.bindings =
+        candle_gen::gen_core::RouteBindings::generator(control_descriptor, load_control)
+            .with_feature_route(Some(crate::FLUX1_DEV_ID), control_descriptor)
+            .with_render_plan(compile_control_feature_route);
     route
 }
 

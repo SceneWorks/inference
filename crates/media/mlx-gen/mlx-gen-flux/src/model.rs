@@ -3068,7 +3068,10 @@ mod tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
 
@@ -3098,7 +3101,10 @@ mod tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img.clone()),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
         let img2img_plan = compile_trajectory(FluxVariant::Dev, &img2img_ok).unwrap();
@@ -3107,7 +3113,10 @@ mod tests {
 
         // K = 4 >= M = 4 after strength truncation is refused with a typed error!
         let img2img_bad_k = GenerationRequest {
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..img2img_ok
         };
         assert!(validate_request(&descriptor_dev(), &img2img_bad_k).is_err());
@@ -3405,9 +3414,12 @@ mod tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
-                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ), ..Default::default() },
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(
+                        LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 
@@ -3550,7 +3562,10 @@ mod tests {
                 },
                 strength: Some(0.75),
             }],
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

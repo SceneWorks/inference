@@ -1615,8 +1615,7 @@ impl MiniMaxH3 {
             .h3
             .as_ref()
             .is_some_and(|h3| h3.terminal_telemetry);
-        let mut terminal_probe = h3_terminal_telemetry
-            .then(gen_core_telemetry::Collector::default);
+        let mut terminal_probe = h3_terminal_telemetry.then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));
@@ -2035,8 +2034,7 @@ impl MiniMaxH3 {
             .h3
             .as_ref()
             .is_some_and(|h3| h3.terminal_telemetry);
-        let mut terminal_probe = h3_terminal_telemetry
-            .then(gen_core_telemetry::Collector::default);
+        let mut terminal_probe = h3_terminal_telemetry.then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));

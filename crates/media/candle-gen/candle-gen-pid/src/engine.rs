@@ -518,7 +518,10 @@ mod tests {
     fn resolve_pid_decoder_requested_without_engine_errors() {
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "some_model"));
@@ -529,7 +532,12 @@ mod tests {
     fn resolve_pid_decoder_rejects_capture_sigma_for_unwired_space() {
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams { capture_sigma: Some(0.2) }), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.2),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "flux"));
@@ -610,7 +618,10 @@ mod tests {
             width: 1536,
             height: 1536,
             count: 1,
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let via_req = err_string(resolve_pid_decoder_at_sigma(
@@ -646,7 +657,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_default = err_string(resolve_pid_decoder_at_sigma(
@@ -689,7 +703,10 @@ mod tests {
                 decode_overlap: Some(64),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_routes = err_string(resolve_pid_decoder_with_routes(
@@ -713,7 +730,10 @@ mod tests {
                 decode_overlap: Some(256),
                 ..Default::default()
             }),
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err_missing_engine = err_string(resolve_pid_decoder_with_routes(
@@ -740,7 +760,10 @@ mod selected_tiling_tests {
         GenerationRequest {
             prompt: "a fox".to_owned(),
             memory,
-            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

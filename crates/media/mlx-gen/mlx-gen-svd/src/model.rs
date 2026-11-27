@@ -22,9 +22,9 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, default_seed, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Result, StepSupport, WeightsSource,
+    curated_sampler_names, default_seed, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Result, StepSupport, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -927,7 +927,14 @@ mod tests {
         let mk = |m: Option<f32>, n: Option<f32>| GenerationRequest {
             width: 512,
             height: 512,
-            extensions: mlx_gen::gen_core::FamilyExtensions { svd: Some(mlx_gen::gen_core::SvdExtension { motion_bucket_id: m, noise_aug_strength: n, ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                svd: Some(mlx_gen::gen_core::SvdExtension {
+                    motion_bucket_id: m,
+                    noise_aug_strength: n,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

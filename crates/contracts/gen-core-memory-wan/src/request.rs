@@ -417,10 +417,7 @@ pub fn validate_request(
     let frames = request.frames.unwrap_or_default();
     let fps = request.fps.unwrap_or_default();
     let steps = request.steps.unwrap_or_default();
-    let unsupported_svd = request
-        .extensions
-        .svd
-        .is_some_and(|svd| !svd.is_empty());
+    let unsupported_svd = request.extensions.svd.is_some_and(|svd| !svd.is_empty());
     let has_lightning = prepared.adapters.first().is_some_and(|receipt| {
         receipt.kind == "lightning_lora"
             && receipt.expert == "high"
@@ -504,7 +501,11 @@ pub fn validate_request(
             .wan
             .and_then(|w| w.trim_first_frames)
             .is_none()
-        && request.extensions.seedvr2.and_then(|s| s.softness).is_none()
+        && request
+            .extensions
+            .seedvr2
+            .and_then(|s| s.softness)
+            .is_none()
         && request.pid_capture_sigma().is_none()
         && request.approximation.is_none());
     if request.count != 1

@@ -463,10 +463,13 @@ mod production_bounder_tests {
         let active_gen = GenerationRequest {
             width: 512,
             height: 512,
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 1.2,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         let active_req = IosPricingRequest {
@@ -507,16 +510,22 @@ mod production_bounder_tests {
         let noop_gen = GenerationRequest {
             width: 512,
             height: 512,
-            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }), ..Default::default() },
+            },
             ..Default::default()
         };
         let none_gen = GenerationRequest {
             width: 512,
             height: 512,
-            features: mlx_gen::gen_core::FeatureParams { pag: None, ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let noop_err = ios_pricing(&IosPricingRequest {

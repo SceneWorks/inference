@@ -206,7 +206,9 @@ fn native_complete_surface_campaign() {
                     &accelerated,
                     &report,
                 );
-                let off_run = generator.generate_with_report(&request, &mut |_| {}).unwrap();
+                let off_run = generator
+                    .generate_with_report(&request, &mut |_| {})
+                    .unwrap();
                 let off_report = off_run.moss_image_report().cloned().unwrap();
                 let off = images(off_run.output.unwrap());
                 assert_eq!(

@@ -476,7 +476,6 @@ impl mlx_gen::Generator for Mochi {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

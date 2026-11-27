@@ -1258,14 +1258,7 @@ mod tests {
             VedaBudget::KeyTiles(u32::MAX),
         ] {
             let mut r = req();
-            let controls = r
-                .extensions
-                .h3
-                .as_mut()
-                .unwrap()
-                .veda
-                .as_mut()
-                .unwrap();
+            let controls = r.extensions.h3.as_mut().unwrap().veda.as_mut().unwrap();
             controls.generated = generated;
             controls.reference = generated;
             controls.full_attention_layers = vec![0, 49];

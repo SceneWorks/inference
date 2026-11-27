@@ -17,9 +17,9 @@
 //! ControlNet-pose and IP-Adapter stay on their existing bespoke Candle providers and are rejected
 //! by this registered generator rather than silently dropped (the false-capability trap).
 
+use candle_gen::gen_core::ModelDescriptor;
 #[cfg(test)]
 use candle_gen::gen_core::{ConditioningKind, Modality, Quant};
-use candle_gen::gen_core::ModelDescriptor;
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";

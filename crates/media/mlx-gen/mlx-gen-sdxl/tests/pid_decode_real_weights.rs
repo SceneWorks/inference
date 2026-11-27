@@ -146,7 +146,10 @@ fn sdxl_pid_decode_vs_vae() {
     assert_eq!(vae_img.width, size, "VAE width == native");
 
     let pid_req = GenerationRequest {
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();
@@ -225,7 +228,10 @@ fn sdxl_pid_from_ldm_early_stop() {
         count: 1,
         seed: Some(7),
         steps: Some(steps),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -305,7 +311,10 @@ fn use_pid_without_loaded_pid_errors() {
         width: 512,
         height: 512,
         seed: Some(1),
-        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let err = (

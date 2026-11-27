@@ -121,7 +121,11 @@ pub fn route_base() -> RouteRecord {
             adapters: AdapterSurface::unsupported(),
             residency: ResidencySurface {
                 lifetime_graph: vec![
-                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["qwen3_vl_8b"], true),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_8b"],
+                        true,
+                    ),
                     ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["boogu_dit"], false),
                     ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux1_ae"], false),
                 ],
@@ -209,9 +213,10 @@ pub fn route_turbo() -> RouteRecord {
         dimensions: Some((1024, 1024)),
         ..Default::default()
     };
-    route.bindings =
-        RouteBindings::generator(descriptor_turbo, |spec| load_turbo(spec).map_err(Into::into))
-            .with_footprint(component_footprint);
+    route.bindings = RouteBindings::generator(descriptor_turbo, |spec| {
+        load_turbo(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint);
     route
 }
 
@@ -2131,10 +2136,13 @@ mod tests {
             seed: Some(42),
             steps: Some(4),
             sampler: Some("euler".into()),
-            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
-                LowResStartSpec::new(2, Some(0.5))
-                    .with_estimate_source(EstimateSource::PreviousEvaluation),
-            ), ..Default::default() },
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5))
+                        .with_estimate_source(EstimateSource::PreviousEvaluation),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/boogu".into()));

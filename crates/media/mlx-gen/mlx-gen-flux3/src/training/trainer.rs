@@ -1184,7 +1184,9 @@ mod tests {
             .load("flux3_klein_base", &spec_with(vec![trained.clone()]))
             .unwrap();
         assert_eq!(adapted.descriptor().id, "flux3_klein_base");
-        let adapted_report = adapted.generate_with_report(&generation, &mut |_| {}).unwrap();
+        let adapted_report = adapted
+            .generate_with_report(&generation, &mut |_| {})
+            .unwrap();
         let reports = &adapted_report.adapter_apply_reports;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].applied, 54, "every trained projection applies");
@@ -1192,10 +1194,12 @@ mod tests {
         let Some(GenerationOutput::Images(adapted_images)) = adapted_report.output else {
             panic!("image output required")
         };
-        assert_eq!((adapted_images[0].width, adapted_images[0].height), (80, 64));
+        assert_eq!(
+            (adapted_images[0].width, adapted_images[0].height),
+            (80, 64)
+        );
         assert_ne!(
-            adapted_images[0].pixels,
-            bare,
+            adapted_images[0].pixels, bare,
             "the trained adapter must change the generated image"
         );
         let mut inert = trained;

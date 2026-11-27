@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::control::AcceptedControlKinds;
 use crate::driver::{DriverRefusalReasons, DriverSupport};
-use crate::feature::{
-    FeatureInapplicabilityCode, FeatureRegistry, Pass0ConditioningRequirement,
-};
+use crate::feature::{FeatureInapplicabilityCode, FeatureRegistry, Pass0ConditioningRequirement};
 use crate::generator::{
     ActivationMemoryAnchor, ConditioningKind, ControlKind, GenerationRequest, Generator, Modality,
     ModelDescriptor, SizeFloor, StepSupport,
@@ -124,10 +122,7 @@ fn stub_begin_request(
     Ok(None)
 }
 
-fn stub_ref_workspace(
-    _spec: &LoadSpec,
-    _facts: &MemoryReferenceResourceFacts,
-) -> Result<u64> {
+fn stub_ref_workspace(_spec: &LoadSpec, _facts: &MemoryReferenceResourceFacts) -> Result<u64> {
     Ok(4096)
 }
 
@@ -336,11 +331,15 @@ fn register_route_one_call_registers_all_tables_and_computes_capabilities() {
     assert_eq!(registry.generator_descriptors().len(), 2);
     assert!(registry.route_record("pilot_flux_dev").is_some());
     assert!(registry.route_record("pilot_kokoro_82m").is_some());
-    assert!(registry.render_plan_registration("pilot_flux_dev").is_some());
+    assert!(registry
+        .render_plan_registration("pilot_flux_dev")
+        .is_some());
     assert_eq!(registry.memory_strategy_registrations().len(), 1);
     assert_eq!(registry.memory_contract_fixture_registrations().len(), 1);
     assert_eq!(
-        registry.memory_contract_surface_resolver_registrations().len(),
+        registry
+            .memory_contract_surface_resolver_registrations()
+            .len(),
         1
     );
     assert_eq!(registry.memory_behavior_registrations().len(), 1);
@@ -352,9 +351,7 @@ fn register_route_one_call_registers_all_tables_and_computes_capabilities() {
     );
     let dummy_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
     assert_eq!(
-        registry
-            .footprint("pilot_flux_dev", &dummy_spec)
-            .unwrap(),
+        registry.footprint("pilot_flux_dev", &dummy_spec).unwrap(),
         Some(PerComponentBytes {
             text_encoder: 100,
             dit: 200,
@@ -371,10 +368,7 @@ fn register_route_one_call_registers_all_tables_and_computes_capabilities() {
     assert!(registry.descriptor_conformance_errors().is_empty());
 
     // Audio route defaults & limits serialize cleanly.
-    let audio_json = registry
-        .route_record("pilot_kokoro_82m")
-        .unwrap()
-        .to_json();
+    let audio_json = registry.route_record("pilot_kokoro_82m").unwrap().to_json();
     assert_eq!(audio_json["defaults"]["audio_voice"], "af_heart");
     assert_eq!(audio_json["defaults"]["audio_sample_rate"], 24_000);
     fn has_expected_audio_limit(json: &serde_json::Value) -> bool {
@@ -536,8 +530,8 @@ fn tier0_conformance_rejects_negative_fixtures_for_all_behavioural_declarations(
 
     // 7. FamilyDriver DriverSupport carry_history without arbitrary_slice.
     let mut bad_driver = det.clone();
-    bad_driver.structure.denoiser = ModelBinding::FamilyDriver(FamilyDriverSpec::new(
-        DriverSupport {
+    bad_driver.structure.denoiser =
+        ModelBinding::FamilyDriver(FamilyDriverSpec::new(DriverSupport {
             driver_id: "broken_driver",
             arbitrary_slice: false,
             carry_history: true,
@@ -548,8 +542,7 @@ fn tier0_conformance_rejects_negative_fixtures_for_all_behavioural_declarations(
             previous_estimate_capture: false,
             uses_global_rng: false,
             refusal_reasons: DriverRefusalReasons::default(),
-        },
-    ));
+        }));
     assert!(verify_route_conformance(&bad_driver).is_err());
 
     // 8. Adapter surface vs install_policy mismatch.
@@ -728,7 +721,9 @@ fn ap18_registry_indexes_descriptors_without_reinvoking_descriptor_fn_on_lookups
     let _ = registry.generator_descriptor("counted_route").unwrap();
     let _ = registry.route_record("counted_route").unwrap();
     let _ = registry.provider_encoder_contract("counted_route");
-    let _ = registry.activation_memory_bytes_1024("counted_route").unwrap();
+    let _ = registry
+        .activation_memory_bytes_1024("counted_route")
+        .unwrap();
     let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
     let _ = registry.footprint("counted_route", &spec).unwrap();
     let _ = registry
@@ -737,7 +732,9 @@ fn ap18_registry_indexes_descriptors_without_reinvoking_descriptor_fn_on_lookups
     let _ = registry
         .reference_workspace_bytes("counted_route", &spec, None)
         .unwrap();
-    let _ = registry.route_feature_applicability("counted_route").unwrap();
+    let _ = registry
+        .route_feature_applicability("counted_route")
+        .unwrap();
     let _ = registry.load("counted_route", &spec);
 
     assert_eq!(

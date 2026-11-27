@@ -125,12 +125,7 @@ pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
             .as_bytes()
             .iter()
             .copied()
-            .chain(
-                vector
-                    .preview
-                    .iter()
-                    .flat_map(|i| i.pixels.iter().copied()),
-            )
+            .chain(vector.preview.iter().flat_map(|i| i.pixels.iter().copied()))
             .collect(),
     }
 }

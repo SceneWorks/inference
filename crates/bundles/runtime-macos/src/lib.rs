@@ -170,8 +170,12 @@ fn load_starvector_8b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen
 #[cfg(feature = "media")]
 fn build_macos_media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     mlx_gen_catalog::register_providers(gen_core::ProviderRegistryBuilder::new())
-        .register_route(runtime_catalog::starvector::route_mlx_1b(load_starvector_1b))
-        .register_route(runtime_catalog::starvector::route_mlx_8b(load_starvector_8b))
+        .register_route(runtime_catalog::starvector::route_mlx_1b(
+            load_starvector_1b,
+        ))
+        .register_route(runtime_catalog::starvector::route_mlx_8b(
+            load_starvector_8b,
+        ))
         .reject_quant(
             mlx_gen_catalog::media::Quant::Nvfp4,
             mlx_gen_catalog::NVFP4_UNSUPPORTED_REASON,

@@ -886,11 +886,9 @@ fn route_pulid_feature() -> gen_core::RouteRecord {
     route.structure.conditioning.modules = vec!["pulid_idformer"];
     route.structure.weight_plan.requires_ip_adapter_overlay = false;
     route.structure.weight_plan.requires_identity_overlay = true;
-    route.bindings = gen_core::RouteBindings::feature_route(
-        Some(FLUX1_DEV_ID),
-        pulid_feature_descriptor,
-    )
-    .with_render_plan(compile_pulid_feature_route);
+    route.bindings =
+        gen_core::RouteBindings::feature_route(Some(FLUX1_DEV_ID), pulid_feature_descriptor)
+            .with_render_plan(compile_pulid_feature_route);
     route
 }
 
@@ -1047,7 +1045,10 @@ mod explicit_registry_tests {
         assert_eq!(schnell.family, "flux");
         assert_eq!(schnell.backend, "candle");
         assert_eq!(schnell.modality, Modality::Image);
-        assert_eq!(schnell.denoiser_output_latent_space, Some(&FLUX1_LATENT_SPACE));
+        assert_eq!(
+            schnell.denoiser_output_latent_space,
+            Some(&FLUX1_LATENT_SPACE)
+        );
         assert!(schnell.encoder_contract.is_none());
         assert!(schnell.control_kinds.is_none());
         assert!(schnell.required_components.is_empty());
@@ -1070,7 +1071,10 @@ mod explicit_registry_tests {
         assert_eq!(schnell.capabilities.max_size, 2048);
         assert_eq!(schnell.capabilities.max_count, 8);
         assert_eq!(schnell.capabilities.size_floor, SizeFloor::RangeChecked);
-        assert_eq!(schnell.capabilities.supported_steps, StepSupport::Unconstrained);
+        assert_eq!(
+            schnell.capabilities.supported_steps,
+            StepSupport::Unconstrained
+        );
         assert!(!schnell.capabilities.mac_only);
         assert!(!schnell.capabilities.requires_sigma_shift);
         assert!(schnell.capabilities.supports_sequential_offload);
@@ -1085,10 +1089,20 @@ mod explicit_registry_tests {
         let dev = registry.generator_descriptor("flux1_dev").unwrap();
         assert!(dev.capabilities.supports_guidance);
         assert!(dev.capabilities.supports_low_res_start);
-        assert_eq!(dev.capabilities.pag, Some(super::Variant::Dev.pag_capability()));
-        assert_eq!(registry.route_record("flux1_dev").unwrap().defaults.steps, Some(25));
         assert_eq!(
-            registry.route_record("flux1_dev").unwrap().defaults.guidance,
+            dev.capabilities.pag,
+            Some(super::Variant::Dev.pag_capability())
+        );
+        assert_eq!(
+            registry.route_record("flux1_dev").unwrap().defaults.steps,
+            Some(25)
+        );
+        assert_eq!(
+            registry
+                .route_record("flux1_dev")
+                .unwrap()
+                .defaults
+                .guidance,
             Some(3.5)
         );
 
@@ -1096,7 +1110,10 @@ mod explicit_registry_tests {
             .route_record("flux1_dev_control")
             .unwrap()
             .compute_descriptor();
-        assert_eq!(ctrl_desc.capabilities.conditioning, vec![ConditioningKind::Control]);
+        assert_eq!(
+            ctrl_desc.capabilities.conditioning,
+            vec![ConditioningKind::Control]
+        );
         assert_eq!(
             ctrl_desc.control_kinds,
             Some(AcceptedControlKinds::Only(vec![
@@ -1188,11 +1205,14 @@ mod tests {
             prompt: "a blue lamp".into(),
             width: 512,
             height: 512,
-            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![gen_core::GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            }]), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![gen_core::GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
@@ -1285,7 +1305,10 @@ mod tests {
                 assert!(registry.compile_render_plan(id, spec, &req).is_err());
             }
             let pid_req = GenerationRequest {
-                features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                    ..Default::default()
+                },
                 ..req.clone()
             };
             let no_pid = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1536,22 +1559,28 @@ mod tests {
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                    scale: 1.5,
-                    layers: Some(vec![0, 28, 56]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 1.5,
+                        layers: Some(vec![0, 28, 56]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }), ..Default::default() },
+                },
                 ..Default::default()
             })
             .is_ok());
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![57]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![57]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }), ..Default::default() },
+                },
                 ..Default::default()
             })
             .is_err());
@@ -1840,7 +1869,10 @@ mod execution_policy_tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
 
@@ -1869,7 +1901,10 @@ mod execution_policy_tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img),
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
         let img2img_plan = compile_base_plan(Variant::Dev, &img2img_ok).unwrap();
@@ -1877,7 +1912,10 @@ mod execution_policy_tests {
         assert_eq!(img2img_plan.denoise_spans(), vec![0..3, 3..4]);
 
         let img2img_bad_k = GenerationRequest {
-            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..img2img_ok
         };
         assert!(validate_base_request(Variant::Dev, &img2img_bad_k).is_err());
@@ -2224,9 +2262,12 @@ mod execution_policy_tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                features: candle_gen::gen_core::FeatureParams { low_res_start: Some(
-                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ), ..Default::default() },
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(
+                        LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 

@@ -94,7 +94,8 @@ pub fn route_for(variant: Variant) -> RouteRecord {
         )
         .with_memory_behavior_registration(mem_beh);
     if variant == Variant::Base {
-        bindings = bindings.with_activation_memory(crate::BASE_ACTIVATION_MEMORY_REGISTRATION.anchor);
+        bindings =
+            bindings.with_activation_memory(crate::BASE_ACTIVATION_MEMORY_REGISTRATION.anchor);
     }
 
     RouteRecord {
@@ -142,21 +143,13 @@ pub fn route_for(variant: Variant) -> RouteRecord {
             adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
             residency: ResidencySurface {
                 lifetime_graph: vec![
-                    ResidencyPhaseNode::new(
-                        ResidencyPhaseKind::PromptEncode,
-                        ["qwen3_0_6b"],
-                        true,
-                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["qwen3_0_6b"], true),
                     ResidencyPhaseNode::new(
                         ResidencyPhaseKind::Denoise,
                         ["anima_text_conditioner", "cosmos_dit"],
                         false,
                     ),
-                    ResidencyPhaseNode::new(
-                        ResidencyPhaseKind::Decode,
-                        ["qwen_image_vae"],
-                        false,
-                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["qwen_image_vae"], false),
                 ],
                 supports_sequential_offload: true,
                 ..Default::default()

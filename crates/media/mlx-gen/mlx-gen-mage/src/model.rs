@@ -926,9 +926,7 @@ pub fn route_for(variant: MageVariant) -> RouteRecord {
         .with_memory_fixture(
             mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             match variant {
-                MageVariant::Rl => {
-                    |spec| weights_free_memory_strategy_contract("mage_flow", spec)
-                }
+                MageVariant::Rl => |spec| weights_free_memory_strategy_contract("mage_flow", spec),
                 MageVariant::Base => {
                     |spec| weights_free_memory_strategy_contract("mage_flow_base", spec)
                 }
@@ -947,9 +945,7 @@ pub fn route_for(variant: MageVariant) -> RouteRecord {
             },
         )
         .with_memory_surface_resolver(match variant {
-            MageVariant::Rl => {
-                |surface| weights_free_memory_surface_contract("mage_flow", surface)
-            }
+            MageVariant::Rl => |surface| weights_free_memory_surface_contract("mage_flow", surface),
             MageVariant::Base => {
                 |surface| weights_free_memory_surface_contract("mage_flow_base", surface)
             }

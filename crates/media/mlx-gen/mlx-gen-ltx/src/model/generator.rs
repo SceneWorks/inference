@@ -388,7 +388,10 @@ pub(super) fn validate_request_with_route(
     let fps = Ltx::fps(req);
     let resolved_frames = match (
         req.frames,
-        req.extensions.ltx.as_ref().and_then(|ext| ext.auto_duration),
+        req.extensions
+            .ltx
+            .as_ref()
+            .and_then(|ext| ext.auto_duration),
     ) {
         (Some(frames), _) => frames,
         (None, Some(range)) => gen_core_ltx::duration_head::resolve_auto_duration_frames(

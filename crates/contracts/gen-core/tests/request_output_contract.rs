@@ -263,11 +263,7 @@ fn check_core_request_fields(src: &str) -> Vec<String> {
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(after_pub) = trimmed.strip_prefix("pub ") {
-            let field = after_pub
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim();
+            let field = after_pub.split(':').next().unwrap_or("").trim();
             if field.is_empty() {
                 continue;
             }
@@ -346,7 +342,11 @@ fn tool4_generator_trait_has_zero_family_named_methods_and_side_channel_getters(
         }
     "#;
     let neg_hits = check_generator_trait_methods(negative_family);
-    assert_eq!(neg_hits.len(), 2, "expected 2 family-method hits: {neg_hits:?}");
+    assert_eq!(
+        neg_hits.len(),
+        2,
+        "expected 2 family-method hits: {neg_hits:?}"
+    );
 
     let negative_getter = r#"
         pub trait Generator {
@@ -393,7 +393,11 @@ fn tool4_core_request_has_zero_family_specific_top_level_fields() {
         }
     "#;
     let neg_hits = check_core_request_fields(negative);
-    assert_eq!(neg_hits.len(), 3, "expected 3 family-field hits: {neg_hits:?}");
+    assert_eq!(
+        neg_hits.len(),
+        3,
+        "expected 3 family-field hits: {neg_hits:?}"
+    );
 }
 
 #[test]
@@ -439,7 +443,10 @@ fn reg4_boundary_selectors_and_extensions_roundtrip_and_compose() {
     // Selectors parse canonical names into typed variants and preserve unknown strings losslessly.
     assert_eq!(SolverId::from("euler"), SolverId::Euler);
     assert_eq!(SolverId::Euler.as_str(), "euler");
-    assert_eq!(SolverId::from("bogus_solver"), SolverId::Custom("bogus_solver".into()));
+    assert_eq!(
+        SolverId::from("bogus_solver"),
+        SolverId::Custom("bogus_solver".into())
+    );
     assert_eq!(
         serde_json::from_str::<SolverId>(&serde_json::to_string(&SolverId::Dpmpp2m).unwrap())
             .unwrap(),
@@ -454,7 +461,10 @@ fn reg4_boundary_selectors_and_extensions_roundtrip_and_compose() {
         ScheduleId::Beta57
     );
 
-    assert_eq!(GuidanceMethodId::from("cfg_rescale"), GuidanceMethodId::CfgRescale);
+    assert_eq!(
+        GuidanceMethodId::from("cfg_rescale"),
+        GuidanceMethodId::CfgRescale
+    );
     assert_eq!(GuidanceMethodId::CfgPp.as_str(), "cfg_pp");
     assert_eq!(
         serde_json::from_str::<GuidanceMethodId>(
@@ -492,7 +502,14 @@ fn reg4_boundary_selectors_and_extensions_roundtrip_and_compose() {
     assert!(req.use_pid());
     assert_eq!(req.pid_capture_sigma(), Some(0.25));
     assert!(!req.extensions.is_empty());
-    assert_eq!(req.extensions.h3.as_ref().unwrap().reference_image_short_edge, Some(1536));
+    assert_eq!(
+        req.extensions
+            .h3
+            .as_ref()
+            .unwrap()
+            .reference_image_short_edge,
+        Some(1536)
+    );
     assert_eq!(req.extensions.svd.unwrap().motion_bucket_id, Some(127.0));
 
     // Capability-driven extension gating refuses unsupported family extensions without checking model id.
@@ -502,31 +519,38 @@ fn reg4_boundary_selectors_and_extensions_roundtrip_and_compose() {
         max_count: 1,
         ..Default::default()
     };
-    let flux3_req = GenerationRequest::default().with_extension(FamilyExtension::Flux3(
-        Flux3Extension {
+    let flux3_req =
+        GenerationRequest::default().with_extension(FamilyExtension::Flux3(Flux3Extension {
             reference_output: Some(gen_core::flux3::references::ReferenceOutputSize {
                 width: Some(512),
                 height: None,
             }),
             ..Default::default()
-        },
-    ));
-    assert!(base_caps.validate_request("flux3_klein", &flux3_req).is_err());
+        }));
+    assert!(base_caps
+        .validate_request("flux3_klein", &flux3_req)
+        .is_err());
     let flux3_caps = Capabilities {
         supported_family_extensions: vec![FamilyExtensionKind::Flux3],
         ..base_caps.clone()
     };
-    assert!(flux3_caps.validate_request("any_route_id", &flux3_req).is_ok());
+    assert!(flux3_caps
+        .validate_request("any_route_id", &flux3_req)
+        .is_ok());
 
     let moss_req = GenerationRequest::default().with_extension(FamilyExtension::MossImage(
         Box::new(MossImageExtension::from_options(Default::default())),
     ));
-    assert!(base_caps.validate_request("moss_image_sft", &moss_req).is_err());
+    assert!(base_caps
+        .validate_request("moss_image_sft", &moss_req)
+        .is_err());
     let moss_caps = Capabilities {
         supported_family_extensions: vec![FamilyExtensionKind::MossImage],
         ..base_caps
     };
-    assert!(moss_caps.validate_request("any_moss_route", &moss_req).is_ok());
+    assert!(moss_caps
+        .validate_request("any_moss_route", &moss_req)
+        .is_ok());
 }
 
 #[test]
@@ -558,7 +582,10 @@ fn pipe12_vector_output_and_per_run_execution_reports_are_typed() {
     assert_eq!(decoded.prompt_tokens, Some(12));
     assert!(!decoded.truncated);
     assert_eq!(decoded.terminal, vector.terminal);
-    assert!(decoded.preview.is_none(), "preview pixels are skipped in JSON");
+    assert!(
+        decoded.preview.is_none(),
+        "preview pixels are skipped in JSON"
+    );
 
     let descriptor = ModelDescriptor {
         encoder_contract: None,

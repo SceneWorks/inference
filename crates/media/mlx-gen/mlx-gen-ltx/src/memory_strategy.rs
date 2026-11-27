@@ -2355,7 +2355,13 @@ mod tests {
                 ..request.clone()
             },
             GenerationRequest {
-                extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { use_uncensored_enhancer: true, ..Default::default() }), ..Default::default() },
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    ltx: Some(mlx_gen::gen_core::LtxExtension {
+                        use_uncensored_enhancer: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..request.clone()
             },
         ] {
@@ -2402,7 +2408,13 @@ mod tests {
         let mut admitted_uncensored = GenerationRequest {
             enhance_prompt: true,
             enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
-            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { use_uncensored_enhancer: true, ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..enhancer_fixture.request.clone()
         };
         enhancer_scope
@@ -2412,7 +2424,13 @@ mod tests {
         let mut crossed_token_budget = GenerationRequest {
             enhance_prompt: true,
             enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS + 1),
-            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { use_uncensored_enhancer: true, ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..enhancer_fixture.request.clone()
         };
         let error = enhancer_scope
@@ -2449,7 +2467,13 @@ mod tests {
             .unwrap();
         assert!(admitted_standard.memory.unwrap().stage_residency);
         let mut crossed_uncensored = GenerationRequest {
-            extensions: mlx_gen::gen_core::FamilyExtensions { ltx: Some(mlx_gen::gen_core::LtxExtension { use_uncensored_enhancer: true, ..Default::default() }), ..Default::default() },
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..request.clone()
         };
         let error = standard_scope

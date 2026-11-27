@@ -273,9 +273,11 @@ pub(crate) fn route_ip(variant: Variant) -> candle_gen::gen_core::RouteRecord {
     route.seed_and_batch.max_count = 1;
     route.defaults.strength = Some(DEFAULT_IP_SCALE);
     route.bindings = match variant {
-        Variant::Dev => candle_gen::gen_core::RouteBindings::generator(ip_descriptor_dev, load_ip_dev)
-            .with_feature_route(Some(crate::FLUX1_DEV_ID), ip_descriptor_dev)
-            .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Dev, spec, req)),
+        Variant::Dev => {
+            candle_gen::gen_core::RouteBindings::generator(ip_descriptor_dev, load_ip_dev)
+                .with_feature_route(Some(crate::FLUX1_DEV_ID), ip_descriptor_dev)
+                .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Dev, spec, req))
+        }
         Variant::Schnell => {
             candle_gen::gen_core::RouteBindings::generator(ip_descriptor_schnell, load_ip_schnell)
                 .with_feature_route(Some(crate::FLUX1_SCHNELL_ID), ip_descriptor_schnell)
@@ -367,7 +369,11 @@ fn resolve_ip_load_contract(
 ) -> candle_gen::gen_core::Result<(IpAdapterFluxPaths, LoadSpec)> {
     let descriptor = ip_descriptor(variant);
     spec.validate_prepared_file_pins()?;
-    candle_gen::gen_core::reject_unknown_components(spec, &["flux_ip_image_encoder"], descriptor.id)?;
+    candle_gen::gen_core::reject_unknown_components(
+        spec,
+        &["flux_ip_image_encoder"],
+        descriptor.id,
+    )?;
     if spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.identity.is_some()

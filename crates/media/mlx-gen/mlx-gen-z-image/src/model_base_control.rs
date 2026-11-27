@@ -48,7 +48,8 @@ pub const MODEL_ID: &str = "z_image_control";
 pub(crate) fn route_base_control() -> mlx_gen::gen_core::RouteRecord {
     let mut route = crate::model_base::route_base();
     route.route_id = MODEL_ID;
-    route.structure.conditioning.kinds = vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.kinds =
+        vec![ConditioningKind::Control, ConditioningKind::Reference];
     route.structure.conditioning.control_kinds = Some(accepted_kinds());
     route.structure.conditioning.pass0_requirement =
         mlx_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
