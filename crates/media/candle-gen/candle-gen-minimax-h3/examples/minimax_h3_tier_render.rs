@@ -31,11 +31,12 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     })
 }
 
-/// Counts every artifact a load asks the saved-quantization cache for, and refuses to produce one,
-/// so a non-zero count cannot be hidden behind a successful render.
-#[derive(Default)]
+/// Counts every artifact a load asks the saved-quantization cache for. Requested artifacts are
+/// produced under `dir` (the run's own `MINIMAX_H3_OUT`) so an MLX-tier control run still completes;
+/// the count is the evidence.
 struct CountingCache {
     requests: AtomicUsize,
+    dir: PathBuf,
 }
 
 struct NoArtifact(PathBuf);
@@ -57,13 +58,9 @@ impl QuantizationArtifactCache for CountingCache {
             key.digest(),
             key.extension()
         );
-        // Produce into a scratch file so an MLX-tier control run still completes; the count is the
-        // evidence, the file is discarded.
-        let path = std::env::temp_dir().join(format!(
-            "h3-tier-render-{}-{n}.{}",
-            std::process::id(),
-            key.extension()
-        ));
+        let path = self
+            .dir
+            .join(format!("saved-quantization-{n}.{}", key.extension()));
         produce(&path)?;
         Ok(Box::new(NoArtifact(path)))
     }
@@ -106,7 +103,10 @@ fn main() {
         ..Default::default()
     };
 
-    let cache = Arc::new(CountingCache::default());
+    let cache = Arc::new(CountingCache {
+        requests: AtomicUsize::new(0),
+        dir: out.clone(),
+    });
     let _scope = QuantizationCacheContext::new(cache.clone()).install();
     let _runtime = candle_gen::quantization_cache::install_runtime_cache_context();
 
