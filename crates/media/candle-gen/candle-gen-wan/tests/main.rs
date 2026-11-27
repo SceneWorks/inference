@@ -29,6 +29,9 @@ mod conformance_14b;
 #[path = "memory_evidence_axes.rs"]
 mod memory_evidence_axes;
 
+#[path = "sol_attention_real_weights.rs"]
+mod sol_attention_real_weights;
+
 #[path = "trainer_conformance.rs"]
 mod trainer_conformance;
 

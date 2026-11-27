@@ -2150,6 +2150,111 @@
       "features": [
         "cuda"
       ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_kernels_compile_without_local_memory",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 CUDA: every Sol-Attn entry point (14) compiles through the nvrtc seam for the live device with zero local memory (prints registers). Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_ratio_one_is_dense_attention",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 AC1: with topk_ratio 1.0 every key block is routed (counted) and the kernel equals the f32 dense attention within its declared INT8 tolerance (cosine >= 0.999, rel-L2 < 0.016), bf16/f16, ragged/aligned lengths, batch > 1. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_chunked_equals_unchunked",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 AC1: the chunked-query variant (route + exact per query-block window) is bitwise the unchunked call, top-k and tau with sinks, windows 1/7/64/150 blocks. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_matches_the_reference_at_sparse_budgets",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 E2: the kernel vs the full-precision eager reference (comfy-kitchen's) at top-k 0.05/0.2/0.5 (cosine > 0.995) and tau 0.5/2 (> 0.998), and a bigger budget moves toward dense attention. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_forced_sinks_carry_a_sink_dependent_fixture",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 mutation guard: a sink-dependent fixture (a key block of +-u pairs whose pooled score is ~0) stays >= 0.99 cosine to dense with the forced sink block and falls below it without (dropping the forced sinks fails). Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sol_attention::cuda_tests::cuda_sol_wan_shape_smoke",
+      "source": "crates/kernels/candle-quant-kernels/src/sol_attention.rs",
+      "reason": "SW-6137 CUDA: one Wan2.2 A14B 480x832x81 self-attention shape (40x128, S=32760) per top-k budget: routed density and ms/call. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "fused_attention::tests::cuda_sol_takes_wan_self_attention_through_the_shared_helper",
+      "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
+      "reason": "SW-6137 dispatch: inside a Sol-Attn scope a Wan-shaped self-attention takes the sol kernel (counted) bitwise equal to the direct call, topk 1.0 equals the f32 reference (cosine >= 0.999, rel-L2 < 0.016), the text cross attention is refused as cross_attention, a training scope never takes it. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
     }
   ]
 }

@@ -321851,5 +321851,63 @@
       "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Wan2.2 T2V-A14B snapshot tier (WAN14B_SNAPSHOT, e.g. the SceneWorks q4 tier) through load_t2v_14b_with_options, Wan14bEngineOptions default (FlashAttention) vs sol_attention: Some(top_k(0.25)); fixed seed 42, 832x480 x 17 frames x 6 steps; crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "required_environment": [],
+    "device_witness": "The clips count FlashAttention-2 calls (default engine) and one Sol-Attn call per denoise self-attention (sol engine: 2 CFG forwards x 40 blocks x 6 steps, zero refusals) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines and the sol clip's PSNR against the flash clip (all frames; recorded, not gated: the sparse trajectory diverges from flash), asserts every sol frame keeps a pixel standard deviation of at least 8 (no degenerate decode) and saves the first and last frame of each clip.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed clip with the default engine and with the sol_attention engine (top-k 0.25), check the route counts, compare PSNR and s/step, save frames."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+      "requirements": []
+    }
   }
 ]
