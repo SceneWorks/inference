@@ -27,8 +27,10 @@ pub struct AdapterSpec {
 
 /// One adapter file's actual provider-side install outcome.
 ///
-/// Providers that can partially accept an adapter publish these reports through
-/// [`Generator::adapter_apply_reports`](crate::Generator::adapter_apply_reports) after generation.
+/// Providers that can partially accept an adapter publish these reports inside
+/// [`GenerationReport::adapter_apply_reports`](crate::GenerationReport::adapter_apply_reports)
+/// returned by [`Generator::generate_with_report`](crate::Generator::generate_with_report) and
+/// [`Generator::generate_with_execution_report`](crate::Generator::generate_with_execution_report).
 /// The report is deliberately tensor-free and additive to the existing generator contract: providers
 /// that do not opt in return an empty list, preserving their current behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]

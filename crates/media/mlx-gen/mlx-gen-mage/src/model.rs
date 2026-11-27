@@ -1002,6 +1002,7 @@ pub fn route_for(variant: MageVariant) -> RouteRecord {
                 } else {
                     vec![]
                 },
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: vec![],
@@ -1045,6 +1046,7 @@ pub fn route_for(variant: MageVariant) -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,

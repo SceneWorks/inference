@@ -92,6 +92,7 @@ pub fn route_base() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -135,6 +136,7 @@ pub fn route_base() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,
@@ -629,7 +631,7 @@ impl Boogu {
         self.residency.run(
             &req.cancel,
             // Boogu's PiD overlay is held on the generator, not the heavy bundle; the loader ignores it.
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: true-CFG mllm conditioning (Sequential loads the mllm, encodes, materializes,
             // drops it + clear_cache before the DiT/VAE load; Resident borrows the warm encoder).
@@ -677,8 +679,8 @@ impl Boogu {
                         steps,
                         text_guidance_scale: guidance,
                         seed: base_seed.wrapping_add(n as u64),
-                        sampler: req.sampler.clone(),
-                        scheduler: req.scheduler.clone(),
+                        sampler: req.sampler.as_deref().map(str::to_owned),
+                        scheduler: req.scheduler.as_deref().map(str::to_owned),
                     };
                     let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
                     let img = match &clean {
@@ -752,13 +754,13 @@ impl Boogu {
             seed: base_seed,
             condition_on_image: true,
             use_input_images_4_neg_instruct: false,
-            sampler: req.sampler.clone(),
-            scheduler: req.scheduler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
         };
 
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |enc: &BooguEncoders| match run {
                 Some(run) => run.encode(|| {
@@ -830,7 +832,7 @@ impl Boogu {
         // "noisy x_k at σ>0" to hand PiD, and Turbo is decode-bound (sc-7993), so the `from_ldm`
         // early-stop has no benefit. Reject `pid_capture_sigma` loudly; the Base variant is the
         // supported path for from_ldm (sc-8048). Resolved before the residency (validation-shaped).
-        if req.use_pid && req.pid_capture_sigma.is_some() {
+        if req.use_pid() && req.pid_capture_sigma().is_some() {
             return Err(Error::Msg(format!(
                 "{id}: pid_capture_sigma (from_ldm early-stop) is not supported on the Boogu Turbo \
                  few-step DMD path — it is decode-bound with no early-stop benefit and the DMD loop \
@@ -854,7 +856,7 @@ impl Boogu {
 
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |enc: &BooguEncoders| enc.encode_turbo_preflight(&preflight),
             |encoded: Option<&BooguBaseCond>| match encoded {
@@ -883,8 +885,8 @@ impl Boogu {
                         conditioning_sigma: DEFAULT_TURBO_SIGMA,
                         guidance: req.guidance.unwrap_or(0.0),
                         scheduler_shift: req.scheduler_shift,
-                        sampler: req.sampler.clone(),
-                        scheduler: req.scheduler.clone(),
+                        sampler: req.sampler.as_deref().map(str::to_owned),
+                        scheduler: req.scheduler.as_deref().map(str::to_owned),
                     };
                     let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
                     let img = match &clean {
@@ -1081,7 +1083,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     } else {
         resolve_reference(req, id)?;
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == BOOGU_IMAGE_TURBO_ID {
             return Err(Error::Unsupported(format!(
                 "{id}: low_res_start is not supported on the Boogu Turbo DMD student path (ENG-5)"
@@ -2129,10 +2131,10 @@ mod tests {
             seed: Some(42),
             steps: Some(4),
             sampler: Some("euler".into()),
-            low_res_start: Some(
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
                 LowResStartSpec::new(2, Some(0.5))
                     .with_estimate_source(EstimateSource::PreviousEvaluation),
-            ),
+            ), ..Default::default() },
             ..Default::default()
         };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/boogu".into()));
@@ -2190,7 +2192,7 @@ mod tests {
         // Base T2I with low_res_start compiles a two-phase RenderPlan
         let mut t2i = req(1024, 1024);
         t2i.steps = Some(10);
-        t2i.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        t2i.features.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
         let plan = registry
             .compile_render_plan(BOOGU_IMAGE_ID, &spec, &t2i)
             .unwrap()
@@ -2210,7 +2212,7 @@ mod tests {
             image: img(512, 512),
             strength: Some(0.6),
         }];
-        i2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        i2i.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
         let i2i_plan = registry
             .compile_render_plan(BOOGU_IMAGE_ID, &spec, &i2i)
             .unwrap()
@@ -2234,7 +2236,7 @@ mod tests {
         assert_eq!(edit_plan.phase_output_size(0), (1024, 1024));
 
         let mut edit_lrs = edit_req.clone();
-        edit_lrs.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        edit_lrs.features.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
         assert!(registry
             .compile_render_plan(BOOGU_IMAGE_EDIT_ID, &spec, &edit_lrs)
             .is_err());

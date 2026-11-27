@@ -173,7 +173,7 @@ fn main() -> Result<()> {
         seed: Some(seed),
         steps: Some(steps),
         guidance: Some(guidance),
-        sampler: sampler.clone(),
+        sampler: (sampler.clone()).map(Into::into),
         ..Default::default()
     };
 

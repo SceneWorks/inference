@@ -1064,7 +1064,7 @@ pub(crate) fn transformer_window(
              request"
         )));
     }
-    if req.use_pid {
+    if req.use_pid() {
         return Err(mlx_gen::Error::Unsupported(format!(
             "{provider_id}: bounded transformer residency is not implemented for the PiD decode \
              overlay"
@@ -1111,7 +1111,7 @@ pub(crate) fn decode_tiling(
     // production render path and not only at selection time.
     decode_routes(provider_id)
         .map_err(|error| mlx_gen::Error::Unsupported(error.to_string()))?
-        .validate(req.use_pid, Some(edge), Some(overlap))
+        .validate(req.use_pid(), Some(edge), Some(overlap))
         .map_err(mlx_gen::Error::Unsupported)?;
     Ok(Some(TilingConfig::spatial_only(
         edge as i32,

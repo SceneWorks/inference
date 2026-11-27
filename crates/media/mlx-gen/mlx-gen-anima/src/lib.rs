@@ -189,7 +189,7 @@ mod explicit_registry_tests {
                 height: 1024,
                 steps: Some(6),
                 seed: Some(19),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
                 ..Default::default()
             };
             let plan = registry

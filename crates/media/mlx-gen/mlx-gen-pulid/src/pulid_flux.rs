@@ -77,6 +77,7 @@ pub(crate) fn route_pulid_flux() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
                 supports_negative_prompt: true,
                 modules: vec!["pulid_idformer", "eva_clip", "arcface"],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers,
@@ -135,6 +136,7 @@ pub(crate) fn route_pulid_flux() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: true,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -428,7 +430,7 @@ pub(crate) fn compile_plan(
             "pulid_flux needs encoder, EVA and face identity weights before load".into(),
         ));
     }
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(
             "pulid_flux PiD decode needs a loaded overlay".into(),
         ));
@@ -670,7 +672,10 @@ impl PulidFlux {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
             let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
             let start_cfg = req
-                .timestep_to_start_cfg
+                .extensions
+                .pulid
+                .as_ref()
+                .and_then(|p| p.timestep_to_start_cfg)
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
             observe_cfg_branch(Some(start_cfg));
@@ -1455,7 +1460,7 @@ mod tests {
         .remove(0);
 
         assert!(!fixture.context.has_phases);
-        assert!(fixture.request.phases.is_none());
+        assert!(fixture.request.features.phases.is_none());
         assert_eq!(fixture.context.geometry.reference_count, 1);
         assert_eq!(fixture.request.conditioning.len(), 1);
         Generator::validate(&weightless_pulid(), &fixture.request).unwrap();
@@ -1575,14 +1580,14 @@ mod tests {
             width: 512,
             height: 512,
             steps: Some(4),
-            pag: Some(gen_core::PagConfig {
-                scale: 1.5,
-                ..Default::default()
-            }),
             conditioning: vec![Conditioning::Reference {
                 image: img(),
                 strength: None,
             }],
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }), ..Default::default() },
             ..Default::default()
         };
         let resolved = desc

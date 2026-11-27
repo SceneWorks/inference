@@ -156,11 +156,11 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
         height: size,
         count: 1,
         seed: Some(11),
-        use_pid: true,
         conditioning: vec![Conditioning::Reference {
             image: reference.clone(),
             strength: Some(strength),
         }],
+        features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
         ..Default::default()
     };
 
@@ -183,7 +183,12 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
 
     // --- (2) img2img + from_ldm early-stop PiD (the sc-10121 combo) ---
     let early_req = GenerationRequest {
-        pid_capture_sigma: Some(capture_sigma),
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::with_capture_sigma(
+                capture_sigma,
+            )),
+            ..Default::default()
+        },
         ..base_img2img.clone()
     };
 

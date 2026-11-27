@@ -69,6 +69,7 @@ pub(crate) fn route_scail2() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
                 supports_negative_prompt: true,
                 modules: vec!["clip_vit_h14"],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: vec!["unipc", "dpm++"],
@@ -132,6 +133,7 @@ pub(crate) fn route_scail2() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -862,7 +864,7 @@ mod tests {
             );
             // ...and it fails closed: a request that asks for memory is refused, not admitted.
             let mut memory_request = GenerationRequest {
-                video_mode: Some("animation".to_owned()),
+                video_mode: Some("animation".into()),
                 ..Default::default()
             };
             memory_request.memory = Some(mlx_gen::gen_core::GenerationMemory::default());
@@ -878,7 +880,7 @@ mod tests {
             (None, false),
         ] {
             let request = GenerationRequest {
-                video_mode: mode.map(str::to_owned),
+                video_mode: mode.map(Into::into),
                 ..Default::default()
             };
             assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");

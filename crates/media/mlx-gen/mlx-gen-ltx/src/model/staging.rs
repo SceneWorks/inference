@@ -224,7 +224,13 @@ impl Ltx {
         video_ctx: &Array,
         audio_ctx: &Array,
     ) -> Result<GenerationRequest> {
-        if req.auto_duration.is_none() {
+        if req
+            .extensions
+            .ltx
+            .as_ref()
+            .and_then(|ltx| ltx.auto_duration)
+            .is_none()
+        {
             return Ok(req.clone());
         }
         let duration_head = &self.ltx25_execution()?.duration_head;

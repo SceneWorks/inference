@@ -490,17 +490,18 @@ pub fn validate_memory_request(request: &GenerationRequest) -> gen_core::Result<
         .is_some_and(|sampler| !mlx_gen::curated_sampler_names().contains(&sampler));
     let frames = request.frames.unwrap_or_default();
     let steps = request.steps.unwrap_or_default();
-    let conditioning_fps = request.conditioning_fps.unwrap_or_default();
-    let motion = request.motion_bucket_id.unwrap_or(f32::NAN);
-    let noise = request.noise_aug_strength.unwrap_or(f32::NAN);
-    let chunk = request.decode_chunk_size.unwrap_or_default();
+    let svd = request.extensions.svd.as_ref();
+    let conditioning_fps = svd.and_then(|s| s.conditioning_fps).unwrap_or_default();
+    let motion = svd.and_then(|s| s.motion_bucket_id).unwrap_or(f32::NAN);
+    let noise = svd.and_then(|s| s.noise_aug_strength).unwrap_or(f32::NAN);
+    let chunk = svd.and_then(|s| s.decode_chunk_size).unwrap_or_default();
     if !matches!(request.video_mode.as_deref(), None | Some("image_to_video"))
         || !request.prompt.is_empty()
         || request.negative_prompt.is_some()
         || request.guidance.is_some()
         || request.true_cfg.is_some()
         || request.audio.is_some()
-        || request.phases.is_some()
+        || request.features.phases.is_some()
         || request.count != 1
         || !PUBLIC_GEOMETRIES.contains(&(request.width, request.height))
         || !(1..=25).contains(&frames)
@@ -517,9 +518,13 @@ pub fn validate_memory_request(request: &GenerationRequest) -> gen_core::Result<
         || request.scheduler.is_some()
         || request.scheduler_shift.is_some()
         || unsupported_sampler
-        || request.use_pid
+        || request.use_pid()
         || request.enhance_prompt
-        || request.use_uncensored_enhancer
+        || request
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
         || request
             .memory
             .is_some_and(|memory| memory != gen_core::GenerationMemory::default())
@@ -552,10 +557,11 @@ pub fn request_evidence_revision(
     hash.update(request.height.to_le_bytes());
     hash.update(request.frames.unwrap().to_le_bytes());
     hash.update(request.fps.unwrap().to_le_bytes());
-    hash.update(request.conditioning_fps.unwrap().to_le_bytes());
-    hash.update(request.motion_bucket_id.unwrap().to_bits().to_le_bytes());
-    hash.update(request.noise_aug_strength.unwrap().to_bits().to_le_bytes());
-    hash.update(request.decode_chunk_size.unwrap().to_le_bytes());
+    let svd = request.extensions.svd.as_ref().unwrap();
+    hash.update(svd.conditioning_fps.unwrap().to_le_bytes());
+    hash.update(svd.motion_bucket_id.unwrap().to_bits().to_le_bytes());
+    hash.update(svd.noise_aug_strength.unwrap().to_bits().to_le_bytes());
+    hash.update(svd.decode_chunk_size.unwrap().to_le_bytes());
     hash.update(request.steps.unwrap().to_le_bytes());
     hash.update(request.seed.unwrap().to_le_bytes());
     hash.update(
@@ -835,7 +841,6 @@ mod tests {
             width: 256,
             height: 320,
             frames: Some(5),
-            decode_chunk_size: Some(64),
             steps: Some(3),
             conditioning: vec![Conditioning::Reference {
                 image: Image {
@@ -845,6 +850,7 @@ mod tests {
                 },
                 strength: None,
             }],
+            extensions: mlx_gen::gen_core::FamilyExtensions { svd: Some(mlx_gen::gen_core::SvdExtension { decode_chunk_size: Some(64), ..Default::default() }), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -916,7 +922,7 @@ mod tests {
         );
         req.sampler = Some("euler".into());
         assert!(plan.bind_admission(&spec, None, &req).is_err());
-        req.decode_chunk_size = Some(1);
+        req.extensions.svd_mut().decode_chunk_size = Some(1);
         req.frames = None;
         let other = registry
             .compile_video_plan(crate::MODEL_ID, &spec, &req)
@@ -1199,7 +1205,7 @@ mod tests {
             count: 1,
             seed: Some(17),
             steps: Some(25),
-            sampler: Some("heun".to_owned()),
+            sampler: Some("heun".into()),
             conditioning: vec![Conditioning::Reference {
                 image: Image {
                     width: 320,
@@ -1210,11 +1216,8 @@ mod tests {
             }],
             frames: Some(25),
             fps: Some(7),
-            video_mode: Some("image_to_video".to_owned()),
-            motion_bucket_id: Some(127.0),
-            noise_aug_strength: Some(0.02),
-            decode_chunk_size: Some(8),
-            conditioning_fps: Some(7),
+            video_mode: Some("image_to_video".into()),
+            extensions: mlx_gen::gen_core::FamilyExtensions { svd: Some(mlx_gen::gen_core::SvdExtension { motion_bucket_id: Some(127.0), noise_aug_strength: Some(0.02), decode_chunk_size: Some(8), conditioning_fps: Some(7), ..Default::default() }), ..Default::default() },
             ..Default::default()
         }
     }

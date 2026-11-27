@@ -142,7 +142,7 @@ fn run_mode(label: &str, replace: bool, quant: Option<Quant>) {
         steps: Some(steps as u32),
         seed: Some(7),
         fps: Some(16),
-        video_mode: replace.then(|| "replacement".to_string()),
+        video_mode: (replace.then(|| "replacement".to_string())).map(Into::into),
         conditioning: vec![
             Conditioning::Reference {
                 image: reference,

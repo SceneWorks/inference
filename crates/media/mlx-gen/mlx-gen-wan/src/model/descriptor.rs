@@ -22,6 +22,7 @@ pub(crate) fn route_ti2v() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: wan_samplers(),
@@ -78,6 +79,7 @@ pub(crate) fn route_ti2v() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,

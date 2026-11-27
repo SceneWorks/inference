@@ -1216,7 +1216,7 @@ impl Generator for QwenImageGenerator {
                     .into(),
             ));
         }
-        if req.use_pid
+        if req.use_pid()
             && req.memory.is_some_and(|memory| {
                 memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
             })
@@ -1231,7 +1231,7 @@ impl Generator for QwenImageGenerator {
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text| run.encode(|| self.pipe.encode_phase(text, req)),
             |_| Ok(self.pipe.device.synchronize()?),
@@ -1276,7 +1276,7 @@ pub(crate) fn validate_request(req: &GenerationRequest) -> gen_core::Result<()> 
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let steps = resolve_steps(req.steps);
         let native = pipeline::qwen_sigmas(steps, req.width, req.height);
         let mu = pipeline::qwen_mu(req.width, req.height);
@@ -1618,6 +1618,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: candle_gen::curated_sampler_names(),
@@ -1680,6 +1681,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -2846,11 +2848,11 @@ mod execution_policy_tests {
 
         let zero_req = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![30]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(desc
@@ -2867,11 +2869,11 @@ mod execution_policy_tests {
 
         let oob_req = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(candle_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![60]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(desc
@@ -2948,7 +2950,7 @@ mod execution_policy_tests {
             height: 1024,
             steps: Some(20),
             seed: Some(42),
-            low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(7, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry

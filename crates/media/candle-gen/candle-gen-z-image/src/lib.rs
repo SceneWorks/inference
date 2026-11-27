@@ -590,7 +590,7 @@ impl Generator for ZImageGenerator {
                                 .into(),
                         ));
                     }
-                    if req.use_pid {
+                    if req.use_pid() {
                         return Err(gen_core::Error::Unsupported(
                             "z_image_turbo: PiD decode is not supported under sequential residency; use the \
                              native VAE route or resident policy"
@@ -626,7 +626,7 @@ impl Generator for ZImageGenerator {
                 let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
                 let start_step = match &reference {
                     Some((_, strength)) => {
-                        if req.low_res_start.is_some() {
+                        if req.features.low_res_start.is_some() {
                             gen_core::resolve_img2img_init_time_step(steps, *strength)?
                         } else {
                             pipeline::init_time_step(steps, *strength)
@@ -672,7 +672,7 @@ pub(crate) fn validate_low_res_start_for(
     let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
     let start_step = match &reference {
         Some((_, strength)) => {
-            if req.low_res_start.is_some() {
+            if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(steps, *strength)?
             } else {
                 pipeline::init_time_step(steps, *strength)
@@ -681,7 +681,7 @@ pub(crate) fn validate_low_res_start_for(
         None => 0,
     };
     let executed_steps = steps.saturating_sub(start_step).max(1);
-    if let Some(low_res) = req.low_res_start.as_ref() {
+    if let Some(low_res) = req.features.low_res_start.as_ref() {
         low_res.resolve_for_descriptor(descriptor, req, executed_steps, SIZE_MULTIPLE)?;
     }
     Ok(())
@@ -737,7 +737,7 @@ pub(crate) fn compile_trajectory_for(
     let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
     let start_step = match &reference {
         Some((_, strength)) => {
-            if req.low_res_start.is_some() {
+            if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(steps, *strength)?
             } else {
                 pipeline::init_time_step(steps, *strength)
@@ -948,7 +948,7 @@ fn compile_control_for(
     } else {
         turbo_control_descriptor()
     };
-    if req.low_res_start.is_some() {
+    if req.features.low_res_start.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: low_res_start conflicts with pass-0 control conditioning (VACE control latents are full-resolution bound)",
             desc.id
@@ -2086,11 +2086,11 @@ mod tests {
         let generator = load(&spec).expect("lazy sequential generator");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
-            use_pid: true,
             memory: Some(gen_core::GenerationMemory {
                 stage_residency: true,
                 ..Default::default()
             }),
+            features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let error = generator.generate(&req, &mut |_| {}).unwrap_err();
@@ -2208,10 +2208,10 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 0.0,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         desc.capabilities.validate_request(MODEL_ID, &noop).unwrap();
@@ -2222,10 +2222,10 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 1.2,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         let resolved = desc
@@ -2240,11 +2240,11 @@ mod tests {
 
         let oob = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 1.0,
                 layers: Some(vec![30]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(desc.capabilities.validate_request(MODEL_ID, &oob).is_err());
@@ -2302,7 +2302,7 @@ mod explicit_registry_tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         for id in ["z_image_turbo", "z_image"] {
@@ -2332,7 +2332,7 @@ mod explicit_registry_tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(1, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = registry
@@ -2400,7 +2400,7 @@ mod explicit_registry_tests {
                 .expect("compiled control plan");
             assert_eq!(plan.denoise_spans(), vec![0..8]);
             let mut bad = control_req.clone();
-            bad.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+            bad.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
             let err = (planner.compile)(&control_spec, &bad).unwrap_err();
             assert!(
                 matches!(err, candle_gen::gen_core::Error::Unsupported(_)),

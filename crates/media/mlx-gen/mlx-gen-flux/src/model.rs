@@ -434,7 +434,7 @@ impl Flux1 {
         let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
             return Ok(None);
         };
-        if req.use_pid
+        if req.use_pid()
             || !memory.stage_residency
             || !self
                 .memory_strategy
@@ -827,12 +827,12 @@ impl Flux1 {
         // bundle: a PiD request keeps Conditioning open across the residency handoff until the
         // decoder (and its caption) is prepared; an ordinary single-source img2img request also
         // keeps Conditioning open until its init image is VAE-encoded at phase-0 geometry.
-        let hold_conditioning = conditioning_started || req.use_pid || req.source_image.is_some();
+        let hold_conditioning = conditioning_started || req.use_pid() || req.source_image.is_some();
         let result = self.residency.run_request_scoped(
             stage_residency,
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &FluxTextOwned| {
                 if hold_conditioning {
@@ -1090,12 +1090,12 @@ impl Flux1 {
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
         // As in the single-branch path, a PiD request holds Conditioning through decoder preparation.
-        let hold_conditioning = conditioning_started || req.use_pid;
+        let hold_conditioning = conditioning_started || req.use_pid();
         let result = self.residency.run_request_scoped(
             matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &FluxTextOwned| {
                 let encode_text = || {
@@ -1718,7 +1718,7 @@ pub(crate) fn compile_ip_adapter(
             variant.id()
         )));
     }
-    if req.low_res_start.is_some() {
+    if req.features.low_res_start.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}_ip_adapter: low_res_start is not supported by this model route",
             variant.id()
@@ -1743,7 +1743,7 @@ pub(crate) fn compile_base(
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: PiD decode needs a loaded overlay",
             variant.id()
@@ -1846,7 +1846,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id
         )));
     }
-    if req.phases.is_some() {
+    if req.features.phases.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: multi-phase denoise (phases) is not supported",
             desc.id
@@ -1945,7 +1945,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             }
         }
     }
-    if req.low_res_start.is_some() {
+    if req.features.low_res_start.is_some() {
         if !desc.capabilities.supports_low_res_start {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start is not supported by this model route",
@@ -2102,7 +2102,7 @@ mod tests {
                 .unwrap()
                 .expect("loaded generator must open its registered request scope");
             let mut request = fixture.request.clone();
-            request.use_pid = use_pid;
+            request.features.pid = (use_pid).then(mlx_gen::gen_core::PidParams::enabled);
             scope.configure_request(&mut request).unwrap();
             assert!(request.memory.unwrap().stage_residency);
         }
@@ -2499,13 +2499,13 @@ mod tests {
         );
         assert_eq!(
             model
-                .matches("let hold_conditioning = conditioning_started || req.use_pid || req.source_image.is_some();")
+                .matches("let hold_conditioning = conditioning_started || req.use_pid() || req.source_image.is_some();")
                 .count(),
             1
         );
         assert_eq!(
             model
-                .matches("let hold_conditioning = conditioning_started || req.use_pid;")
+                .matches("let hold_conditioning = conditioning_started || req.use_pid();")
                 .count(),
             1
         );
@@ -3030,7 +3030,7 @@ mod tests {
             .requested_transformer_window(&wrong_component, None)
             .is_err());
         let mut pid = request.clone();
-        pid.use_pid = true;
+        pid.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
         assert!(model.requested_transformer_window(&pid, None).is_err());
 
         std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v2").unwrap();
@@ -3068,7 +3068,7 @@ mod tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..base_req.clone()
         };
 
@@ -3098,7 +3098,7 @@ mod tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img.clone()),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
             ..base_req.clone()
         };
         let img2img_plan = compile_trajectory(FluxVariant::Dev, &img2img_ok).unwrap();
@@ -3107,7 +3107,7 @@ mod tests {
 
         // K = 4 >= M = 4 after strength truncation is refused with a typed error!
         let img2img_bad_k = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..img2img_ok
         };
         assert!(validate_request(&descriptor_dev(), &img2img_bad_k).is_err());
@@ -3405,9 +3405,9 @@ mod tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                low_res_start: Some(
+                features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(
                     LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ),
+                ), ..Default::default() },
                 ..Default::default()
             };
 
@@ -3550,7 +3550,7 @@ mod tests {
                 },
                 strength: Some(0.75),
             }],
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
 

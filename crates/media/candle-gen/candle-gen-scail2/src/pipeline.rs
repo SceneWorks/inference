@@ -1351,7 +1351,7 @@ mod tests {
             (None, false),
         ] {
             let request = GenerationRequest {
-                video_mode: mode.map(str::to_owned),
+                video_mode: mode.map(Into::into),
                 ..Default::default()
             };
             assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");
@@ -2049,7 +2049,7 @@ mod tests {
             guidance: Some(5.0),
             seed: Some(18473),
             fps: Some(16),
-            video_mode: Some("animation".to_owned()),
+            video_mode: Some("animation".into()),
             conditioning: vec![
                 Conditioning::Reference {
                     image: image([120, 80, 40]),

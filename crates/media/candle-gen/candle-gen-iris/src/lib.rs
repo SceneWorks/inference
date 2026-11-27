@@ -122,6 +122,7 @@ fn route_depth_composed() -> candle_gen::gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             ..Default::default()
         },
@@ -163,6 +164,7 @@ fn route_restore_composed() -> candle_gen::gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             ..Default::default()
         },

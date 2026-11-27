@@ -34,8 +34,9 @@ use crate::feature::{
     FeatureApplicability, FeatureMemoryEffect, Pass0ConditioningRequirement, TransitionResidency,
 };
 use crate::generator::{
-    AudioEditMode, Capabilities, ComponentPrecisionFloor, ConditioningKind, ControlKind, Modality,
-    ModelDescriptor, SizeFloor, StagedResidencyAvailability, StepSupport,
+    AudioEditMode, Capabilities, ComponentPrecisionFloor, ConditioningKind, ControlKind,
+    FamilyExtensionKind, Modality, ModelDescriptor, SizeFloor, StagedResidencyAvailability,
+    StepSupport,
 };
 use crate::image_embed::ImageEmbedderDescriptor;
 use crate::latent::{
@@ -668,6 +669,10 @@ impl ExportedRouteV2 {
                     record.structure.conditioning.pass0_requirement,
                 )
                 .to_string(),
+                low_res_start_forbids_reference_conditioning: record
+                    .structure
+                    .conditioning
+                    .low_res_start_forbids_reference_conditioning,
                 aligned: derive_conditioning_alignment(
                     &capabilities.conditioning,
                     record.structure.conditioning.pass0_requirement,
@@ -771,6 +776,7 @@ impl ExportedRouteV2 {
                     .weight_plan
                     .requires_ip_adapter_overlay,
                 requires_identity_overlay: record.structure.weight_plan.requires_identity_overlay,
+                supports_ar_load_controls: record.structure.weight_plan.supports_ar_load_controls,
                 text_encoders: record
                     .structure
                     .text_encoders
@@ -832,7 +838,7 @@ impl ExportedRouteV2 {
         let modes = derive_route_modes(
             descriptor.modality,
             capabilities,
-            Pass0ConditioningRequirement::NoiseStartSupported,
+            capabilities.pass0_requirement,
             control_required,
         );
         let alternate_decoder_ids = derive_alternate_decoders(
@@ -903,13 +909,16 @@ impl ExportedRouteV2 {
                     .control_kinds
                     .as_ref()
                     .map(ExportedControlKindsV2::from_accepted),
-                pass0_requirement: pass0_requirement_name(
-                    Pass0ConditioningRequirement::NoiseStartSupported,
-                )
-                .to_string(),
+                pass0_requirement: pass0_requirement_name(capabilities.pass0_requirement)
+                    .to_string(),
+                low_res_start_forbids_reference_conditioning: capabilities.supports_low_res_start
+                    && capabilities
+                        .conditioning
+                        .contains(&ConditioningKind::Reference)
+                    && !capabilities.allows_low_res_start_single_ref_img2img,
                 aligned: derive_conditioning_alignment(
                     &capabilities.conditioning,
-                    Pass0ConditioningRequirement::NoiseStartSupported,
+                    capabilities.pass0_requirement,
                 ),
                 supports_negative_prompt: capabilities.supports_negative_prompt,
                 modules: Vec::new(),
@@ -998,6 +1007,7 @@ impl ExportedRouteV2 {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                supports_ar_load_controls: capabilities.supports_ar_load_controls,
                 text_encoders: Vec::new(),
                 upsamplers: Vec::new(),
                 has_encoder_contract: descriptor.encoder_contract.is_some(),
@@ -1208,6 +1218,7 @@ pub struct ExportedConditioningSurfaceV2 {
     pub kinds: Vec<String>,
     pub control_kinds: Option<ExportedControlKindsV2>,
     pub pass0_requirement: String,
+    pub low_res_start_forbids_reference_conditioning: bool,
     pub aligned: ConditioningAlignment,
     pub supports_negative_prompt: bool,
     pub modules: Vec<String>,
@@ -1521,6 +1532,7 @@ pub struct ExportedWeightPlanV2 {
     pub requires_control_overlay: bool,
     pub requires_ip_adapter_overlay: bool,
     pub requires_identity_overlay: bool,
+    pub supports_ar_load_controls: bool,
     pub text_encoders: Vec<ExportedTextEncoderV2>,
     pub upsamplers: Vec<String>,
     pub has_encoder_contract: bool,
@@ -1561,6 +1573,7 @@ pub struct ExportedCapabilitiesV2 {
     pub supports_caption_overflow_policy: bool,
     pub supports_h3_image_sampler: bool,
     pub max_prompt_tokens: Option<u32>,
+    pub max_enhance_tokens: Option<u32>,
     pub supports_alpha_output: bool,
     pub supports_prompt_enhancement: bool,
     pub supports_streaming: bool,
@@ -1583,6 +1596,7 @@ pub struct ExportedCapabilitiesV2 {
     pub supports_conversation_session: bool,
     pub supported_quants: Vec<String>,
     pub component_precision_floors: Vec<ExportedComponentPrecisionFloorV2>,
+    pub supports_ar_load_controls: bool,
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
     pub supports_sequential_offload: bool,
@@ -1592,106 +1606,170 @@ pub struct ExportedCapabilitiesV2 {
     pub pag: Option<PagCapability>,
     pub supports_phases: bool,
     pub supports_low_res_start: bool,
+    pub pass0_requirement: String,
+    pub allows_low_res_start_single_ref_img2img: bool,
+    pub supported_family_extensions: Vec<FamilyExtensionKind>,
 }
 
 impl ExportedCapabilitiesV2 {
     pub fn from_capabilities(caps: &Capabilities) -> Self {
+        let Capabilities {
+            supports_negative_prompt,
+            supports_guidance,
+            supports_true_cfg,
+            conditioning,
+            supports_lora,
+            supports_lokr,
+            samplers,
+            schedulers,
+            supported_guidance_methods,
+            min_size,
+            max_size,
+            max_count,
+            supported_steps,
+            mac_only,
+            size_floor,
+            audio_sample_rates,
+            max_audio_duration_secs,
+            audio_voices,
+            audio_languages,
+            audio_edit_modes,
+            supports_preview,
+            supports_hdr,
+            supports_cfg_interval,
+            supports_prompt_batch,
+            supports_caption_overflow_policy,
+            supports_h3_image_sampler,
+            max_prompt_tokens,
+            max_enhance_tokens,
+            supports_alpha_output,
+            supports_prompt_enhancement,
+            supports_streaming,
+            supports_multi_speaker,
+            max_speakers,
+            supports_segmented_lyrics,
+            supports_repetition_penalty,
+            supports_reference_region,
+            supports_output_limiter,
+            supports_symbolic_song,
+            supports_audio_artifacts,
+            supports_song_plan_only,
+            supports_song_cover,
+            request_memory_strategies,
+            supports_auto_duration,
+            supports_generated_keyframes,
+            max_temporal_upsample_rounds,
+            supports_diffusion_decoder,
+            supports_conversation_history,
+            supports_conversation_session,
+            supported_quants,
+            component_precision_floors,
+            supports_ar_load_controls,
+            supports_kv_cache,
+            requires_sigma_shift,
+            supports_sequential_offload,
+            unconditionally_engages_staged_residency,
+            execution,
+            approximation,
+            pag,
+            supports_phases,
+            supports_low_res_start,
+            pass0_requirement,
+            allows_low_res_start_single_ref_img2img,
+            supported_family_extensions,
+        } = caps;
+
         Self {
-            supports_negative_prompt: caps.supports_negative_prompt,
-            supports_guidance: caps.supports_guidance,
-            supports_true_cfg: caps.supports_true_cfg,
-            conditioning: caps
-                .conditioning
+            supports_negative_prompt: *supports_negative_prompt,
+            supports_guidance: *supports_guidance,
+            supports_true_cfg: *supports_true_cfg,
+            conditioning: conditioning
                 .iter()
                 .copied()
                 .map(conditioning_name)
                 .map(str::to_string)
                 .collect(),
-            supports_lora: caps.supports_lora,
-            supports_lokr: caps.supports_lokr,
-            samplers: caps.samplers.iter().map(|s| (*s).to_string()).collect(),
-            schedulers: caps.schedulers.iter().map(|s| (*s).to_string()).collect(),
-            supported_guidance_methods: caps
-                .supported_guidance_methods
+            supports_lora: *supports_lora,
+            supports_lokr: *supports_lokr,
+            samplers: samplers.iter().map(|s| (*s).to_string()).collect(),
+            schedulers: schedulers.iter().map(|s| (*s).to_string()).collect(),
+            supported_guidance_methods: supported_guidance_methods
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
-            min_size: caps.min_size,
-            max_size: caps.max_size,
-            max_count: caps.max_count,
-            supported_steps: ExportedStepSupportV2::from_step_support(&caps.supported_steps),
-            mac_only: caps.mac_only,
-            size_floor: ExportedSizeFloorV2::from_size_floor(caps.size_floor),
-            audio_sample_rates: caps.audio_sample_rates.clone(),
-            max_audio_duration_secs: caps.max_audio_duration_secs,
-            audio_voices: caps.audio_voices.iter().map(|v| (*v).to_string()).collect(),
-            audio_languages: caps
-                .audio_languages
-                .iter()
-                .map(|l| (*l).to_string())
-                .collect(),
-            audio_edit_modes: caps
-                .audio_edit_modes
+            min_size: *min_size,
+            max_size: *max_size,
+            max_count: *max_count,
+            supported_steps: ExportedStepSupportV2::from_step_support(supported_steps),
+            mac_only: *mac_only,
+            size_floor: ExportedSizeFloorV2::from_size_floor(*size_floor),
+            audio_sample_rates: audio_sample_rates.clone(),
+            max_audio_duration_secs: *max_audio_duration_secs,
+            audio_voices: audio_voices.iter().map(|v| (*v).to_string()).collect(),
+            audio_languages: audio_languages.iter().map(|l| (*l).to_string()).collect(),
+            audio_edit_modes: audio_edit_modes
                 .iter()
                 .copied()
                 .map(audio_edit_mode_name)
                 .map(str::to_string)
                 .collect(),
-            supports_preview: caps.supports_preview,
-            supports_hdr: caps.supports_hdr,
-            supports_cfg_interval: caps.supports_cfg_interval,
-            supports_prompt_batch: caps.supports_prompt_batch,
-            supports_caption_overflow_policy: caps.supports_caption_overflow_policy,
-            supports_h3_image_sampler: caps.supports_h3_image_sampler,
-            max_prompt_tokens: caps.max_prompt_tokens,
-            supports_alpha_output: caps.supports_alpha_output,
-            supports_prompt_enhancement: caps.supports_prompt_enhancement,
-            supports_streaming: caps.supports_streaming,
-            supports_multi_speaker: caps.supports_multi_speaker,
-            max_speakers: caps.max_speakers,
-            supports_segmented_lyrics: caps.supports_segmented_lyrics,
-            supports_repetition_penalty: caps.supports_repetition_penalty,
-            supports_reference_region: caps.supports_reference_region,
-            supports_output_limiter: caps.supports_output_limiter,
-            supports_symbolic_song: caps.supports_symbolic_song,
-            supports_audio_artifacts: caps.supports_audio_artifacts,
-            supports_song_plan_only: caps.supports_song_plan_only,
-            supports_song_cover: caps.supports_song_cover,
-            request_memory_strategies: caps
-                .request_memory_strategies
+            supports_preview: *supports_preview,
+            supports_hdr: *supports_hdr,
+            supports_cfg_interval: *supports_cfg_interval,
+            supports_prompt_batch: *supports_prompt_batch,
+            supports_caption_overflow_policy: *supports_caption_overflow_policy,
+            supports_h3_image_sampler: *supports_h3_image_sampler,
+            max_prompt_tokens: *max_prompt_tokens,
+            max_enhance_tokens: *max_enhance_tokens,
+            supports_alpha_output: *supports_alpha_output,
+            supports_prompt_enhancement: *supports_prompt_enhancement,
+            supports_streaming: *supports_streaming,
+            supports_multi_speaker: *supports_multi_speaker,
+            max_speakers: *max_speakers,
+            supports_segmented_lyrics: *supports_segmented_lyrics,
+            supports_repetition_penalty: *supports_repetition_penalty,
+            supports_reference_region: *supports_reference_region,
+            supports_output_limiter: *supports_output_limiter,
+            supports_symbolic_song: *supports_symbolic_song,
+            supports_audio_artifacts: *supports_audio_artifacts,
+            supports_song_plan_only: *supports_song_plan_only,
+            supports_song_cover: *supports_song_cover,
+            request_memory_strategies: request_memory_strategies
                 .iter()
                 .copied()
                 .map(memory_strategy_name)
                 .map(str::to_string)
                 .collect(),
-            supports_auto_duration: caps.supports_auto_duration,
-            supports_generated_keyframes: caps.supports_generated_keyframes,
-            max_temporal_upsample_rounds: caps.max_temporal_upsample_rounds,
-            supports_diffusion_decoder: caps.supports_diffusion_decoder,
-            supports_conversation_history: caps.supports_conversation_history,
-            supports_conversation_session: caps.supports_conversation_session,
-            supported_quants: caps
-                .supported_quants
+            supports_auto_duration: *supports_auto_duration,
+            supports_generated_keyframes: *supports_generated_keyframes,
+            max_temporal_upsample_rounds: *max_temporal_upsample_rounds,
+            supports_diffusion_decoder: *supports_diffusion_decoder,
+            supports_conversation_history: *supports_conversation_history,
+            supports_conversation_session: *supports_conversation_session,
+            supported_quants: supported_quants
                 .iter()
                 .copied()
                 .map(quant_name)
                 .map(str::to_string)
                 .collect(),
-            component_precision_floors: caps
-                .component_precision_floors
+            component_precision_floors: component_precision_floors
                 .iter()
                 .copied()
                 .map(ExportedComponentPrecisionFloorV2::from_floor)
                 .collect(),
-            supports_kv_cache: caps.supports_kv_cache,
-            requires_sigma_shift: caps.requires_sigma_shift,
-            supports_sequential_offload: caps.supports_sequential_offload,
-            unconditionally_engages_staged_residency: caps.unconditionally_engages_staged_residency,
-            execution: ExportedExecutionSurfaceV2::from_surface(&caps.execution),
-            approximation: ExportedApproximationSurfaceV2::from_surface(&caps.approximation),
-            pag: caps.pag.clone(),
-            supports_phases: caps.supports_phases,
-            supports_low_res_start: caps.supports_low_res_start,
+            supports_ar_load_controls: *supports_ar_load_controls,
+            supports_kv_cache: *supports_kv_cache,
+            requires_sigma_shift: *requires_sigma_shift,
+            supports_sequential_offload: *supports_sequential_offload,
+            unconditionally_engages_staged_residency: *unconditionally_engages_staged_residency,
+            execution: ExportedExecutionSurfaceV2::from_surface(execution),
+            approximation: ExportedApproximationSurfaceV2::from_surface(approximation),
+            pag: pag.clone(),
+            supports_phases: *supports_phases,
+            supports_low_res_start: *supports_low_res_start,
+            pass0_requirement: pass0_requirement_name(*pass0_requirement).to_string(),
+            allows_low_res_start_single_ref_img2img: *allows_low_res_start_single_ref_img2img,
+            supported_family_extensions: supported_family_extensions.clone(),
         }
     }
 }
@@ -3064,5 +3142,103 @@ mod tests {
             exported.modes,
             vec!["image_to_image", "image_to_video", "video_to_video"]
         );
+    }
+
+    #[test]
+    fn export_preserves_sw6981_capabilities_and_detects_disagreement() {
+        let mut route = sample_low_res_route();
+        route.structure.text_encoders.max_enhance_tokens = Some(4096);
+        route.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+        route
+            .structure
+            .conditioning
+            .low_res_start_forbids_reference_conditioning = true;
+        route.structure.weight_plan.supports_ar_load_controls = true;
+        route.structure.supported_family_extensions = vec![
+            FamilyExtensionKind::Flux3,
+            FamilyExtensionKind::MossImage,
+        ];
+
+        let exported_route = ExportedRouteV2::from_route_record(&route, None, false);
+        assert_eq!(exported_route.capabilities.max_enhance_tokens, Some(4096));
+        assert!(
+            exported_route
+                .conditioning
+                .low_res_start_forbids_reference_conditioning
+        );
+        assert!(
+            !exported_route
+                .capabilities
+                .allows_low_res_start_single_ref_img2img
+        );
+        assert!(exported_route.weight_plan.supports_ar_load_controls);
+        assert!(exported_route.capabilities.supports_ar_load_controls);
+        assert_eq!(
+            exported_route.capabilities.pass0_requirement,
+            "noise_start_supported"
+        );
+        assert_eq!(
+            exported_route.capabilities.supported_family_extensions,
+            vec![FamilyExtensionKind::Flux3, FamilyExtensionKind::MossImage]
+        );
+
+        let export_a = sample_export(exported_route);
+        let bytes = export_a.to_canonical_json_bytes().unwrap();
+        let round_tripped = CapabilitiesExportV2::from_json_bytes(&bytes).unwrap();
+        assert_eq!(round_tripped, export_a);
+
+        // Mutating each newly wired capability field must trigger RouteDefinitionMismatch.
+        let mut diff_enhance = export_a.clone();
+        diff_enhance
+            .routes
+            .get_mut("sample_flux")
+            .unwrap()
+            .capabilities
+            .max_enhance_tokens = Some(2048);
+        let err = verify_runtime_against_export(&diff_enhance, &export_a).unwrap_err();
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::RouteDefinitionMismatch));
+
+        let mut diff_ext = export_a.clone();
+        diff_ext
+            .routes
+            .get_mut("sample_flux")
+            .unwrap()
+            .capabilities
+            .supported_family_extensions
+            .pop();
+        let err = verify_runtime_against_export(&diff_ext, &export_a).unwrap_err();
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::RouteDefinitionMismatch));
+
+        let mut diff_ar = export_a.clone();
+        diff_ar
+            .routes
+            .get_mut("sample_flux")
+            .unwrap()
+            .capabilities
+            .supports_ar_load_controls = false;
+        let err = verify_runtime_against_export(&diff_ar, &export_a).unwrap_err();
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::RouteDefinitionMismatch));
+
+        let mut diff_lrs_ref = export_a.clone();
+        diff_lrs_ref
+            .routes
+            .get_mut("sample_flux")
+            .unwrap()
+            .conditioning
+            .low_res_start_forbids_reference_conditioning = false;
+        let err = verify_runtime_against_export(&diff_lrs_ref, &export_a).unwrap_err();
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::RouteDefinitionMismatch));
     }
 }

@@ -773,7 +773,7 @@ impl QwenMemoryScope {
 impl MemoryRequestScope for QwenMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.use_pid {
+        if request.use_pid() != self.use_pid {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: request PiD route changed after memory admission",
                 self.provider_id

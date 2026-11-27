@@ -53,6 +53,7 @@ pub(crate) fn route_supra2() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: vec![s2::SAMPLER],
@@ -106,6 +107,7 @@ pub(crate) fn route_supra2() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -546,7 +548,7 @@ impl Supra2Image {
                 "{PROVIDER_ID}: only resident execution is implemented"
             )));
         }
-        if request.use_pid {
+        if request.use_pid() {
             return Err(Error::Unsupported(format!(
                 "{PROVIDER_ID}: PiD decoding is not available for the SD VAE latent space"
             )));

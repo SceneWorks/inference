@@ -674,7 +674,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         )));
     }
     single_reference(req)?;
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
         let executed_steps = sigmas[start_step..].len().saturating_sub(1);
         low_res.resolve_for_descriptor(desc, req, executed_steps, SIZE_MULTIPLE)?;
@@ -746,7 +746,7 @@ pub(crate) fn compile_base(
         )));
     }
     resolve_root(spec, id)?;
-    if req.use_pid {
+    if req.use_pid() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{id}: PiD decode is not supported on SD3.5"
         )));

@@ -331,10 +331,6 @@ impl Generator for MiniMaxH3 {
         })
     }
 
-    fn veda_execution_report(&self) -> Option<mlx_gen::gen_core::VedaExecutionReport> {
-        Some(self.veda_report.borrow().clone())
-    }
-
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -375,14 +371,22 @@ impl Generator for MiniMaxH3 {
                 ),
             });
         }
+        report.family_report = Some(mlx_gen::gen_core::FamilyExecutionReport::Veda(Box::new(
+            self.veda_report.borrow().clone(),
+        )));
         Ok(report)
     }
 
-    fn veda_workspace_bound(
+    fn request_workspace_bound(
         &self,
-        req: mlx_gen::gen_core::veda::workspace::Request<'_>,
-    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
-        crate::memory_strategy::veda_workspace_bound_for_contract(req, &self.memory_strategy)
+        req: &GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RequestWorkspaceBound>> {
+        let veda_req = mlx_gen::gen_core::veda::workspace::Request::from(req);
+        Ok(crate::memory_strategy::veda_workspace_bound_for_contract(
+            veda_req,
+            &self.memory_strategy,
+        )?
+        .map(mlx_gen::gen_core::RequestWorkspaceBound::SparseAttention))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {

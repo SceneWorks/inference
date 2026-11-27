@@ -181,7 +181,7 @@ fn main() -> Result<()> {
         guidance,
         frames,
         fps,
-        sampler,
+        sampler: sampler.map(Into::into),
         ..Default::default()
     };
 

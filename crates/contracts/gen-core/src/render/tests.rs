@@ -39,36 +39,39 @@ fn adapter_phase_request() -> GenerationRequest {
     GenerationRequest {
         count: 2,
         seed: Some(11),
-        phases: Some(vec![
-            GenerationPhase {
-                steps: 1,
-                guidance: Some(0.0),
-                adapters: vec![],
-            },
-            GenerationPhase {
-                steps: 2,
-                guidance: None,
-                adapters: vec![
-                    PhaseAdapter {
-                        adapter: 1,
-                        weight: Some(-0.25),
-                    },
-                    PhaseAdapter {
-                        adapter: 0,
-                        weight: None,
-                    },
-                    PhaseAdapter {
-                        adapter: 1,
-                        weight: Some(1.25),
-                    },
-                ],
-            },
-            GenerationPhase {
-                steps: 1,
-                guidance: Some(0.0),
-                adapters: vec![],
-            },
-        ]),
+        features: crate::FeatureParams {
+            phases: Some(vec![
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![],
+                },
+                GenerationPhase {
+                    steps: 2,
+                    guidance: None,
+                    adapters: vec![
+                        PhaseAdapter {
+                            adapter: 1,
+                            weight: Some(-0.25),
+                        },
+                        PhaseAdapter {
+                            adapter: 0,
+                            weight: None,
+                        },
+                        PhaseAdapter {
+                            adapter: 1,
+                            weight: Some(1.25),
+                        },
+                    ],
+                },
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![],
+                },
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -134,13 +137,17 @@ fn krea_plan_lowers_ordered_phase_arguments_and_binds_the_request_and_load() {
     swapped.adapters.swap(0, 1);
     assert!(plan.check_load_spec(&swapped).is_err());
     let mut changed = req.clone();
-    changed.phases.as_mut().unwrap()[1].adapters.swap(0, 1);
+    changed.features.phases.as_mut().unwrap()[1]
+        .adapters
+        .swap(0, 1);
     assert!(plan.check_request(&descriptor, &changed).is_err());
     changed = req.clone();
-    changed.pag = Some(crate::PagConfig::default());
+    changed.features.pag = Some(crate::PagConfig::default());
     assert!(plan.check_request(&descriptor, &changed).is_err());
     changed = req;
-    changed.text_style_gain = Some(0.75);
+    changed.extensions.krea = Some(crate::KreaExtension {
+        text_style_gain: Some(0.75),
+    });
     assert!(plan.check_request(&descriptor, &changed).is_err());
 }
 
@@ -227,10 +234,12 @@ fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
             .unwrap();
     assert_eq!(short.denoise_spans(), [0..1, 1..2]);
     assert_eq!(short.capture_sigma(), 0.0);
-    req.phases.as_mut().unwrap()[2].adapters.push(PhaseAdapter {
-        adapter: 2,
-        weight: None,
-    });
+    req.features.phases.as_mut().unwrap()[2]
+        .adapters
+        .push(PhaseAdapter {
+            adapter: 2,
+            weight: None,
+        });
     assert!(
         RenderPlan::krea_multiphase(
             &descriptor,
@@ -241,7 +250,7 @@ fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
         .is_err(),
         "an adapter in a clipped phase is still validated"
     );
-    req.phases.as_mut().unwrap()[2].adapters.clear();
+    req.features.phases.as_mut().unwrap()[2].adapters.clear();
     let long = RenderPlan::krea_multiphase(
         &descriptor,
         &spec,
@@ -259,16 +268,19 @@ fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
 fn krea_pag_receipt_counts_the_prefix_on_the_full_ddim_uniform_grid() {
     let req = GenerationRequest {
         scheduler: Some("ddim_uniform".into()),
-        phases: Some(vec![
-            GenerationPhase {
-                steps: 16,
-                ..Default::default()
-            },
-            GenerationPhase {
-                steps: 15,
-                ..Default::default()
-            },
-        ]),
+        features: crate::FeatureParams {
+            phases: Some(vec![
+                GenerationPhase {
+                    steps: 16,
+                    ..Default::default()
+                },
+                GenerationPhase {
+                    steps: 15,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let sigmas =
@@ -1360,11 +1372,19 @@ fn exact_multi_pass_plan_retains_pins_and_terminal_reference_controls_across_pla
             ..live.clone()
         },
         GenerationRequest {
-            text_style_gain: Some(0.8),
+            extensions: crate::FamilyExtensions {
+                krea: Some(crate::KreaExtension {
+                    text_style_gain: Some(0.8),
+                }),
+                ..Default::default()
+            },
             ..live.clone()
         },
         GenerationRequest {
-            pag: Some(crate::PagConfig::default()),
+            features: crate::FeatureParams {
+                pag: Some(crate::PagConfig::default()),
+                ..Default::default()
+            },
             ..live.clone()
         },
         GenerationRequest {
@@ -2069,7 +2089,7 @@ fn s10_decode_inner_driver_cancellation_preserves_scope_ownership() {
 #[test]
 fn krea_multiphase_intentionally_excludes_use_pid() {
     let mut req = adapter_phase_request();
-    req.use_pid = true;
+    req.features.pid = Some(crate::PidParams::enabled());
     let err = RenderPlan::krea_multiphase(
         &adapter_phase_descriptor(),
         &adapter_phase_spec(),

@@ -256,8 +256,9 @@ impl LtxRenderPlanInput {
         fps: f32,
         has_temporal_upsampler: bool,
     ) -> Self {
-        let generated_slots = req.num_generated_keyframes.unwrap_or(0);
-        let temporal_rounds = req.temporal_upsample_rounds.unwrap_or(0);
+        let ltx = req.extensions.ltx.as_ref();
+        let generated_slots = ltx.and_then(|ext| ext.num_generated_keyframes).unwrap_or(0);
+        let temporal_rounds = ltx.and_then(|ext| ext.temporal_upsample_rounds).unwrap_or(0);
         let uses_dfr = generated_slots > 0 || temporal_rounds > 0;
         let clip_count = req.video_clips().len() + usize::from(req.control_clip().is_some());
         let keyframe_count = req
@@ -309,7 +310,7 @@ impl LtxRenderPlanInput {
             variant,
             route,
             conditioning,
-            sampler: req.sampler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
             width: req.width,
             height: req.height,
             frames: resolved_frames,
@@ -1217,7 +1218,13 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(1),
-            num_generated_keyframes: Some(1),
+            extensions: gen_core::FamilyExtensions {
+                ltx: Some(gen_core::LtxExtension {
+                    num_generated_keyframes: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let req_err = LtxRenderPlan::from_generation_request(

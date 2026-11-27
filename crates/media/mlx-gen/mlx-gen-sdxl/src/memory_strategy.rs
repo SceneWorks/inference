@@ -1566,8 +1566,8 @@ fn decode_tiling_with_contract(
         ));
     }
     let (edge, overlap) =
-        resolve_decode_geometry(req.use_pid, memory.decode_tile_edge, memory.decode_overlap);
-    validate_route_blind_decode(crate::MODEL_ID, req.use_pid, edge, overlap)
+        resolve_decode_geometry(req.use_pid(), memory.decode_tile_edge, memory.decode_overlap);
+    validate_route_blind_decode(crate::MODEL_ID, req.use_pid(), edge, overlap)
         .map_err(|error| mlx_gen::Error::Unsupported(error.to_string()))?;
     // `validate` refused a missing value on either route, so both are present here.
     let (Some(edge), Some(overlap)) = (edge, overlap) else {
@@ -1969,13 +1969,13 @@ mod tests {
 
         // The request-side resolver: the selected geometry, the published default, and the refusals.
         let tiled = |edge: Option<u32>, overlap: Option<u32>, use_pid: bool| GenerationRequest {
-            use_pid,
             memory: Some(GenerationMemory {
                 tile_vae_decode: true,
                 decode_tile_edge: edge,
                 decode_overlap: overlap,
                 ..Default::default()
             }),
+            features: mlx_gen::gen_core::FeatureParams { pid: (use_pid).then(mlx_gen::gen_core::PidParams::enabled), ..Default::default() },
             ..Default::default()
         };
         let spatial = |req: &GenerationRequest| {

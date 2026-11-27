@@ -262,6 +262,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec!["qwen3_vl_vision"],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -318,6 +319,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
@@ -1197,6 +1199,8 @@ impl QwenImage21 {
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 }
@@ -1305,7 +1309,7 @@ pub(crate) fn validate_request_with_schedule(
             )));
         }
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if !req.conditioning.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with pass-0 reference/edit conditioning",
@@ -1907,11 +1911,11 @@ mod tests {
         let turbo = descriptor_turbo();
         let zero = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![16]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(Variant::Base, &base.capabilities, &zero).is_ok());
@@ -1925,11 +1929,11 @@ mod tests {
 
         let oob = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
                 scale: 0.0,
                 layers: Some(vec![32]),
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(validate_request(Variant::Turbo, &turbo.capabilities, &oob).is_err());
@@ -1968,7 +1972,7 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(20),
-            low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(6, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let base_plan = compile_render_plan(&spec, &base_req)
@@ -1983,7 +1987,7 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let turbo_plan = compile_render_plan_turbo(&spec, &turbo_req)

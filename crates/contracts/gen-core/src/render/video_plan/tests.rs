@@ -283,13 +283,16 @@ fn cached_placement_and_real_pixels_are_bound_before_provider_work() {
     image.pixels[0] ^= 1;
     assert!(execute(&actual, &changed).is_err());
     changed = request();
-    changed.low_res_start = Some(crate::LowResStartSpec::new(1, None));
+    changed.features.low_res_start = Some(crate::LowResStartSpec::new(1, None));
     assert!(registry()
         .compile_video_plan(descriptor().id, &spec, &changed)
         .is_err());
     assert!(execute(&actual, &changed).is_err());
-    changed.low_res_start = None;
-    changed.conditioning_fps = Some(6);
+    changed.features.low_res_start = None;
+    changed.extensions.svd = Some(crate::SvdExtension {
+        conditioning_fps: Some(6),
+        ..Default::default()
+    });
     assert!(execute(&actual, &changed).is_err());
     actual.latent_frames = 1;
     assert!(execute(&actual, &req).is_err());

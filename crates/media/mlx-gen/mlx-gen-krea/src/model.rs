@@ -366,6 +366,7 @@ pub fn route_turbo() -> RouteRecord {
                 max_prompt_tokens: None,
                 supports_caption_overflow_policy: false,
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: ConditioningSurface {
                 kinds: vec![ConditioningKind::Reference],
@@ -373,6 +374,7 @@ pub fn route_turbo() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: curated_sampler_names(),
@@ -424,6 +426,7 @@ pub fn route_turbo() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::LatentProjection,
@@ -1501,7 +1504,10 @@ impl Krea {
             // Raw branch below); `None`/g≈1 is a no-op.
             let pos = maybe_apply_style_gain(
                 text.encode_grounded_from_vision(&gv, &req.prompt)?,
-                req.text_style_gain,
+                req.extensions
+                    .krea
+                    .as_ref()
+                    .and_then(|ext| ext.text_style_gain),
             )?;
             let neg = if encode_neg {
                 Some(text.encode_grounded_from_vision(&gv, negative)?)
@@ -1513,7 +1519,13 @@ impl Krea {
             // POSITIVE context carries the Krea "text style" tap-reweight gain (sc-11878); the
             // CFG-negative context is encoded WITHOUT it so the knob steers only the conditional
             // prediction (mirrors candle-gen-krea `encode_prompt_context`). `None`/g≈1 is a no-op.
-            let pos = maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+            let pos = maybe_apply_style_gain(
+                text.encode(&req.prompt)?,
+                req.extensions
+                    .krea
+                    .as_ref()
+                    .and_then(|ext| ext.text_style_gain),
+            )?;
             let neg = if encode_neg {
                 Some(text.encode(negative)?)
             } else {
@@ -1555,7 +1567,7 @@ impl Krea {
                 }
                 Some(plan)
             }
-            None if req.phases.is_some() => {
+            None if req.features.phases.is_some() => {
                 compiled = compile_multiphase_plan(&self.descriptor, &self.file_pin_spec, req)?;
                 Some(&compiled)
             }
@@ -1577,7 +1589,7 @@ impl Krea {
         // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &KreaText| {
                 let encode = || {
@@ -1919,8 +1931,8 @@ impl Krea {
             height: req.height,
             steps,
             seed: request.base_seed.wrapping_add(n as u64),
-            sampler: req.sampler.clone(),
-            scheduler: req.scheduler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
             transformer_window_size: request.transformer_window_size,
             memory: req.memory.unwrap_or_default(),
             provider_id: self.descriptor.id,
@@ -2114,7 +2126,7 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
         0.0
     };
     let effective_guidance = req.guidance.unwrap_or(default_guidance);
-    match req.phases.as_deref() {
+    match req.features.phases.as_deref() {
         Some(phases) if id == KREA_2_RAW_ID && !phases.is_empty() => phases.iter().any(|phase| {
             crate::pipeline::krea_uses_cfg(phase.guidance.unwrap_or(effective_guidance))
         }),
@@ -2243,7 +2255,7 @@ fn compile_multiphase_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> Result<RenderPlan> {
-    let total = req.phases.as_ref().map_or(0, |phases| {
+    let total = req.features.phases.as_ref().map_or(0, |phases| {
         phases.iter().map(|phase| phase.steps as usize).sum()
     });
     let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
@@ -2275,7 +2287,7 @@ pub(crate) fn compile_raw_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<RenderPlan>> {
-    if req.phases.is_none() {
+    if req.features.phases.is_none() {
         return Ok(None);
     }
     let descriptor = raw_descriptor();
@@ -2296,7 +2308,7 @@ pub(crate) fn compile_raw_render_plan(
 /// plan compilation time (the count isn't on the descriptor). A
 /// no-op when `req.phases` is `None` (the ordinary single-phase render).
 fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
-    let Some(phases) = req.phases.as_ref() else {
+    let Some(phases) = req.features.phases.as_ref() else {
         return Ok(());
     };
     if id != KREA_2_RAW_ID {
@@ -2315,7 +2327,7 @@ fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
              supported (sc-13884 v1)"
         )));
     }
-    if req.use_pid {
+    if req.use_pid() {
         return Err(Error::Msg(format!(
             "{id}: multi-phase denoise does not support the PiD decoder yet (sc-13884 follow-on)"
         )));
@@ -2343,7 +2355,7 @@ fn ensure_multiphase_allowed_for(
     has_diff_patch: bool,
     req: &GenerationRequest,
 ) -> Result<()> {
-    if req.phases.is_some() && has_diff_patch {
+    if req.features.phases.is_some() && has_diff_patch {
         return Err(Error::Msg(format!(
             "{id}: multi-phase denoise is not supported on a model loaded with a diff-patch \
              (.diff/.diff_b) adapter — a diff-patch folds irreversibly into the base weights at load \
@@ -2815,7 +2827,7 @@ mod tests {
             width: 256,
             height: 256,
             sampler: Some("heun".into()),
-            phases: Some(vec![
+            features: mlx_gen::gen_core::FeatureParams { phases: Some(vec![
                 gen_core::GenerationPhase {
                     steps: 1,
                     guidance: Some(0.0),
@@ -2826,7 +2838,7 @@ mod tests {
                     guidance: Some(2.5),
                     ..Default::default()
                 },
-            ]),
+            ]), ..Default::default() },
             ..Default::default()
         };
         let plan = compile_raw_render_plan(&spec, &request).unwrap().unwrap();
@@ -2841,7 +2853,7 @@ mod tests {
             .arguments()
             .uses_classifier_free_guidance());
         assert!(plan.adapter_phases_need_negative());
-        request.phases = None;
+        request.features.phases = None;
         assert!(compile_raw_render_plan(&spec, &request).unwrap().is_none());
     }
 
@@ -3795,8 +3807,7 @@ mod tests {
         let steps = full.len() - 1; // 8-step flow-match schedule (len = steps + 1).
         let start_of = |strength: f32| init_time_step(steps, Some(strength)).min(full.len() - 1);
         let capture_req = |ceiling: f32| GenerationRequest {
-            use_pid: true,
-            pid_capture_sigma: Some(ceiling),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams { capture_sigma: Some(ceiling) }), ..Default::default() },
             ..Default::default()
         };
 
@@ -4589,7 +4600,7 @@ mod tests {
 
     fn phase_req(phases: Vec<mlx_gen::GenerationPhase>) -> GenerationRequest {
         GenerationRequest {
-            phases: Some(phases),
+            features: mlx_gen::gen_core::FeatureParams { phases: Some(phases), ..Default::default() },
             ..req(1024, 1024)
         }
     }
@@ -4691,7 +4702,7 @@ mod tests {
             .contains("renders from pure noise"));
 
         let mut with_pid = phase_req(vec![phase(8, None)]);
-        with_pid.use_pid = true;
+        with_pid.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
         assert!(validate_request(&raw_descriptor(), &with_pid)
             .unwrap_err()
             .to_string()
@@ -4702,7 +4713,7 @@ mod tests {
     #[test]
     fn single_phase_request_is_unaffected() {
         assert!(validate_request(&raw_descriptor(), &req(1024, 1024)).is_ok());
-        assert_eq!(req(1024, 1024).phases, None);
+        assert_eq!(req(1024, 1024).features.phases, None);
     }
 
     #[test]
@@ -4756,7 +4767,7 @@ mod tests {
             kind: mlx_gen::ControlKind::Pose,
             scale: Some(1.0),
         }];
-        ctrl_req.pag = Some(mlx_gen::gen_core::PagConfig {
+        ctrl_req.features.pag = Some(mlx_gen::gen_core::PagConfig {
             scale: 1.2,
             ..Default::default()
         });
@@ -4786,7 +4797,7 @@ mod tests {
 
             // Valid curated default + explicit boundary blocks 0..28.
             let mut ok_default = base.clone();
-            ok_default.pag = Some(PagConfig {
+            ok_default.features.pag = Some(PagConfig {
                 scale: 1.5,
                 ..Default::default()
             });
@@ -4799,7 +4810,7 @@ mod tests {
             assert_eq!(resolved.layers, vec![14]);
 
             let mut ok_bounds = base.clone();
-            ok_bounds.pag = Some(PagConfig {
+            ok_bounds.features.pag = Some(PagConfig {
                 scale: 1.5,
                 layers: Some(vec![27, 0, 14, 0]),
                 ..Default::default()
@@ -4817,7 +4828,7 @@ mod tests {
             // scale == 0.0 is a strict zero-pass no-op (`resolve_pag` -> None), while still
             // validating block indices `0..28`.
             let mut zero_noop = base.clone();
-            zero_noop.pag = Some(PagConfig {
+            zero_noop.features.pag = Some(PagConfig {
                 scale: 0.0,
                 layers: Some(vec![14]),
                 ..Default::default()
@@ -4829,7 +4840,7 @@ mod tests {
             );
 
             let mut bad_zero_layer = base.clone();
-            bad_zero_layer.pag = Some(PagConfig {
+            bad_zero_layer.features.pag = Some(PagConfig {
                 scale: 0.0,
                 layers: Some(vec![28]),
                 ..Default::default()
@@ -4862,7 +4873,7 @@ mod tests {
                 },
             ] {
                 let mut invalid = base.clone();
-                invalid.pag = Some(bad);
+                invalid.features.pag = Some(bad);
                 assert!(validate_request(&desc, &invalid).is_err());
             }
         }
@@ -4878,7 +4889,7 @@ mod tests {
             let mut base_zero = req(1024, 1024);
             base_zero.guidance = Some(0.0);
             base_zero.negative_prompt = None;
-            base_zero.pag = Some(PagConfig {
+            base_zero.features.pag = Some(PagConfig {
                 scale: 1.5,
                 ..Default::default()
             });
@@ -4920,7 +4931,7 @@ mod tests {
             let mut r = req(1024, 1024);
             r.guidance = Some(1.0);
             r.negative_prompt = None;
-            r.pag = Some(PagConfig {
+            r.features.pag = Some(PagConfig {
                 scale: 1.5,
                 ..Default::default()
             });
@@ -4947,7 +4958,7 @@ mod tests {
         all_cfg_off_no_neg.negative_prompt = None;
         assert!(validate_request(&raw_descriptor(), &all_cfg_off_no_neg).is_ok());
         let mut mixed_cfg = all_cfg_off;
-        mixed_cfg.phases = Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]);
+        mixed_cfg.features.phases = Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]);
         assert!(validate_request(&raw_descriptor(), &mixed_cfg).is_ok());
 
         assert!(!crate::pipeline::krea_uses_cfg(0.0));

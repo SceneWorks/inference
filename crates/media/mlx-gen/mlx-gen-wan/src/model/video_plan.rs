@@ -20,7 +20,13 @@ pub(super) fn video_dimensions(
 ) -> Result<VideoDimensions> {
     let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
     let stride = provider_vae_stride(vae);
-    let trim_out = req.trim_first_frames.unwrap_or(0) as usize * stride.0;
+    let trim_out = req
+        .extensions
+        .wan
+        .as_ref()
+        .and_then(|w| w.trim_first_frames)
+        .unwrap_or(0) as usize
+        * stride.0;
     let gen_frames = frames
         .checked_add(trim_out)
         .filter(|f| *f <= i32::MAX as usize)

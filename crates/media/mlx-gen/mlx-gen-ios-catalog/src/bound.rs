@@ -226,12 +226,6 @@ impl Generator for BoundGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         self.inner.descriptor()
     }
-    fn veda_execution_report(&self) -> Option<VedaExecutionReport> {
-        self.inner.veda_execution_report()
-    }
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.inner.adapter_apply_reports()
-    }
     fn checkpoint_weight_facts(&self) -> Option<CheckpointWeightFacts> {
         self.inner.checkpoint_weight_facts()
     }
@@ -247,12 +241,16 @@ impl Generator for BoundGenerator {
     fn predicted_memory_peak_from_base(&self, bytes: u64) -> MemoryPeakBreakdown {
         self.inner.predicted_memory_peak_from_base(bytes)
     }
-    fn veda_workspace_bound(
-        &self,
-        req: veda::workspace::Request<'_>,
-    ) -> Result<Option<veda::workspace::WorkspaceBound>> {
+    fn request_memory_peak(&self, req: &GenerationRequest) -> Result<Option<u64>> {
         self.spec
-            .read_prepared_files_unchanged(|| self.inner.veda_workspace_bound(req))
+            .read_prepared_files_unchanged(|| self.inner.request_memory_peak(req))
+    }
+    fn request_workspace_bound(
+        &self,
+        req: &GenerationRequest,
+    ) -> Result<Option<RequestWorkspaceBound>> {
+        self.spec
+            .read_prepared_files_unchanged(|| self.inner.request_workspace_bound(req))
     }
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         let decision = self.check_context(context).and_then(|()| {
@@ -723,7 +721,7 @@ mod tests {
                         let mut request = GenerationRequest {
                             prompt: "borrowed λ\n\"quoted\"\\path\t雪".into(),
                             negative_prompt: Some("negative Ω\n\"quoted\"\\tail".into()),
-                            sampler: sampler.map(str::to_owned),
+                            sampler: sampler.map(Into::into),
                             memory,
                             strength: scalar,
                             conditioning,

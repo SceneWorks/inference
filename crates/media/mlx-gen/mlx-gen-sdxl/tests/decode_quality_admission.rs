@@ -184,7 +184,7 @@ fn production_latent_quality_admission() {
                 seed: Some(seed),
                 steps: Some(steps),
                 guidance: Some(guidance),
-                sampler: sampler.clone(),
+                sampler: (sampler.clone()).map(Into::into),
                 ..Default::default()
             };
             let (output, mut samples) = (

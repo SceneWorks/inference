@@ -323,6 +323,7 @@ pub(crate) fn route_vace() -> mlx_gen::gen_core::RouteRecord {
                     mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: mlx_gen::gen_core::SamplingSurface {
                 samplers: crate::model::wan_native_samplers(),
@@ -379,6 +380,7 @@ pub(crate) fn route_vace() -> mlx_gen::gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: mlx_gen::gen_core::OutputSurface {
                 preview: mlx_gen::gen_core::PreviewSupport::Unsupported,
@@ -585,28 +587,44 @@ impl WanVace {
 }
 
 impl Generator for WanVace {
+    fn generate_with_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.adapter_apply_reports = self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(report)
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            let output = self.generate_execution_attempt(req, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
-            })
-            .map(mlx_gen::gen_core::GenerationReport::from_output)
+            })?;
+            let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+            report.adapter_apply_reports = self
+                .adapter_reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            Ok(report)
         })
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
-    }
-
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -1104,24 +1122,8 @@ impl WanVaceFun {
     }
 }
 
-impl Generator for WanVaceFun {
-    fn generate_with_execution_report(
-        &self,
-        req: &mlx_gen::GenerationRequest,
-        on_progress: &mut dyn FnMut(mlx_gen::Progress),
-    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
-                mlx_gen::video_execution::without_capture(|| on_progress(event));
-            })
-            .map(mlx_gen::gen_core::GenerationReport::from_output)
-        })
-    }
-
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+impl WanVaceFun {
+    fn current_adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
         let outcomes = self
             .adapter_outcomes
             .lock()
@@ -1132,6 +1134,40 @@ impl Generator for WanVaceFun {
             return Vec::new();
         }
         adapter_apply_reports(&self.adapters, &adapted)
+    }
+}
+
+impl Generator for WanVaceFun {
+    fn generate_with_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.adapter_apply_reports = self.current_adapter_apply_reports();
+        Ok(report)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            let output = self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })?;
+            let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+            report.adapter_apply_reports = self.current_adapter_apply_reports();
+            Ok(report)
+        })
+    }
+
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
     }
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
         validate_vace_clip(&self.descriptor, MODEL_ID_VACE_FUN, &self.config, req)

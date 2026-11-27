@@ -1110,7 +1110,7 @@ impl Pipeline {
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, *strength)?
                 } else {
                     init_time_step(steps, *strength)
@@ -1235,7 +1235,7 @@ impl Pipeline {
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, *strength)?
                 } else {
                     init_time_step(steps, *strength)

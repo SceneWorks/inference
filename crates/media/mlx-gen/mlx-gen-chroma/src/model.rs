@@ -1069,7 +1069,7 @@ fn validate_request_for_variant(variant: ChromaVariant, req: &GenerationRequest)
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{}: steps must be >= 1", descriptor.id)));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let steps = req.steps.unwrap_or_else(|| variant.default_steps());
         let sigmas = build_schedule_for(
             variant,
@@ -1125,7 +1125,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     resolve_root(variant, spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
             variant.id()
@@ -1288,11 +1288,11 @@ impl Chroma {
             rung_plan.stage_residency,
             rung_plan.streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: prompt → T5 conditioning (pos + optional neg).
             |text: &ChromaTextOwned| {
-                if req.use_pid {
+                if req.use_pid() {
                     run.begin_conditioning()?;
                     encode_cfg(
                         &text.tokenizer,
@@ -1343,7 +1343,7 @@ impl Chroma {
                     self.descriptor.id,
                     run.plan().capture_sigma(),
                 )?;
-                if req.use_pid {
+                if req.use_pid() {
                     run.end_conditioning()?;
                 }
                 let images = run.images_with_denoise_phases(

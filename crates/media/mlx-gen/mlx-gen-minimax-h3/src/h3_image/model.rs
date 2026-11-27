@@ -120,6 +120,7 @@ pub fn route() -> RouteRecord {
                 max_prompt_tokens: Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
                 supports_caption_overflow_policy: false,
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: ConditioningSurface {
                 kinds: vec![
@@ -130,6 +131,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
@@ -183,6 +185,7 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::Unsupported,
@@ -1176,12 +1179,24 @@ mod tests {
                 ..req(2048, 2048)
             },
             GenerationRequest {
-                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.0)),
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    h3: Some(mlx_gen::gen_core::H3Extension {
+                        image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.0)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..req(2048, 2048)
             },
             GenerationRequest {
                 sampler: Some("euler".into()),
-                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm_default()),
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    h3: Some(mlx_gen::gen_core::H3Extension {
+                        image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm_default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..req(2048, 2048)
             },
         ] {
@@ -1198,11 +1213,17 @@ mod tests {
                 ..req(2048, 2048)
             },
             GenerationRequest {
-                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm {
-                    s_noise: 1.1,
-                    s_noise_end: 0.9,
-                    noise_clip_std: 2.0,
-                }),
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    h3: Some(mlx_gen::gen_core::H3Extension {
+                        image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm {
+                            s_noise: 1.1,
+                            s_noise_end: 0.9,
+                            noise_clip_std: 2.0,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..req(2048, 2048)
             },
         ] {
@@ -1492,10 +1513,13 @@ mod tests {
         // T2I and 1..=16 reference edit accept active PAG while keeping guidance=1.0 / no negative prompt.
         let t2i_pag = GenerationRequest {
             guidance: Some(1.0),
-            pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: pag_cap.recommended_scale,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: pag_cap.recommended_scale,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..req(2048, 2048)
         };
         validate_request(&d.capabilities, &t2i_pag).unwrap();
@@ -1520,7 +1544,7 @@ mod tests {
         );
 
         let mut edit_pag = with_refs(16, 64, 64);
-        edit_pag.pag = Some(mlx_gen::gen_core::PagConfig {
+        edit_pag.features.pag = Some(mlx_gen::gen_core::PagConfig {
             scale: 1.5,
             layers: Some(vec![49, 0, 25]),
             ..Default::default()
@@ -1537,11 +1561,14 @@ mod tests {
 
         // Zero scale resolves to None; block 50 is rejected even at scale 0.
         let zero_pag = GenerationRequest {
-            pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![25]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![25]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..req(2048, 2048)
         };
         validate_request(&d.capabilities, &zero_pag).unwrap();
@@ -1553,19 +1580,25 @@ mod tests {
 
         for bad in [
             GenerationRequest {
-                pag: Some(mlx_gen::gen_core::PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![50]),
+                features: mlx_gen::gen_core::FeatureParams {
+                    pag: Some(mlx_gen::gen_core::PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![50]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..req(2048, 2048)
             },
             GenerationRequest {
-                pag: Some(mlx_gen::gen_core::PagConfig {
-                    scale: 1.2,
-                    layers: Some(vec![50]),
+                features: mlx_gen::gen_core::FeatureParams {
+                    pag: Some(mlx_gen::gen_core::PagConfig {
+                        scale: 1.2,
+                        layers: Some(vec![50]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..req(2048, 2048)
             },
             GenerationRequest {

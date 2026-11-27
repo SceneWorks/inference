@@ -156,6 +156,7 @@ fn route_for(variant: MossImageVariant) -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: vec!["euler"],
@@ -215,12 +216,14 @@ fn route_for(variant: MossImageVariant) -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
                 supports_hdr: false,
                 supports_alpha_output: false,
             },
+            supported_family_extensions: vec![gen_core::FamilyExtensionKind::MossImage],
             ..Default::default()
         },
         limits: gen_core::ProductLimits {
@@ -380,6 +383,51 @@ impl MossImage {
             return Ok(self.sources.clone());
         }
         Sources::selected(self.variant, &self.spec, mode)
+    }
+    fn prepare_generator_request<'a>(
+        request: &'a GenerationRequest,
+    ) -> gen_core::Result<(
+        std::borrow::Cow<'a, GenerationRequest>,
+        MossImageAdvancedInputs<'a>,
+        Option<MossImageEditInputs<'a>>,
+    )> {
+        let edit_req = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        if let Some(edit) = edit_req {
+            let inputs = edit.as_inputs();
+            if inputs.advanced.output != MossImageOutputKind::Images {
+                return Err(gen_core::Error::Unsupported(
+                    "generic MOSS generation requires image output".into(),
+                ));
+            }
+            inputs.validate()?;
+            let normalized = edit_request(request)?;
+            Ok((
+                std::borrow::Cow::Owned(normalized),
+                inputs.advanced,
+                Some(inputs),
+            ))
+        } else {
+            Ok((
+                std::borrow::Cow::Borrowed(request),
+                MossImageAdvancedInputs::default(),
+                None,
+            ))
+        }
+    }
+    #[cfg(test)]
+    fn validate_generator_request_policy(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        request: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        let (request, advanced, _) = Self::prepare_generator_request(request)?;
+        Self::resolve_request_inputs(variant, spec, &request, advanced)
+            .map(|_| ())
+            .map_err(Into::into)
     }
     fn validate_inputs(
         &self,
@@ -1130,6 +1178,20 @@ impl MossImageAdvancedGenerator for MossImage {
         gen_core::generator::CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
+impl MossImage {
+    /// Last-run MOSS-Image execution report for concrete `MossImageAdvancedGenerator` callers.
+    /// Generic `Generator` callers receive this directly on `GenerationReport::moss_image_report()`.
+    pub fn last_execution_report(&self) -> Option<MossImageExecutionReport> {
+        self.state.lock().ok().and_then(|s| s.report.clone())
+    }
+
+    /// Last-run adapter apply reports for concrete advanced-generator test harnesses.
+    pub(crate) fn last_adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
+        self.state
+            .lock()
+            .map_or_else(|_| Vec::new(), |state| state.apply_reports.clone())
+    }
+}
 impl Generator for MossImage {
     fn generate_with_report(
         &self,
@@ -1144,40 +1206,17 @@ impl Generator for MossImage {
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-        let (output, pag, execution) = self.execute_with_execution(
-            request,
-            MossImageAdvancedInputs::default(),
-            progress,
-            None,
-        )?;
-        let MossImageAdvancedOutput::Images(images) = output else {
-            unreachable!("default image output")
-        };
-        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
-        report.pag = pag;
-        gen_core::generator::CompletedGeneration::new(report, execution, &self.descriptor)
-    }
-    fn generate_moss_image_edit(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<MossImageAdvancedOutput> {
-        self.generate_moss_image_edit_with_execution_report(request, inputs, progress)
-            .map(|completed| completed.output)
-    }
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<gen_core::generator::CompletedMossImageEdit> {
-        // Clear both receipts even if edit validation rejects before execution starts.
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into()))?;
+        let is_edit_req = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref())
+            .is_some();
+        if is_edit_req {
+            // Clear both receipts even if edit validation rejects before execution starts.
+            let mut state = self.state.lock().map_err(|_| {
+                gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into())
+            })?;
             let mut edit_report = self.edit_report.lock().map_err(|_| {
                 gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
             })?;
@@ -1185,30 +1224,53 @@ impl Generator for MossImage {
                 .begin_request(&self.custom_pins, &mut edit_report)
                 .map_err(gen_core::Error::from)?;
         }
-        inputs.validate()?;
-        let request = edit_request(request)?;
-        let (output, _, execution) =
-            self.execute_with_execution(&request, inputs.advanced, progress, Some(inputs))?;
-        gen_core::generator::CompletedMossImageEdit::new(output, execution, &self.descriptor)
+        let (request, advanced, edit_inputs) = Self::prepare_generator_request(request)?;
+        let is_edit = edit_inputs.is_some();
+        let (output, pag, execution) =
+            self.execute_with_execution(&request, advanced, progress, edit_inputs)?;
+        let MossImageAdvancedOutput::Images(images) = output else {
+            return Err(gen_core::Error::Unsupported(
+                "generic MOSS generation requires image output".into(),
+            ));
+        };
+        let apply_reports = self.last_adapter_apply_reports();
+        let family_report = if is_edit {
+            self.edit_report
+                .lock()
+                .ok()
+                .and_then(|report| report.clone())
+                .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
+        } else {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|s| s.report.clone())
+                .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
+        };
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag;
+        report.adapter_apply_reports = apply_reports;
+        report.family_report = family_report;
+        gen_core::generator::CompletedGeneration::new(report, execution, &self.descriptor)
     }
-    fn moss_image_edit_request_peak(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-    ) -> gen_core::Result<u64> {
-        memory_strategy::edit_request_peak(self.variant, &self.spec, request, inputs)
-    }
-    fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
-        self.edit_report
-            .lock()
-            .ok()
-            .and_then(|report| report.clone())
+    fn request_memory_peak(&self, request: &GenerationRequest) -> gen_core::Result<Option<u64>> {
+        let Some(edit_req) = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref())
+        else {
+            return Ok(None);
+        };
+        memory_strategy::edit_request_peak(self.variant, &self.spec, request, edit_req.as_inputs())
+            .map(Some)
     }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
     fn validate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_inputs(request, MossImageAdvancedInputs::default())
+        let (request, advanced, _) = Self::prepare_generator_request(request)?;
+        self.validate_inputs(&request, advanced)
             .map(|_| ())
             .map_err(Into::into)
     }
@@ -1217,17 +1279,9 @@ impl Generator for MossImage {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        match self.execute(
-            request,
-            MossImageAdvancedInputs::default(),
-            on_progress,
-            None,
-        )? {
-            MossImageAdvancedOutput::Images(images) => Ok(GenerationOutput::Images(images)),
-            _ => Err(gen_core::Error::Unsupported(
-                "generic MOSS generation requires image output".into(),
-            )),
-        }
+        self.generate_with_report(request, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("MOSS generation produced no output".into()))
     }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.memory)
@@ -1235,19 +1289,11 @@ impl Generator for MossImage {
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         memory_strategy::safety(&self.spec, &self.memory, context)
     }
-    fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
-        self.state.lock().ok().and_then(|s| s.report.clone())
-    }
-    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+    fn retained_weight_bytes(&self) -> Option<u64> {
         self.state
             .lock()
             .ok()
             .map(|state| self.cached_owned_weight_bytes(&state))
-    }
-    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        self.state
-            .lock()
-            .map_or_else(|_| Vec::new(), |state| state.apply_reports.clone())
     }
 }
 fn request_branches(resolved: &MossImageResolved) -> u32 {
@@ -1488,11 +1534,14 @@ mod cpu_tests {
             let noop = GenerationRequest {
                 width: 16,
                 height: 32,
-                pag: Some(gen_core::PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![0, 20, 41]),
+                features: gen_core::FeatureParams {
+                    pag: Some(gen_core::PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![0, 20, 41]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             };
             assert_eq!(
@@ -1505,11 +1554,14 @@ mod cpu_tests {
             let bad_layer = GenerationRequest {
                 width: 16,
                 height: 32,
-                pag: Some(gen_core::PagConfig {
-                    scale: 2.0,
-                    layers: Some(vec![42]),
+                features: gen_core::FeatureParams {
+                    pag: Some(gen_core::PagConfig {
+                        scale: 2.0,
+                        layers: Some(vec![42]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             };
             assert!(descriptor
@@ -1526,6 +1578,136 @@ mod cpu_tests {
                 .unwrap()
                 .acceleration,
             MossImageAcceleration::Off
+        );
+    }
+
+    #[test]
+    fn validate_agrees_with_generate_on_edit_requests() {
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(std::path::PathBuf::from(
+            "synthetic-moss",
+        )));
+        let reference = gen_core::Image {
+            width: 16,
+            height: 16,
+            pixels: vec![128; 16 * 16 * 3],
+        };
+        let make_edit_req = || {
+            let mut req = GenerationRequest::default();
+            req.extensions.moss_image_mut().edit = Some(
+                gen_core::moss_image_edit::MossImageEditRequest {
+                    references: vec![reference.clone()],
+                    ..Default::default()
+                },
+            );
+            req
+        };
+
+        // Valid edit request passes generator validation policy.
+        assert!(MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &make_edit_req()
+        )
+        .is_ok());
+
+        // Non-Images output is rejected by validate (matches generate).
+        let mut latent_edit = make_edit_req();
+        latent_edit
+            .extensions
+            .moss_image_mut()
+            .edit
+            .as_mut()
+            .unwrap()
+            .advanced
+            .output = MossImageOutputKind::Latents;
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &latent_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("image output"),
+            "expected Unsupported image output refusal, got {err}"
+        );
+
+        // Edit + DMD is rejected by validate (matches generate).
+        let mut dmd_edit = make_edit_req();
+        dmd_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &dmd_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("edit+DMD"),
+            "expected Unsupported edit+DMD refusal, got {err}"
+        );
+
+        // Edit + SLG is rejected by validate.
+        let mut slg_edit = make_edit_req();
+        slg_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            slg: Some(MossSkipLayerGuidance {
+                scale: 1.5,
+                layers: vec![10],
+                start: 0.0,
+                stop: 1.0,
+            }),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &slg_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("SLG"),
+            "expected Unsupported edit+SLG refusal, got {err}"
+        );
+
+        // Edit + uncond_skip_layers is rejected by validate.
+        let mut skip_edit = make_edit_req();
+        skip_edit.extensions.moss_image_mut().options = Some(MossImageOptions {
+            uncond_skip_layers: Some(vec![20]),
+            ..Default::default()
+        });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &skip_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("full-layer CFG"),
+            "expected Unsupported edit+skip-layers refusal, got {err}"
+        );
+
+        // Edit + conditioning is rejected by validate.
+        let mut cond_edit = make_edit_req();
+        cond_edit
+            .conditioning
+            .push(gen_core::Conditioning::Reference {
+                image: reference,
+                strength: None,
+            });
+        let err = MossImage::validate_generator_request_policy(
+            MossImageVariant::Sft,
+            &spec,
+            &cond_edit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("typed edit inputs"),
+            "expected Unsupported edit+conditioning refusal, got {err}"
         );
     }
 

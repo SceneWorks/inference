@@ -1583,7 +1583,7 @@ fn ios_admission_carries_explicit_low_res_posture_into_request_configuration() {
     )
     .unwrap();
     config.set_request_validator(move |req| {
-        if req.low_res_start.is_some() {
+        if req.features.low_res_start.is_some() {
             if let Some(low_res) = admitted_context.low_res_start() {
                 if low_res.posture
                     == mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence
@@ -1611,7 +1611,10 @@ fn ios_admission_carries_explicit_low_res_posture_into_request_configuration() {
         width: 512,
         height: 512,
         count: 1,
-        low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(1, Some(0.5))),
+        features: mlx_gen::gen_core::FeatureParams {
+            low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(1, Some(0.5))),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let err = scope

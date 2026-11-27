@@ -144,8 +144,9 @@ pub struct Request<'a> {
 }
 impl<'a> From<&'a GenerationRequest> for Request<'a> {
     fn from(r: &'a GenerationRequest) -> Self {
+        let h3 = r.extensions.h3.as_ref();
         Self {
-            veda: r.veda.as_ref(),
+            veda: h3.and_then(|ext| ext.veda.as_ref()),
             width: r.width,
             height: r.height,
             // The engine's own resolution (`frames` wins, `duration` aligns upward, neither is the
@@ -156,8 +157,8 @@ impl<'a> From<&'a GenerationRequest> for Request<'a> {
             count: r.count,
             prompt: &r.prompt,
             conditioning: &r.conditioning,
-            reference_image_short_edge: r.reference_image_short_edge,
-            reference_image_resize_mode: r.reference_image_resize_mode,
+            reference_image_short_edge: h3.and_then(|ext| ext.reference_image_short_edge),
+            reference_image_resize_mode: h3.and_then(|ext| ext.reference_image_resize_mode),
         }
     }
 }

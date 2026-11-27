@@ -671,7 +671,11 @@ impl Seedvr2RenderPlan {
                 )));
             }
         }
-        let softness = req.softness.unwrap_or(0.0);
+        let softness = req
+            .extensions
+            .seedvr2
+            .and_then(|s| s.softness)
+            .unwrap_or(0.0);
         if !softness.is_finite() {
             return Err(Error::Unsupported(format!(
                 "{}: softness must be finite",
@@ -1232,7 +1236,12 @@ mod tests {
         let valid = GenerationRequest {
             width: 512,
             height: 512,
-            softness: Some(f32::NAN),
+            extensions: gen_core::FamilyExtensions {
+                seedvr2: Some(gen_core::SeedVr2Extension {
+                    softness: Some(f32::NAN),
+                }),
+                ..Default::default()
+            },
             conditioning: vec![Conditioning::Reference {
                 image: lr.clone(),
                 strength: None,
@@ -1241,7 +1250,7 @@ mod tests {
         };
         assert!(Seedvr2RenderPlan::compile(&desc, &valid, 0, 64.0, None).is_err());
         let valid_ok = GenerationRequest {
-            softness: None,
+            extensions: gen_core::FamilyExtensions::default(),
             ..valid
         };
         assert!(matches!(

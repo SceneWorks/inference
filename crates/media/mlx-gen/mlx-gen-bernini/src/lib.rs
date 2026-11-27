@@ -522,7 +522,7 @@ mod explicit_registry_tests {
                         !fixture.context.has_phases,
                         "{provider_id}: bernini reads no GenerationPhase"
                     );
-                    assert!(fixture.request.phases.is_none(), "{provider_id}");
+                    assert!(fixture.request.features.phases.is_none(), "{provider_id}");
                     assert_eq!(fixture.request.frames, Some(45), "{provider_id}");
                     descriptor
                         .capabilities

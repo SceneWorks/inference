@@ -182,14 +182,10 @@ fn registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report() {
             .unwrap()
             .load(MODEL_ID, &spec)
             .unwrap_or_else(|e| panic!("{route}: registry load must succeed: {e}"));
-        assert!(
-            provider.adapter_apply_reports().is_empty(),
-            "{route}: reports describe completed generation, never an unrun provider"
-        );
-        provider
-            .generate(&req, &mut |_| {})
+        let gen_report = provider
+            .generate_with_report(&req, &mut |_| {})
             .unwrap_or_else(|e| panic!("{route}: generation must succeed: {e}"));
-        let reports = provider.adapter_apply_reports();
+        let reports = &gen_report.adapter_apply_reports;
         assert_eq!(reports.len(), 1, "{route}: one selected adapter");
         assert_eq!(
             reports[0].adapter_path, adapter,

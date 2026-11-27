@@ -488,7 +488,13 @@ fn veda_ab_render() {
         seed: Some(seed),
         scheduler_shift: recipe.video_shift,
         conditioning,
-        veda,
+        extensions: candle_gen::gen_core::FamilyExtensions {
+            h3: Some(candle_gen::gen_core::H3Extension {
+                veda,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -539,8 +545,8 @@ fn veda_ab_render() {
     let gen_started = Instant::now();
     let mut step_ticks: Vec<Duration> = Vec::new();
     let mut decode_tick: Option<Duration> = None;
-    let out_video = generator
-        .generate(&req, &mut |p| match p {
+    let gen_report = generator
+        .generate_with_report(&req, &mut |p| match p {
             Progress::Step { .. } => step_ticks.push(gen_started.elapsed()),
             Progress::Decoding => decode_tick = Some(gen_started.elapsed()),
             Progress::Loading(_)
@@ -551,10 +557,11 @@ fn veda_ab_render() {
             | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("generate {MODEL_ID} ({tier}, veda {veda_on}): {e}"));
+    let report = gen_report.veda_report().cloned();
+    let out_video = gen_report.output;
     let gen_total = gen_started.elapsed();
     let max_rss = rss.finish();
     let (device_bytes, device_detail) = device_peak();
-    let report = generator.veda_execution_report();
 
     // ---- timings ------------------------------------------------------------------------------
     // Step ticks fire after each evaluation's device sync, so the n-1 inter-tick gaps are whole
@@ -574,7 +581,7 @@ fn veda_ab_render() {
 
     // ---- outputs ------------------------------------------------------------------------------
     let (frames_out, fps, audio) = match out_video {
-        GenerationOutput::Video { frames, fps, audio } => (frames, fps, audio),
+        Some(GenerationOutput::Video { frames, fps, audio }) => (frames, fps, audio),
         other => panic!("{MODEL_ID} must produce Video, got {other:?}"),
     };
     assert_eq!(frames_out.len(), frames as usize, "decoded frame count");

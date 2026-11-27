@@ -34,6 +34,12 @@ pub use output::*;
 mod execution;
 pub use execution::*;
 
+mod selectors;
+pub use selectors::*;
+
+mod extensions;
+pub use extensions::*;
+
 mod request;
 pub use request::*;
 

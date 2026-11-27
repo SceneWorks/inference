@@ -74,5 +74,9 @@ impl std::str::FromStr for ReferenceImageResizeMode {
 pub fn effective_reference_image_resize_mode(
     req: &crate::GenerationRequest,
 ) -> ReferenceImageResizeMode {
-    req.reference_image_resize_mode.unwrap_or_default()
+    req.extensions
+        .h3
+        .as_ref()
+        .and_then(|h3| h3.reference_image_resize_mode)
+        .unwrap_or_default()
 }

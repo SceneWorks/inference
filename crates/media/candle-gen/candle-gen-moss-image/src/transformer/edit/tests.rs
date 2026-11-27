@@ -723,7 +723,7 @@ fn run(device: &Device) {
         assert_eq!(values(&sampled), values(&reentry));
 
         let mut pag_zero_req = request();
-        pag_zero_req.pag = Some(candle_gen::gen_core::pag::PagConfig {
+        pag_zero_req.features.pag = Some(candle_gen::gen_core::pag::PagConfig {
             scale: 0.0,
             layers: Some(vec![0]),
             ..Default::default()
@@ -745,7 +745,7 @@ fn run(device: &Device) {
         for guidance in [1.0, 4.0] {
             let mut pag_req = request();
             pag_req.guidance = Some(guidance);
-            pag_req.pag = Some(candle_gen::gen_core::pag::PagConfig {
+            pag_req.features.pag = Some(candle_gen::gen_core::pag::PagConfig {
                 scale: 2.0,
                 layers: Some(vec![0]),
                 ..Default::default()

@@ -230,7 +230,7 @@ impl CaptureConfig {
             height: self.height,
             frames: Some(self.frames),
             fps: Some(self.fps),
-            video_mode: self.video_mode.request_value(),
+            video_mode: (self.video_mode.request_value()).map(Into::into),
             seed: Some(1234),
             ..Default::default()
         }

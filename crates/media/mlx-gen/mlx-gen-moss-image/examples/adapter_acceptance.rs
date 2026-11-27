@@ -136,8 +136,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .adapters
         .push(AdapterSpec::new(trained.adapter_path.clone(), 1., kind));
     let model = mlx_gen_moss_image::MossImage::load(variant, &adapted)?;
-    let after = match model.generate(&generation, &mut |_| {})? {
-        mlx_gen::GenerationOutput::Images(images) => images,
+    let after_report = model.generate_with_report(&generation, &mut |_| {})?;
+    let adapter_reports = after_report.adapter_apply_reports;
+    let after = match after_report.output {
+        Some(mlx_gen::GenerationOutput::Images(images)) => images,
         _ => return Err("expected image output".into()),
     };
     if before.len() != 1 || after.len() != 1 || before[0].pixels == after[0].pixels {
@@ -146,7 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let receipt = serde_json::json!({"provider":variant.provider_id(),"revision":variant.revision(),"network":format!("{network:?}"),
         "steps":trained.steps,"loss":trained.final_loss,"adapter":trained.adapter_path,
         "posterior":moss_image_training::POSTERIOR,"sampler":moss_image_training::SAMPLER,
-        "generation_changed":true,"adapter_reports":format!("{:?}",model.adapter_apply_reports())});
+        "generation_changed":true,"adapter_reports":format!("{adapter_reports:?}")});
     std::fs::write(
         output.join(format!(
             "{}-{network:?}-receipt.json",

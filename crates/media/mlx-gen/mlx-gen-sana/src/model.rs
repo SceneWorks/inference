@@ -104,6 +104,7 @@ pub(crate) fn route_base() -> mlx_gen::gen_core::RouteRecord {
                 pass0_requirement: mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: Vec::new(),
+                ..Default::default()
             },
             sampling: mlx_gen::gen_core::SamplingSurface {
                 samplers,
@@ -156,6 +157,7 @@ pub(crate) fn route_base() -> mlx_gen::gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: mlx_gen::gen_core::OutputSurface {
                 preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,
@@ -680,7 +682,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == SPRINT_MODEL_ID {
             return Err(Error::Unsupported(format!(
                 "{id}: low_res_start is not supported on continuous-time consistency SCM Sprint"
@@ -2176,7 +2178,7 @@ mod tests {
         // T2I with low_res_start on sana_1600m compiles a two-phase RenderPlan
         let mut t2i = req(1024, 1024);
         t2i.steps = Some(10);
-        t2i.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        t2i.features.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
         let plan = registry
             .compile_render_plan(MODEL_ID, &spec, &t2i)
             .unwrap()
@@ -2199,7 +2201,7 @@ mod tests {
             strength: Some(0.6),
         }];
         // 10 steps @ strength 0.6 -> start_step = 6 -> 4 executed steps (5 sigmas); warmup 2 steps
-        i2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        i2i.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
         let i2i_plan = registry
             .compile_render_plan(MODEL_ID, &spec, &i2i)
             .unwrap()

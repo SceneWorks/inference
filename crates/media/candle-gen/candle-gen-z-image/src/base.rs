@@ -249,7 +249,7 @@ impl Generator for ZImageBaseGenerator {
                         .into(),
                 ));
             }
-            if req.use_pid {
+            if req.use_pid() {
                 return Err(gen_core::Error::Unsupported(
                     "z_image: PiD decode is not supported under sequential residency; use the \
                      native VAE route or resident policy"
@@ -282,7 +282,7 @@ impl Generator for ZImageBaseGenerator {
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let start_step = match &reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, *strength)?
                 } else {
                     pipeline::init_time_step(steps, *strength)
@@ -689,10 +689,10 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 1.5,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         let resolved = desc
@@ -707,10 +707,10 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 0.0,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert_eq!(
@@ -720,10 +720,10 @@ mod tests {
 
         let bad_scale = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                 scale: 15.5,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(desc

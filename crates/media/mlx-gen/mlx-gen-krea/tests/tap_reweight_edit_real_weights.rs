@@ -163,11 +163,16 @@ fn text_style_gain_edit_sweep() {
             seed: Some(0),
             steps: Some(steps),
             guidance: Some(3.5),
-            text_style_gain: gain,
             conditioning: vec![Conditioning::Reference {
                 image: source.clone(),
                 strength: Some(1.0),
             }],
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                krea: Some(mlx_gen::gen_core::KreaExtension {
+                    text_style_gain: gain,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let GenerationOutput::Images(mut imgs) = gen

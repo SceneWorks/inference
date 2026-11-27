@@ -102,6 +102,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec!["kolors_controlnet_pose", "kolors_ip_adapter_plus"],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers,
@@ -153,6 +154,7 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::LatentProjection,
@@ -617,7 +619,7 @@ impl KolorsGenerator {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &KolorsText| {
                 run.encode(|| {
@@ -739,7 +741,7 @@ impl KolorsGenerator {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: encode the positive (+ negative when CFG is on) ChatGLM3 conditioning.
             // Seed-independent; under `Sequential` the shared seam materializes these + DROPS the 6B
@@ -1293,7 +1295,7 @@ fn resolve_vp_plan(
     mode: &KolorsBoundMode<'_, '_>,
 ) -> Result<Option<VpCapturePlan>> {
     let req = request.req;
-    if !(req.use_pid && req.pid_capture_sigma.is_some()) {
+    if !(req.use_pid() && req.pid_capture_sigma().is_some()) {
         return Ok(None);
     }
     let steps = request.steps;
@@ -1309,7 +1311,7 @@ fn resolve_vp_plan(
         // Mirrors the curated init: combined-pose + img2img are strength-sliced; txt2img runs the
         // full schedule.
         match mode.curated_init() {
-            Some((_, strength)) if req.low_res_start.is_some() => {
+            Some((_, strength)) if req.features.low_res_start.is_some() => {
                 let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                     full_sigmas.len().saturating_sub(1),
                     Some(strength),
@@ -1344,7 +1346,7 @@ fn resolve_vp_plan(
                 .to_vec(),
         }
     };
-    Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma))
+    Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma()))
 }
 
 /// Stages 2–3 for one Kolors output, over the request's bound mode and init (sc-27336).
@@ -1590,7 +1592,7 @@ pub(crate) fn validate_low_res_start_kolors(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if has_ip || spec.is_some_and(|s| s.ip_adapter.is_some()) {
@@ -1645,8 +1647,8 @@ pub(crate) fn validate_low_res_start_kolors(
         None => full_sigmas,
     };
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,
@@ -1723,7 +1725,7 @@ fn compile_kolors_for_mode(
         let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
         let sigmas = match mode.curated_init() {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     let raw_strength = reference
                         .and_then(|(_, s)| s)
                         .or(req.strength)
@@ -1765,8 +1767,8 @@ fn compile_kolors_for_mode(
     };
 
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,

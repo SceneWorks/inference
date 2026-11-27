@@ -539,7 +539,7 @@ pub(crate) fn denoise_loop_bounded(
         sampler: Some(selected.name().into()),
         scheduler: scheduler
             .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
-            .map(str::to_owned),
+            .map(Into::into),
         scheduler_shift,
         steps: Some(steps.max(1) as u32),
         guidance: Some(guidance),

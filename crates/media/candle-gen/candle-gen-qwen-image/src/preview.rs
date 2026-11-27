@@ -853,7 +853,7 @@ mod tests {
             height: 512,
             steps: Some(4),
             seed: Some(7),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(2, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));

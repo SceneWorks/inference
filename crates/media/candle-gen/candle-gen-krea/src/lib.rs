@@ -453,7 +453,7 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
                 || (request.width, request.height)
                     != (refiner.geometry.width, refiner.geometry.height)
                 || request.source_image.is_some()
-                || request.low_res_start.is_some()
+                || request.features.low_res_start.is_some()
                 || request.count != 1
             {
                 return Err(gen_core::Error::Unsupported(
@@ -503,8 +503,8 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
             })?
         };
         if reference_count != self.reference_count
-            || request.phases.is_some() != self.has_phases
-            || request.use_pid != self.use_pid
+            || request.features.phases.is_some() != self.has_phases
+            || request.use_pid() != self.use_pid
         {
             return Err(gen_core::Error::Unsupported(
                 format!(
@@ -944,7 +944,7 @@ impl Generator for KreaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
-        let plan = if req.phases.is_some() {
+        let plan = if req.features.phases.is_some() {
             Some(pipeline::compile_multiphase_plan(
                 &self.descriptor,
                 &self.file_pin_spec,
@@ -969,7 +969,7 @@ impl Generator for KreaGenerator {
         plan.check_request(&self.descriptor, req)?;
         match (
             self.descriptor.id,
-            req.phases.is_some(),
+            req.features.phases.is_some(),
             plan.adapter_phases().is_empty(),
         ) {
             (KREA_2_TURBO_ID, false, true) | (KREA_2_RAW_ID, true, false) => {
@@ -1080,9 +1080,9 @@ impl KreaGenerator {
                 || context.mode != gen_core::MemoryMode::ImageToImage
                 || context.geometry != geometry
                 || context.use_pid
-                || request.use_pid
+                || request.use_pid()
                 || context.has_phases
-                || request.phases.is_some()
+                || request.features.phases.is_some()
                 || context.low_res_start.is_some()
                 || context.overlay.is_some()
             {
@@ -1206,8 +1206,8 @@ impl KreaGenerator {
             if self.descriptor.id != KREA_2_TURBO_ID
                 || !self.descriptor.capabilities.supports_sequential_offload
                 || reference.is_some()
-                || req.phases.is_some()
-                || req.use_pid
+                || req.features.phases.is_some()
+                || req.use_pid()
             {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: per-generation memory adaptation is supported only for native-VAE, \
@@ -1299,7 +1299,7 @@ impl KreaGenerator {
             stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             &mut progress,
             |_| {
                 if let Some(run) = turbo {
@@ -1539,6 +1539,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: candle_gen::curated_sampler_names(),
@@ -1593,6 +1594,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::LatentProjection,
@@ -1740,7 +1742,7 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
         0.0
     };
     let effective_guidance = req.guidance.unwrap_or(default_guidance);
-    match req.phases.as_deref() {
+    match req.features.phases.as_deref() {
         Some(phases) if id == KREA_2_RAW_ID && !phases.is_empty() => phases
             .iter()
             .any(|phase| pipeline::krea_uses_cfg(phase.guidance.unwrap_or(effective_guidance))),
@@ -1818,7 +1820,7 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
 /// time by [`multiphase::resolve_phases`] (the count isn't on the descriptor). A no-op when `req.phases`
 /// is `None` (the ordinary single-phase render).
 fn validate_phases(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
-    let Some(phases) = req.phases.as_ref() else {
+    let Some(phases) = req.features.phases.as_ref() else {
         return Ok(());
     };
     if id != KREA_2_RAW_ID {
@@ -1837,7 +1839,7 @@ fn validate_phases(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
              supported (sc-13887 v1)"
         )));
     }
-    if req.use_pid {
+    if req.use_pid() {
         return Err(gen_core::Error::Msg(format!(
             "{id}: multi-phase denoise does not support the PiD decoder yet (sc-13887 follow-on)"
         )));
@@ -1866,7 +1868,7 @@ fn ensure_multiphase_allowed_for(
     has_diff_patch: bool,
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
-    if req.phases.is_some() && has_diff_patch {
+    if req.features.phases.is_some() && has_diff_patch {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: multi-phase denoise is not supported on a model loaded with a diff-patch \
              (.diff/.diff_b) adapter — a diff-patch folds irreversibly into the base weights at load \
@@ -3612,7 +3614,7 @@ fn registered_krea_valid_fixture(
                 }
             }
             if has_phases {
-                fixture.request.phases = Some(vec![gen_core::GenerationPhase {
+                fixture.request.features.phases = Some(vec![gen_core::GenerationPhase {
                     steps: 1,
                     ..Default::default()
                 }]);
@@ -4235,7 +4237,7 @@ fn compile_raw_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
-    if req.phases.is_none() {
+    if req.features.phases.is_none() {
         return Ok(None);
     }
     validate_phases(KREA_2_RAW_ID, req)?;
@@ -7859,17 +7861,17 @@ mod tests {
             (
                 descriptor(),
                 GenerationRequest {
-                    use_pid: true,
+                    features: candle_gen::gen_core::FeatureParams { pid: Some(candle_gen::gen_core::PidParams::enabled()), ..Default::default() },
                     ..staged()
                 },
             ),
             (
                 raw_descriptor(),
                 GenerationRequest {
-                    phases: Some(vec![gen_core::GenerationPhase {
+                    features: candle_gen::gen_core::FeatureParams { phases: Some(vec![gen_core::GenerationPhase {
                         steps: 1,
                         ..Default::default()
-                    }]),
+                    }]), ..Default::default() },
                     ..staged()
                 },
             ),
@@ -8366,7 +8368,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             prompt: "a red apple on a wooden table".into(),
             width: 1024,
             height: 1024,
-            phases: Some(phases),
+            features: candle_gen::gen_core::FeatureParams { phases: Some(phases), ..Default::default() },
             ..Default::default()
         }
     }
@@ -8861,8 +8863,8 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 prompt: "a courtyard".into(),
                 width: 512,
                 height: 512,
-                use_pid: spec.pid.is_some(),
                 cancel: cancel.clone(),
+                features: candle_gen::gen_core::FeatureParams { pid: (spec.pid.is_some()).then(candle_gen::gen_core::PidParams::enabled), ..Default::default() },
                 ..Default::default()
             };
             let generator = registry.load(KREA_2_TURBO_ID, &spec).unwrap();
@@ -8902,7 +8904,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             registry.compile_render_plan(KREA_2_TURBO_ID, &spec, &request),
             Err(gen_core::Error::Unsupported(message)) if message.contains("krea_2_raw")
         ));
-        request.phases = None;
+        request.features.phases = None;
         for id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
             assert!(registry
                 .compile_render_plan(id, &spec, &request)
@@ -9015,7 +9017,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             .contains("renders from pure noise"));
 
         let mut with_pid = phase_req(vec![phase(8, None)]);
-        with_pid.use_pid = true;
+        with_pid.features.pid = Some(candle_gen::gen_core::PidParams::enabled());
         assert!(validate_phases(KREA_2_RAW_ID, &with_pid)
             .unwrap_err()
             .to_string()
@@ -9033,7 +9035,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             ..Default::default()
         };
         assert!(validate_phases(KREA_2_RAW_ID, &single).is_ok());
-        assert_eq!(single.phases, None);
+        assert_eq!(single.features.phases, None);
         let fixture = tempfile::tempdir().unwrap();
         let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
@@ -9097,10 +9099,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 kind: gen_core::ControlKind::Pose,
                 scale: Some(1.0),
             }],
-            pag: Some(gen_core::PagConfig {
+            features: candle_gen::gen_core::FeatureParams { pag: Some(gen_core::PagConfig {
                 scale: 1.2,
                 ..Default::default()
-            }),
+            }), ..Default::default() },
             ..Default::default()
         };
         assert!(matches!(
@@ -9138,7 +9140,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             }
 
             let mut ok_default = base.clone();
-            ok_default.pag = Some(PagConfig {
+            ok_default.features.pag = Some(PagConfig {
                 scale: 1.5,
                 ..Default::default()
             });
@@ -9154,7 +9156,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             );
 
             let mut ok_bounds = base.clone();
-            ok_bounds.pag = Some(PagConfig {
+            ok_bounds.features.pag = Some(PagConfig {
                 scale: 1.5,
                 layers: Some(vec![27, 0, 14, 0]),
                 ..Default::default()
@@ -9172,7 +9174,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
 
             // scale == 0.0 resolves to None (strict zero-pass no-op), while still rejecting block >= 28.
             let mut zero_noop = base.clone();
-            zero_noop.pag = Some(PagConfig {
+            zero_noop.features.pag = Some(PagConfig {
                 scale: 0.0,
                 layers: Some(vec![14]),
                 ..Default::default()
@@ -9187,7 +9189,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             );
 
             let mut bad_zero_layer = base.clone();
-            bad_zero_layer.pag = Some(PagConfig {
+            bad_zero_layer.features.pag = Some(PagConfig {
                 scale: 0.0,
                 layers: Some(vec![28]),
                 ..Default::default()
@@ -9220,7 +9222,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 },
             ] {
                 let mut invalid = base.clone();
-                invalid.pag = Some(bad);
+                invalid.features.pag = Some(bad);
                 assert!(g.validate(&invalid).is_err());
             }
         }
@@ -9248,10 +9250,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 height: 1024,
                 guidance: Some(0.0),
                 negative_prompt: None,
-                pag: Some(PagConfig {
+                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                     scale: 1.5,
                     ..Default::default()
-                }),
+                }), ..Default::default() },
                 ..Default::default()
             };
             if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
@@ -9287,10 +9289,10 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                 height: 1024,
                 guidance: Some(1.0),
                 negative_prompt: None,
-                pag: Some(PagConfig {
+                features: candle_gen::gen_core::FeatureParams { pag: Some(PagConfig {
                     scale: 1.5,
                     ..Default::default()
-                }),
+                }), ..Default::default() },
                 ..Default::default()
             };
             if id == KREA_2_EDIT_ID {
@@ -9312,7 +9314,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             height: 1024,
             guidance: Some(0.0),
             negative_prompt: Some("blurry".into()),
-            phases: Some(vec![phase(20, Some(0.0)), phase(8, None)]),
+            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![phase(20, Some(0.0)), phase(8, None)]), ..Default::default() },
             ..Default::default()
         };
         assert!(matches!(
@@ -9325,7 +9327,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         };
         assert!(raw_g.validate(&all_cfg_off_no_neg).is_ok());
         let mixed_cfg = GenerationRequest {
-            phases: Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]),
+            features: candle_gen::gen_core::FeatureParams { phases: Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]), ..Default::default() },
             ..all_cfg_off
         };
         assert!(raw_g.validate(&mixed_cfg).is_ok());

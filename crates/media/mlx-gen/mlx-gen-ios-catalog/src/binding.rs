@@ -31,7 +31,6 @@ impl fmt::Debug for GenerationView<'_> {
         let r = self.0;
         f.debug_struct("GenerationRequest")
             .field("prompt", &r.prompt)
-            .field("moss_image", &r.moss_image)
             .field("negative_prompt", &r.negative_prompt)
             .field("width", &r.width)
             .field("height", &r.height)
@@ -40,64 +39,38 @@ impl fmt::Debug for GenerationView<'_> {
             .field("steps", &r.steps)
             .field("guidance", &r.guidance)
             .field("true_cfg", &r.true_cfg)
-            .field("timestep_to_start_cfg", &r.timestep_to_start_cfg)
             .field("sampler", &r.sampler)
             .field("scheduler", &r.scheduler)
             .field("scheduler_shift", &r.scheduler_shift)
-            .field("h3_image_sampler", &r.h3_image_sampler)
             .field("guidance_method", &r.guidance_method)
             .field("guidance_eta", &r.guidance_eta)
             .field("guidance_momentum", &r.guidance_momentum)
             .field("guidance_norm_threshold", &r.guidance_norm_threshold)
             .field("cfg_interval", &r.cfg_interval)
-            .field("pag", &r.pag)
             .field("prompt_batch", &r.prompt_batch)
             .field("caption_overflow", &r.caption_overflow)
             .field("conditioning", &r.conditioning)
-            .field("flux3_reference_output", &r.flux3_reference_output)
-            .field("flux3_layout", &r.flux3_layout)
-            .field("flux3_layout_bindings", &r.flux3_layout_bindings)
+            .field("source_image", &r.source_image)
             .field("strength", &r.strength)
             .field("control_scale", &r.control_scale)
-            .field("text_style_gain", &r.text_style_gain)
             .field("image_guidance", &r.image_guidance)
             .field("frames", &r.frames)
             .field("fps", &r.fps)
             .field("duration", &r.duration)
             .field("video_mode", &r.video_mode)
-            .field("veda", &r.veda)
-            .field("h3_terminal_telemetry", &r.h3_terminal_telemetry)
-            .field("trim_first_frames", &r.trim_first_frames)
-            .field("num_generated_keyframes", &r.num_generated_keyframes)
-            .field("reference_image_short_edge", &r.reference_image_short_edge)
-            .field(
-                "reference_image_resize_mode",
-                &r.reference_image_resize_mode,
-            )
-            .field("temporal_upsample_rounds", &r.temporal_upsample_rounds)
-            .field("auto_duration", &r.auto_duration)
-            .field("motion_bucket_id", &r.motion_bucket_id)
-            .field("noise_aug_strength", &r.noise_aug_strength)
-            .field("decode_chunk_size", &r.decode_chunk_size)
-            .field("conditioning_fps", &r.conditioning_fps)
-            .field("softness", &r.softness)
             .field("enhance_prompt", &r.enhance_prompt)
-            .field("use_uncensored_enhancer", &r.use_uncensored_enhancer)
             .field("enhance_max_tokens", &r.enhance_max_tokens)
             .field("enhance_temperature", &r.enhance_temperature)
             .field("prompt_enhancement", &r.prompt_enhancement)
-            .field("use_pid", &r.use_pid)
-            .field("pid_capture_sigma", &r.pid_capture_sigma)
             .field("memory", &r.memory)
             .field("approximation", &r.approximation)
             .field("audio", &r.audio)
-            .field("phases", &r.phases)
+            .field("features", &r.features)
+            .field("extensions", &r.extensions)
             .field("cancel", neutral_cancel())
             .field("preview", &r.preview)
             .field("hdr", &r.hdr)
             .field("output_channels", &r.output_channels)
-            .field("low_res_start", &r.low_res_start)
-            .field("source_image", &r.source_image)
             .finish()
     }
 }
@@ -293,7 +266,7 @@ pub(crate) mod tests {
         let IosWork::Generate(r) = &mut works[0] else {
             unreachable!()
         };
-        r.h3_terminal_telemetry = true;
+        r.extensions.h3_mut().terminal_telemetry = true;
         assert_ne!(work_binding(&works[0]), before_telemetry);
         assert_eq!(work_binding(&works[0]), tiny_reference(&works[0]));
     }
@@ -314,30 +287,34 @@ pub(crate) mod tests {
             previous = current;
         };
 
-        request.moss_image = Some(MossImageOptions::default());
+        request.extensions.moss_image_mut().options = Some(MossImageOptions::default());
         check(&request);
-        request.flux3_reference_output = Some(ReferenceOutputSize {
+        request.extensions.flux3_mut().reference_output = Some(ReferenceOutputSize {
             width: Some(512),
             height: None,
         });
         check(&request);
-        request.flux3_layout = Some(Layout::parse(r#"{"version":1,"boxes":[]}"#).unwrap());
+        request.extensions.flux3_mut().layout =
+            Some(Layout::parse(r#"{"version":1,"boxes":[]}"#).unwrap());
         check(&request);
-        request.flux3_layout_bindings = vec![ReferenceBinding::oriented("reference-1", (64, 64))];
+        request.extensions.flux3_mut().layout_bindings =
+            vec![ReferenceBinding::oriented("reference-1", (64, 64))];
         check(&request);
         // sc-26691: the H3 reference resize policy changes the rendered work, so it is bound.
-        request.reference_image_resize_mode =
+        request.extensions.h3_mut().reference_image_resize_mode =
             Some(mlx_gen::gen_core::ReferenceImageResizeMode::Match);
         check(&request);
-        request.reference_image_resize_mode =
+        request.extensions.h3_mut().reference_image_resize_mode =
             Some(mlx_gen::gen_core::ReferenceImageResizeMode::Max);
         check(&request);
         // SW-7106: the H3-Image sampler and its LCM parameters change the rendered work.
-        request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(1.1));
+        request.extensions.h3_mut().image_sampler =
+            Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(1.1));
         check(&request);
-        request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.9));
+        request.extensions.h3_mut().image_sampler =
+            Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.9));
         check(&request);
-        request.pag = Some(mlx_gen::gen_core::PagConfig {
+        request.features.pag = Some(mlx_gen::gen_core::PagConfig {
             scale: 1.2,
             ..Default::default()
         });

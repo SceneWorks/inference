@@ -327,7 +327,7 @@ impl LowResStartSpec {
         executed_steps: usize,
         pixel_stride: u32,
     ) -> Result<ResolvedLowResStartPlan> {
-        if req.phases.is_some() {
+        if req.features.phases.is_some() {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with multi-phase denoise (phases)",
                 descriptor.id
@@ -336,12 +336,7 @@ impl LowResStartSpec {
         let pass0_conditioning = classify_descriptor_pass0_conditioning(descriptor);
         let is_plain_single_reference_img2img = pass0_conditioning
             == Pass0ConditioningRequirement::NoiseStartSupported
-            && descriptor.family != "flux"
-            && !descriptor.id.starts_with("flux1_")
-            && !descriptor.id.contains("ip_adapter")
-            && descriptor
-                .capabilities
-                .accepts(crate::ConditioningKind::Reference)
+            && descriptor.capabilities.allows_low_res_start_single_ref_img2img
             && req.source_image.is_none()
             && req.conditioning.len() == 1
             && matches!(req.conditioning[0], Conditioning::Reference { .. });
@@ -2761,18 +2756,13 @@ fn probe_dimension(descriptor: &ModelDescriptor, stride: u32) -> u32 {
 fn classify_descriptor_pass0_conditioning(
     descriptor: &ModelDescriptor,
 ) -> Pass0ConditioningRequirement {
-    if descriptor.control_kinds.is_some()
+    if descriptor.capabilities.pass0_requirement != Pass0ConditioningRequirement::NoiseStartSupported
+    {
+        descriptor.capabilities.pass0_requirement
+    } else if descriptor.control_kinds.is_some()
         || descriptor.capabilities.conditioning == [ConditioningKind::Control]
     {
         Pass0ConditioningRequirement::RequiresControl
-    } else if descriptor.id.contains("edit") || descriptor.id.contains("fill") {
-        Pass0ConditioningRequirement::RequiresEdit
-    } else if descriptor.family == "pulid"
-        || descriptor.id.contains("pulid")
-        || descriptor.id.contains("ip_adapter")
-        || descriptor.id.contains("instantid")
-    {
-        Pass0ConditioningRequirement::RequiresReference
     } else {
         Pass0ConditioningRequirement::NoiseStartSupported
     }
@@ -3210,7 +3200,7 @@ impl ComposedRenderPlan {
         Ok(Self {
             route_id: route.route_id.clone(),
             backend: route.backend.clone(),
-            request_has_phases: req.phases.is_some(),
+            request_has_phases: req.features.phases.is_some(),
             pass0_has_conditioning: !req.conditioning.is_empty() || plan.has_conditioning(),
             resolved_feature_order: Vec::new(),
             passes: vec![pass],
@@ -4770,7 +4760,7 @@ pub fn validate_low_res_start_request(
     k: usize,
     scale: Option<f32>,
 ) -> Result<ComposedRenderPlan> {
-    if req.phases.is_some() {
+    if req.features.phases.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: low_res_start conflicts with multi-phase denoise (phases)",
             descriptor.id
@@ -4813,7 +4803,7 @@ pub fn validate_low_res_start_request(
     let base_plan = ComposedRenderPlan {
         route_id: route.route_id.clone(),
         backend: route.backend.clone(),
-        request_has_phases: req.phases.is_some(),
+        request_has_phases: req.features.phases.is_some(),
         pass0_has_conditioning: !req.conditioning.is_empty(),
         resolved_feature_order: Vec::new(),
         passes: vec![pass0],
@@ -5587,11 +5577,14 @@ mod tests {
         );
 
         let phased_req = GenerationRequest {
-            phases: Some(vec![GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            }]),
+            features: crate::FeatureParams {
+                phases: Some(vec![GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..clean_req.clone()
         };
         assert!(matches!(
@@ -5797,7 +5790,10 @@ mod tests {
             count: 2,
             frames: Some(25),
             seed: Some(42),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: crate::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = RenderPlan::base_image(
@@ -5826,7 +5822,10 @@ mod tests {
             height: 1024,
             count: 1,
             seed: Some(7),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: crate::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let pass1_req = GenerationRequest {
@@ -6298,15 +6297,19 @@ mod tests {
                 width: 512,
                 height: 512,
                 sampler: Some(unsupported_sampler.into()),
-                low_res_start: Some(
-                    LowResStartSpec::new(2, Some(0.5))
-                        .with_estimate_source(EstimateSource::PreviousEvaluation),
-                ),
+                features: crate::FeatureParams {
+                    low_res_start: Some(
+                        LowResStartSpec::new(2, Some(0.5))
+                            .with_estimate_source(EstimateSource::PreviousEvaluation),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             assert!(
                 matches!(
                     req_prev
+                        .features
                         .low_res_start
                         .unwrap()
                         .resolve_for_descriptor(&desc, &req_prev, 4, 16),
@@ -6315,8 +6318,9 @@ mod tests {
                 "PreviousEvaluation must refuse unsupported sampler {unsupported_sampler}"
             );
             // EndpointEvaluation continues to resolve without removing its supported routes or fallback behavior.
-            req_prev.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+            req_prev.features.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
             assert!(req_prev
+                .features
                 .low_res_start
                 .unwrap()
                 .resolve_for_descriptor(&desc, &req_prev, 4, 16)
@@ -6330,14 +6334,18 @@ mod tests {
             height: 512,
             sampler: Some("euler".into()),
             guidance_method: Some("cfg_pp".into()),
-            low_res_start: Some(
-                LowResStartSpec::new(2, Some(0.5))
-                    .with_estimate_source(EstimateSource::PreviousEvaluation),
-            ),
+            features: crate::FeatureParams {
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5))
+                        .with_estimate_source(EstimateSource::PreviousEvaluation),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(
             req_cfgpp
+                .features
                 .low_res_start
                 .unwrap()
                 .resolve_for_descriptor(&desc, &req_cfgpp, 4, 16),
@@ -6573,7 +6581,10 @@ mod tests {
             width: 1024,
             height: 1024,
             count: 1,
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: crate::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(matches!(
@@ -6752,6 +6763,7 @@ mod tests {
                 max_size: 2048,
                 max_count: 8,
                 supports_low_res_start: true,
+                allows_low_res_start_single_ref_img2img: true,
                 ..Default::default()
             },
         };
@@ -6769,10 +6781,14 @@ mod tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: crate::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved_f2 = req
+            .features
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&flux2_desc, &req, 4, 16)
@@ -6791,20 +6807,23 @@ mod tests {
             strength: Some(0.5),
         });
         assert!(req
+            .features
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&flux2_desc, &multi_ref_req, 4, 16)
             .is_err());
 
         // FLUX.1 descriptors treat `Conditioning::Reference` as XLabs IP-Adapter conditioning
-        // (plain img2img uses `req.source_image`), so `Conditioning::Reference` + `low_res_start`
-        // must be rejected on both `flux1_dev` and `flux1_dev_ip_adapter`.
+        // (plain img2img uses `req.source_image`), so `allows_low_res_start_single_ref_img2img`
+        // is false on both `flux1_dev` and `flux1_dev_ip_adapter`.
         let mut flux1_desc = flux2_desc.clone();
         flux1_desc.id = "flux1_dev";
         flux1_desc.family = "flux";
         flux1_desc.capabilities.conditioning = vec![ConditioningKind::Reference];
         flux1_desc.capabilities.supports_low_res_start = true;
+        flux1_desc.capabilities.allows_low_res_start_single_ref_img2img = false;
         assert!(req
+            .features
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&flux1_desc, &req, 4, 16)
@@ -6816,7 +6835,10 @@ mod tests {
         let mut flux1_ip_desc = flux1_desc.clone();
         flux1_ip_desc.id = "flux1_dev_ip_adapter";
         flux1_ip_desc.capabilities.supports_low_res_start = false;
+        flux1_ip_desc.capabilities.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresReference;
         assert!(req
+            .features
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&flux1_ip_desc, &req, 4, 16)
@@ -6838,10 +6860,14 @@ mod tests {
             width: 512,
             height: 512,
             count: 1,
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: crate::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved_anima = t2i_req
+            .features
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&anima_desc, &t2i_req, 4, 16)

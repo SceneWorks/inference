@@ -385,7 +385,7 @@ fn validate_request_for_variant(variant: Variant, req: &GenerationRequest) -> ge
         )));
     }
     pipeline::resolve_reference(req)?;
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
         let executed_steps = sigmas[start_step..].len().saturating_sub(1);
         low_res.resolve_for_descriptor(&descriptor, req, executed_steps, SIZE_MULTIPLE)?;
@@ -1210,7 +1210,7 @@ mod tests {
                     height: 768,
                     steps: Some(steps as u32),
                     seed: Some(1234),
-                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    features: candle_gen::gen_core::FeatureParams { low_res_start: Some(LowResStartSpec::new(3, Some(0.5))), ..Default::default() },
                     ..Default::default()
                 };
                 if via_source_image {

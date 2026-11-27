@@ -158,9 +158,9 @@ struct VideoInputs {
 
 impl VideoInputs {
     fn from_request(req: &GenerationRequest) -> Result<Self> {
-        if req.low_res_start.is_some()
-            || req.phases.is_some()
-            || req.use_pid
+        if req.features.low_res_start.is_some()
+            || req.features.phases.is_some()
+            || req.use_pid()
             || req.source_image.is_some()
         {
             return Err(Error::Unsupported(
@@ -224,28 +224,29 @@ impl VideoInputs {
                 }
             }
         }
+        let svd = req.extensions.svd;
         Ok(Self {
             width: req.width,
             height: req.height,
             frames: req.frames,
-            trim: req.trim_first_frames,
+            trim: req.extensions.wan.and_then(|w| w.trim_first_frames),
             count: req.count,
             fps: req.fps,
-            mode: req.video_mode.clone(),
-            sampler: req.sampler.clone(),
+            mode: req.video_mode.as_deref().map(str::to_owned),
+            sampler: req.sampler.as_deref().map(str::to_owned),
             steps: req.steps,
             seed: req.seed,
             guidance: req.guidance.map(f32::to_bits),
             shift: req.scheduler_shift.map(f32::to_bits),
-            decode_chunk: req.decode_chunk_size,
+            decode_chunk: svd.and_then(|s| s.decode_chunk_size),
             carrier_bytes,
             reference_rgb_digests,
             content: content.finalize().into(),
             strength: req.strength.map(f32::to_bits),
-            scheduler: req.scheduler.clone(),
-            conditioning_fps: req.conditioning_fps,
-            motion_bucket: req.motion_bucket_id.map(f32::to_bits),
-            noise_aug: req.noise_aug_strength.map(f32::to_bits),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
+            conditioning_fps: svd.and_then(|s| s.conditioning_fps),
+            motion_bucket: svd.and_then(|s| s.motion_bucket_id).map(f32::to_bits),
+            noise_aug: svd.and_then(|s| s.noise_aug_strength).map(f32::to_bits),
             approximation: req.approximation.clone(),
         })
     }

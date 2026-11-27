@@ -1058,7 +1058,13 @@ impl WanMemoryRequestScope {
                 "{MODEL_ID}: calibrated memory route requires empty T2V conditioning"
             )));
         }
-        if request.enhance_prompt || request.use_uncensored_enhancer {
+        if request.enhance_prompt
+            || request
+                .extensions
+                .ltx
+                .as_ref()
+                .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include prompt enhancement"
             )));
@@ -1068,7 +1074,7 @@ impl WanMemoryRequestScope {
                 "{MODEL_ID}: calibrated memory route does not include video_mode variants"
             )));
         }
-        if request.phases.is_some() {
+        if request.features.phases.is_some() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated memory route does not include multi-phase generation"
             )));
@@ -2164,7 +2170,7 @@ mod tests {
                 "fps" => request.fps = Some(DEFAULT_FPS + 1),
                 "frames" => request.frames = Some(DEFAULT_FRAMES - 4),
                 "video_mode" => request.video_mode = Some("variant".into()),
-                "phases" => request.phases = Some(Vec::new()),
+                "phases" => request.features.phases = Some(Vec::new()),
                 _ => unreachable!(),
             }
             assert!(scope.configure_request(&mut request).is_err(), "{mutation}");

@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 
 use crate::feature::{FeatureRouteStructure, Pass0ConditioningRequirement};
 use crate::generator::{
-    Capabilities, ConditioningKind, Modality, ModelDescriptor, SizeFloor, StepSupport,
+    Capabilities, ConditioningKind, FamilyExtensionKind, Modality, ModelDescriptor, SizeFloor,
+    StepSupport,
 };
 use crate::runtime::Quant;
 
@@ -19,6 +20,16 @@ impl RouteRecord {
             && s.denoiser.supports_low_res_transition()
             && s.latent_codec.supports_spatial_unpack_repack()
             && s.conditioning.pass0_requirement == Pass0ConditioningRequirement::NoiseStartSupported;
+        let allows_low_res_start_single_ref_img2img = supports_low_res_start
+            && s.conditioning.pass0_requirement == Pass0ConditioningRequirement::NoiseStartSupported
+            && s.conditioning.kinds.contains(&ConditioningKind::Reference)
+            && !s.conditioning.low_res_start_forbids_reference_conditioning;
+        let mut supported_family_extensions = s.supported_family_extensions.clone();
+        if s.sampling.supports_h3_image_sampler
+            && !supported_family_extensions.contains(&FamilyExtensionKind::H3ImageSampler)
+        {
+            supported_family_extensions.push(FamilyExtensionKind::H3ImageSampler);
+        }
 
         Capabilities {
             supports_negative_prompt: s.conditioning.supports_negative_prompt,
@@ -48,6 +59,7 @@ impl RouteRecord {
             supports_caption_overflow_policy: s.text_encoders.supports_caption_overflow_policy,
             supports_h3_image_sampler: s.sampling.supports_h3_image_sampler,
             max_prompt_tokens: s.text_encoders.max_prompt_tokens,
+            max_enhance_tokens: s.text_encoders.max_enhance_tokens,
             supports_alpha_output: s.output.supports_alpha_output,
             supports_prompt_enhancement: s.text_encoders.supports_prompt_enhancement,
             supports_streaming: s.audio.supports_streaming,
@@ -70,6 +82,7 @@ impl RouteRecord {
             supports_conversation_session: s.audio.supports_conversation_session,
             supported_quants: s.weight_plan.supported_quants,
             component_precision_floors: s.weight_plan.component_precision_floors,
+            supports_ar_load_controls: s.weight_plan.supports_ar_load_controls,
             supports_kv_cache: s.residency.supports_kv_cache,
             requires_sigma_shift: s.sampling.requires_sigma_shift,
             supports_sequential_offload: s.residency.supports_sequential_offload,
@@ -81,6 +94,9 @@ impl RouteRecord {
             pag: s.denoiser.pag().cloned(),
             supports_phases: s.denoiser.supports_multiphase_denoise(),
             supports_low_res_start,
+            pass0_requirement: s.conditioning.pass0_requirement,
+            allows_low_res_start_single_ref_img2img,
+            supported_family_extensions,
         }
     }
 

@@ -405,7 +405,7 @@ impl Generator for SdxlControlGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        if req.low_res_start.is_some() {
+        if req.features.low_res_start.is_some() {
             return Err(gen_core::Error::Unsupported(
                 "sdxl: low_res_start conflicts with pass-0 ControlNet conditioning".into(),
             ));
@@ -429,7 +429,7 @@ impl Generator for SdxlControlGenerator {
                 req.width, req.height
             )));
         }
-        if req.use_pid {
+        if req.use_pid() {
             return Err(gen_core::Error::Unsupported(
                 "sdxl: generic ControlNet does not support the PiD decoder".into(),
             ));

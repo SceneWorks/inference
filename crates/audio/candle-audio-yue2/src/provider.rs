@@ -192,6 +192,7 @@ pub fn route() -> gen_core::RouteRecord {
                 source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
                 supported_quants: SUPPORTED_QUANTS,
                 required_components: REQUIRED_COMPONENTS,
+                supports_ar_load_controls: true,
                 ..Default::default()
             },
             audio: gen_core::AudioSurface {
@@ -991,6 +992,8 @@ impl Generator for Yue2Generator {
             prefix_kv_cache: None,
             pag: None,
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 }

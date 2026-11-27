@@ -29,9 +29,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
-use gen_core::generator::{
-    CompletedGeneration, CompletedMossImageAdvanced, CompletedMossImageEdit, ExecutionIdentity,
-};
+use gen_core::generator::{CompletedGeneration, CompletedMossImageAdvanced, ExecutionIdentity};
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use loader::Sources;
 use release::release_then_sync;
@@ -630,6 +628,24 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
         CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
+impl MossImageGenerator {
+    /// Last-run MOSS-Image execution report for concrete `MossImageAdvancedGenerator` callers.
+    /// Generic `Generator` callers receive this directly on `GenerationReport::moss_image_report()`.
+    pub fn last_execution_report(&self) -> Option<MossImageExecutionReport> {
+        candle_gen::lock_recover(&self.state).report.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
+        candle_gen::lock_recover(&self.state).edit_report.clone()
+    }
+
+    /// Last-run adapter apply reports for concrete advanced-generator test harnesses.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        candle_gen::lock_recover(&self.state).apply_reports.clone()
+    }
+}
 impl Generator for MossImageGenerator {
     fn generate_with_report(
         &self,
@@ -644,57 +660,79 @@ impl Generator for MossImageGenerator {
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedGeneration> {
-        let (output, pag, execution) =
-            self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?;
+        let edit_req = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        let (output, pag, execution, is_edit) = if let Some(edit_req) = edit_req {
+            let inputs = edit_req.as_inputs();
+            if inputs.advanced.output != MossImageOutputKind::Images {
+                return Err(gen_core::Error::Unsupported(
+                    "generic MOSS generation requires image output".into(),
+                ));
+            }
+            let (output, pag, execution) =
+                self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
+            (output, pag, execution, true)
+        } else {
+            let (output, pag, execution) = self.run_with_execution(
+                request,
+                MossImageAdvancedInputs::default(),
+                None,
+                progress,
+            )?;
+            (output, pag, execution, false)
+        };
         let MossImageAdvancedOutput::Images(images) = output else {
             unreachable!("default image output")
         };
+        let (family_report, apply_reports) = {
+            let state = candle_gen::lock_recover(&self.state);
+            let family_report = if is_edit {
+                state
+                    .edit_report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
+            } else {
+                state
+                    .report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
+            };
+            (family_report, state.apply_reports.clone())
+        };
         let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
         report.pag = pag;
+        report.adapter_apply_reports = apply_reports;
+        report.family_report = family_report;
         CompletedGeneration::new(report, execution, &self.descriptor)
     }
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<CompletedMossImageEdit> {
-        let (output, _, execution) =
-            self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
-        CompletedMossImageEdit::new(output, execution, &self.descriptor)
-    }
-    fn generate_moss_image_edit(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<MossImageAdvancedOutput> {
-        self.run_with_edit(request, inputs.advanced, Some(inputs), progress)
-    }
-    fn moss_image_edit_request_peak(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-    ) -> gen_core::Result<u64> {
-        memory_strategy::edit_request_peak(self.variant(), &self.sources.spec, request, inputs)
-    }
-    fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
-        candle_gen::lock_recover(&self.state).edit_report.clone()
+    fn request_memory_peak(&self, request: &GenerationRequest) -> gen_core::Result<Option<u64>> {
+        let Some(edit_req) = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref())
+        else {
+            return Ok(None);
+        };
+        memory_strategy::edit_request_peak(
+            self.variant(),
+            &self.sources.spec,
+            request,
+            edit_req.as_inputs(),
+        )
+        .map(Some)
     }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
-    fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
-        candle_gen::lock_recover(&self.state).report.clone()
-    }
-    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+    fn retained_weight_bytes(&self) -> Option<u64> {
         self.state
             .lock()
             .ok()
             .and_then(|state| self.cached_resident_bytes(&state).ok())
-    }
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        candle_gen::lock_recover(&self.state).apply_reports.clone()
     }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.contract)
@@ -709,21 +747,32 @@ impl Generator for MossImageGenerator {
         decision
     }
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        let edit_req = req
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        let normalized;
+        let (req, advanced) = if let Some(edit) = edit_req {
+            let inputs = edit.as_inputs();
+            if inputs.advanced.output != MossImageOutputKind::Images {
+                return Err(gen_core::Error::Unsupported(
+                    "generic MOSS generation requires image output".into(),
+                ));
+            }
+            inputs.validate()?;
+            edit::check_precision(&self.device)?;
+            normalized = edit_request(req)?;
+            (&normalized, inputs.advanced)
+        } else {
+            (req, MossImageAdvancedInputs::default())
+        };
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
         let r = MossImageResolved::resolve(self.variant(), req)?;
-        MossImageAdvancedInputs::default().validate(req, &r)?;
-        checked_host_elements(
-            req,
-            req.prompt_batch
-                .len()
-                .max(1)
-                .checked_mul(req.count as usize)
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported("MOSS expanded batch overflow".into())
-                })?,
-        )?;
+        let images = advanced.validate(req, &r)?;
+        checked_host_elements(req, images)?;
         memory_strategy::check_request(req)?;
         self.selected_sources(r.acceleration, &req.cancel)?
             .assets(r.acceleration)?;
@@ -734,10 +783,9 @@ impl Generator for MossImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        match self.run(req, MossImageAdvancedInputs::default(), on_progress)? {
-            MossImageAdvancedOutput::Images(images) => Ok(GenerationOutput::Images(images)),
-            MossImageAdvancedOutput::Latents { .. } => unreachable!("default image output"),
-        }
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("MOSS generation produced no output".into()))
     }
 }
 
@@ -865,6 +913,7 @@ pub(crate) fn route(v: MossImageVariant) -> gen_core::RouteRecord {
                 },
                 ..Default::default()
             },
+            supported_family_extensions: vec![gen_core::FamilyExtensionKind::MossImage],
             ..Default::default()
         },
         limits: gen_core::ProductLimits {

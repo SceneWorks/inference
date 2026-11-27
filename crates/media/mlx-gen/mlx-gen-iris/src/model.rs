@@ -58,6 +58,7 @@ pub fn route() -> RouteRecord {
                 max_prompt_tokens: None,
                 supports_caption_overflow_policy: true,
                 supports_prompt_enhancement: false,
+                ..Default::default()
             },
             conditioning: ConditioningSurface {
                 kinds: vec![],
@@ -65,6 +66,7 @@ pub fn route() -> RouteRecord {
                 pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: true,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: SamplingSurface {
                 samplers: SAMPLERS.to_vec(),
@@ -107,6 +109,7 @@ pub fn route() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: OutputSurface {
                 preview: PreviewSupport::PixelSpace,
@@ -175,6 +178,7 @@ pub fn route_depth() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             ..Default::default()
         },
@@ -231,6 +235,7 @@ pub fn route_restore() -> RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             ..Default::default()
         },
@@ -771,6 +776,8 @@ impl Iris3b {
             prefix_kv_cache: None,
             pag: None,
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 
@@ -917,13 +924,6 @@ impl Generator for Iris3b {
         &self.descriptor
     }
 
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .map(|reports| reports.clone())
-            .unwrap_or_default()
-    }
-
     /// The registered contract, priced from the loaded resources: the same one
     /// [`crate::memory_strategy::MEMORY_REGISTRATION`] builds for this spec.
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -1019,7 +1019,13 @@ impl Iris3b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let mut report = self.generate_impl(req, on_progress)?;
+        report.adapter_apply_reports = self
+            .adapter_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default();
+        Ok(report)
     }
 }
 

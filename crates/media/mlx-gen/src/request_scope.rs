@@ -253,7 +253,7 @@ pub fn validate_geometry_decode_authorization(
             // API boundary a caller can hand an arbitrary policy to; this site reads a
             // thread-local that only that call populates, so repeating it here would add a
             // condition that cannot fail on any reachable path.
-            || binding.use_pid != request.use_pid
+            || binding.use_pid != request.use_pid()
             || binding.tile_edge != tile_edge
             || binding.overlap != overlap
         {
@@ -404,10 +404,12 @@ impl MlxRequestScopeCore {
 impl MlxRequestScopeCore {
     fn validate_configuration(&self, request: &GenerationRequest) -> Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.config.use_pid {
+        if request.use_pid() != self.config.use_pid {
             return Err(Error::Unsupported(format!(
                 "{}: request use_pid={} does not match admitted use_pid={}",
-                self.config.provider_id, request.use_pid, self.config.use_pid
+                self.config.provider_id,
+                request.use_pid(),
+                self.config.use_pid
             )));
         }
         if request.width != self.config.geometry.width
@@ -1466,7 +1468,7 @@ mod tests {
             height: 1024,
             count: 1,
             steps: Some(8),
-            low_res_start: Some(crate::gen_core::LowResStartSpec::new(4, Some(0.5))),
+            features: gen_core::FeatureParams { low_res_start: Some(crate::gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = crate::gen_core::RenderPlan::base_image(

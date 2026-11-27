@@ -509,7 +509,7 @@ pub fn resolve_sprint_with_init(
         || req.scheduler.as_deref().is_some_and(|s| s != "default")
         || req.guidance_method.is_some()
         || req.true_cfg.is_some()
-        || req.use_pid
+        || req.use_pid()
     {
         return Err(Error::Unsupported(
             "SANA Sprint serves only default SCM with embedded guidance".into(),

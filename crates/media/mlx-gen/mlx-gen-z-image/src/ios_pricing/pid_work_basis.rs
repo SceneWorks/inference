@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     fn flow(use_pid: bool) -> FlowSamplingRecipe {
         let req = mlx_gen::GenerationRequest {
-            use_pid,
+            features: mlx_gen::gen_core::FeatureParams { pid: (use_pid).then(mlx_gen::gen_core::PidParams::enabled), ..Default::default() },
             ..Default::default()
         };
         crate::sampling::resolve(&req).unwrap().recipe().clone()
@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn actual_utf8_input_bytes_roundtrip_without_prompt_or_synthetic_replay_request() {
         let req = mlx_gen::GenerationRequest {
-            use_pid: true,
             prompt: "é界".into(),
+            features: mlx_gen::gen_core::FeatureParams { pid: Some(mlx_gen::gen_core::PidParams::enabled()), ..Default::default() },
             ..Default::default()
         };
         let basis = PidWorkBasis::actual(&req);

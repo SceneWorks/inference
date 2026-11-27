@@ -547,6 +547,7 @@ pub(crate) fn route_video() -> gen_core::RouteRecord {
                 pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
                 supports_negative_prompt: false,
                 modules: vec![],
+                ..Default::default()
             },
             sampling: gen_core::SamplingSurface {
                 samplers: Vec::new(),
@@ -601,12 +602,17 @@ pub(crate) fn route_video() -> gen_core::RouteRecord {
                 requires_control_overlay: false,
                 requires_ip_adapter_overlay: false,
                 requires_identity_overlay: false,
+                ..Default::default()
             },
             output: gen_core::OutputSurface {
                 preview: gen_core::PreviewSupport::Unsupported,
                 supports_hdr: false,
                 supports_alpha_output: false,
             },
+            supported_family_extensions: vec![
+                gen_core::FamilyExtensionKind::H3Veda,
+                gen_core::FamilyExtensionKind::H3Reference,
+            ],
             ..Default::default()
         },
         limits: gen_core::ProductLimits {
@@ -1423,7 +1429,12 @@ impl MiniMaxH3 {
         let _stream_request =
             crate::block_stream::RequestGuard::enter(req, self.load_shape, &self.device)?;
         *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
-            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            requested: req
+                .extensions
+                .h3
+                .as_ref()
+                .and_then(|h3| h3.veda.as_ref())
+                .is_some_and(|v| v.enabled),
             ..Default::default()
         };
         Generator::validate(self, req)?;
@@ -1577,7 +1588,13 @@ impl MiniMaxH3 {
         // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
         // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
         model.set_cancel(&req.cancel);
-        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+        if let Some(request) = req
+            .extensions
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.veda.as_ref())
+            .filter(|v| v.enabled)
+        {
             model.prepare_veda(
                 request,
                 self.veda_component.as_deref(),
@@ -1593,8 +1610,12 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let mut terminal_probe = req
-            .h3_terminal_telemetry
+        let h3_terminal_telemetry = req
+            .extensions
+            .h3
+            .as_ref()
+            .is_some_and(|h3| h3.terminal_telemetry);
+        let mut terminal_probe = h3_terminal_telemetry
             .then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
@@ -1612,7 +1633,7 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
-            req.h3_terminal_telemetry
+            h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
         phase.done();
@@ -1987,7 +2008,13 @@ impl MiniMaxH3 {
         // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
         // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
         model.set_cancel(&req.cancel);
-        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+        if let Some(request) = req
+            .extensions
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.veda.as_ref())
+            .filter(|v| v.enabled)
+        {
             model.prepare_veda(
                 request,
                 self.veda_component.as_deref(),
@@ -2003,8 +2030,12 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let mut terminal_probe = req
-            .h3_terminal_telemetry
+        let h3_terminal_telemetry = req
+            .extensions
+            .h3
+            .as_ref()
+            .is_some_and(|h3| h3.terminal_telemetry);
+        let mut terminal_probe = h3_terminal_telemetry
             .then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
@@ -2022,7 +2053,7 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
-            req.h3_terminal_telemetry
+            h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
         phase.done();
@@ -2508,16 +2539,12 @@ impl Generator for MiniMaxH3 {
         (held > 0).then_some(held)
     }
 
-    fn veda_execution_report(&self) -> Option<candle_gen::gen_core::VedaExecutionReport> {
-        Some(self.veda_report.borrow().clone())
-    }
-
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
-        if let Some(veda) = &req.veda {
+        if let Some(veda) = req.extensions.h3.as_ref().and_then(|h3| h3.veda.as_ref()) {
             veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
                 .map_err(candle_gen::gen_core::Error::Msg)?;
         }
@@ -2615,12 +2642,15 @@ impl Generator for MiniMaxH3 {
         Ok(())
     }
 
-    fn veda_workspace_bound(
+    fn request_workspace_bound(
         &self,
-        req: candle_gen::gen_core::veda::workspace::Request<'_>,
-    ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>>
-    {
-        crate::memory_strategy::veda_workspace_bound_for_contract(req, &self.contract)
+        req: &GenerationRequest,
+    ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::RequestWorkspaceBound>> {
+        let veda_req = candle_gen::gen_core::veda::workspace::Request::from(req);
+        Ok(
+            crate::memory_strategy::veda_workspace_bound_for_contract(veda_req, &self.contract)?
+                .map(candle_gen::gen_core::RequestWorkspaceBound::SparseAttention),
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
@@ -2663,6 +2693,19 @@ impl Generator for MiniMaxH3 {
     {
         candle_gen::request_scope::admit(self.memory_strategy_safety_check(context))?;
         crate::memory_strategy::begin_request(&self.contract, self.device.clone(), context)
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        let output = self.generate(req, on_progress)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(output);
+        report.family_report = Some(candle_gen::gen_core::FamilyExecutionReport::Veda(Box::new(
+            self.veda_report.borrow().clone(),
+        )));
+        Ok(report)
     }
 
     fn generate_with_execution_report(
@@ -3036,7 +3079,7 @@ mod tests {
                 assert_eq!(actual.moe_expert, expected.moe_expert);
             }
             let mut request = request(1344, 768);
-            request.veda = Some(VedaRequest {
+            request.extensions.h3_mut().veda = Some(VedaRequest {
                 enabled: true,
                 ..Default::default()
             });
@@ -3101,13 +3144,7 @@ mod tests {
                 !missing.exists(),
                 "offload/load must not fetch or require optional predictor"
             );
-            assert_eq!(
-                model
-                    .veda_execution_report()
-                    .unwrap()
-                    .predictor_load_attempts,
-                0
-            );
+            assert_eq!(model.veda_report.borrow().predictor_load_attempts, 0);
         }
     }
 
@@ -3121,7 +3158,7 @@ mod tests {
                 candle_gen::gen_core::VedaBudget::SparsityPercent(100.0),
             ] {
                 let mut request = request(1344, 768);
-                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                request.extensions.h3_mut().veda = Some(candle_gen::gen_core::VedaRequest {
                     enabled,
                     generated: bad,
                     ..Default::default()
@@ -3132,21 +3169,39 @@ mod tests {
             for steps in [4, 8, 50] {
                 let mut request = request(1344, 768);
                 request.steps = Some(steps);
-                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                request.extensions.h3_mut().veda = Some(candle_gen::gen_core::VedaRequest {
                     enabled,
                     full_attention_steps: vec![steps as usize],
                     ..Default::default()
                 });
                 let error = generator.validate(&request).unwrap_err().to_string();
                 assert!(error.contains("zero-based index"), "{error}");
-                request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
-                request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+                request
+                    .extensions
+                    .h3_mut()
+                    .veda
+                    .as_mut()
+                    .unwrap()
+                    .full_attention_steps = vec![steps as usize - 1];
+                request
+                    .extensions
+                    .h3_mut()
+                    .veda
+                    .as_mut()
+                    .unwrap()
+                    .full_attention_layers = vec![50];
                 assert!(generator
                     .validate(&request)
                     .unwrap_err()
                     .to_string()
                     .contains("full_attention_layers"));
-                request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+                request
+                    .extensions
+                    .h3_mut()
+                    .veda
+                    .as_mut()
+                    .unwrap()
+                    .full_attention_layers = vec![49];
                 generator.validate(&request).unwrap();
             }
         }
@@ -5348,7 +5403,13 @@ mod tests {
     fn validate_refuses_a_reference_image_short_edge_outside_1024_to_2048() {
         let model = validator();
         let with = |edge: u32| GenerationRequest {
-            reference_image_short_edge: Some(edge),
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                h3: Some(candle_gen::gen_core::H3Extension {
+                    reference_image_short_edge: Some(edge),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..request(576, 320)
         };
 
@@ -5377,7 +5438,13 @@ mod tests {
     #[test]
     fn the_generate_path_read_refuses_an_out_of_range_reference_short_edge() {
         let with = |edge: u32| GenerationRequest {
-            reference_image_short_edge: Some(edge),
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                h3: Some(candle_gen::gen_core::H3Extension {
+                    reference_image_short_edge: Some(edge),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..request(576, 320)
         };
 

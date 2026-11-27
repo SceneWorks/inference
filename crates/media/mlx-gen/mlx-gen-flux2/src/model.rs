@@ -1310,7 +1310,7 @@ impl Flux2 {
             request_stages_residency(self.residency.is_sequential(), req),
             transformer_window.is_some(),
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: (dev) caption upsample → prompt encode (+ base true-CFG negative).
             |text: &Flux2TextOwned| {
@@ -2132,7 +2132,7 @@ pub(crate) fn validate_request(
             desc.id
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let default_steps = if desc.id == crate::config::FLUX2_DEV_ID
             || desc.id == crate::config::FLUX2_DEV_EDIT_ID
             || desc.id == crate::config::FLUX2_DEV_CONTROL_ID
@@ -2197,7 +2197,7 @@ pub(crate) fn compile_base(
     }
     resolve_root(variant, spec)?;
     request_transformer_window(variant, spec, req)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
             variant.id()
@@ -5169,13 +5169,12 @@ mod execution_policy_tests {
             height: 1024,
             steps: Some(8),
             sampler: Some("euler".into()),
-            low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))),
-            pag: Some(mlx_gen::gen_core::PagConfig {
+            features: mlx_gen::gen_core::FeatureParams { pag: Some(mlx_gen::gen_core::PagConfig {
                 scale: 1.5,
                 start: Some(0.0),
                 stop: Some(0.625),
                 ..Default::default()
-            }),
+            }), low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5))), ..Default::default() },
             ..Default::default()
         };
         let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req).unwrap();

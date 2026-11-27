@@ -157,14 +157,14 @@ fn native_complete_surface_campaign() {
         let generator =
             MossImageGenerator::load_on_device(variant, &spec, Device::new_cuda(0).unwrap())
                 .unwrap();
-        let ordinary = images(
-            generator
-                .generate(&request, &mut |p| eprintln!("{variant:?} {p:?}"))
-                .unwrap(),
-        );
-        let report = generator
-            .moss_image_execution_report()
+        let ordinary_run = generator
+            .generate_with_report(&request, &mut |p| eprintln!("{variant:?} {p:?}"))
+            .unwrap();
+        let report = ordinary_run
+            .moss_image_report()
+            .cloned()
             .expect("actual complete native receipt");
+        let ordinary = images(ordinary_run.output.unwrap());
         assert_eq!(
             report.data().execution_device,
             MossImageExecutionDevice::Cuda
@@ -183,16 +183,15 @@ fn native_complete_surface_campaign() {
             for precision in [MossDmdPrecision::UnmergedBf16, MossDmdPrecision::FullFp32] {
                 let mut req = request.clone();
                 req.steps = Some(8);
-                req.moss_image = Some(MossImageOptions {
+                req.extensions.moss_image_mut().options = Some(MossImageOptions {
                     acceleration: MossImageAcceleration::Dmd(precision),
                     ..Default::default()
                 });
-                let accelerated = images(
-                    generator
-                        .generate(&req, &mut |p| eprintln!("{precision:?} {p:?}"))
-                        .unwrap(),
-                );
-                let report = generator.moss_image_execution_report().unwrap();
+                let accel_run = generator
+                    .generate_with_report(&req, &mut |p| eprintln!("{precision:?} {p:?}"))
+                    .unwrap();
+                let report = accel_run.moss_image_report().cloned().unwrap();
+                let accelerated = images(accel_run.output.unwrap());
                 assert_eq!(
                     report.data().resolved.acceleration,
                     MossImageAcceleration::Dmd(precision)
@@ -207,7 +206,9 @@ fn native_complete_surface_campaign() {
                     &accelerated,
                     &report,
                 );
-                let off = images(generator.generate(&request, &mut |_| {}).unwrap());
+                let off_run = generator.generate_with_report(&request, &mut |_| {}).unwrap();
+                let off_report = off_run.moss_image_report().cloned().unwrap();
+                let off = images(off_run.output.unwrap());
                 assert_eq!(
                     ordinary, off,
                     "OFF must recover exact ordinary weights after {precision:?}"
@@ -216,7 +217,7 @@ fn native_complete_surface_campaign() {
                     &output,
                     &format!("Sft-off-after-{precision:?}"),
                     &off,
-                    &generator.moss_image_execution_report().unwrap(),
+                    &off_report,
                 );
             }
             // The native advanced route consumes real provided embeddings, masks and exact FP32
@@ -233,7 +234,7 @@ fn native_complete_surface_campaign() {
             req.prompt.clear();
             req.count = 2;
             req.guidance = Some(1.0);
-            req.moss_image = Some(MossImageOptions {
+            req.extensions.moss_image_mut().options = Some(MossImageOptions {
                 uncond_skip_layers: Some(vec![]),
                 slg: Some(MossSkipLayerGuidance {
                     layers: vec![24],
@@ -270,7 +271,7 @@ fn native_complete_surface_campaign() {
                 }
                 other => panic!("unexpected advanced output {other:?}"),
             };
-            let report = generator.moss_image_execution_report().unwrap();
+            let report = generator.last_execution_report().unwrap();
             assert!(report.data().samples.iter().all(|s| s.seed.is_none()));
             std::fs::write(
                 output.join("Sft-advanced.receipt.json"),
@@ -291,20 +292,24 @@ fn native_complete_surface_campaign() {
             }
         });
         assert!(matches!(result, Err(gen_core::Error::Canceled)));
-        assert!(generator.moss_image_execution_report().is_none());
+        assert!(generator.last_execution_report().is_none());
         record(
             &output,
             serde_json::json!({"case":format!("{variant:?}-cancel"),"status":"canceled","typed_cancelled":true,"receipt_cleared":true}),
         );
         let mut recovered = request.clone();
         recovered.cancel = CancelFlag::default();
-        let recovered = images(generator.generate(&recovered, &mut |_| {}).unwrap());
+        let recovered_run = generator
+            .generate_with_report(&recovered, &mut |_| {})
+            .unwrap();
+        let recovered_report = recovered_run.moss_image_report().cloned().unwrap();
+        let recovered = images(recovered_run.output.unwrap());
         assert_eq!(ordinary, recovered);
         save(
             &output,
             &format!("{variant:?}-warm-after-cancel"),
             &recovered,
-            &generator.moss_image_execution_report().unwrap(),
+            &recovered_report,
         );
     }
 }

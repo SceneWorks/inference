@@ -539,7 +539,7 @@ impl QwenImageEdit {
         // encode carries no RNG, so ordering it before the dual-latent VAE-encode is byte-identical.
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |vl: &QwenVisionLanguageEncoder| {
                 let encode_body = || -> Result<_> {

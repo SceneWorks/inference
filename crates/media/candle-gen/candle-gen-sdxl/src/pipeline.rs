@@ -1258,7 +1258,7 @@ impl Pipeline {
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
-        if req.use_pid && self.pid_spec.is_none() {
+        if req.use_pid() && self.pid_spec.is_none() {
             return Err(CandleError::Msg(
                 "sdxl: PiD requested but no PiD decoder loaded".into(),
             ));
