@@ -401,7 +401,6 @@ pub struct KreaGenerator {
     checkpoint_facts: gen_core::CheckpointFactsSink,
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct KreaMemoryScope {
     device: Device,
     memory: Option<gen_core::GenerationMemory>,
@@ -414,7 +413,6 @@ struct KreaMemoryScope {
     finished: bool,
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct KreaProducedReferenceScope {
     geometry: gen_core::MemoryGeometry,
     reference: gen_core::ProducedReference,
@@ -429,7 +427,6 @@ fn krea_generation_memory(
     contract.generation_memory(&selection)
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl KreaMemoryScope {
     fn ensure_active(&self) -> gen_core::Result<()> {
         if self.finished {
@@ -442,7 +439,6 @@ impl KreaMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
@@ -650,7 +646,6 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl Drop for KreaMemoryScope {
     fn drop(&mut self) {
         if !self.finished {
@@ -3524,7 +3519,6 @@ fn registered_krea_safety_check(
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_krea_valid_fixture(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3630,7 +3624,6 @@ fn registered_krea_valid_fixture(
         .collect()
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_krea_begin_request(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3978,7 +3971,6 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     contract: registered_krea_turbo_memory_strategy_contract,
     safety_check: registered_krea_safety_check,
 };
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: KREA_2_TURBO_ID,
@@ -4012,7 +4004,6 @@ macro_rules! request_scoped_memory_registration {
             safety_check: registered_krea_safety_check,
         };
 
-        #[cfg(feature = "cuda")]
         const $behavior: gen_core::MemoryBehaviorRegistration =
             gen_core::MemoryBehaviorRegistration {
                 provider_id: $provider_id,
@@ -4226,7 +4217,6 @@ const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memo
     contract: registered_krea_control_memory_strategy_contract,
     safety_check: registered_krea_safety_check,
 };
-#[cfg(feature = "cuda")]
 const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "krea_2_turbo_control",
@@ -4322,6 +4312,7 @@ pub fn register_memory_contract_surfaces(
             provider_id: KREA_2_TURBO_ID,
             contract: weights_free_krea_turbo_memory_strategy_contract,
         })
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(RAW_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -4339,6 +4330,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_krea_raw_surface_contract,
             },
         )
+        .register_memory_behavior(RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -4356,6 +4348,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_krea_edit_surface_contract,
             },
         )
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(TURBO_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -4373,6 +4366,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_krea_turbo_edit_surface_contract,
             },
         )
+        .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
         .register_memory_strategy(CONTROL_MEMORY_REGISTRATION)
@@ -4381,6 +4375,7 @@ pub fn register_memory_contract_surfaces(
             provider_id: "krea_2_turbo_control",
             contract: weights_free_krea_control_memory_strategy_contract,
         })
+        .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Krea provider catalog.

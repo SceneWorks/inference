@@ -55,14 +55,31 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
     // the ORIGINAL dense checkpoint (`crate::convert`). The CUDA build also loads publisher
     // FP8R / NVFP4 artifacts as shipped onto their frozen-recipe kernels.
     #[cfg(not(feature = "cuda"))]
-    let supported_quants: &'static [gen_core::Quant] = &[gen_core::Quant::Q4, gen_core::Quant::Q8];
+    {
+        route_distilled_for_target(false)
+    }
     #[cfg(feature = "cuda")]
-    let supported_quants: &'static [gen_core::Quant] = &[
-        gen_core::Quant::Q4,
-        gen_core::Quant::Q8,
-        gen_core::Quant::Fp8Rowwise,
-        gen_core::Quant::Nvfp4,
-    ];
+    {
+        route_distilled_for_target(true)
+    }
+}
+
+pub(crate) fn route_distilled_for_target(cuda_target: bool) -> gen_core::RouteRecord {
+    let supported_quants: &'static [gen_core::Quant] = if cuda_target {
+        &[
+            gen_core::Quant::Q4,
+            gen_core::Quant::Q8,
+            gen_core::Quant::Fp8Rowwise,
+            gen_core::Quant::Nvfp4,
+        ]
+    } else {
+        &[gen_core::Quant::Q4, gen_core::Quant::Q8]
+    };
+    let descriptor_fn: fn() -> ModelDescriptor = if cuda_target {
+        descriptor_cuda
+    } else {
+        descriptor
+    };
 
     gen_core::RouteRecord {
         route_id: MODEL_ID,
@@ -195,7 +212,7 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
             dimensions: Some((1024, 1024)),
             ..Default::default()
         },
-        bindings: gen_core::RouteBindings::generator(descriptor, load)
+        bindings: gen_core::RouteBindings::generator(descriptor_fn, load)
             .with_reference_workspace(
                 crate::memory_strategy::REFERENCE_WORKSPACE_REGISTRATION.reference_workspace_bytes,
             )
@@ -209,7 +226,16 @@ pub(crate) fn route_distilled() -> gen_core::RouteRecord {
 
 /// Primary typed route declaration for Candle base FLUX 3 Klein (`SW-6979`, `REG-1`).
 pub(crate) fn route_base() -> gen_core::RouteRecord {
-    let mut route = route_distilled();
+    route_base_for_target(cfg!(feature = "cuda"))
+}
+
+pub(crate) fn route_base_for_target(cuda_target: bool) -> gen_core::RouteRecord {
+    let mut route = route_distilled_for_target(cuda_target);
+    let descriptor_fn: fn() -> ModelDescriptor = if cuda_target {
+        descriptor_base_cuda
+    } else {
+        descriptor_base
+    };
     route.route_id = BASE_MODEL_ID;
     route.structure.conditioning.supports_negative_prompt = true;
     route.structure.sampling.supports_guidance = true;
@@ -222,7 +248,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
     );
     route.defaults.steps = Some(gen_core_flux3::BASE_DEFAULT_STEPS);
     route.defaults.guidance = Some(gen_core_flux3::BASE_DEFAULT_GUIDANCE);
-    route.bindings = gen_core::RouteBindings::generator(descriptor_base, load_base)
+    route.bindings = gen_core::RouteBindings::generator(descriptor_fn, load_base)
         .with_reference_workspace(
             crate::memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION.reference_workspace_bytes,
         )
@@ -234,14 +260,24 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
     route
 }
 
-/// Identity + capabilities, constructible without weights, computed from [`route_distilled`].
+/// Identity + capabilities, constructible without weights, computed from `route_distilled`.
 pub fn descriptor() -> ModelDescriptor {
     route_distilled().compute_descriptor()
 }
 
-/// Base checkpoint public surface, computed from [`route_base`].
+/// CUDA-target descriptor for hardware-free hosted capability export (`SW-6980`, `REG-3`).
+pub fn descriptor_cuda() -> ModelDescriptor {
+    route_distilled_for_target(true).compute_descriptor()
+}
+
+/// Base checkpoint public surface, computed from `route_base`.
 pub fn descriptor_base() -> ModelDescriptor {
     route_base().compute_descriptor()
+}
+
+/// CUDA-target base descriptor for hardware-free hosted capability export (`SW-6980`, `REG-3`).
+pub fn descriptor_base_cuda() -> ModelDescriptor {
+    route_base_for_target(true).compute_descriptor()
 }
 
 /// The heavy half: the DiT and the autoencoder.

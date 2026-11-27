@@ -87,6 +87,17 @@ pub fn register_providers(
         .register_trainer(training::trainer::TRAINER_REGISTRATION)
 }
 
+/// Register the CUDA-target descriptor-only FLUX 3 routes (including FP8R / NVFP4 quant tiers)
+/// without requiring `--features cuda` (`SW-6980`, `REG-3`).
+pub fn register_cuda_descriptor_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_route(model::route_distilled_for_target(true))
+        .register_route(model::route_base_for_target(true))
+        .register_trainer(training::trainer::TRAINER_REGISTRATION)
+}
+
 /// The shared-ladder registrations of the route: strategy, weights-free contract fixture and
 /// behavior. Split out the way the sibling Candle providers do, so a catalog can append the
 /// contract surface to a registry that already carries the generator.

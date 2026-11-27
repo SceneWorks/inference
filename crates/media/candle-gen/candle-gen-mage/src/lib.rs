@@ -1279,36 +1279,42 @@ pub fn register_memory_contract_surfaces(
             provider_id: config::MODEL_ID,
             contract: memory_strategy::contract_rl,
         })
+        .register_memory_behavior(RL_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::BASE_MODEL_ID,
             contract: memory_strategy::contract_base,
         })
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::TURBO_MODEL_ID,
             contract: memory_strategy::contract_turbo,
         })
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_MODEL_ID,
             contract: memory_strategy::contract_edit,
         })
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_BASE_MODEL_ID,
             contract: memory_strategy::contract_edit_base,
         })
+        .register_memory_behavior(EDIT_BASE_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_TURBO_MODEL_ID,
             contract: memory_strategy::contract_edit_turbo,
         })
+        .register_memory_behavior(EDIT_TURBO_MEMORY_BEHAVIOR)
 }
 
 const RL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -1344,7 +1350,6 @@ const EDIT_TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
 
 macro_rules! memory_behavior {
     ($name:ident, $id:expr) => {
-        #[cfg(feature = "cuda")]
         const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
             provider_id: $id,
             valid_fixtures: memory_strategy::registered_valid_fixture,

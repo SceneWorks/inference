@@ -1931,12 +1931,14 @@ pub fn register_memory_contract_surfaces(
             provider_id: MODEL_ID,
             contract: weights_free_qwen_image_memory_contract,
         })
+        .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: "qwen_image_edit",
             contract: weights_free_qwen_edit_memory_contract,
         })
+        .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR)
 }
 
 fn registered_qwen_image_memory_contract(
@@ -1969,7 +1971,6 @@ const QWEN_IMAGE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const QWEN_IMAGE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,
@@ -1985,7 +1986,6 @@ const QWEN_EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Me
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const QWEN_EDIT_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "qwen_image_edit",

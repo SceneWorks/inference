@@ -628,7 +628,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// Wan-VACE descriptor — computed from [`route`].
+/// Wan-VACE descriptor — computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }
@@ -673,7 +673,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         i2v_memory,
     }))
 }
-
 
 #[cfg(test)]
 mod tests {

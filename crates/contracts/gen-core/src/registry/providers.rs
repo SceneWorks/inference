@@ -147,6 +147,16 @@ impl ProviderRegistry {
             .map(|&idx| &self.render_plans[idx])
     }
 
+    /// Whether a pre-load [`crate::VideoPlanRegistration`] is registered for `id`.
+    pub fn has_video_plan(&self, id: &str) -> bool {
+        self.video_plan_index.contains_key(id)
+    }
+
+    /// Quantization tiers explicitly refused by this registry (tier and refusal reason).
+    pub fn rejected_quants(&self) -> &[(Quant, &'static str)] {
+        &self.rejected_quants
+    }
+
     /// Every registered conditioned or platform-composed feature route in this catalog.
     pub fn feature_route_registrations(
         &self,

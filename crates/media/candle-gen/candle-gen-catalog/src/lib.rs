@@ -86,8 +86,10 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
         verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
     }];
 
-/// Add every provider shipped by the Candle media platform to an explicit registry builder.
-pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+fn register_providers_with_flux3_mode(
+    registry: ProviderRegistryBuilder,
+    cuda_flux3_target: bool,
+) -> ProviderRegistryBuilder {
     // The engine's checkpoint codec table is registered here, exactly once, before any family
     // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
     // register one, and the builder refuses a duplicate row outright.
@@ -104,7 +106,11 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_clip::register_providers(registry);
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
-    let registry = candle_gen_flux3::register_providers(registry);
+    let registry = if cuda_flux3_target {
+        candle_gen_flux3::register_cuda_descriptor_providers(registry)
+    } else {
+        candle_gen_flux3::register_providers(registry)
+    };
     let registry = candle_gen_ideogram::register_providers(registry);
     let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
@@ -134,9 +140,46 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     candle_gen_z_image::register_providers(registry)
 }
 
+/// Add every provider shipped by the Candle media platform to an explicit registry builder.
+pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    register_providers_with_flux3_mode(registry, false)
+}
+
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
+}
+
+/// Build the hardware-free descriptor-only Candle media provider catalog representing the
+/// shipping CUDA feature set (`SW-6980`, `REG-3`).
+///
+/// Produces the exact route, descriptor, quantization-tier (including FLUX 3 FP8R / NVFP4),
+/// and memory-contract surface of [`provider_registry`] under `--features cuda` without
+/// requiring the NVIDIA CUDA toolkit.
+pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    let registry = register_providers_with_flux3_mode(ProviderRegistryBuilder::new(), true);
+    #[cfg(not(feature = "cuda"))]
+    let registry = {
+        let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
+        candle_gen_wan::register_memory_contract_surfaces(registry)
+    };
+    registry.build()
+}
+
+/// Advanced quant tiers surfaced by the shipping CUDA feature set, usable in hardware-free
+/// descriptor-only exports without `--features cuda` (`SW-6980`, `REG-3`).
+pub fn cuda_descriptor_nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
+    &[media::gen_core::Quant::Nvfp4]
 }
 
 /// Build the complete Candle registry contract surface without loading model weights or requiring
