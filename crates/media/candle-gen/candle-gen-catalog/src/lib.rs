@@ -190,14 +190,9 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("ideogram_4", R::exact_only(HD256)),
         ("ideogram_4_turbo", R::exact_only(HD256)),
         ("iris_3b", ALL),
-        (
-            "kolors",
-            R::exact_only(
-                "denoises a dense snapshot without adapters (its default) with candle's stock \
-                 SDXL UNet attention, outside the shared Candle attention helpers (only its \
-                 packed / adapter UNet routes through them)",
-            ),
-        ),
+        // Kolors: a lossy opt-in loads its dense snapshot through the vendored SDXL UNet (shared
+        // helpers, f32 at bf16, 64-wide heads padded for Sol-Attn); the default keeps the stock UNet.
+        ("kolors", ALL),
         ("krea_2_turbo", ALL),
         ("krea_2_raw", ALL),
         ("krea_2_edit", ALL),

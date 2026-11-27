@@ -1560,7 +1560,7 @@ fn catalog_attention_routing_covers_every_provider() {
         ("sensenova_u1_8b", Some((false, false))),
         ("ideogram_4", Some((false, false))),
         ("qwen_image_2_1", Some((true, false))),
-        ("kolors", Some((false, false))),
+        ("kolors", Some((true, true))),
         ("moss_image_base", None),
         ("sana_1600m", None),
         ("supra2_img", None),
@@ -1649,7 +1649,6 @@ fn lossy_attention_admission_is_typed() {
         admit("qwen_image_2_1", &both),
         "sol_attention: `qwen_image_2_1`",
     );
-    unsupported(admit("kolors", &int8), "candle's stock");
     // Operand layout is never refused: f32 attention and 64 / 120-wide heads take both kernels.
     if INT8_ATTN_COMPILED && SOL_ATTN_COMPILED {
         for id in [
@@ -1660,6 +1659,7 @@ fn lossy_attention_admission_is_typed() {
             "instantid",
             "boogu_image",
             "lens",
+            "kolors",
         ] {
             admit(id, &both).unwrap();
         }

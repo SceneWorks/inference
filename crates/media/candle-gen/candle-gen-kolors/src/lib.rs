@@ -108,6 +108,23 @@ pub struct KolorsGenerator {
 
 impl KolorsGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
+        // SW-6132: the UNet build follows the job's lossy-attention opt-in
+        // (`pipeline::select_unet_build`), and the job switch can change between jobs. A warm set
+        // built for the other build is retired first, so an opted-in job never renders on the stock
+        // UNet (whose attention the lossy kernels cannot reach) and an exact job never keeps the
+        // vendored one.
+        let want = pipe.unet_build()?;
+        let stale = {
+            let mut slot = candle_gen::lock_recover(&self.components);
+            if slot.as_ref().is_some_and(|warm| warm.unet_build() != want) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(stale) = stale {
+            release_warm_after_synchronize(&self.device, stale)?;
+        }
         // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
         Ok(candle_gen::cached(&self.components, || {
             pipe.load_components()
