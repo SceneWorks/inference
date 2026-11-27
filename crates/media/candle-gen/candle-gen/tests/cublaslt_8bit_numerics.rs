@@ -892,3 +892,158 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16");
     Ok(())
 }
+
+// ---- SW-6126: the fused on-device activation quantizer behind the 8-bit linears -------------
+
+/// [`pseudo_random`] with a heavy tail: every 97th value scaled by 300 (an activation outlier).
+fn outlier_heavy(n: usize, seed: u64) -> Vec<f32> {
+    pseudo_random(n, seed)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| if i % 97 == 0 { v * 300.0 } else { v })
+        .collect()
+}
+
+/// Bit patterns of a bf16 output, for byte-identity comparisons.
+fn bf16_bits(t: &Tensor) -> Vec<u16> {
+    t.to_dtype(DType::BF16)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<half::bf16>())
+        .expect("output to host")
+        .into_iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// `(M, K, N, outliers)`: random and outlier-heavy bf16 activations, a multi-row and a small
+/// (decode-sized) M.
+const FUSED_LINEAR_CASES: &[(usize, usize, usize, bool)] = &[
+    (64, 512, 256, false),
+    (64, 512, 256, true),
+    (3, 256, 128, true),
+];
+
+fn bf16_activation(dev: &Device, m: usize, k: usize, outliers: bool) -> Tensor {
+    let v = if outliers {
+        outlier_heavy(m * k, 0x6126)
+    } else {
+        pseudo_random(m * k, 0x6126)
+    };
+    Tensor::from_vec(v, (m, k), dev)
+        .and_then(|t| t.to_dtype(DType::BF16))
+        .expect("activation")
+}
+
+fn bf16_weight(dev: &Device, n: usize, k: usize) -> Tensor {
+    Tensor::from_vec(pseudo_random(n * k, 0x6127), (n, k), dev)
+        .and_then(|t| (t * 0.05)?.to_dtype(DType::BF16))
+        .expect("weight")
+}
+
+/// SW-6126: `Fp8Linear`'s dynamic E4M3 forward runs the fused activation quantizer — the codes
+/// and the scale go straight into the GEMM operand and its scale pointer, so the forward moves no
+/// activation data (and no scale) to the host — and its path record says so; with the seam's
+/// switch off the same forward reports the reference (`disabled`), and both outputs are
+/// bit-identical on random and outlier-heavy inputs.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path() {
+    use candle_gen::fused_path::media_fused_policy_guard;
+    use candle_gen::quant::act_quant::ACT_QUANT_FP8_PATH;
+    use candle_gen::quant::Fp8Linear;
+
+    let dev = Device::new_cuda(0).expect("CUDA device 0");
+    let lt = std::sync::Arc::new(CublasLt::new(&dev).expect("cuBLASLt"));
+    if !lt.meets_fp8_floor().expect("compute cap") {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs (fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path): the fp8 GEMM needs sm_89.");
+        eprintln!("skipping: the fp8 GEMM needs sm_89");
+        return;
+    }
+    let _media = media_fused_policy_guard(Some(true));
+    let _kernel = ACT_QUANT_FP8_PATH.guard(Some(true));
+    for &(m, k, n, outliers) in FUSED_LINEAR_CASES {
+        let layer = Fp8Linear::new(&bf16_weight(&dev, n, k), None, lt.clone()).expect("Fp8Linear");
+        let x = bf16_activation(&dev, m, k, outliers);
+
+        ACT_QUANT_FP8_PATH.set_enabled(Some(true));
+        let start = ACT_QUANT_FP8_PATH.thread_counts();
+        let fused = __model_proof_output!(layer.forward(&x)).expect("fused forward");
+        let d = ACT_QUANT_FP8_PATH.thread_counts().since(&start);
+        assert_eq!((d.fused, d.reference_total()), (1, 0), "{m}x{k}->{n}: {d}");
+
+        ACT_QUANT_FP8_PATH.set_enabled(Some(false));
+        let start = ACT_QUANT_FP8_PATH.thread_counts();
+        let reference = __model_proof_output!(layer.forward(&x)).expect("reference forward");
+        let d = ACT_QUANT_FP8_PATH.thread_counts().since(&start);
+        assert_eq!(
+            (d.fused, d.reference_for("disabled")),
+            (0, 1),
+            "{m}x{k}->{n}: {d}"
+        );
+
+        assert_eq!(fused.dims(), [m, n]);
+        assert_eq!(
+            bf16_bits(&fused),
+            bf16_bits(&reference),
+            "{m}x{k}->{n} outliers={outliers}: fused and reference forwards differ"
+        );
+    }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path");
+}
+
+/// SW-6126: the resident per-channel `Int8Linear` forward (the ConvRot consume path, on-device
+/// fold) runs the fused quantizer with the scale kept on the device and reports it; the switch
+/// sends it to the reference op chain (host scale, per-call row upload), with a bit-identical
+/// output.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path() {
+    use candle_gen::fused_path::media_fused_policy_guard;
+    use candle_gen::quant::act_quant::ACT_QUANT_INT8_PATH;
+    use candle_gen::quant::cublaslt::quantize_weight_int8_per_channel;
+    use candle_gen::quant::Int8Linear;
+
+    let dev = Device::new_cuda(0).expect("CUDA device 0");
+    let lt = std::sync::Arc::new(CublasLt::new(&dev).expect("cuBLASLt"));
+    if !lt.meets_fp8_floor().expect("compute cap") || !lt.supports_ondevice_int8_dequant() {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs (fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path): the 8-bit track is gated at sm_89 and the fused forward needs the on-device int32 fold.");
+        eprintln!("skipping: needs sm_89 and the on-device int8 fold");
+        return;
+    }
+    let _media = media_fused_policy_guard(Some(true));
+    let _kernel = ACT_QUANT_INT8_PATH.guard(Some(true));
+    for &(m, k, n, outliers) in FUSED_LINEAR_CASES {
+        let q = quantize_weight_int8_per_channel(&bf16_weight(&dev, n, k)).expect("weight quant");
+        let layer =
+            Int8Linear::from_per_channel_parts(q.q, q.scale, None, lt.clone()).expect("Int8Linear");
+        let x = bf16_activation(&dev, m, k, outliers);
+
+        ACT_QUANT_INT8_PATH.set_enabled(Some(true));
+        let start = ACT_QUANT_INT8_PATH.thread_counts();
+        let fused = __model_proof_output!(layer.forward(&x)).expect("fused forward");
+        let d = ACT_QUANT_INT8_PATH.thread_counts().since(&start);
+        assert_eq!((d.fused, d.reference_total()), (1, 0), "{m}x{k}->{n}: {d}");
+
+        ACT_QUANT_INT8_PATH.set_enabled(Some(false));
+        let start = ACT_QUANT_INT8_PATH.thread_counts();
+        let reference = __model_proof_output!(layer.forward(&x)).expect("reference forward");
+        let d = ACT_QUANT_INT8_PATH.thread_counts().since(&start);
+        assert_eq!(
+            (d.fused, d.reference_for("disabled")),
+            (0, 1),
+            "{m}x{k}->{n}: {d}"
+        );
+
+        assert_eq!(fused.dims(), [m, n]);
+        assert_eq!(
+            bf16_bits(&fused),
+            bf16_bits(&reference),
+            "{m}x{k}->{n} outliers={outliers}: fused and reference forwards differ"
+        );
+    }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path");
+}

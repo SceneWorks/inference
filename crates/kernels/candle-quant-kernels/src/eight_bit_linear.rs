@@ -19,8 +19,10 @@
 //! or a test, **wrong in a loader** (sc-12301, and sc-12274 for the NVFP4 lane: 32.00 MiB × N).
 
 use super::cublaslt::{
-    quantize_activation_int8, quantize_weight_int8, quantize_weight_int8_per_channel, CublasLt,
+    quantize_activation_int8, quantize_activation_int8_reference, quantize_weight_int8,
+    quantize_weight_int8_per_channel, CublasLt,
 };
+use crate::act_quant::{fused_int8, Int8Output, ACT_QUANT_INT8_PATH};
 use candle_core::{Device, Result, Tensor};
 use std::sync::Arc;
 
@@ -64,6 +66,10 @@ pub struct Int8Linear {
     /// `i32 → f32` via the vendored `cast_i32_f32` kernel. When set, the per-channel staged forward folds
     /// on-device (no int32→host round-trip); otherwise it falls back to the exact host fold. Probed once.
     ondevice_dequant: bool,
+    /// The per-channel weight scale as a resident `[1, N]` F32 device row (SW-6126), set with the
+    /// staged weight when the on-device fold is available: the fused forward folds against it
+    /// instead of uploading the row vector every call.
+    scale_w_dev: Option<Tensor>,
 }
 
 impl Int8Linear {
@@ -79,6 +85,7 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant: false, // per-tensor forward uses the host fold (tests)
+            scale_w_dev: None,
         })
     }
 
@@ -111,6 +118,7 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant: false, // from-dense (no staged weight) uses the host fold (tests)
+            scale_w_dev: None,
         })
     }
 
@@ -137,6 +145,11 @@ impl Int8Linear {
         let w_staged = Some(lt.stage_int8(&w_i8)?);
         // Probe once whether the on-device int32→f32 dequant fast path is available (sc-9601).
         let ondevice_dequant = lt.supports_ondevice_int8_dequant();
+        let scale_w_dev = if ondevice_dequant {
+            Some(Tensor::from_vec(scale_w.clone(), (1, n), &lt.device())?)
+        } else {
+            None
+        };
         Ok(Self {
             shape: w_i8.dims2()?,
             device: lt.device(),
@@ -146,6 +159,7 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant,
+            scale_w_dev,
         })
     }
     /// Exact I8 byte-pattern parts, one staged compact base and resident F32 scales.
@@ -170,6 +184,7 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant: true,
+            scale_w_dev: None,
         })
     }
 
@@ -204,8 +219,41 @@ impl Int8Linear {
         y.to_dtype(dtype)
     }
 
+    /// `x: (..., K)` → bf16 `(..., N)`, the activation quantized dynamically per call.
+    ///
+    /// The resident per-channel projection with the on-device fold (the ConvRot consume path)
+    /// runs the fused activation quantizer (SW-6126, [`ACT_QUANT_INT8_PATH`]): i8 bytes and the
+    /// scale written on the device, the fold against the resident row scale — no host transfer and
+    /// no stream synchronization in the forward, and the same bf16 output as the reference (the
+    /// candle op chain, a host scale and a per-call row upload). The other forms keep their host
+    /// fold (they read the int32 accumulate back by design) and quantize through
+    /// [`quantize_activation_int8`], which is itself fused on CUDA.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
+        if let (WeightScale::PerChannel(s), Some(w), Some(sw), true) = (
+            &self.scale_w,
+            &self.w_staged,
+            &self.scale_w_dev,
+            self.ondevice_dequant,
+        ) {
+            let y = ACT_QUANT_INT8_PATH.dispatch(
+                || {
+                    fused_int8(&flat, Int8Output::I8Bytes)?.try_map(|q| {
+                        let xq = self.lt.stage_int8_bytes(&q.codes)?;
+                        self.lt
+                            .matmul_int8_per_channel_staged_ondevice_device_scales(
+                                w, sw, &xq, &q.scale,
+                            )
+                    })
+                },
+                || {
+                    let qx = quantize_activation_int8_reference(&flat)?;
+                    self.lt
+                        .matmul_int8_per_channel_staged_ondevice(w, s, &qx.q, qx.scale)
+                },
+            )?;
+            return self.finish(restore(y)?);
+        }
         let qx = quantize_activation_int8(&flat)?;
         let y = match (&self.scale_w, &self.w_staged) {
             (WeightScale::PerChannel(s), Some(w)) if self.ondevice_dequant => self
@@ -224,7 +272,11 @@ impl Int8Linear {
                 candle_core::bail!("Kitchen INT8 must use forward_kitchen")
             }
         };
-        let y = restore(y)?;
+        self.finish(restore(y)?)
+    }
+
+    /// Add the bias (in the output dtype).
+    fn finish(&self, y: Tensor) -> Result<Tensor> {
         match &self.bias {
             Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
             None => Ok(y),

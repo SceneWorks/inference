@@ -101,3 +101,10 @@ float8 = "0.7"
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+# The shared fused-kernel bench (SW-F287, SW-6126): one reference-vs-fused table for every fused
+# CUDA kernel; each kernel adds a module under `examples/fused_kernels_bench/` and one `SUITES` line.
+[[example]]
+name = "fused_kernels_bench"
+path = "examples/fused_kernels_bench.rs"
+required-features = ["cuda"]
