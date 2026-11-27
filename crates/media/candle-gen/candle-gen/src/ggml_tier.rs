@@ -122,6 +122,10 @@ pub enum GgmlTierError {
     #[error("ggml tier: split tier {}: {detail}", .dir.display())]
     Split { dir: PathBuf, detail: String },
     #[error(
+        "ggml tier: --keep-q8 `{pattern}` matches no packed projection of {} (typo?)", .dir.display()
+    )]
+    KeepQ8NoMatch { dir: PathBuf, pattern: String },
+    #[error(
         "ggml tier: `{tensor}` packs {inferred}-bit codes at group {group_size}, but the \
          component config declares {expected} bits (wrong group_size?)"
     )]
@@ -202,6 +206,9 @@ pub struct ComponentReport {
     pub mxfp4_sources: usize,
     /// Files copied byte-for-byte (a split tier's components that hold no packed triple).
     pub copied_files: usize,
+    /// Projections of a q4 tier stored `Q8_0` from the dense source by a `--keep-q8` override
+    /// (counted in [`converted`](Self::converted) too; the rest of `converted` is lossless `Q4_1`).
+    pub keep_q8: usize,
 }
 
 /// An explicit tensor-name prefix rewrite between the MLX template and the dense source. Never
@@ -1104,6 +1111,8 @@ struct Ctx<'a> {
     /// Write each template shard's `__metadata__` into its output shard (split tiers: the
     /// LTX-2.5 per-component stamps). Component tiers keep the slice-B output (no metadata).
     keep_metadata: bool,
+    /// A q4 tier's `--keep-q8` overrides and their opened dense source.
+    keep: Option<(&'a KeepQ8, ShardSet)>,
 }
 
 /// Little-endian bytes of a float tensor at `dtype` (F32/F16/BF16).
@@ -1191,22 +1200,17 @@ fn dense_passthrough(
     })
 }
 
-/// The `Q8_0` blocks of template triple `base` (`entry` = its `.weight`) from the dense source:
-/// its float `{base}.weight`, or — when the source carries none — an MXFP4 `{base}_blocks` +
-/// `{base}_scales` pair (the Lens / gpt-oss fused experts).
-fn q8_from_dense_source(
+/// Validate a template triple's shapes (`entry` is its `.weight`, `s_shape` its `.scales`) and the
+/// width they imply at `group_size` against `want_bits`; returns the dense `[out, in]` /
+/// `[E, out, in]` shape the triple stands for. Structure only: the template's data is never read.
+fn triple_dense_shape(
     base: &str,
     name: &str,
     entry: &Entry,
     s_shape: &[usize],
-    file: &std::ffi::OsStr,
-    ctx: &Ctx,
-    report: &mut ComponentReport,
-) -> Result<Blocks> {
-    let SourceMode::FromBf16(src) = ctx.mode else {
-        unreachable!("q8_from_dense_source runs only in from-bf16 mode");
-    };
-    // Structure only: the template's shapes, never its data.
+    group_size: usize,
+    want_bits: usize,
+) -> Result<Vec<usize>> {
     if entry.dtype != "U32" {
         return Err(GgmlTierError::NotPackedCodes {
             tensor: name.to_string(),
@@ -1224,24 +1228,39 @@ fn q8_from_dense_source(
         });
     }
     let s_cols = s_shape[s_shape.len() - 1];
-    let inferred = mlx_packed_bits_gs(wq_cols, s_cols, ctx.group_size);
-    if inferred != 8 {
+    let inferred = mlx_packed_bits_gs(wq_cols, s_cols, group_size);
+    if inferred != want_bits {
         return Err(GgmlTierError::BitsMismatch {
             tensor: base.to_string(),
             inferred,
-            expected: 8,
-            group_size: ctx.group_size,
+            expected: want_bits,
+            group_size,
         });
     }
     let mut expected = entry.shape.clone();
-    *expected.last_mut().expect("rank checked") = s_cols * ctx.group_size;
+    *expected.last_mut().expect("rank checked") = s_cols * group_size;
+    Ok(expected)
+}
+
+/// The `Q8_0` blocks of projection `base` (`expected` = its dense shape) from the dense source
+/// `src` / `dense`: its float `{base}.weight`, or — when the source carries none — an MXFP4
+/// `{base}_blocks` + `{base}_scales` pair (the Lens / gpt-oss fused experts). The one dense ->
+/// `Q8_0` path of the from-bf16 tiers and the q4 tiers' `--keep-q8` overrides.
+fn q8_from_source(
+    base: &str,
+    name: &str,
+    expected: &[usize],
+    file: &std::ffi::OsStr,
+    src: &Bf16Source,
+    dense_set: &ShardSet,
+    report: &mut ComponentReport,
+) -> Result<Blocks> {
     let mapped = PrefixMap::apply(&src.prefix_maps, base);
     let looked_up = format!("{mapped}.weight");
-    let dense_set = ctx.dense.as_ref().expect("dense source opened");
     if let Some((dshard, dentry)) = dense_set.find(&looked_up, file)? {
         let dense = dshard.read_tensor(&looked_up)?;
         report.bytes_in += dentry.len();
-        return blocks_q8_from_dense(base, &dense, &expected);
+        return blocks_q8_from_dense(base, &dense, expected);
     }
     let (b_name, s_name) = (format!("{mapped}_blocks"), format!("{mapped}_scales"));
     match (
@@ -1255,7 +1274,7 @@ fn q8_from_dense_source(
                 base,
                 (bentry, bshard.read_raw(&b_name)?),
                 (sentry, sshard.read_raw(&s_name)?),
-                &expected,
+                expected,
             )
         }
         _ => Err(GgmlTierError::MissingDenseSource {
@@ -1318,7 +1337,25 @@ fn convert_shard(
                 detail: "has no `.biases`".into(),
             });
         }
+        let keep = ctx
+            .keep
+            .as_ref()
+            .filter(|(k, _)| matches!(ctx.mode, SourceMode::FromMlx) && k.matches(base));
         let blocks = match ctx.mode {
+            SourceMode::FromMlx if keep.is_some() => {
+                // A `--keep-q8` override: Q8_0 from the dense source, never from the q4 codes.
+                let (k, dense) = keep.expect("checked");
+                let expected = triple_dense_shape(
+                    base,
+                    name,
+                    entry,
+                    &shard.entries[&s_name].shape,
+                    ctx.group_size,
+                    ctx.cfg_bits as usize,
+                )?;
+                report.keep_q8 += 1;
+                q8_from_source(base, name, &expected, file, &k.source, dense, report)?
+            }
             SourceMode::FromMlx => {
                 let wq = shard.read_tensor(name)?;
                 let scales = shard.read_tensor(&s_name)?;
@@ -1334,15 +1371,18 @@ fn convert_shard(
                     Some(ctx.cfg_bits),
                 )?
             }
-            SourceMode::FromBf16(_) => q8_from_dense_source(
-                base,
-                name,
-                entry,
-                &shard.entries[&s_name].shape,
-                file,
-                ctx,
-                report,
-            )?,
+            SourceMode::FromBf16(src) => {
+                let expected = triple_dense_shape(
+                    base,
+                    name,
+                    entry,
+                    &shard.entries[&s_name].shape,
+                    ctx.group_size,
+                    8,
+                )?;
+                let dense = ctx.dense.as_ref().expect("dense source opened");
+                q8_from_source(base, name, &expected, file, src, dense, report)?
+            }
         };
         out.insert(
             name.clone(),
@@ -1451,6 +1491,17 @@ pub fn convert_component(
     mode: &SourceMode,
     progress: &mut dyn FnMut(&Path, &ComponentReport) -> Result<()>,
 ) -> Result<ComponentReport> {
+    convert_component_with(src, dst, mode, &ConvertOptions::default(), progress)
+}
+
+/// [`convert_component`] with [`ConvertOptions`] (the q4 `--keep-q8` recipe override).
+pub fn convert_component_with(
+    src: &Path,
+    dst: &Path,
+    mode: &SourceMode,
+    options: &ConvertOptions,
+    progress: &mut dyn FnMut(&Path, &ComponentReport) -> Result<()>,
+) -> Result<ComponentReport> {
     if dst.exists() {
         return Err(GgmlTierError::DestinationExists(dst.to_path_buf()));
     }
@@ -1472,6 +1523,23 @@ pub fn convert_component(
     if matches!(mode, SourceMode::FromMlx) && !group_size.is_multiple_of(GGML_BLOCK) {
         return Err(GgmlTierError::GroupSize { group_size });
     }
+    let overrides = match &options.keep_q8 {
+        None => None,
+        Some(keep) => {
+            if !matches!(mode, SourceMode::FromMlx) || cfg_bits != 4 {
+                return Err(GgmlTierError::Spec(format!(
+                    "--keep-q8 overrides a q4 from-mlx tier; {} is {cfg_bits}-bit {}",
+                    src.display(),
+                    if matches!(mode, SourceMode::FromMlx) {
+                        "from-mlx"
+                    } else {
+                        "from-bf16"
+                    }
+                )));
+            }
+            Some(keep.counts(src, &template)?)
+        }
+    };
     let ctx = Ctx {
         mode,
         dense: match mode {
@@ -1481,6 +1549,10 @@ pub fn convert_component(
         group_size,
         cfg_bits,
         keep_metadata: false,
+        keep: match &options.keep_q8 {
+            Some(k) => Some((k, ShardSet::open(&k.source.dir, false)?)),
+            None => None,
+        },
     };
 
     let partial = partial_path(dst);
@@ -1510,13 +1582,12 @@ pub fn convert_component(
                 Marker::Config => ggml_config(&text)?,
                 _ => insert_ggml_marker(&text, cfg_bits)?,
             };
+            let rewritten = with_overrides(rewritten, overrides.as_deref())?;
             io(std::fs::write(&target, rewritten), target.display())?;
         } else if text_name == QUANTIZE_CONFIG && marker == Marker::QuantizeConfig {
             let text = io(std::fs::read_to_string(file), file.display())?;
-            io(
-                std::fs::write(&target, ggml_quantize_config(&text)?),
-                target.display(),
-            )?;
+            let rewritten = with_overrides(ggml_quantize_config(&text)?, overrides.as_deref())?;
+            io(std::fs::write(&target, rewritten), target.display())?;
         } else if text_name.ends_with(".index.json") {
             let text = io(std::fs::read_to_string(file), file.display())?;
             let mut index: Value = serde_json::from_str(&text)
@@ -1573,6 +1644,130 @@ fn write_shard(
         .map_err(|e| GgmlTierError::Candle(format!("{}: {e}", target.display())))?;
     report.shards += 1;
     Ok((target, keys))
+}
+
+// ---------------------------------------------------------------------------------------------
+// q4 recipe override: --keep-q8
+// ---------------------------------------------------------------------------------------------
+
+/// A q4 tier's **keep-q8 recipe override** (SW-7285): every packed projection whose **base name**
+/// (the tensor name without `.weight`, e.g. `transformer_blocks.3.img_mod.1`) matches one of
+/// `patterns` (unanchored [`regex::Regex::is_match`]; anchor with `^...$` for an exact match) is
+/// stored `Q8_0`, quantized from the dense source's `{base}.weight` by the same quantizer as a
+/// from-bf16 tier; every other projection stays lossless `Q4_1` from the MLX triple. The loaders
+/// classify each stored tensor by its own block size, so a mixed tier needs no reader change.
+#[derive(Clone, Debug)]
+pub struct KeepQ8 {
+    pub patterns: Vec<regex::Regex>,
+    /// The dense source of the overridden projections (component directory, any sharding).
+    pub source: Bf16Source,
+}
+
+impl KeepQ8 {
+    fn matches(&self, base: &str) -> bool {
+        self.patterns.iter().any(|p| p.is_match(base))
+    }
+
+    /// Per-pattern match counts over `template`'s packed projections, as the config record. A
+    /// pattern matching nothing is refused (the typo guard) before anything is written.
+    fn counts(
+        &self,
+        src: &Path,
+        template: &[(std::ffi::OsString, ShardFile)],
+    ) -> Result<Vec<Value>> {
+        let mut counts = vec![0usize; self.patterns.len()];
+        for (_, shard) in template {
+            for name in shard.entries.keys() {
+                let Some(base) = name.strip_suffix(".scales") else {
+                    continue;
+                };
+                if !shard.entries.contains_key(&format!("{base}.weight")) {
+                    continue;
+                }
+                for (i, p) in self.patterns.iter().enumerate() {
+                    counts[i] += usize::from(p.is_match(base));
+                }
+            }
+        }
+        if let Some(i) = counts.iter().position(|&n| n == 0) {
+            return Err(GgmlTierError::KeepQ8NoMatch {
+                dir: src.to_path_buf(),
+                pattern: self.patterns[i].as_str().to_string(),
+            });
+        }
+        Ok(self
+            .patterns
+            .iter()
+            .zip(counts)
+            .map(|(p, n)| serde_json::json!({ "pattern": p.as_str(), "bits": 8, "count": n }))
+            .collect())
+    }
+}
+
+/// The CLI form of [`KeepQ8`]: the patterns and the dense root holding `<component>` dirs.
+#[derive(Clone, Debug)]
+pub struct KeepQ8Spec {
+    pub patterns: Vec<regex::Regex>,
+    pub root: PathBuf,
+}
+
+impl KeepQ8Spec {
+    /// Compile `patterns` (a bad regex is a typed [`GgmlTierError::Spec`]).
+    pub fn new(patterns: &[String], root: PathBuf) -> Result<Self> {
+        let patterns = patterns
+            .iter()
+            .map(|p| {
+                regex::Regex::new(p)
+                    .map_err(|e| GgmlTierError::Spec(format!("--keep-q8 `{p}`: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { patterns, root })
+    }
+}
+
+/// Options of one component conversion.
+#[derive(Clone, Debug, Default)]
+pub struct ConvertOptions {
+    /// The q4 keep-q8 recipe override ([`KeepQ8`]).
+    pub keep_q8: Option<KeepQ8>,
+}
+
+/// Record `overrides` in every GGML-marked `quantization` block of a rewritten config:
+/// `"overrides": [{"pattern": ..., "bits": 8, "count": N}]` beside the unchanged `"bits": 4,
+/// "storage": "ggml"`. `None` returns `text` untouched (no override, byte-identical output).
+fn with_overrides(text: String, overrides: Option<&[Value]>) -> Result<String> {
+    let Some(overrides) = overrides else {
+        return Ok(text);
+    };
+    fn add(v: &mut Value, overrides: &[Value]) -> usize {
+        let mut n = 0;
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::Object(q)) = map.get_mut("quantization") {
+                    if q.get("storage").and_then(Value::as_str) == Some(GGML_STORAGE) {
+                        q.insert("overrides".into(), Value::Array(overrides.to_vec()));
+                        n += 1;
+                    }
+                }
+                for (key, child) in map.iter_mut() {
+                    if key != "quantization" {
+                        n += add(child, overrides);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|c| n += add(c, overrides)),
+            _ => {}
+        }
+        n
+    }
+    let mut config: Value =
+        serde_json::from_str(&text).map_err(|e| GgmlTierError::Config(e.to_string()))?;
+    if add(&mut config, overrides) == 0 {
+        return Err(GgmlTierError::Config(
+            "no GGML quantization block to record the --keep-q8 overrides in".into(),
+        ));
+    }
+    serde_json::to_string_pretty(&config).map_err(|e| GgmlTierError::Config(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1769,6 +1964,7 @@ pub fn convert_split_tier(
         group_size,
         cfg_bits: bits,
         keep_metadata: true,
+        keep: None,
     };
 
     let partial = partial_path(dst);
@@ -1894,6 +2090,8 @@ pub struct Job {
     pub mode: SourceMode,
     /// A whole split tier ([`convert_split_tier`]) rather than one component directory.
     pub split: bool,
+    /// Per-job options (the q4 `--keep-q8` override of a from-mlx component job).
+    pub options: ConvertOptions,
 }
 
 impl Job {
@@ -1903,9 +2101,14 @@ impl Job {
         progress: &mut dyn FnMut(&Path, &ComponentReport) -> Result<()>,
     ) -> Result<ComponentReport> {
         if self.split {
+            if self.options.keep_q8.is_some() {
+                return Err(GgmlTierError::Spec(
+                    "--keep-q8 applies to component tiers, not split tiers".into(),
+                ));
+            }
             convert_split_tier(&self.src, &self.dst, &self.mode, progress)
         } else {
-            convert_component(&self.src, &self.dst, &self.mode, progress)
+            convert_component_with(&self.src, &self.dst, &self.mode, &self.options, progress)
         }
     }
 }
@@ -1927,11 +2130,31 @@ pub fn plan_jobs(
     components: &[String],
     prefix_maps: &[PrefixMap],
 ) -> Result<Vec<Job>> {
+    plan_jobs_keep(src_root, out_root, tiers, components, prefix_maps, None)
+}
+
+/// [`plan_jobs`] plus the q4 `--keep-q8` override: every **from-mlx component** job reads its
+/// overridden projections from `<keep.root>/<component>` (the tier dir's own root for `.`), with
+/// the same `prefix_maps`. From-bf16 jobs are already all-`Q8_0` and ignore it; split tiers refuse
+/// it (see [`Job::run`]).
+pub fn plan_jobs_keep(
+    src_root: &Path,
+    out_root: &Path,
+    tiers: &[TierSpec],
+    components: &[String],
+    prefix_maps: &[PrefixMap],
+    keep: Option<&KeepQ8Spec>,
+) -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
     for c in components {
         check_rel(c)?;
     }
     if components.is_empty() {
+        if keep.is_some() {
+            return Err(GgmlTierError::Spec(
+                "--keep-q8 applies to component tiers (--component), not split tiers".into(),
+            ));
+        }
         for t in tiers {
             jobs.push(Job {
                 label: format!("{} (split)", t.tier),
@@ -1945,6 +2168,7 @@ pub fn plan_jobs(
                     }),
                 },
                 split: true,
+                options: ConvertOptions::default(),
             });
         }
         return Ok(jobs);
@@ -1974,6 +2198,22 @@ pub fn plan_jobs(
                     }),
                 },
                 split: false,
+                options: match (&t.bf16_root, keep) {
+                    (None, Some(k)) => ConvertOptions {
+                        keep_q8: Some(KeepQ8 {
+                            patterns: k.patterns.clone(),
+                            source: Bf16Source {
+                                dir: if c == "." {
+                                    k.root.clone()
+                                } else {
+                                    k.root.join(&dense)
+                                },
+                                prefix_maps: prefix_maps.to_vec(),
+                            },
+                        }),
+                    },
+                    _ => ConvertOptions::default(),
+                },
             });
         }
     }
@@ -3342,6 +3582,225 @@ mod tests {
             SourceMode::FromBf16(b) => assert_eq!(b.dir, PathBuf::from("b/distilled/bf16")),
             SourceMode::FromMlx => panic!("from-bf16 expected"),
         }
+    }
+
+    fn keep(patterns: &[&str], dir: PathBuf, maps: Vec<PrefixMap>) -> ConvertOptions {
+        let spec = KeepQ8Spec::new(
+            &patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        ConvertOptions {
+            keep_q8: Some(KeepQ8 {
+                patterns: spec.patterns,
+                source: Bf16Source {
+                    dir,
+                    prefix_maps: maps,
+                },
+            }),
+        }
+    }
+
+    /// A q4 component with two per-block modulation projections and one attention projection,
+    /// plus a bf16 source (under a different prefix) for the modulation weights.
+    fn keep_fixture(root: &Path) -> (PathBuf, PathBuf, [Tensor; 3], Tensor, Tensor) {
+        let (src, dense) = (root.join("q4/transformer"), root.join("bf16/transformer"));
+        let q = q4_pack(4, 64, 64, 3);
+        let mut s = HashMap::new();
+        put_triple(
+            &mut s,
+            "transformer_blocks.0.img_mod.1",
+            q4_pack(6, 128, 64, 1),
+        );
+        put_triple(
+            &mut s,
+            "transformer_blocks.1.img_mod.1",
+            q4_pack(6, 128, 64, 2),
+        );
+        put_triple(&mut s, "transformer_blocks.0.attn.to_q", q.clone());
+        s.insert("transformer_blocks.0.img_mod.1.bias".into(), norm());
+        write_component(&src, 4, 64, &[s]);
+        let (m0, m1) = (dense_bf16(6, 128, 0.2), dense_bf16(6, 128, 0.8));
+        std::fs::create_dir_all(&dense).unwrap();
+        save(
+            &HashMap::from([
+                (
+                    "model.transformer_blocks.0.img_mod.1.weight".to_string(),
+                    m0.clone(),
+                ),
+                (
+                    "model.transformer_blocks.1.img_mod.1.weight".to_string(),
+                    m1.clone(),
+                ),
+            ]),
+            dense.join("diffusion_pytorch_model.safetensors"),
+        );
+        (src, dense, q, m0, m1)
+    }
+
+    #[test]
+    fn keep_q8_mixes_q8_0_overrides_from_bf16_with_lossless_q4_1() {
+        let root = tmp();
+        let (src, dense, [wq, s, b], m0, m1) = keep_fixture(root.path());
+        let dst = root.path().join("out");
+        let opts = keep(
+            &[r"^transformer_blocks\.\d+\.img_mod\.1$"],
+            dense,
+            vec![PrefixMap::parse("transformer_blocks.=model.transformer_blocks.").unwrap()],
+        );
+        let report =
+            convert_component_with(&src, &dst, &SourceMode::FromMlx, &opts, &mut noop).unwrap();
+        assert_eq!((report.converted, report.keep_q8), (3, 2));
+        let got = load(dst.join("model-00001-of-00001.safetensors"));
+        // The overrides are Q8_0 of the bf16 weight, exactly the from-bf16 quantizer.
+        for (base, w) in [
+            ("transformer_blocks.0.img_mod.1", &m0),
+            ("transformer_blocks.1.img_mod.1", &m1),
+        ] {
+            let stored = &got[&format!("{base}.weight")];
+            assert_eq!(stored.dims(), [6, 4, 34], "{base}");
+            assert_eq!(
+                bytes(stored),
+                bytes(&dense_to_q8_0_blocks(base, w).unwrap())
+            );
+            assert!(!got.contains_key(&format!("{base}.scales")));
+        }
+        // Everything else stays lossless Q4_1 from the MLX triple.
+        let stored = &got["transformer_blocks.0.attn.to_q.weight"];
+        assert_eq!(stored.dims(), [4, 2, 20]);
+        let want = repack_packed_weight_uncached(&wq, &s, &b, 64, &Device::Cpu).unwrap();
+        assert_eq!(bytes(stored), want.data().unwrap().into_owned());
+        assert_eq!(
+            got["transformer_blocks.0.img_mod.1.bias"].dtype(),
+            DType::BF16
+        );
+        // The config records the recipe and stays readable as a 4-bit GGML tier.
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["quantization"],
+            serde_json::json!({"bits": 4, "storage": "ggml", "overrides": [
+                {"pattern": r"^transformer_blocks\.\d+\.img_mod\.1$", "bits": 8, "count": 2}
+            ]})
+        );
+        let packed = candle_layers::quant::PackedConfig::from_config(&cfg).unwrap();
+        assert_eq!((packed.bits, packed.group_size), (4, 64));
+        assert!(candle_layers::stored_ggml::config_declares_ggml_storage(
+            &cfg
+        ));
+        // Without an override the same component is all Q4_1 and the config carries no record.
+        let plain = root.path().join("plain");
+        convert_component(&src, &plain, &SourceMode::FromMlx, &mut noop).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(plain.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["quantization"],
+            serde_json::json!({"bits": 4, "storage": "ggml"})
+        );
+    }
+
+    #[test]
+    fn keep_q8_refuses_typos_missing_or_misshaped_sources_and_non_q4_tiers() {
+        let root = tmp();
+        let (src, dense, _, _, _) = keep_fixture(root.path());
+        let map =
+            || vec![PrefixMap::parse("transformer_blocks.=model.transformer_blocks.").unwrap()];
+        let run = |opts: &ConvertOptions, out: &str| {
+            let dst = root.path().join(out);
+            let r = convert_component_with(&src, &dst, &SourceMode::FromMlx, opts, &mut noop);
+            assert!(!dst.exists(), "{out}: a refused run leaves no tier");
+            r
+        };
+        // A pattern that matches nothing (here: one of two) is the typo guard, before any write.
+        let typo = keep(
+            &[r"img_mod\.1$", r"^transformer_blocks\.\d+\.img_mod1$"],
+            dense.clone(),
+            map(),
+        );
+        assert!(matches!(
+            run(&typo, "o1"),
+            Err(GgmlTierError::KeepQ8NoMatch { pattern, .. }) if pattern.ends_with("img_mod1$")
+        ));
+        assert!(!root.path().join("o1.partial").exists());
+        // The bf16 tensor must exist (no prefix map here -> not found)...
+        assert!(matches!(
+            run(&keep(&[r"img_mod\.1$"], dense.clone(), vec![]), "o2"),
+            Err(GgmlTierError::MissingDenseSource { .. })
+        ));
+        // ...and match the projection's shape.
+        let bad = root.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        save(
+            &HashMap::from([
+                (
+                    "model.transformer_blocks.0.img_mod.1.weight".to_string(),
+                    dense_bf16(6, 64, 0.1),
+                ),
+                (
+                    "model.transformer_blocks.1.img_mod.1.weight".to_string(),
+                    dense_bf16(6, 64, 0.1),
+                ),
+            ]),
+            bad.join("w.safetensors"),
+        );
+        assert!(matches!(
+            run(&keep(&[r"img_mod\.1$"], bad, map()), "o3"),
+            Err(GgmlTierError::DenseShapeMismatch { .. })
+        ));
+        // Only a q4 from-mlx tier takes the override.
+        let q8 = root.path().join("q8");
+        let mut s = HashMap::new();
+        put_triple(
+            &mut s,
+            "transformer_blocks.0.img_mod.1",
+            q8_template(6, 128, 64),
+        );
+        write_component(&q8, 8, 64, &[s]);
+        assert!(matches!(
+            convert_component_with(
+                &q8,
+                &root.path().join("o4"),
+                &SourceMode::FromMlx,
+                &keep(&[r"img_mod"], dense, map()),
+                &mut noop
+            ),
+            Err(GgmlTierError::Spec(_))
+        ));
+        assert!(KeepQ8Spec::new(&["(".to_string()], PathBuf::new()).is_err());
+    }
+
+    #[test]
+    fn keep_q8_is_planned_onto_from_mlx_component_jobs_only() {
+        let spec = KeepQ8Spec::new(&[r"img_mod\.1$".to_string()], PathBuf::from("b16")).unwrap();
+        let jobs = plan_jobs_keep(
+            Path::new("s"),
+            Path::new("o"),
+            &[
+                TierSpec::parse("q4=from-mlx").unwrap(),
+                TierSpec::parse("q8=from-bf16@b16").unwrap(),
+            ],
+            &["transformer".into()],
+            &[],
+            Some(&spec),
+        )
+        .unwrap();
+        let k = jobs[0].options.keep_q8.as_ref().expect("q4 job keeps q8");
+        assert_eq!(k.source.dir, Path::new("b16").join("transformer"));
+        assert!(
+            jobs[1].options.keep_q8.is_none(),
+            "from-bf16 is all Q8_0 already"
+        );
+        assert!(plan_jobs_keep(
+            Path::new("s"),
+            Path::new("o"),
+            &[TierSpec::parse("q4=from-mlx").unwrap()],
+            &[],
+            &[],
+            Some(&spec)
+        )
+        .is_err());
     }
 
     #[test]

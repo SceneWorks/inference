@@ -32,12 +32,23 @@
 //! * Stacked MoE experts (rank-3 triples, Lens's text encoder) convert to rank-4 stored blocks; a
 //!   from-bf16 source that ships them MXFP4 (`{base}_blocks` / `{base}_scales`) is dequantized and
 //!   quantized to Q8_0 (reported as `mxfp4`).
+//! * `--keep-q8 REGEX` (repeatable) + `--keep-src BF16_ROOT` -- a q4 **recipe override** for
+//!   from-mlx component tiers: every packed projection whose **base name** (tensor name without
+//!   `.weight`, e.g. `transformer_blocks.3.img_mod.1`) matches a REGEX (unanchored; use `^...$`)
+//!   is stored Q8_0 quantized from `BF16_ROOT/<component>/{base}.weight` (same quantizer as
+//!   from-bf16, `--map-prefix` applies); the rest stay lossless Q4_1. A pattern matching nothing is
+//!   refused. config.json keeps `"bits": 4, "storage": "ggml"` and records
+//!   `"overrides": [{"pattern", "bits": 8, "count"}]`. E.g. Qwen-Image:
+//!   `--tier q4=from-mlx --keep-q8 '^transformer_blocks\.\d+\.img_mod\.1$' --keep-src <bf16 root>
+//!   --components transformer`.
 //! * An existing output component is a hard error, so a partial run resumes by naming only the
 //!   components still missing.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use candle_gen::ggml_tier::{dump_headers, plan_jobs, write_header_dump, PrefixMap, TierSpec};
+use candle_gen::ggml_tier::{
+    dump_headers, plan_jobs_keep, write_header_dump, KeepQ8Spec, PrefixMap, TierSpec,
+};
 
 fn usage(msg: &str) -> ! {
     eprintln!("error: {msg}\nsee the module docs of examples/candle_ggml_tier.rs for usage");
@@ -190,6 +201,8 @@ fn build(args: Vec<String>) {
     let mut tiers = Vec::new();
     let mut components: Vec<String> = Vec::new();
     let mut maps = Vec::new();
+    let mut keep_q8: Vec<String> = Vec::new();
+    let mut keep_src: Option<PathBuf> = None;
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut val = || {
@@ -211,6 +224,8 @@ fn build(args: Vec<String>) {
             "--map-prefix" => {
                 maps.push(PrefixMap::parse(&val()).unwrap_or_else(|e| usage(&e.to_string())))
             }
+            "--keep-q8" => keep_q8.push(val()),
+            "--keep-src" => keep_src = Some(PathBuf::from(val())),
             other => usage(&format!("unknown argument {other}")),
         }
     }
@@ -219,8 +234,23 @@ fn build(args: Vec<String>) {
     if tiers.is_empty() {
         usage("at least one --tier is required (no --component = split tiers)");
     }
-    let jobs = plan_jobs(&src_root, &out_root, &tiers, &components, &maps)
-        .unwrap_or_else(|e| usage(&e.to_string()));
+    let keep = match (keep_q8.is_empty(), keep_src) {
+        (true, None) => None,
+        (false, Some(root)) => {
+            Some(KeepQ8Spec::new(&keep_q8, root).unwrap_or_else(|e| usage(&e.to_string())))
+        }
+        (true, Some(_)) => usage("--keep-src needs at least one --keep-q8 pattern"),
+        (false, None) => usage("--keep-q8 needs --keep-src <bf16 root holding <component>>"),
+    };
+    let jobs = plan_jobs_keep(
+        &src_root,
+        &out_root,
+        &tiers,
+        &components,
+        &maps,
+        keep.as_ref(),
+    )
+    .unwrap_or_else(|e| usage(&e.to_string()));
     for job in jobs {
         let started = std::time::Instant::now();
         println!(
@@ -254,6 +284,19 @@ fn build(args: Vec<String>) {
             report.tensor_bytes,
             started.elapsed().as_secs_f64()
         );
+        if job.options.keep_q8.is_some() {
+            println!(
+                "  [recipe] {}: {} Q4_1 (lossless from MLX q4) + {} Q8_0 --keep-q8 overrides (from {})",
+                job.label,
+                report.converted - report.keep_q8,
+                report.keep_q8,
+                job.options
+                    .keep_q8
+                    .as_ref()
+                    .map(|k| k.source.dir.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
         let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
         for (_, from, to) in &report.casts {
             *kinds.entry(format!("{from}->{to}")).or_default() += 1;

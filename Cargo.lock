@@ -521,6 +521,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "rayon",
+ "regex",
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-testkit",
