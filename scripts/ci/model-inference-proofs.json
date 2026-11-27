@@ -321905,6 +321905,209 @@
     }
   },
   {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Fixed-seed 1024x1024 8-step Krea 2 Turbo renders: the bf16 snapshot, the SW-6135 W4A8 tier (native single file over the bf16 base), loaded resident and again through the staged-residency shape (Sequential + DeferredMaterialization File load, staged request; DiT resident in the heavy phase), and the optional q8/q4/NVFP4 (resident and staged)/blanket-W4A8 rows; each staged render must match its resident twin; image PSNR vs bf16, s/step and device peak; both W4A8 renders must clear the declared 22 dB floor.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+      "requirements": [
+        {
+          "slot": "krea-selected-native-checkpoint",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-base-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-retained-file-batch-postchecked",
+          "role": "artifact-input",
+          "readers": [
+            "gen-core::LoadSpec::read_files_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "A real Krea 2 LoRA installed additively on the q8 snapshot trunk and on the SW-6135 W4A8 tier trunk (identical applied/skipped census), then four fixed-seed 1024x1024 renders (q8 and W4A8, with and without the LoRA) checked for the same result class.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+      "requirements": [
+        {
+          "slot": "krea-selected-native-checkpoint",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-base-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-actual-adapter-install",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-retained-file-batch-postchecked",
+          "role": "artifact-input",
+          "readers": [
+            "gen-core::LoadSpec::read_files_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
     "package": "candle-gen",
     "target": "integration",
     "target_kind": "test",

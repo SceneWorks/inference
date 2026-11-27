@@ -366,6 +366,51 @@ pub(crate) fn tiny_native_nvfp4_fixture(tmp: &tempfile::TempDir) -> (PathBuf, Kr
     (path, cfg)
 }
 
+/// The tiny native transformer with one projection replaced by a real W4A8 operand set (SW-6135),
+/// packed by gen-core's packer. W4A8 needs `in % 256 == 0`, which no tiny architecture projection
+/// has, so the replaced projection is `blocks.0.attn.wk` at a logical `[16, 256]`: an attention
+/// projection the architecture shape check does not pin. That keeps the fixture honest for what it
+/// proves (delegated planning, key-surface accounting, typed refusals) and says nothing about a
+/// forward. Returns `(base snapshot root, native file, cfg)`.
+pub(crate) fn tiny_native_w4a8_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, Krea2Config) {
+    let (root, path, cfg) = tiny_native_transformer_fixture(tmp);
+    let bytes = std::fs::read(&path).unwrap();
+    let tensors = ::safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let mut owned: std::collections::BTreeMap<String, (::safetensors::Dtype, Vec<usize>, Vec<u8>)> =
+        tensors
+            .tensors()
+            .into_iter()
+            .map(|(name, t)| (name, (t.dtype(), t.shape().to_vec(), t.data().to_vec())))
+            .collect();
+    let base = "model.diffusion_model.blocks.0.attn.wk";
+    owned.remove(&format!("{base}.weight")).unwrap();
+    let weight: Vec<f32> = (0..16 * 256)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 400.0)
+        .collect();
+    let packed = candle_gen::gen_core::w4a8_int8::quantize_weight(&weight, 16, 256).unwrap();
+    for t in packed.checkpoint_tensors(base) {
+        let dtype = match format!("{:?}", t.dtype).as_str() {
+            "U8" => ::safetensors::Dtype::U8,
+            "I8" => ::safetensors::Dtype::I8,
+            "F32" => ::safetensors::Dtype::F32,
+            "F8_E4M3" => ::safetensors::Dtype::F8_E4M3,
+            other => panic!("unexpected W4A8 operand dtype {other}"),
+        };
+        owned.insert(t.name, (dtype, t.shape, t.data));
+    }
+    let views = owned
+        .iter()
+        .map(|(name, (dtype, shape, bytes))| {
+            (
+                name.clone(),
+                ::safetensors::tensor::TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    ::safetensors::serialize_to_file(views, None, &path).unwrap();
+    (root, path, cfg)
+}
+
 /// Serialize a built tensor map to a `.safetensors` inside `tmp` and load it as a [`KreaTrainDit`].
 /// Returns `(dit, path)`; `tmp` owns the file and removes it on drop.
 fn serialize_and_load(

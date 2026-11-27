@@ -314,6 +314,13 @@ impl QLinear {
         matches!(self, Self::Adapt(linear) if linear.is_convrot_int8())
     }
 
+    /// Whether this projection loaded as a packed **W4A8** layer (SW-6135): a native W4A8 tier's
+    /// delegated projection fired the `W4A8Linear` path, not a silent dense fallback. Public for the
+    /// same reason as [`Self::is_convrot_int8`]: the CUDA real-weight test asserts on it.
+    pub fn is_w4a8(&self) -> bool {
+        matches!(self, Self::Adapt(linear) if linear.is_w4a8())
+    }
+
     /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. The shared host also owns additive stacks for native ConvRot bases.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
@@ -349,7 +356,7 @@ impl QLinear {
     /// intended, and the same rule `AdditiveProj for AdaptLinear::strict_admission`
     /// (`crate::adapters`) applies, so the two hosts of one projection never disagree.
     pub(crate) fn strict_adapter_admission(&self) -> bool {
-        matches!(self, Self::Nvfp4(_)) || self.is_convrot_int8()
+        matches!(self, Self::Nvfp4(_)) || self.is_convrot_int8() || self.is_w4a8()
     }
 
     pub(crate) fn additive_shape(&self) -> (usize, usize) {
@@ -364,7 +371,9 @@ impl QLinear {
 
     pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         match self {
-            Self::Adapt(host) if host.is_convrot_int8() => host.push_lora_checked(a, b, scale),
+            Self::Adapt(host) if host.is_convrot_int8() || host.is_w4a8() => {
+                host.push_lora_checked(a, b, scale)
+            }
             Self::Adapt(host) => host.push_lora(a, b, scale),
             // NVFP4 admits through the shared CHECKED push: a shape/dtype/device mismatch is a typed
             // error here — at install, before the first sampler step — and the packed base is never
@@ -382,7 +391,7 @@ impl QLinear {
         factors: candle_gen::quant::LokrFactors,
     ) -> Result<()> {
         match self {
-            Self::Adapt(host) if host.is_convrot_int8() => {
+            Self::Adapt(host) if host.is_convrot_int8() || host.is_w4a8() => {
                 host.push_lokr_structured_checked(factors)
             }
             Self::Adapt(host) => host.push_lokr_structured(factors),
