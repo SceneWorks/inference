@@ -1571,7 +1571,6 @@ fn lens_memory_strategy_safety_decision(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct LensMemoryScope {
     provider_id: &'static str,
     device: Device,
@@ -1590,7 +1589,6 @@ fn lens_generation_memory(
     contract.generation_memory(&selection)
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl LensMemoryScope {
     fn new(
         provider_id: &'static str,
@@ -1643,7 +1641,6 @@ impl LensMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl gen_core::MemoryRequestScope for LensMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
@@ -1759,7 +1756,6 @@ impl gen_core::MemoryRequestScope for LensMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl Drop for LensMemoryScope {
     fn drop(&mut self) {
         if !self.finished {
@@ -3000,7 +2996,6 @@ fn registered_lens_turbo_memory_strategy_safety_check(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_lens_valid_fixture(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3028,7 +3023,6 @@ fn registered_lens_valid_fixture(
     Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_lens_begin_request(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3468,14 +3462,12 @@ const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryR
     contract: registered_lens_base_memory_strategy_contract,
     safety_check: registered_lens_turbo_memory_strategy_safety_check,
 };
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID_TURBO,
         valid_fixtures: registered_lens_valid_fixture,
         begin_request: registered_lens_begin_request,
     };
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID_BASE,
@@ -3526,6 +3518,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_lens_turbo_surface_contract,
             },
         )
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -3538,6 +3531,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_lens_base_surface_contract,
             },
         )
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Lens provider catalog.

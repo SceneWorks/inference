@@ -881,6 +881,77 @@ mod tests {
                 .memory
                 .has_memory_contract
         );
+        // Every CUDA-gated behavior-bearing route (all 20 routes across flux, flux2, krea, lens,
+        // mage, qwen-image, z-image plus bernini, ltx, minimax-h3, wan) must report
+        // `has_memory_behavior == true` in hosted `candle-cuda` export so it matches live
+        // `runtime-cuda`.
+        for route_id in [
+            "flux1_schnell",
+            "flux1_dev",
+            "flux2_dev",
+            "flux2_klein_9b",
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+            "krea_2_turbo_control",
+            "lens",
+            "lens_turbo",
+            "mage_flow",
+            "mage_flow_base",
+            "mage_flow_turbo",
+            "mage_flow_edit",
+            "mage_flow_edit_base",
+            "mage_flow_edit_turbo",
+            "qwen_image",
+            "z_image",
+            "z_image_turbo",
+            "bernini",
+            "bernini_renderer",
+            "ltx_2_3_distilled",
+            "ltx_2_5_distilled",
+            "minimax_h3",
+            "minimax_h3_image",
+            "wan2_2_ti2v_5b",
+            "wan2_2_t2v_14b",
+            "wan2_2_i2v_14b",
+        ] {
+            assert!(
+                cuda_export.routes[route_id].memory.has_memory_behavior,
+                "hosted candle-cuda export must report has_memory_behavior=true for `{route_id}`"
+            );
+        }
+        // Conditioned-only routes must not advertise false text_to_image / text_to_video modes.
+        for route_id in [
+            "krea_2_turbo_control",
+            "krea_2_edit",
+            "boogu_image_edit",
+            "mage_flow_edit",
+            "seedvr2",
+        ] {
+            assert!(
+                !cuda_export.routes[route_id]
+                    .modes
+                    .contains(&"text_to_image".to_string()),
+                "conditioned-only route `{route_id}` must not advertise text_to_image"
+            );
+            assert!(
+                !cuda_export.routes[route_id].modes.is_empty(),
+                "conditioned-only route `{route_id}` must still advertise its real modes"
+            );
+        }
+        for route_id in ["wan2_2_i2v_14b", "svd_xt", "scail2_14b", "seedvr2"] {
+            assert!(
+                !cuda_export.routes[route_id]
+                    .modes
+                    .contains(&"text_to_video".to_string()),
+                "conditioned-only route `{route_id}` must not advertise text_to_video"
+            );
+            assert!(
+                !cuda_export.routes[route_id].modes.is_empty(),
+                "conditioned-only route `{route_id}` must still advertise its real modes"
+            );
+        }
         if !candle_gen_catalog::SURFACES_NVFP4_TIER {
             assert!(cpu_export.advanced_quant_tiers.is_empty());
             assert!(!cpu_export.routes["flux3_klein"]
@@ -888,6 +959,7 @@ mod tests {
                 .supported_tiers
                 .contains(&"nvfp4".to_string()));
             assert!(!cpu_export.routes["krea_2_turbo"].memory.has_memory_contract);
+            assert!(!cpu_export.routes["krea_2_turbo"].memory.has_memory_behavior);
         }
 
         // Independent non-generator entrypoints populated cleanly.

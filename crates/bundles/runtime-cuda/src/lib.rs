@@ -623,11 +623,50 @@ mod tests {
     }
 
     /// SW-6980 (`REG-3`, `AC1`): the live CUDA runtime's `sga.capabilities/2` export matches the
-    /// hardware-free hosted CUDA descriptor-only registry byte-for-byte.
+    /// hardware-free hosted CUDA descriptor-only registry byte-for-byte, and reports
+    /// `has_memory_behavior == true` on every CUDA-gated behavior-bearing route (non-CUDA branch
+    /// parity is additionally pinned by `candle-gen-catalog`'s source+runtime test and
+    /// `runtime-cpu`'s hosted `candle-cuda` export test).
     #[cfg(all(feature = "media", feature = "audio"))]
     #[test]
     fn live_cuda_export_matches_hosted_descriptor_only_cuda_export() {
         let live = super::capabilities_export().expect("live runtime-cuda export");
+        for route_id in [
+            "flux1_schnell",
+            "flux1_dev",
+            "flux2_dev",
+            "flux2_klein_9b",
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+            "krea_2_turbo_control",
+            "lens",
+            "lens_turbo",
+            "mage_flow",
+            "mage_flow_base",
+            "mage_flow_turbo",
+            "mage_flow_edit",
+            "mage_flow_edit_base",
+            "mage_flow_edit_turbo",
+            "qwen_image",
+            "z_image",
+            "z_image_turbo",
+            "bernini",
+            "bernini_renderer",
+            "ltx_2_3_distilled",
+            "ltx_2_5_distilled",
+            "minimax_h3",
+            "minimax_h3_image",
+            "wan2_2_ti2v_5b",
+            "wan2_2_t2v_14b",
+            "wan2_2_i2v_14b",
+        ] {
+            assert!(
+                live.routes[route_id].memory.has_memory_behavior,
+                "live runtime-cuda export must report has_memory_behavior=true for `{route_id}`"
+            );
+        }
         let descriptor_catalog = super::RuntimeCatalog::try_new_with_audio(
             super::PLATFORM,
             super::BACKEND,

@@ -942,12 +942,14 @@ pub fn register_memory_contract_surfaces(
             provider_id: FLUX1_SCHNELL_ID,
             contract: registered_schnell_memory_contract,
         })
+        .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
         .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: FLUX1_DEV_ID,
             contract: registered_dev_memory_contract,
         })
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR)
 }
 
 fn registered_schnell_memory_contract(
@@ -974,7 +976,6 @@ const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: FLUX1_SCHNELL_ID,
@@ -984,7 +985,6 @@ const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(feature = "cuda")]
 const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: FLUX1_DEV_ID,

@@ -2435,12 +2435,14 @@ pub fn register_memory_contract_surfaces(
             provider_id: config::FLUX2_KLEIN_9B_ID,
             contract: memory_strategy::klein_provider_contract,
         })
+        .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
         .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::FLUX2_DEV_ID,
             contract: memory_strategy::provider_contract,
         })
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR)
 }
 
 const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -2455,7 +2457,6 @@ const KLEIN_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: config::FLUX2_DEV_ID,
@@ -2463,7 +2464,6 @@ const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: memory_strategy::registered_begin_request,
     };
 
-#[cfg(feature = "cuda")]
 const KLEIN_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: config::FLUX2_KLEIN_9B_ID,

@@ -1971,12 +1971,25 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
     let catalog_lib = strip_line_comments(
         &std::fs::read_to_string(candle_gen_root.join("candle-gen-catalog/src/lib.rs")).unwrap(),
     );
-    let catalog_registration = function_body(&catalog_lib, "pub fn register_providers");
+    let register_providers_body = function_body(&catalog_lib, "pub fn register_providers");
+    assert!(
+        register_providers_body.contains("register_providers_with_flux3_mode("),
+        "register_providers must delegate to the shared register_providers_with_flux3_mode spine"
+    );
+    let cuda_descriptor_body =
+        function_body(&catalog_lib, "pub fn cuda_descriptor_provider_registry");
+    assert!(
+        cuda_descriptor_body.contains("register_providers_with_flux3_mode("),
+        "cuda_descriptor_provider_registry must delegate to the shared register_providers_with_flux3_mode spine"
+    );
+    let catalog_registration = function_body(&catalog_lib, "fn register_providers_with_flux3_mode");
     let contract_surface_registration =
         function_body(&catalog_lib, "pub fn memory_contract_surface_registry");
 
     let mut cuda_gated = BTreeSet::new();
     let mut surface_registered = BTreeSet::new();
+    let mut cuda_descriptor_surface_registered = BTreeSet::new();
+    let mut cuda_behavior_crates = BTreeSet::new();
     let mut crate_dirs: Vec<_> = std::fs::read_dir(candle_gen_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1998,18 +2011,48 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
             continue;
         }
         let surface_call = format!("{crate_ident}::register_memory_contract_surfaces(");
+        let cuda_descriptor_provider_call =
+            format!("{crate_ident}::register_cuda_descriptor_providers(");
         if contract_surface_registration.contains(&surface_call) {
             surface_registered.insert(dir.clone());
         }
+        if cuda_descriptor_body.contains(&surface_call)
+            || catalog_registration.contains(&cuda_descriptor_provider_call)
+        {
+            cuda_descriptor_surface_registered.insert(dir.clone());
+        }
         let mut rs_files = Vec::new();
         collect_non_test_rs_files(&crate_dir.join("src"), &mut rs_files);
-        let has_cuda_gate = rs_files.iter().any(|path| {
-            let raw = std::fs::read_to_string(path).unwrap();
-            let stripped = strip_cfg_test_only_items(&strip_line_comments(&raw));
-            file_has_cuda_gated_registration(&stripped)
-        });
+        let stripped_sources: Vec<String> = rs_files
+            .iter()
+            .map(|path| {
+                let raw = std::fs::read_to_string(path).unwrap();
+                strip_cfg_test_only_items(&strip_line_comments(&raw))
+            })
+            .collect();
+        let has_cuda_gate = stripped_sources
+            .iter()
+            .any(|stripped| file_has_cuda_gated_registration(stripped));
         if has_cuda_gate {
-            cuda_gated.insert(dir);
+            cuda_gated.insert(dir.clone());
+            let with_behavior_calls: usize = stripped_sources
+                .iter()
+                .map(|s| s.matches(".with_memory_behavior_registration(").count())
+                .sum();
+            let surface_behavior_calls: usize = stripped_sources
+                .iter()
+                .map(|s| s.matches(".register_memory_behavior(").count())
+                .sum();
+            if with_behavior_calls > 0 {
+                cuda_behavior_crates.insert(dir.clone());
+                assert!(
+                    surface_behavior_calls >= with_behavior_calls,
+                    "{dir} registers {with_behavior_calls} CUDA memory behavior(s) via \
+                     .with_memory_behavior_registration(...) but only {surface_behavior_calls} via \
+                     .register_memory_behavior(...) in non-test sources; hosted candle-cuda export \
+                     would diverge from live runtime-cuda on memory.has_memory_behavior"
+                );
+            }
         }
     }
 
@@ -2038,6 +2081,66 @@ fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
         !surface_registered.is_empty() && surface_registered.is_subset(&cuda_gated),
         "every crate in memory_contract_surface_registry ({surface_registered:?}) must be detected as CUDA-gated ({cuda_gated:?})"
     );
+    assert_eq!(
+        cuda_descriptor_surface_registered, cuda_gated,
+        "cuda_descriptor_provider_registry must invoke register_memory_contract_surfaces for every CUDA-gated crate"
+    );
+    assert!(
+        cuda_behavior_crates.len() >= 11,
+        "expected at least 11 CUDA-gated crates with memory behaviors, got {cuda_behavior_crates:?}"
+    );
+
+    // Runtime parity check: cuda_descriptor_provider_registry() must register MemoryBehaviorRegistration
+    // for every route in the 11 CUDA-gated behavior-bearing crates (all 20 generator routes across
+    // flux, flux2, krea, lens, mage, qwen-image, z-image plus bernini, ltx, minimax-h3, wan, and
+    // the 3 composed edit/control routes).
+    let cuda_descriptor_registry = super::cuda_descriptor_provider_registry()
+        .expect("cuda_descriptor_provider_registry must compose cleanly");
+    let registered_behaviors: BTreeSet<&str> = cuda_descriptor_registry
+        .memory_behavior_registrations()
+        .map(|b| b.provider_id)
+        .collect();
+    for expected_behavior_id in [
+        "flux1_schnell",
+        "flux1_dev",
+        "flux2_dev",
+        "flux2_klein_9b",
+        "flux3_klein",
+        "flux3_klein_base",
+        "krea_2_turbo",
+        "krea_2_raw",
+        "krea_2_edit",
+        "krea_2_turbo_edit",
+        "krea_2_turbo_control",
+        "lens",
+        "lens_turbo",
+        "mage_flow",
+        "mage_flow_base",
+        "mage_flow_turbo",
+        "mage_flow_edit",
+        "mage_flow_edit_base",
+        "mage_flow_edit_turbo",
+        "qwen_image",
+        "qwen_image_edit",
+        "z_image",
+        "z_image_turbo",
+        "z_image_control",
+        "z_image_turbo_control",
+        "bernini",
+        "bernini_renderer",
+        "ltx_2_3_distilled",
+        "ltx_2_5_distilled",
+        "minimax_h3",
+        "minimax_h3_image",
+        "wan2_2_ti2v_5b",
+        "wan2_2_t2v_14b",
+        "wan2_2_i2v_14b",
+    ] {
+        assert!(
+            registered_behaviors.contains(expected_behavior_id),
+            "cuda_descriptor_provider_registry() is missing MemoryBehaviorRegistration for `{expected_behavior_id}`"
+        );
+    }
 
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

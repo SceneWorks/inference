@@ -86,8 +86,10 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
         verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
     }];
 
-/// Add every provider shipped by the Candle media platform to an explicit registry builder.
-pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+fn register_providers_with_flux3_mode(
+    registry: ProviderRegistryBuilder,
+    cuda_flux3_target: bool,
+) -> ProviderRegistryBuilder {
     // The engine's checkpoint codec table is registered here, exactly once, before any family
     // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
     // register one, and the builder refuses a duplicate row outright.
@@ -104,7 +106,11 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_clip::register_providers(registry);
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
-    let registry = candle_gen_flux3::register_providers(registry);
+    let registry = if cuda_flux3_target {
+        candle_gen_flux3::register_cuda_descriptor_providers(registry)
+    } else {
+        candle_gen_flux3::register_providers(registry)
+    };
     let registry = candle_gen_ideogram::register_providers(registry);
     let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
@@ -134,6 +140,11 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     candle_gen_z_image::register_providers(registry)
 }
 
+/// Add every provider shipped by the Candle media platform to an explicit registry builder.
+pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    register_providers_with_flux3_mode(registry, false)
+}
+
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
@@ -146,48 +157,9 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
 /// and memory-contract surface of [`provider_registry`] under `--features cuda` without
 /// requiring the NVIDIA CUDA toolkit.
 pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
-    #[cfg(feature = "cuda")]
-    {
-        provider_registry()
-    }
+    let registry = register_providers_with_flux3_mode(ProviderRegistryBuilder::new(), true);
     #[cfg(not(feature = "cuda"))]
-    {
-        let registry =
-            candle_gen::logical_weights::register_checkpoint_codecs(ProviderRegistryBuilder::new());
-        let registry =
-            registry.register_checkpoint_codec(candle_gen::gen_core::GGUF_CONTAINER_CODEC);
-        let registry = candle_gen_anima::register_providers(registry);
-        let registry = candle_gen_bernini::register_providers(registry);
-        let registry = candle_gen_boogu::register_providers(registry);
-        let registry = candle_gen_chroma::register_providers(registry);
-        let registry = candle_gen_clip::register_providers(registry);
-        let registry = candle_gen_flux::register_providers(registry);
-        let registry = candle_gen_flux2::register_providers(registry);
-        let registry = candle_gen_flux3::register_cuda_descriptor_providers(registry);
-        let registry = candle_gen_ideogram::register_providers(registry);
-        let registry = candle_gen_iris::register_providers(registry);
-        let registry = candle_gen_joycaption::register_providers(registry);
-        let registry = candle_gen_kolors::register_providers(registry);
-        let registry = candle_gen_krea::register_providers(registry);
-        let registry = candle_gen_lens::register_providers(registry);
-        let registry = candle_gen_ltx::register_providers(registry);
-        let registry = candle_gen_mage::register_providers(registry);
-        let registry = candle_gen_minimax_h3::register_providers(registry);
-        let registry = candle_gen_mochi::register_providers(registry);
-        let registry = candle_gen_moss_image::register_providers(registry);
-        let registry = candle_gen_qwen_image::register_providers(registry);
-        let registry = candle_gen_qwen_image_2_1::register_providers(registry);
-        let registry = candle_gen_sana::register_providers(registry);
-        let registry = candle_gen_scail2::register_providers(registry);
-        let registry = candle_gen_sd3::register_providers(registry);
-        let registry = candle_gen_sdxl::register_providers(registry);
-        let registry = candle_gen_seedvr2::register_providers(registry);
-        let registry = candle_gen_sensenova::register_providers(registry);
-        let registry = candle_gen_supra2::register_providers(registry);
-        let registry = candle_gen_svd::register_providers(registry);
-        let registry = candle_gen_wan::register_providers(registry);
-        let registry = candle_gen_z_image::register_providers(registry);
-
+    let registry = {
         let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
         let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
         let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
@@ -199,9 +171,9 @@ pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<Provi
         let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
         let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
         let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
-        let registry = candle_gen_wan::register_memory_contract_surfaces(registry);
-        registry.build()
-    }
+        candle_gen_wan::register_memory_contract_surfaces(registry)
+    };
+    registry.build()
 }
 
 /// Advanced quant tiers surfaced by the shipping CUDA feature set, usable in hardware-free

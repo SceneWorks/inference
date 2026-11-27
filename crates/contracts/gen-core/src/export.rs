@@ -605,7 +605,12 @@ impl ExportedRouteV2 {
             || registry.is_some_and(|reg| reg.has_video_plan(record.route_id));
 
         let capabilities = &descriptor.capabilities;
-        let modes = derive_route_modes(record.modality, capabilities, control_required);
+        let modes = derive_route_modes(
+            record.modality,
+            capabilities,
+            record.structure.conditioning.pass0_requirement,
+            control_required,
+        );
         let alternate_decoder_ids = derive_alternate_decoders(
             record.backend,
             record.route_id,
@@ -824,7 +829,12 @@ impl ExportedRouteV2 {
         let has_render_plan =
             registry.is_some_and(|reg| reg.render_plan_registration(descriptor.id).is_some());
         let has_video_plan = registry.is_some_and(|reg| reg.has_video_plan(descriptor.id));
-        let modes = derive_route_modes(descriptor.modality, capabilities, control_required);
+        let modes = derive_route_modes(
+            descriptor.modality,
+            capabilities,
+            Pass0ConditioningRequirement::NoiseStartSupported,
+            control_required,
+        );
         let alternate_decoder_ids = derive_alternate_decoders(
             descriptor.backend,
             descriptor.id,
@@ -2408,6 +2418,7 @@ fn derive_conditioning_alignment(
 fn derive_route_modes(
     modality: Modality,
     caps: &Capabilities,
+    pass0_requirement: Pass0ConditioningRequirement,
     control_required: bool,
 ) -> Vec<String> {
     let mut modes = Vec::new();
@@ -2416,10 +2427,12 @@ fn derive_route_modes(
             modes.push(mode.to_string());
         }
     };
+    let supports_noise_start =
+        pass0_requirement == Pass0ConditioningRequirement::NoiseStartSupported && !control_required;
 
     match modality {
         Modality::Image => {
-            if !control_required {
+            if supports_noise_start {
                 push("text_to_image");
             }
             if caps.accepts(ConditioningKind::Reference) {
@@ -2445,7 +2458,9 @@ fn derive_route_modes(
             }
         }
         Modality::Video => {
-            push("text_to_video");
+            if supports_noise_start {
+                push("text_to_video");
+            }
             if caps.accepts(ConditioningKind::Reference) || caps.accepts(ConditioningKind::Keyframe)
             {
                 push("image_to_video");
@@ -2466,7 +2481,7 @@ fn derive_route_modes(
             }
         }
         Modality::Both => {
-            if !control_required {
+            if supports_noise_start {
                 push("text_to_image");
                 push("text_to_video");
             }
@@ -2960,6 +2975,94 @@ mod tests {
         assert_eq!(
             aligned.conditioning.aligned,
             ConditioningAlignment::GridAligned
+        );
+    }
+
+    #[test]
+    fn derive_route_modes_honors_pass0_requirement_for_image_video_and_both_routes() {
+        // Image routes: text_to_image is emitted ONLY when NoiseStartSupported && !control_required.
+        let mut img_noise = sample_low_res_route();
+        img_noise.modality = Modality::Image;
+        img_noise.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::NoiseStartSupported;
+        img_noise.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+        let exported = ExportedRouteV2::from_route_record(&img_noise, None, false);
+        assert_eq!(exported.modes, vec!["text_to_image", "image_to_image"]);
+
+        let exported_ctrl_flag = ExportedRouteV2::from_route_record(&img_noise, None, true);
+        assert_eq!(exported_ctrl_flag.modes, vec!["image_to_image"]);
+
+        let mut img_ctrl = sample_low_res_route();
+        img_ctrl.modality = Modality::Image;
+        img_ctrl.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresControl;
+        img_ctrl.structure.conditioning.kinds = vec![ConditioningKind::Control];
+        let exported = ExportedRouteV2::from_route_record(&img_ctrl, None, false);
+        assert_eq!(exported.modes, vec!["control"]);
+
+        let mut img_edit = sample_low_res_route();
+        img_edit.modality = Modality::Image;
+        img_edit.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresEdit;
+        img_edit.structure.conditioning.kinds = vec![
+            ConditioningKind::Reference,
+            ConditioningKind::MultiReference,
+        ];
+        let exported = ExportedRouteV2::from_route_record(&img_edit, None, false);
+        assert_eq!(exported.modes, vec!["image_to_image", "multi_reference"]);
+
+        let mut img_ref = sample_low_res_route();
+        img_ref.modality = Modality::Image;
+        img_ref.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresReference;
+        img_ref.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+        let exported = ExportedRouteV2::from_route_record(&img_ref, None, false);
+        assert_eq!(exported.modes, vec!["image_to_image"]);
+
+        // Video routes: text_to_video is emitted ONLY when NoiseStartSupported && !control_required.
+        let mut vid_noise = sample_low_res_route();
+        vid_noise.modality = Modality::Video;
+        vid_noise.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::NoiseStartSupported;
+        vid_noise.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+        let exported = ExportedRouteV2::from_route_record(&vid_noise, None, false);
+        assert_eq!(exported.modes, vec!["text_to_video", "image_to_video"]);
+
+        let mut vid_ctrl = sample_low_res_route();
+        vid_ctrl.modality = Modality::Video;
+        vid_ctrl.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresControl;
+        vid_ctrl.structure.conditioning.kinds = vec![ConditioningKind::ControlClip];
+        let exported = ExportedRouteV2::from_route_record(&vid_ctrl, None, false);
+        assert_eq!(exported.modes, vec!["control_video"]);
+
+        let mut vid_edit = sample_low_res_route();
+        vid_edit.modality = Modality::Video;
+        vid_edit.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresEdit;
+        vid_edit.structure.conditioning.kinds = vec![ConditioningKind::VideoClip];
+        let exported = ExportedRouteV2::from_route_record(&vid_edit, None, false);
+        assert_eq!(exported.modes, vec!["video_to_video"]);
+
+        let mut vid_ref = sample_low_res_route();
+        vid_ref.modality = Modality::Video;
+        vid_ref.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresReference;
+        vid_ref.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+        let exported = ExportedRouteV2::from_route_record(&vid_ref, None, false);
+        assert_eq!(exported.modes, vec!["image_to_video"]);
+
+        // Both-modality routes (e.g. SeedVR2): omit text_to_image/text_to_video when conditioned-only.
+        let mut both_ref = sample_low_res_route();
+        both_ref.modality = Modality::Both;
+        both_ref.structure.conditioning.pass0_requirement =
+            Pass0ConditioningRequirement::RequiresReference;
+        both_ref.structure.conditioning.kinds =
+            vec![ConditioningKind::Reference, ConditioningKind::VideoClip];
+        let exported = ExportedRouteV2::from_route_record(&both_ref, None, false);
+        assert_eq!(
+            exported.modes,
+            vec!["image_to_image", "image_to_video", "video_to_video"]
         );
     }
 }
