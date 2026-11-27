@@ -11,6 +11,18 @@ pub mod duration_head;
 pub mod gemma_assets;
 pub mod ltx_checkpoint;
 pub mod ltx_dfr;
+pub mod ltx_plan;
+
+pub use ltx_plan::{
+    compute_audio_frames, ltx_dev_sigmas, LtxConditioningProfile, LtxDomainMemorySummary,
+    LtxMemoryFootprintSpec, LtxModelFamily, LtxOrchestrationRoute, LtxRenderPlan,
+    LtxRenderPlanInput, LtxStagePlanSpec, LtxStageScheduleEntry, LtxVariant, MemoryBudgetDomainKey,
+    LTX_AUDIO_LATENT_CHANNELS, LTX_AUDIO_MEL_BINS, LTX_DEV_STEPS, LTX_LATENT_CHANNELS,
+    LTX_MAX_FRAMES, LTX_NATIVE_DISTILLED_STEPS, LTX_SIZE_MULTIPLE, LTX_SPATIAL_SCALE,
+    LTX_SPATIAL_UPSAMPLER_COMPONENT_NAME, LTX_STAGE1_SIGMAS, LTX_STAGE2_SIGMAS, LTX_STAGE2_STEPS,
+    LTX_TEMPORAL_SCALE, LTX_TEMPORAL_SIGMAS, LTX_TEMPORAL_UPSAMPLER_COMPONENT_NAME,
+    LTX_UPSAMPLER_NORMALIZATION,
+};
 
 pub use ltx_checkpoint::{
     caption_feature_version, check_gemma_version, declared_layout, declared_model_version,

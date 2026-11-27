@@ -145,7 +145,11 @@ fn generation_output_units(report: &GenerationReport) -> Result<usize> {
     let units = match &report.output {
         Some(GenerationOutput::Images(images)) => images.len(),
         Some(GenerationOutput::ImagesRgba(images)) => images.len(),
-        Some(GenerationOutput::Video { .. } | GenerationOutput::Audio(_)) => 1,
+        Some(
+            GenerationOutput::Video { .. }
+            | GenerationOutput::Audio(_)
+            | GenerationOutput::Interleaved { .. },
+        ) => 1,
         None if report.artifacts.is_some() => 1,
         None => 0,
     };

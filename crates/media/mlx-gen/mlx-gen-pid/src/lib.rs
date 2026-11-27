@@ -33,6 +33,7 @@ pub mod engine;
 pub mod gemma2;
 pub mod lq;
 pub(crate) mod memo;
+pub mod plan;
 pub mod registry;
 pub mod sampler;
 pub mod tiling;
@@ -43,13 +44,15 @@ pub use config::{ConvPadding, PidConfig, SampleType, SamplerConfig};
 pub use decode_routes::{assert_decode_routes, DecodeRoutes};
 pub use decoder::PidDecoder;
 pub use engine::{
-    flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_tiling,
-    resolve_pid_decoder, resolve_pid_decoder_at_sigma, PidEngine,
+    flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_routes,
+    mint_planned_decoder_with_tiling, resolve_pid_decoder, resolve_pid_decoder_at_sigma,
+    resolve_pid_decoder_with_routes, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
+pub use plan::{PidDecodePlan, PidTilingPlan, FM_TIMESCALE, STUDENT_SCHEDULE};
 pub use registry::{lookup, BackboneSpec, CkptType, LatentNorm};
-pub use sampler::Sampler;
+pub use sampler::{PidSamplerDriver, PidVelocityForward, Sampler};
 
 #[cfg(test)]
 pub(crate) mod model_inference_device;

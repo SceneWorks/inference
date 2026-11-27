@@ -15,6 +15,7 @@ pub mod h3_conditioning_memory;
 pub mod h3_image_tier;
 pub mod h3_keyframe;
 pub mod h3_memory;
+pub mod h3_plan;
 pub mod h3_reference;
 pub mod h3_schedule;
 pub mod pruned_adaln;

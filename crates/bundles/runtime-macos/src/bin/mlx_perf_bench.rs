@@ -1356,6 +1356,12 @@ fn fingerprint_output(
                     .to_owned(),
             );
         }
+        GenerationOutput::Interleaved { .. } => {
+            return Err(
+                "image/video P6 matrix unexpectedly produced interleaved output; no case requests it"
+                    .to_owned(),
+            );
+        }
     };
     if payload_bytes == 0 || items == 0 {
         return Err("generation returned an empty output".to_owned());

@@ -21,13 +21,23 @@ pub(crate) fn planner_weight_policy(quant: Option<Quant>) -> serde_json::Value {
         "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE})
 }
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use mlx_rs::memory::clear_cache;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
+use gen_core_family::bernini_plan::{
+    build_bernini_render_plan, BerniniBackendKind, BerniniEntrypoint, BerniniOutputContract,
+    BerniniPlanKnobs, BerniniRenderPlan, BerniniRendererGuidanceMode,
+};
 use mlx_gen::block_residency::BlockPlan;
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverSupport, FamilyDriver, SliceInput, SliceSpec, SliceTransition, StepHooks,
+};
+use mlx_gen::gen_core::BoundaryState;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -37,11 +47,11 @@ use mlx_gen::{
 };
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
-use mlx_gen_wan::scheduler::{make_scheduler, SolverKind};
+use mlx_gen_wan::scheduler::{compute_sigmas, SolverKind, WanNativeDriver};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
 use mlx_gen_wan::{WanBlockStream, WanTransformer};
 
-use crate::config::{resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults};
+use crate::config::{BerniniKnobs, Defaults};
 use crate::forward::{
     guided_velocity, num_momentum_buffers, vit_one_step, GuidanceParams, Mode, PackedForward,
     Trunk, VitGuidanceParams, VitMode, VitStreams,
@@ -218,6 +228,438 @@ impl<'a> BExpert<'a> {
     }
 }
 
+impl BerniniKnobs {
+    pub(crate) fn to_plan_knobs(&self) -> BerniniPlanKnobs {
+        BerniniPlanKnobs {
+            switch_dit_boundary: self.switch_dit_boundary,
+            shift: self.shift,
+            max_trained_src_id: self.max_trained_src_id,
+            interpolate_src_id: self.interpolate_src_id,
+            max_sequence_length: self.max_sequence_length,
+        }
+    }
+}
+
+fn renderer_mode_from_plan(mode: BerniniRendererGuidanceMode) -> Mode {
+    match mode {
+        BerniniRendererGuidanceMode::T2v => Mode::T2v,
+        BerniniRendererGuidanceMode::T2vApg => Mode::T2vApg,
+        BerniniRendererGuidanceMode::V2v => Mode::V2v,
+        BerniniRendererGuidanceMode::V2vChain => Mode::V2vChain,
+        BerniniRendererGuidanceMode::V2vApg => Mode::V2vApg,
+        BerniniRendererGuidanceMode::R2vApg => Mode::R2vApg,
+        BerniniRendererGuidanceMode::Rv2v => Mode::Rv2v,
+    }
+}
+
+/// Active dual-expert branch for Bernini Stage 2 DiT denoising (`High` for `t >= boundary`,
+/// `Low` below it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BerniniExpert {
+    High,
+    Low,
+}
+
+/// Unified guidance weights carried across the Stage 2 `high -> low` boundary switch where all
+/// active omegas are multiplied once by `omega_scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BerniniStage2Omegas {
+    pub omega_vid: f32,
+    pub omega_img: f32,
+    pub omega_txt: f32,
+    pub omega_tgt: Option<f32>,
+}
+
+impl BerniniStage2Omegas {
+    pub fn from_guidance(g: &GuidanceParams) -> Self {
+        Self {
+            omega_vid: g.omega_vid,
+            omega_img: g.omega_img,
+            omega_txt: g.omega_txt,
+            omega_tgt: None,
+        }
+    }
+
+    pub fn from_vit(g: &VitGuidanceParams) -> Self {
+        Self {
+            omega_vid: g.omega_vid,
+            omega_img: g.omega_img,
+            omega_txt: g.omega_txt,
+            omega_tgt: Some(g.omega_tgt),
+        }
+    }
+
+    pub fn to_guidance(&self, base: &GuidanceParams) -> GuidanceParams {
+        GuidanceParams {
+            omega_vid: self.omega_vid,
+            omega_img: self.omega_img,
+            omega_txt: self.omega_txt,
+            eta: base.eta,
+            norm_threshold: base.norm_threshold,
+        }
+    }
+
+    pub fn to_vit(&self, base: &VitGuidanceParams) -> VitGuidanceParams {
+        VitGuidanceParams {
+            omega_txt: self.omega_txt,
+            omega_img: self.omega_img,
+            omega_vid: self.omega_vid,
+            omega_tgt: self.omega_tgt.unwrap_or(base.omega_tgt),
+            eta: base.eta,
+            norm_threshold: base.norm_threshold,
+        }
+    }
+
+    fn scale_once(&mut self, factor: f32) {
+        self.omega_vid *= factor;
+        self.omega_img *= factor;
+        self.omega_txt *= factor;
+        if let Some(tgt) = &mut self.omega_tgt {
+            *tgt *= factor;
+        }
+    }
+
+    fn bits(self) -> [u32; 4] {
+        [
+            self.omega_vid.to_bits(),
+            self.omega_img.to_bits(),
+            self.omega_txt.to_bits(),
+            self.omega_tgt.map_or(0, f32::to_bits),
+        ]
+    }
+}
+
+/// Forward-evaluation seam for [`BerniniDualExpertDriver`] (`PIPE-7`, `DEC-13`).
+pub trait BerniniStage2Forward {
+    /// Compute the guided Stage 2 velocity at `step` for `expert`, using the boundary-scaled
+    /// `omegas` and persistent APG `mbufs`.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_step_velocity(
+        &self,
+        expert: BerniniExpert,
+        latent: &Array,
+        step: usize,
+        timestep: f32,
+        sigma: f32,
+        omegas: BerniniStage2Omegas,
+        mbufs: &mut [MomentumBuffer],
+    ) -> Result<Array>;
+}
+
+struct BerniniStage2History {
+    total_steps: usize,
+    boundary_bits: u32,
+    omega_scale_bits: u32,
+    shift_bits: u32,
+    num_train_timesteps: usize,
+    base_omegas_bits: [u32; 4],
+    num_momentum_buffers: usize,
+    momentum_bits: u32,
+    switched: bool,
+    active_omegas: BerniniStage2Omegas,
+    mbufs: Vec<MomentumBuffer>,
+    expected_next_step: usize,
+    wan_state: DriverRunState,
+}
+
+struct ActiveStage2State {
+    switched: bool,
+    active_omegas: BerniniStage2Omegas,
+    mbufs: Vec<MomentumBuffer>,
+}
+
+/// Typed [`FamilyDriver`] for Bernini Stage 2 dual-expert UniPC denoising across both
+/// `bernini_renderer` (`Mode` + APG momentum buffers) and full `bernini` (`VitMode`, 4-stream ViT
+/// guidance) (`PIPE-7`, `DEC-13`).
+///
+/// Delegates UniPC multistep integration and MLX per-step evaluation to
+/// [`WanNativeDriver`] while persisting the one-time `omega_scale` boundary latch and APG momentum
+/// buffers inside [`DriverRunState`].
+pub struct BerniniDualExpertDriver<F> {
+    boundary: f32,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    sigmas: Vec<f32>,
+    base_omegas: BerniniStage2Omegas,
+    omega_scale: f32,
+    num_momentum_buffers: usize,
+    momentum: f32,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: BerniniStage2Forward> BerniniDualExpertDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native MLX Bernini Stage 2 driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native MLX Bernini Stage 2 driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native MLX Bernini Stage 2 driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        driver_id: &'static str,
+        boundary: f32,
+        num_train_timesteps: usize,
+        steps: usize,
+        shift: f32,
+        base_omegas: BerniniStage2Omegas,
+        omega_scale: f32,
+        num_momentum_buffers: usize,
+        momentum: f32,
+        forward: F,
+    ) -> Result<Self> {
+        if steps == 0 {
+            return Err(Error::Msg(format!(
+                "{driver_id}: Stage 2 steps must be >= 1"
+            )));
+        }
+        let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+        Ok(Self {
+            boundary,
+            num_train_timesteps,
+            steps,
+            shift,
+            sigmas,
+            base_omegas,
+            omega_scale,
+            num_momentum_buffers,
+            momentum,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+}
+
+impl<F: BerniniStage2Forward> FamilyDriver<Array> for BerniniDualExpertDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        if input.total_steps != self.steps || input.span.end > self.steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with Bernini Stage 2 steps {}",
+                self.support.driver_id, input.span, input.total_steps, self.steps
+            )));
+        }
+
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<BerniniStage2History>() else {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Bernini Stage 2 history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.total_steps != input.total_steps
+                || existing.boundary_bits != self.boundary.to_bits()
+                || existing.omega_scale_bits != self.omega_scale.to_bits()
+                || existing.shift_bits != self.shift.to_bits()
+                || existing.num_train_timesteps != self.num_train_timesteps
+                || existing.base_omegas_bits != self.base_omegas.bits()
+                || existing.num_momentum_buffers != self.num_momentum_buffers
+                || existing.momentum_bits != self.momentum.to_bits()
+            {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Bernini Stage 2 schedule or guidance settings",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous step {} (expected {})",
+                    self.support.driver_id, input.span.start, existing.expected_next_step
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        let mut stage2 = if carrying {
+            state
+                .take_history::<BerniniStage2History>()
+                .expect("validated BerniniStage2History")
+        } else {
+            BerniniStage2History {
+                total_steps: input.total_steps,
+                boundary_bits: self.boundary.to_bits(),
+                omega_scale_bits: self.omega_scale.to_bits(),
+                shift_bits: self.shift.to_bits(),
+                num_train_timesteps: self.num_train_timesteps,
+                base_omegas_bits: self.base_omegas.bits(),
+                num_momentum_buffers: self.num_momentum_buffers,
+                momentum_bits: self.momentum.to_bits(),
+                switched: false,
+                active_omegas: self.base_omegas,
+                mbufs: (0..self.num_momentum_buffers)
+                    .map(|_| MomentumBuffer::new(self.momentum))
+                    .collect(),
+                expected_next_step: input.span.start,
+                wan_state: DriverRunState::new(),
+            }
+        };
+
+        let prev_evals = stage2.wan_state.internal_evaluations;
+        let prev_end = stage2.expected_next_step;
+        let active_cell = RefCell::new(ActiveStage2State {
+            switched: stage2.switched,
+            active_omegas: stage2.active_omegas,
+            mbufs: std::mem::take(&mut stage2.mbufs),
+        });
+
+        let wan_res = {
+            let wan_driver = WanNativeDriver::new(
+                self.support.driver_id,
+                SolverKind::UniPC,
+                self.num_train_timesteps,
+                self.steps,
+                self.shift,
+                |latent: &Array, step: usize, t: f32| {
+                    let mut st = active_cell.borrow_mut();
+                    let expert = if t >= self.boundary {
+                        BerniniExpert::High
+                    } else {
+                        if !st.switched {
+                            st.switched = true;
+                            st.active_omegas.scale_once(self.omega_scale);
+                        }
+                        BerniniExpert::Low
+                    };
+                    let omegas = st.active_omegas;
+                    let sigma = self.sigmas[step];
+                    self.forward.predict_step_velocity(
+                        expert,
+                        latent,
+                        step,
+                        t,
+                        sigma,
+                        omegas,
+                        &mut st.mbufs,
+                    )
+                },
+            );
+            wan_driver.run_slice(
+                SliceInput {
+                    pass: input.pass,
+                    phase: input.phase,
+                    span: input.span.clone(),
+                    total_steps: input.total_steps,
+                    state: input.state,
+                    transition: input.transition,
+                    history: input.history,
+                    geometry: input.geometry,
+                    seed: input.seed,
+                    cancel: input.cancel,
+                    request_boundary_estimate: input.request_boundary_estimate,
+                },
+                &mut stage2.wan_state,
+                hooks,
+            )
+        };
+
+        let active = active_cell.into_inner();
+        stage2.switched = active.switched;
+        stage2.active_omegas = active.active_omegas;
+        stage2.mbufs = active.mbufs;
+
+        let delta_evals = stage2.wan_state.internal_evaluations - prev_evals;
+        for _ in 0..delta_evals {
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+        }
+        let new_end = stage2.wan_state.last_span_end.unwrap_or(prev_end);
+        for completed_step in prev_end..new_end {
+            state.record_outer_step(completed_step);
+        }
+        stage2.expected_next_step = new_end;
+        state.set_history(stage2);
+
+        let out = wan_res?;
+        state.finish_slice(input.span.end);
+        Ok(out)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bernini_mlx_stage2_driver<F: BerniniStage2Forward>(
+    driver_id: &'static str,
+    boundary: f32,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    init_noise: &Array,
+    base_omegas: BerniniStage2Omegas,
+    omega_scale: f32,
+    num_momentum_buffers: usize,
+    momentum: f32,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    forward: F,
+) -> Result<Array> {
+    let driver = BerniniDualExpertDriver::new(
+        driver_id,
+        boundary,
+        num_train_timesteps,
+        steps,
+        shift,
+        base_omegas,
+        omega_scale,
+        num_momentum_buffers,
+        momentum,
+        forward,
+    )?;
+    let mut state = DriverRunState::new();
+    let mut progress_adapter = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = StepHooks::new(&mut progress_adapter);
+    let out = run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(steps)],
+        BoundaryState::XSigma(init_noise.clone()),
+        steps,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    let BoundaryState::XSigma(latent) = out else {
+        unreachable!("BerniniDualExpertDriver always emits BoundaryState::XSigma");
+    };
+    Ok(latent)
+}
+
 /// The boundary-switched, APG-guided denoise loop (the Bernini analog of
 /// `mlx_gen_wan::pipeline::denoise_moe`). Runs in **spatial latent space** `[16, T, H8, W8]`: each
 /// step picks the high-noise expert while `t ≥ boundary` and the low-noise expert below it, multiplies
@@ -242,10 +684,7 @@ fn denoise_bernini(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(SolverKind::UniPC, num_train);
-    sched.set_timesteps(steps, shift);
-    let timesteps = sched.timesteps().to_vec();
-    let sigmas = sched.sigmas().to_vec();
+    let sigmas = compute_sigmas(steps, shift, num_train);
     mlx_gen::video_execution::sampling(
         "bernini_renderer",
         "unipc",
@@ -254,52 +693,72 @@ fn denoise_bernini(
     );
     mlx_gen::video_execution::schedule("bernini_renderer", &sigmas);
 
-    let mut latent = init_noise.clone();
-    let mut switched = false;
-    let mut g = base_g.clone();
-    let mut mbufs: Vec<MomentumBuffer> = (0..num_momentum_buffers(mode))
-        .map(|_| MomentumBuffer::new(momentum))
-        .collect();
+    struct RendererForward<'a> {
+        pf: &'a PackedForward,
+        mode: Mode,
+        low: &'a BExpert<'a>,
+        high: &'a BExpert<'a>,
+        videos: &'a [Array],
+        images: &'a [Array],
+        base_g: &'a GuidanceParams,
+    }
 
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract (F-003): a render runs minutes, so check before
-        // each step. The per-step `eval` below makes this effective (lazy MLX graph otherwise defers
-        // all compute past every check).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    impl BerniniStage2Forward for RendererForward<'_> {
+        fn predict_step_velocity(
+            &self,
+            expert: BerniniExpert,
+            latent: &Array,
+            _step: usize,
+            timestep: f32,
+            sigma: f32,
+            omegas: BerniniStage2Omegas,
+            mbufs: &mut [MomentumBuffer],
+        ) -> Result<Array> {
+            let ex = match expert {
+                BerniniExpert::High => self.high,
+                BerniniExpert::Low => self.low,
+            };
+            let g = omegas.to_guidance(self.base_g);
+            guided_velocity(
+                self.pf,
+                self.mode,
+                ex.trunk,
+                latent,
+                self.videos,
+                self.images,
+                timestep,
+                sigma,
+                &ex.cross_kv_cond,
+                &ex.cross_kv_uncond,
+                &g,
+                mbufs,
+            )
         }
-        // 1-based, so the final step reaches `total` (the Progress::Step 1..=total contract, F-038).
-        on_step(i + 1);
-        let expert = if t >= boundary {
-            high
-        } else {
-            if !switched {
-                switched = true;
-                g.omega_vid *= omega_scale;
-                g.omega_img *= omega_scale;
-                g.omega_txt *= omega_scale;
-            }
-            low
-        };
-        let sigma = sigmas[i];
-        let v = guided_velocity(
+    }
+
+    run_bernini_mlx_stage2_driver(
+        "bernini_mlx_renderer_stage2_driver",
+        boundary,
+        num_train,
+        steps,
+        shift,
+        init_noise,
+        BerniniStage2Omegas::from_guidance(base_g),
+        omega_scale,
+        num_momentum_buffers(mode),
+        momentum,
+        cancel,
+        on_step,
+        RendererForward {
             pf,
             mode,
-            expert.trunk,
-            &latent,
+            low,
+            high,
             videos,
             images,
-            t,
-            sigma,
-            &expert.cross_kv_cond,
-            &expert.cross_kv_uncond,
-            &g,
-            &mut mbufs,
-        )?;
-        latent = sched.step(&v, &latent)?;
-        eval([&latent])?;
-    }
-    Ok(latent)
+            base_g,
+        },
+    )
 }
 
 /// One expert (high or low) with its prepared cross-attention K/V for the planner's **4** prompt-embed
@@ -372,10 +831,7 @@ pub fn denoise_bernini_wvitcfg(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
-    let mut sched = make_scheduler(SolverKind::UniPC, num_train);
-    sched.set_timesteps(steps, shift);
-    let timesteps = sched.timesteps().to_vec();
-    let sigmas = sched.sigmas().to_vec();
+    let sigmas = compute_sigmas(steps, shift, num_train);
     mlx_gen::video_execution::sampling(
         "bernini_renderer",
         "unipc",
@@ -384,45 +840,70 @@ pub fn denoise_bernini_wvitcfg(
     );
     mlx_gen::video_execution::schedule("bernini_renderer", &sigmas);
 
-    let mut latent = init_noise.clone();
-    let mut switched = false;
-    let mut g = base_g.clone();
+    struct VitRendererForward<'a> {
+        pf: &'a PackedForward,
+        mode: VitMode,
+        low: &'a BVitExpert<'a>,
+        high: &'a BVitExpert<'a>,
+        images: &'a [(Array, f64)],
+        videos: &'a [(Array, f64)],
+        base_g: &'a VitGuidanceParams,
+    }
 
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract (F-003): check before each (minutes-long) step.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    impl BerniniStage2Forward for VitRendererForward<'_> {
+        fn predict_step_velocity(
+            &self,
+            expert: BerniniExpert,
+            latent: &Array,
+            _step: usize,
+            timestep: f32,
+            sigma: f32,
+            omegas: BerniniStage2Omegas,
+            _mbufs: &mut [MomentumBuffer],
+        ) -> Result<Array> {
+            let ex = match expert {
+                BerniniExpert::High => self.high,
+                BerniniExpert::Low => self.low,
+            };
+            let g = omegas.to_vit(self.base_g);
+            vit_one_step(
+                self.pf,
+                ex.trunk,
+                self.mode,
+                latent,
+                self.images,
+                self.videos,
+                timestep,
+                sigma,
+                &ex.streams(),
+                &g,
+            )
         }
-        // 1-based, so the final step reaches `total` (the Progress::Step 1..=total contract, F-038).
-        on_step(i + 1);
-        let expert = if t >= boundary {
-            high
-        } else {
-            if !switched {
-                switched = true;
-                g.omega_txt *= omega_scale;
-                g.omega_img *= omega_scale;
-                g.omega_vid *= omega_scale;
-                g.omega_tgt *= omega_scale;
-            }
-            low
-        };
-        let v = vit_one_step(
+    }
+
+    run_bernini_mlx_stage2_driver(
+        "bernini_mlx_vit_stage2_driver",
+        boundary,
+        num_train,
+        steps,
+        shift,
+        init_noise,
+        BerniniStage2Omegas::from_vit(base_g),
+        omega_scale,
+        0,
+        0.0,
+        cancel,
+        on_step,
+        VitRendererForward {
             pf,
-            expert.trunk,
             mode,
-            &latent,
+            low,
+            high,
             images,
             videos,
-            t,
-            sigmas[i],
-            &expert.streams(),
-            &g,
-        )?;
-        latent = sched.step(&v, &latent)?;
-        eval([&latent])?;
-    }
-    Ok(latent)
+            base_g,
+        },
+    )
 }
 
 // Hand-written rather than `mlx_gen::impl_generator!` (sc-18609). That macro emits only
@@ -507,19 +988,20 @@ impl Generator for BerniniRenderer {
 }
 
 impl BerniniRenderer {
+    /// Build and validate the pre-load [`BerniniRenderPlan`] before loading weights (`DEC-3`).
+    pub fn render_plan(&self, req: &GenerationRequest) -> Result<BerniniRenderPlan> {
+        build_bernini_render_plan(
+            &self.descriptor,
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Mlx,
+            self.knobs.to_plan_knobs(),
+            req,
+        )
+        .map_err(Into::into)
+    }
+
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
-        // Shared geometry guard (sc-12454/F-003 + sc-12500/F-040): the sc-12308 14B video-only area
-        // cap, the 16-px grid rejection (replacing the silent `align_dim` refit), and the
-        // `1 + 4·k` frame rule — mirrored from candle's `validate_bernini_geometry` so the same
-        // request gets the same rejection on both backends.
-        validate_bernini_geometry(self.descriptor.id, req)?;
-        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
-        // same conditioning through the same encode path, so they must give the same answer.
-        crate::bernini::reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
-        Ok(())
+        self.render_plan(req).map(|_| ())
     }
 
     fn generate_impl(
@@ -527,28 +1009,24 @@ impl BerniniRenderer {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate(req)?;
+        let render_plan = self.render_plan(req)?;
         let cfg = &self.config;
         let k = &self.knobs;
 
         // --- Resolve geometry + knobs ---
-        let frames = req
-            .frames
-            .map(|f| f as usize)
-            .unwrap_or(Defaults::NUM_FRAMES)
-            .max(1);
+        let frames = render_plan.frames;
         // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
         // align-down is a no-op here — assert that instead of silently refitting the request
         // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
-        let width = align_dim(req.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
-        let height = align_dim(req.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
+        let width = align_dim(render_plan.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
+        let height = align_dim(render_plan.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
         debug_assert_eq!(
             (width, height),
-            (req.width, req.height),
+            (render_plan.width, render_plan.height),
             "bernini_renderer: off-grid request survived validate"
         );
-        let steps = req.steps.map(|s| s as usize).unwrap_or(Defaults::STEPS);
-        let seed = req.seed.unwrap_or(42);
+        let steps = render_plan.steps;
+        let seed = render_plan.seed.unwrap_or(42);
         let neg = req.negative_prompt.clone().unwrap_or_default();
 
         // Conditioning split: VideoClip → videos, Reference/MultiReference → images.
@@ -562,14 +1040,17 @@ impl BerniniRenderer {
                 Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
             )
         });
-        let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
+        let mode = renderer_mode_from_plan(
+            render_plan
+                .renderer_mode
+                .expect("Renderer plan always resolves a guidance mode"),
+        );
 
-        let omega_txt = req.guidance.unwrap_or(Defaults::OMEGA_TXT);
         let base_g = GuidanceParams {
-            omega_vid: Defaults::OMEGA_VID,
-            omega_img: Defaults::OMEGA_IMG,
-            omega_txt,
-            eta: Defaults::ETA,
+            omega_vid: render_plan.omega_vid,
+            omega_img: render_plan.omega_img,
+            omega_txt: render_plan.omega_txt,
+            eta: render_plan.eta,
             norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
         };
 
@@ -727,7 +1208,7 @@ impl BerniniRenderer {
                 k.max_trained_src_id,
                 k.interpolate_src_id,
             );
-            let boundary = k.switch_dit_boundary * cfg.num_train_timesteps as f32;
+            let boundary = render_plan.switch_dit_boundary * cfg.num_train_timesteps as f32;
             let total = steps as u32;
             // `denoise_bernini` reports 1-based steps, so `current` runs exactly 1..=total (F-038).
             let mut on_step = |i: usize| {
@@ -744,12 +1225,12 @@ impl BerniniRenderer {
                 boundary,
                 cfg.num_train_timesteps,
                 steps,
-                k.shift,
+                render_plan.shift as f32,
                 &init_noise,
                 &videos,
                 &images,
                 &base_g,
-                Defaults::OMEGA_SCALE,
+                render_plan.omega_scale,
                 Defaults::MOMENTUM,
                 &req.cancel,
                 &mut on_step,
@@ -774,18 +1255,18 @@ impl BerniniRenderer {
         // num_frames == 1 ⇒ a still image (t2i/i2i). A single latent frame (T_lat = 1) still decodes
         // to one VAE temporal chunk (the causal decode emits `vae_stride_t` near-identical frames);
         // the still image is the first of them, matching the reference's single-frame PNG.
-        if frames == 1 {
-            let first = images_out.into_iter().next().ok_or_else(|| {
-                Error::Msg("bernini_renderer: VAE decode produced no frames".into())
-            })?;
-            Ok(GenerationOutput::Images(vec![first]))
-        } else {
-            let fps = req.fps.unwrap_or(16);
-            Ok(GenerationOutput::Video {
+        match render_plan.output_contract {
+            BerniniOutputContract::Images { .. } => {
+                let first = images_out.into_iter().next().ok_or_else(|| {
+                    Error::Msg("bernini_renderer: VAE decode produced no frames".into())
+                })?;
+                Ok(GenerationOutput::Images(vec![first]))
+            }
+            BerniniOutputContract::Video { fps, .. } => Ok(GenerationOutput::Video {
                 frames: images_out,
                 fps,
                 audio: None,
-            })
+            }),
         }
     }
 }
@@ -936,5 +1417,338 @@ mod tests {
         println!(
             "MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::denoise_wvitcfg_runs_and_keeps_shape"
         );
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Stage2Log = Rc<RefCell<Vec<(usize, BerniniExpert, f32, BerniniStage2Omegas, usize)>>>;
+
+    struct MockStage2Forward {
+        log: Stage2Log,
+    }
+
+    impl BerniniStage2Forward for MockStage2Forward {
+        fn predict_step_velocity(
+            &self,
+            expert: BerniniExpert,
+            latent: &Array,
+            step: usize,
+            timestep: f32,
+            sigma: f32,
+            omegas: BerniniStage2Omegas,
+            mbufs: &mut [MomentumBuffer],
+        ) -> Result<Array> {
+            let mut non_empty_mbufs = 0usize;
+            for buf in mbufs.iter_mut() {
+                let diff = mlx_rs::ops::multiply(latent, Array::from_f32(0.05))?;
+                let _ = buf.update(&mlx_gen::MlxLatentOps, &diff)?;
+                if !buf.is_empty() {
+                    non_empty_mbufs += 1;
+                }
+            }
+            self.log
+                .borrow_mut()
+                .push((step, expert, timestep, omegas, non_empty_mbufs));
+            let expert_gain = match expert {
+                BerniniExpert::High => -0.6,
+                BerniniExpert::Low => -0.35,
+            };
+            let omega_sum = omegas.omega_txt
+                + omegas.omega_img
+                + omegas.omega_vid
+                + omegas.omega_tgt.unwrap_or(0.0);
+            mlx_rs::ops::add(
+                &mlx_rs::ops::multiply(latent, Array::from_f32(expert_gain - 0.05 * sigma))?,
+                Array::from_f32(0.002 * omega_sum + 0.0001 * timestep),
+            )
+            .map_err(Into::into)
+        }
+    }
+
+    fn mlx_f32_bit_equal(a: &Array, b: &Array) -> bool {
+        let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&af, &bf]).unwrap();
+        af.shape() == bf.shape()
+            && af
+                .as_slice::<f32>()
+                .iter()
+                .zip(bf.as_slice::<f32>().iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn bernini_mlx_dual_expert_driver_passes_conformance_across_boundary() {
+        let init = Array::from_slice(&[0.5f32, -0.4, 0.8, -0.2], &[4]);
+        let renderer_omegas = BerniniStage2Omegas {
+            omega_vid: Defaults::OMEGA_VID,
+            omega_img: Defaults::OMEGA_IMG,
+            omega_txt: Defaults::OMEGA_TXT,
+            omega_tgt: None,
+        };
+        let vit_omegas = BerniniStage2Omegas {
+            omega_vid: Defaults::OMEGA_VID,
+            omega_img: Defaults::OMEGA_IMG,
+            omega_txt: Defaults::OMEGA_TXT,
+            omega_tgt: Some(0.5),
+        };
+
+        for (name, omegas, n_bufs, momentum) in [
+            ("bernini_mlx_stage2_apg", renderer_omegas, 2usize, 0.5f32),
+            ("bernini_mlx_stage2_vit", vit_omegas, 0usize, 0.0f32),
+        ] {
+            let report = verify_driver_conformance(ConformanceCase {
+                total_steps: 6,
+                split_at: 3,
+                seed: 42,
+                base_geometry: (256, 256),
+                alt_geometry: (512, 512),
+                make_driver: || {
+                    Box::new(
+                        BerniniDualExpertDriver::new(
+                            name,
+                            875.0,
+                            1000,
+                            6,
+                            5.0,
+                            omegas,
+                            Defaults::OMEGA_SCALE,
+                            n_bufs,
+                            momentum,
+                            MockStage2Forward {
+                                log: Rc::new(RefCell::new(Vec::new())),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                },
+                make_initial: || init.clone(),
+                latents_equal: mlx_f32_bit_equal,
+            })
+            .unwrap_or_else(|err| panic!("{name} conformance failed: {err}"));
+            assert_eq!(report.total_steps, 6);
+            assert!(report.verified_inert_split);
+            assert!(report.verified_cancellation);
+        }
+    }
+
+    #[test]
+    fn bernini_mlx_stage2_switches_once_at_boundary_and_carries_apg_across_split() {
+        let boundary = 875.0f32;
+        let base_omegas = BerniniStage2Omegas {
+            omega_vid: 1.25,
+            omega_img: 4.5,
+            omega_txt: 4.0,
+            omega_tgt: Some(0.5),
+        };
+        let init = Array::from_slice(&[0.5f32, -0.4, 0.8, -0.2], &[4]);
+        let cancel = CancelFlag::default();
+
+        // Find step crossing with 6 steps, shift 5.0 so the split lands right across boundary.
+        let sigmas = compute_sigmas(6, 5.0, 1000);
+        assert!(sigmas[2] * 1000.0 >= boundary);
+        assert!(sigmas[3] * 1000.0 < boundary);
+
+        let log_unsplit: Stage2Log = Rc::new(RefCell::new(Vec::new()));
+        let drv_unsplit = BerniniDualExpertDriver::new(
+            "bernini_mlx_boundary_unsplit",
+            boundary,
+            1000,
+            6,
+            5.0,
+            base_omegas,
+            Defaults::OMEGA_SCALE,
+            2,
+            0.5,
+            MockStage2Forward {
+                log: log_unsplit.clone(),
+            },
+        )
+        .unwrap();
+        let mut st_u = DriverRunState::new();
+        let mut noop = |_: Progress| {};
+        let mut hooks_u = StepHooks::new(&mut noop);
+        let unsplit = run_mlx_driver_slices(
+            &drv_unsplit,
+            [SliceSpec::full(6)],
+            BoundaryState::XSigma(init.clone()),
+            6,
+            0,
+            &cancel,
+            None,
+            &mut st_u,
+            &mut hooks_u,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+
+        let log_split: Stage2Log = Rc::new(RefCell::new(Vec::new()));
+        let drv_split = BerniniDualExpertDriver::new(
+            "bernini_mlx_boundary_split",
+            boundary,
+            1000,
+            6,
+            5.0,
+            base_omegas,
+            Defaults::OMEGA_SCALE,
+            2,
+            0.5,
+            MockStage2Forward {
+                log: log_split.clone(),
+            },
+        )
+        .unwrap();
+        let mut st_s = DriverRunState::new();
+        let mut noop_s = |_: Progress| {};
+        let mut hooks_s = StepHooks::new(&mut noop_s);
+        let split_out = run_mlx_driver_slices(
+            &drv_split,
+            [
+                SliceSpec {
+                    pass: 0,
+                    phase: 0,
+                    span: 0..3,
+                    transition: SliceTransition::Start,
+                    history: DriverHistoryPolicy::Reset,
+                    geometry: Some((256, 256)),
+                    request_boundary_estimate: false,
+                },
+                SliceSpec {
+                    pass: 0,
+                    phase: 1,
+                    span: 3..6,
+                    transition: SliceTransition::Continue,
+                    history: DriverHistoryPolicy::Carry,
+                    geometry: Some((256, 256)),
+                    request_boundary_estimate: false,
+                },
+            ],
+            BoundaryState::XSigma(init),
+            6,
+            0,
+            &cancel,
+            None,
+            &mut st_s,
+            &mut hooks_s,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+
+        let (BoundaryState::XSigma(a), BoundaryState::XSigma(b)) = (unsplit, split_out) else {
+            panic!("expected XSigma");
+        };
+        assert!(mlx_f32_bit_equal(&a, &b));
+
+        let entries = log_split.borrow();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(log_unsplit.borrow().as_slice(), entries.as_slice());
+        // Steps 0..=2 use High expert and unscaled base omegas; steps 3..=5 use Low and scale ONCE by 0.8.
+        for &(step, expert, t, omegas, non_empty_bufs) in entries.iter() {
+            assert_eq!(non_empty_bufs, 2);
+            if t >= boundary {
+                assert_eq!(expert, BerniniExpert::High, "step {step} >= boundary");
+                assert_eq!(omegas, base_omegas);
+            } else {
+                assert_eq!(expert, BerniniExpert::Low, "step {step} < boundary");
+                assert_eq!(
+                    omegas.omega_vid,
+                    base_omegas.omega_vid * Defaults::OMEGA_SCALE
+                );
+                assert_eq!(
+                    omegas.omega_img,
+                    base_omegas.omega_img * Defaults::OMEGA_SCALE
+                );
+                assert_eq!(
+                    omegas.omega_txt,
+                    base_omegas.omega_txt * Defaults::OMEGA_SCALE
+                );
+                assert_eq!(
+                    omegas.omega_tgt,
+                    Some(base_omegas.omega_tgt.unwrap() * Defaults::OMEGA_SCALE)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bernini_mlx_renderer_pre_load_plan_validates_output_contracts_and_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"model_type": "t2v", "dim": 5120, "dual_model": true}"#,
+        )
+        .unwrap();
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf())),
+            )
+            .unwrap();
+
+        let still_req = GenerationRequest {
+            prompt: "a lantern in the mist".into(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            steps: Some(8),
+            ..Default::default()
+        };
+        g.validate(&still_req).unwrap();
+        let still_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Mlx,
+            BerniniKnobs::default().to_plan_knobs(),
+            &still_req,
+        )
+        .unwrap();
+        assert_eq!(
+            still_plan.output_contract,
+            BerniniOutputContract::Images { expected_count: 1 }
+        );
+
+        let video_req = GenerationRequest {
+            prompt: "a lantern drifting on water".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            fps: Some(16),
+            ..Default::default()
+        };
+        g.validate(&video_req).unwrap();
+        let video_plan = build_bernini_render_plan(
+            g.descriptor(),
+            BerniniEntrypoint::Renderer,
+            BerniniBackendKind::Mlx,
+            BerniniKnobs::default().to_plan_knobs(),
+            &video_req,
+        )
+        .unwrap();
+        assert_eq!(
+            video_plan.output_contract,
+            BerniniOutputContract::Video {
+                fps: 16,
+                latent_frames: 3
+            }
+        );
+
+        // Invalid frame count (16 != 1 + 4k) and negative scheduler_shift fail pre-load.
+        let bad_frames = GenerationRequest {
+            frames: Some(16),
+            ..still_req.clone()
+        };
+        assert!(g.validate(&bad_frames).is_err());
+        let bad_shift = GenerationRequest {
+            scheduler_shift: Some(-1.0),
+            ..still_req
+        };
+        assert!(g.validate(&bad_shift).is_err());
     }
 }

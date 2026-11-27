@@ -66,6 +66,28 @@ impl QLinear {
         })
     }
 
+    /// Build a **packed** projection from a **stored GGML block tensor** (`U8 [out, in/32,
+    /// block_bytes]`, a Candle-native tier such as `SceneWorks/minimax-h3-candle`) on `device`. The
+    /// blocks are used exactly as stored — no repack and no saved-quantization cache entry. The
+    /// precision floor's bit width is the block type's: 4 for the Q4 containers, 8 for `Q8_0`.
+    pub fn from_stored_ggml(
+        stored: &Tensor,
+        bias: Option<Tensor>,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<Self> {
+        use candle_gen::candle_core::quantized::GgmlDType;
+        let qt = candle_gen::candle_layers::llm_projection::from_ggml_block_tensor(stored, device)
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        let bits = match qt.dtype() {
+            GgmlDType::Q8_0 => 8,
+            _ => 4,
+        };
+        Ok(Self::Packed {
+            linear: shared::QLinear::from_qtensor_dequant(std::sync::Arc::new(qt), bias),
+            bits,
+        })
+    }
+
     /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
     /// dequant-on-forward `QLinear` (sc-7702).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

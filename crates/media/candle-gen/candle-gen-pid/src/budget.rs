@@ -59,6 +59,8 @@ pub const DEFAULT_TILE_OVERLAP: i32 = 256;
 /// memory forces it (see [`plan_tile_edge`]).
 pub const PREFERRED_TILE_EDGE: i32 = 2048;
 
+const MAX_CANDIDATE_EDGE: i32 = 4096;
+
 /// GiB of the resident full-res buffers for a `[b,3,th,tw]` output — the term tiling can't shrink.
 fn resident_full_gib(b: f64, th: f64, tw: f64) -> f64 {
     RESIDENT_FULL_TENSORS * b * 3.0 * th * tw * F32_BYTES / GIB
@@ -144,6 +146,38 @@ pub fn plan_tile_edge(
 /// The PiD decode budget backstop (F-013 + sc-10087): with tiling, a large output is *tiled* rather than
 /// refused, so this refuses only when even a [`MIN_TILE_EDGE`] tile plus the resident full-res buffers
 /// exceeds `safe_gib`. `model_id` only labels the error. Pure (budget injected).
+pub fn tile_edge_candidates() -> Vec<i32> {
+    let mut edges: Vec<i32> = (MIN_TILE_EDGE..=MAX_CANDIDATE_EDGE)
+        .step_by(TILE_ALIGN as usize)
+        .collect();
+    edges.reverse();
+    edges
+}
+
+/// Whether `edge` is one of [`tile_edge_candidates`] — the single legality predicate for the PiD
+/// tile domain (SC-15775).
+pub fn is_tile_edge_candidate(edge: i32) -> bool {
+    tile_edge_candidates().contains(&edge)
+}
+
+/// Accept or reject an externally chosen `(edge, overlap)` for a PiD decode of `th × tw` output.
+pub fn validate_tile(model_id: &str, edge: i32, overlap: i32, th: i32, tw: i32) -> Result<()> {
+    if !is_tile_edge_candidate(edge) {
+        let candidates = tile_edge_candidates();
+        return Err(CandleError::Msg(format!(
+            "{model_id}: PiD decode tile edge {edge} is not one of the production candidates \
+             {candidates:?} ({TILE_ALIGN}px-aligned, {MIN_TILE_EDGE}..={MAX_CANDIDATE_EDGE}) for a \
+             {tw}×{th} output"
+        )));
+    }
+    if overlap <= 0 || overlap >= edge {
+        return Err(CandleError::Msg(format!(
+            "{model_id}: PiD decode overlap {overlap} must be in 1..{edge} (the tile edge)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn guard(
     model_id: &str,
     count: u32,
@@ -230,5 +264,28 @@ mod tests {
             "typed refusal, got {err:?}"
         );
         assert!(msg.contains("minimum"), "names the min-tile floor: {msg}");
+    }
+
+    #[test]
+    fn published_candidates_and_overlap_validation_match_domain() {
+        let candidates = tile_edge_candidates();
+        assert_eq!(candidates.first(), Some(&MAX_CANDIDATE_EDGE));
+        assert_eq!(candidates.last(), Some(&MIN_TILE_EDGE));
+        assert!(candidates.contains(&PREFERRED_TILE_EDGE));
+        for edge in &candidates {
+            assert_eq!(edge % TILE_ALIGN, 0);
+            validate_tile("t", *edge, DEFAULT_TILE_OVERLAP, 8192, 8192).unwrap();
+        }
+        for bad in [
+            512,
+            768,
+            MIN_TILE_EDGE + 1,
+            MAX_CANDIDATE_EDGE + TILE_ALIGN,
+            0,
+        ] {
+            assert!(validate_tile("t", bad, DEFAULT_TILE_OVERLAP, 8192, 8192).is_err());
+        }
+        assert!(validate_tile("t", PREFERRED_TILE_EDGE, 0, 8192, 8192).is_err());
+        assert!(validate_tile("t", PREFERRED_TILE_EDGE, PREFERRED_TILE_EDGE, 8192, 8192).is_err());
     }
 }

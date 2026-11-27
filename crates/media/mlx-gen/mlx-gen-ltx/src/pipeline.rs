@@ -25,16 +25,28 @@ use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::driver::{DriverEvaluationKind, DriverRunState, SliceSpec, StepHooks, StreamId};
+use mlx_gen::gen_core::multistream::{
+    LearnedUpsamplerComponent, ResolvedSchedule, ScheduleSource, StreamTransition,
+    StreamTransitionKind, TransitionBoundaryGuard,
+};
 use mlx_gen::gen_core::phase::ScaleContext;
+use mlx_gen::gen_core::{BoundaryState, EstimateSource};
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
 use mlx_gen::{AvLatents, CancelFlag, Error, Image, Progress, Result};
 
+use crate::drivers::{
+    apply_mlx_stream_transition, LtxMlxAvDistilledDriver, LtxMlxDevGuidedDriver,
+    LtxMlxRfAncestralDriver, LtxMlxVideoGridDriver, MlxAudioLayout, MlxAvState, MlxSeededKeyNoise,
+    MlxVideoLayout,
+};
+
 use crate::audio_vae::AudioDecoder;
 use crate::conditioning::{
-    append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, token_timesteps,
-    unpatchify_grid, I2vConditioning, Keyframe, VideoTokenState,
+    append_keyframe_clip, apply_conditioning, apply_keyframes, unpatchify_grid, I2vConditioning,
+    Keyframe, VideoTokenState,
 };
 use crate::contiguous;
 use crate::positions::{SPATIAL_SCALE, TEMPORAL_SCALE};
@@ -49,16 +61,14 @@ use crate::vocoder::LtxVocoder;
 pub const NUM_DENOISE_PASSES: usize = 2;
 
 /// Distilled stage-1 sigmas (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps).
-pub const STAGE1_SIGMAS: [f32; 9] = [
-    1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
-];
+pub const STAGE1_SIGMAS: [f32; 9] = gen_core_ltx::LTX_STAGE1_SIGMAS;
 /// Distilled stage-2 sigmas (`DEFAULT_STAGE_2_SIGMAS`, 3 denoise steps). `STAGE2_SIGMAS[0]` is the
 /// stage-transition re-noise scale.
-pub const STAGE2_SIGMAS: [f32; 4] = [0.909_375, 0.725, 0.421_875, 0.0];
+pub const STAGE2_SIGMAS: [f32; 4] = gen_core_ltx::LTX_STAGE2_SIGMAS;
 
 /// DFR temporal-round sigmas (`dfr_pipeline`'s `DISTILLED_SIGMAS[4:]`, 4 denoise steps).
 /// `TEMPORAL_SIGMAS[0]` doubles as the tile-entry re-noise scale.
-pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909_375, 0.725, 0.421_875, 0.0];
+pub const TEMPORAL_SIGMAS: [f32; 5] = gen_core_ltx::LTX_TEMPORAL_SIGMAS;
 
 /// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`), and
 /// therefore the ONLY value of `req.steps` this engine can honor (sc-19502).
@@ -116,6 +126,56 @@ pub fn denoise(
     )
 }
 
+fn resolve_mlx_schedule(table_id: &str, sigmas: &[f32]) -> Result<ResolvedSchedule> {
+    ScheduleSource::ExplicitTable {
+        table_id: table_id.to_owned(),
+        sigmas: sigmas.to_vec(),
+    }
+    .resolve()
+    .map_err(Into::into)
+}
+
+fn unwrap_xsigma_av(boundary: BoundaryState<MlxAvState>) -> (Array, Option<Array>) {
+    match boundary {
+        BoundaryState::XSigma(st)
+        | BoundaryState::CleanEstimate { latent: st, .. }
+        | BoundaryState::RouteSpecific { state: st, .. } => (st.video, st.audio),
+    }
+}
+
+pub(crate) fn stage2_video_transition(spatial_workspace_bytes: u64) -> Result<StreamTransition> {
+    StreamTransition::new(
+        "stage1_to_stage2_video_spatial_upsample_renoise",
+        vec![StreamId::Video],
+        StreamTransitionKind::Composed(vec![
+            StreamTransitionKind::LatentResample {
+                upsampler: Some(LearnedUpsamplerComponent {
+                    name: gen_core_ltx::LTX_SPATIAL_UPSAMPLER_COMPONENT_NAME.into(),
+                    normalization: gen_core_ltx::LTX_UPSAMPLER_NORMALIZATION.into(),
+                    workspace_bytes: spatial_workspace_bytes.max(1),
+                }),
+                spatial_factor: (2, 2),
+                temporal_factor: 1,
+            },
+            StreamTransitionKind::Renoise {
+                sigma: STAGE2_SIGMAS[0],
+            },
+        ]),
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn stage2_audio_transition() -> Result<StreamTransition> {
+    StreamTransition::new(
+        "stage1_to_stage2_audio_renoise",
+        vec![StreamId::Audio],
+        StreamTransitionKind::Renoise {
+            sigma: STAGE2_SIGMAS[0],
+        },
+    )
+    .map_err(Into::into)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_with_scales(
     dit: &LtxDiT,
@@ -135,54 +195,54 @@ fn denoise_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise", sigmas);
-    let dt = latents.dtype();
     let sh = latents.shape();
-    let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
-    let num_tokens = f * h * w;
-    let mut lat = latents.clone();
+    let shape = [sh[0], sh[1], sh[2], sh[3], sh[4]];
+    let schedule = resolve_mlx_schedule("ltx_denoise", sigmas)?;
+    let total_steps = schedule.num_steps();
     // One fresh RoPE epoch for this stage: `positions` is constant across the loop, so the SPLIT-RoPE
     // tables compute on step 0 and hit the memo for the rest — no per-step positions host copy (sc-7141).
     let rope_epoch = Some(dit.next_rope_epoch());
-
-    for i in 0..sigmas.len() - 1 {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551,
-        // the video sibling of chroma's sc-5514). The per-step `eval` below makes this effective.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let driver = LtxMlxVideoGridDriver::new(
+        "mlx_ltx_denoise",
+        schedule,
+        shape,
+        state,
+        |flat: &Array, ts: &Array, _sigma: f32, _kind: DriverEvaluationKind| {
+            dit.forward_with_scales(
+                flat,
+                ts,
+                context,
+                None,
+                positions,
+                rope_epoch,
+                adapter_scales,
+            )
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        // (B, C, F, H, W) → (B, C, S) → (B, S, C) packed tokens.
-        let flat = lat.reshape(&[b, c, -1])?.transpose_axes(&[0, 2, 1])?;
-        // Per-token timesteps, shape (B, num_tokens): T2V → uniform σ; I2V → σ·mask (conditioned
-        // tokens get 0). Matches the reference `denoise`.
-        let ts = match state {
-            Some(st) => st.token_timesteps(sigma, h, w)?,
-            None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[b, num_tokens])?,
-        };
-        let velocity = dit.forward_with_scales(
-            &flat,
-            &ts,
-            context,
-            None,
-            positions,
-            rope_epoch,
-            adapter_scales,
-        )?;
-        // (B, S, C) → (B, C, S) → (B, C, F, H, W).
-        let velocity = velocity
-            .transpose_axes(&[0, 2, 1])?
-            .reshape(&[b, c, f, h, w])?;
-        let sig = scalar(sigma).as_dtype(dt)?;
-        let mut denoised = to_denoised(&lat, &velocity, &sig)?;
-        // I2V: pin the conditioned frame(s) to the clean image latent (reference `apply_denoise_mask`).
-        if let Some(st) = state {
-            denoised = apply_denoise_mask(&denoised, &st.clean_latent, &st.denoise_mask)?;
-        }
-        lat = euler_step(&lat, &denoised, sigma, sigma_next)?;
-        mlx_rs::transforms::eval([&lat])?;
-        on_step(i + 1);
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(latents.clone()),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    match out {
+        BoundaryState::XSigma(lat)
+        | BoundaryState::CleanEstimate { latent: lat, .. }
+        | BoundaryState::RouteSpecific { state: lat, .. } => Ok(lat),
     }
-    Ok(lat)
 }
 
 /// Stage-transition re-noise: `noise·scale + latent·(1 − scale)`, dtype-preserving. `1 − scale` is
@@ -613,6 +673,7 @@ pub fn generate_t2v_latents(
     let _compile_glue = crate::CompileGlueGuard::enable();
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     let stage_one_scales = ScaleContext::new().with_pass(0);
+    // Stage 1 -> Learned spatial upsampler -> Stage 2 transition guarded against double-noising (PIPE-4).
     let lat = denoise_with_scales(
         dit,
         stage1_noise,
@@ -624,8 +685,22 @@ pub fn generate_t2v_latents(
         on_step,
         Some(&stage_one_scales),
     )?;
-    let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
-    let lat = renoise(&lat, stage2_noise, STAGE2_SIGMAS[0])?;
+    let v_tr = stage2_video_transition(384 * 1024 * 1024)?;
+    let BoundaryState::XSigma(lat) = apply_mlx_stream_transition(
+        StreamId::Video,
+        &v_tr,
+        BoundaryState::CleanEstimate {
+            latent: lat,
+            source: EstimateSource::EndpointEvaluation,
+        },
+        |clean| {
+            let up = upsample_latents(&clean, upsampler, latent_mean, latent_std)?;
+            renoise(&up, stage2_noise, STAGE2_SIGMAS[0])
+        },
+    )?
+    else {
+        unreachable!("video stage transition yields BoundaryState::XSigma");
+    };
     let stage_two_scales = ScaleContext::new().with_pass(1);
     denoise_with_scales(
         dit,
@@ -691,13 +766,37 @@ pub fn generate_i2v_latents(
         on_step,
     )?;
 
-    // Upsample 2×.
-    let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
+    // Upsample 2× and re-noise stage-2 through the typed transition guard (PIPE-4).
+    let v_tr = stage2_video_transition(384 * 1024 * 1024)?;
+    let st2 = match TransitionBoundaryGuard::new(
+        StreamId::Video,
+        BoundaryState::CleanEstimate {
+            latent: lat,
+            source: EstimateSource::EndpointEvaluation,
+        },
+    )
+    .apply(&v_tr, |state| match state {
+        BoundaryState::CleanEstimate { latent: clean, .. } => {
+            let up = upsample_latents(&clean, upsampler, latent_mean, latent_std)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            let cond2 = stage2_image_latent
+                .as_dtype(up.dtype())
+                .map_err(|e| mlx_gen::gen_core::Error::from(Error::from(e)))?;
+            let st2 = apply_conditioning(&up, &cond2, frame_idx, strength)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            let st2 = st2
+                .noised(stage2_noise, STAGE2_SIGMAS[0])
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            Ok(BoundaryState::XSigma(st2))
+        }
+        _ => unreachable!(),
+    }) {
+        Ok(BoundaryState::XSigma(st2)) => st2,
+        Err(err) => return Err(err.into()),
+        _ => unreachable!(),
+    };
 
-    // Stage 2: condition over the upscaled latent, re-noise (σ₀ = STAGE2_SIGMAS[0]), conditioned denoise.
-    let cond2 = stage2_image_latent.as_dtype(lat.dtype())?;
-    let st2 = apply_conditioning(&lat, &cond2, frame_idx, strength)?;
-    let st2 = st2.noised(stage2_noise, STAGE2_SIGMAS[0])?;
+    // Stage 2: conditioned denoise from transitioned XSigma state.
     denoise(
         dit,
         &st2.latent,
@@ -808,69 +907,67 @@ fn denoise_av_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise_av", sigmas);
-    let dt = video.dtype();
     let v = video.shape();
-    let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
-    let v_tokens = vf * vh * vw;
-    let a = audio.shape();
-    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
-
-    let mut vlat = video.clone();
-    let mut alat = audio.clone();
+    let vshape = [v[0], v[1], v[2], v[3], v[4]];
+    let audio_layout = MlxAudioLayout::from_array(audio);
+    let schedule = resolve_mlx_schedule("ltx_denoise_av", sigmas)?;
+    let total_steps = schedule.num_steps();
     // One fresh RoPE epoch for this stage: both position grids are constant across the loop (sc-7141).
     let rope_epoch = Some(dit.next_rope_epoch());
-    for i in 0..sigmas.len() - 1 {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let driver = LtxMlxAvDistilledDriver::new(
+        "mlx_ltx_denoise_av",
+        schedule,
+        MlxVideoLayout::Grid {
+            shape: vshape,
+            i2v: video_state,
+        },
+        Some(audio_layout),
+        |vflat: &Array,
+         vts: &Array,
+         audio_in: Option<(&Array, &Array)>,
+         _sigma: f32,
+         _kind: DriverEvaluationKind| {
+            let (aflat, ats) = audio_in.expect("audio stream active in denoise_av");
+            let (vvel, avel) = dit.forward_controlled_with_scales(
+                vflat,
+                vts,
+                video_ctx,
+                None,
+                video_pos,
+                aflat,
+                ats,
+                audio_ctx,
+                None,
+                audio_pos,
+                None,
+                rope_epoch,
+                AvPerturbation::NONE,
+                adapter_scales,
+            )?;
+            Ok((vvel, Some(avel)))
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F).
-        let vflat = vlat.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;
-        let aflat = alat
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[ab, at, ac * af])?;
-        // Video per-token σ: I2V → σ·mask (conditioned tokens 0); T2V → uniform σ. Audio uniform σ.
-        let vts = match video_state {
-            Some(st) => st.token_timesteps(sigma, vh, vw)?,
-            None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?,
-        };
-        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-        let (vvel, avel) = dit.forward_controlled_with_scales(
-            &vflat,
-            &vts,
-            video_ctx,
-            None,
-            video_pos,
-            &aflat,
-            &ats,
-            audio_ctx,
-            None,
-            audio_pos,
-            None,
-            rope_epoch,
-            AvPerturbation::NONE,
-            adapter_scales,
-        )?;
-        let vvel = vvel
-            .transpose_axes(&[0, 2, 1])?
-            .reshape(&[vb, vc, vf, vh, vw])?;
-        let avel = avel
-            .reshape(&[ab, at, ac, af])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let sig = scalar(sigma).as_dtype(dt)?;
-        let mut vden = to_denoised(&vlat, &vvel, &sig)?;
-        // I2V: pin the conditioned frame(s) to the clean image latent (video only).
-        if let Some(st) = video_state {
-            vden = apply_denoise_mask(&vden, &st.clean_latent, &st.denoise_mask)?;
-        }
-        let aden = to_denoised(&alat, &avel, &sig)?;
-        vlat = euler_step(&vlat, &vden, sigma, sigma_next)?;
-        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
-        mlx_rs::transforms::eval([&vlat, &alat])?;
-        on_step(i + 1);
-    }
-    Ok((vlat, alat))
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(MlxAvState::av(video.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let (vlat, alat) = unwrap_xsigma_av(out);
+    Ok((vlat, alat.expect("audio stream preserved in denoise_av")))
 }
 
 /// The non-distilled LTX-2.5 stage-1 loop.  Each of the thirty transitions executes the four
@@ -935,100 +1032,118 @@ fn denoise_av_dev_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise_av_dev", sigmas);
-    let dt = video.dtype();
     let v = video.shape();
-    let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
-    let v_tokens = vf * vh * vw;
-    let a = audio.shape();
-    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
-    let mut vlat = video.clone();
-    let mut alat = audio.clone();
+    let vshape = [v[0], v[1], v[2], v[3], v[4]];
+    let [vb, vc, vf, vh, vw] = vshape;
+    let audio_layout = MlxAudioLayout::from_array(audio);
+    let [ab, ac, at, af] = audio_layout.shape;
+    let schedule = resolve_mlx_schedule("ltx_denoise_av_dev", sigmas)?;
+    let total_steps = schedule.num_steps();
     let rope_epoch = Some(dit.next_rope_epoch());
 
-    for i in 0..sigmas.len() - 1 {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        let vflat = vlat.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;
-        let aflat = alat
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[ab, at, ac * af])?;
-        let vts = match video_state {
-            Some(st) => st.token_timesteps(sigma, vh, vw)?,
-            None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?,
-        };
-        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-
-        let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
-            dit.forward_controlled_with_scales(
-                &vflat,
-                &vts,
-                vctx,
-                None,
-                video_pos,
-                &aflat,
-                &ats,
-                actx,
-                None,
-                audio_pos,
-                None,
-                rope_epoch,
-                perturbation,
-                adapter_scales,
-            )
-        };
-        let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
-        let (uncond_v, uncond_a) =
-            forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
-        let (perturbed_v, perturbed_a) = forward(
-            video_ctx,
-            audio_ctx,
-            AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS),
-        )?;
-        let (isolated_v, isolated_a) =
-            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
-
-        let to_stream_denoised = |vvel: Array, avel: Array| -> Result<(Array, Array)> {
-            let vvel = vvel
-                .transpose_axes(&[0, 2, 1])?
-                .reshape(&[vb, vc, vf, vh, vw])?;
-            let avel = avel
-                .reshape(&[ab, at, ac, af])?
-                .transpose_axes(&[0, 2, 1, 3])?;
+    let driver = LtxMlxDevGuidedDriver::new(
+        "mlx_ltx_denoise_av_dev",
+        schedule,
+        MlxVideoLayout::Grid {
+            shape: vshape,
+            i2v: video_state,
+        },
+        Some(audio_layout),
+        |cur: &MlxAvState,
+         vflat: &Array,
+         vts: &Array,
+         audio_in: Option<(&Array, &Array)>,
+         sigma: f32,
+         _kind: DriverEvaluationKind| {
+            let alat = cur.audio.as_ref().expect("audio stream active");
+            let (aflat, ats) = audio_in.expect("audio flattened");
+            let dt = cur.video.dtype();
+            let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
+                dit.forward_controlled_with_scales(
+                    vflat,
+                    vts,
+                    vctx,
+                    None,
+                    video_pos,
+                    aflat,
+                    ats,
+                    actx,
+                    None,
+                    audio_pos,
+                    None,
+                    rope_epoch,
+                    perturbation,
+                    adapter_scales,
+                )
+            };
+            let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
+            let (uncond_v, uncond_a) =
+                forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
+            let (perturbed_v, perturbed_a) = forward(
+                video_ctx,
+                audio_ctx,
+                AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS),
+            )?;
+            let (isolated_v, isolated_a) =
+                forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
             let sig = scalar(sigma).as_dtype(dt)?;
-            Ok((
-                to_denoised(&vlat, &vvel, &sig)?,
-                to_denoised(&alat, &avel, &sig)?,
-            ))
-        };
-        let (cond_v, cond_a) = to_stream_denoised(cond_v, cond_a)?;
-        let (uncond_v, uncond_a) = to_stream_denoised(uncond_v, uncond_a)?;
-        let (perturbed_v, perturbed_a) = to_stream_denoised(perturbed_v, perturbed_a)?;
-        let (isolated_v, isolated_a) = to_stream_denoised(isolated_v, isolated_a)?;
-        let mut vden = crate::dev_sampler::combine_guidance(
-            &cond_v,
-            &uncond_v,
-            &perturbed_v,
-            &isolated_v,
-            crate::params::LTX_2_5_PARAMS.video_guider,
-        )?;
-        let aden = crate::dev_sampler::combine_guidance(
-            &cond_a,
-            &uncond_a,
-            &perturbed_a,
-            &isolated_a,
-            crate::params::LTX_2_5_PARAMS.audio_guider,
-        )?;
-        if let Some(st) = video_state {
-            vden = apply_denoise_mask(&vden, &st.clean_latent, &st.denoise_mask)?;
+            let to_stream_denoised = |vvel: Array, avel: Array| -> Result<(Array, Array)> {
+                let vvel = vvel
+                    .transpose_axes(&[0, 2, 1])?
+                    .reshape(&[vb, vc, vf, vh, vw])?;
+                let avel = avel
+                    .reshape(&[ab, at, ac, af])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                Ok((
+                    to_denoised(&cur.video, &vvel, &sig)?,
+                    to_denoised(alat, &avel, &sig)?,
+                ))
+            };
+            let (cond_v, cond_a) = to_stream_denoised(cond_v, cond_a)?;
+            let (uncond_v, uncond_a) = to_stream_denoised(uncond_v, uncond_a)?;
+            let (perturbed_v, perturbed_a) = to_stream_denoised(perturbed_v, perturbed_a)?;
+            let (isolated_v, isolated_a) = to_stream_denoised(isolated_v, isolated_a)?;
+            let vden = crate::dev_sampler::combine_guidance(
+                &cond_v,
+                &uncond_v,
+                &perturbed_v,
+                &isolated_v,
+                crate::params::LTX_2_5_PARAMS.video_guider,
+            )?;
+            let aden = crate::dev_sampler::combine_guidance(
+                &cond_a,
+                &uncond_a,
+                &perturbed_a,
+                &isolated_a,
+                crate::params::LTX_2_5_PARAMS.audio_guider,
+            )?;
+            Ok((vden, Some(aden), 4))
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-        vlat = euler_step(&vlat, &vden, sigma, sigma_next)?;
-        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
-        mlx_rs::transforms::eval([&vlat, &alat])?;
-        on_step(i + 1);
-    }
-    Ok((vlat, alat))
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(MlxAvState::av(video.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let (vlat, alat) = unwrap_xsigma_av(out);
+    Ok((
+        vlat,
+        alat.expect("audio stream preserved in denoise_av_dev"),
+    ))
 }
 
 /// One stage's joint video+audio denoise driven by a **curated unified solver** (epic 7114, sc-7122) —
@@ -1243,63 +1358,64 @@ pub(crate) fn denoise_av_tokens_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise_av_tokens", sigmas);
-    let dt = video.latent.dtype();
-    let a = audio.shape();
-    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
-
-    let mut vtok = video.latent.clone();
-    let mut alat = audio.clone();
-    // One fresh RoPE epoch for this stage: `video.positions` / `audio_pos` are constant across the loop
-    // (the input `video` is borrowed read-only; its `positions` is only mutated to build the return
-    // state *after* the loop), so the per-stage tables hit the memo for steps 1.. (sc-7141).
+    let audio_layout = MlxAudioLayout::from_array(audio);
+    let schedule = resolve_mlx_schedule("ltx_denoise_av_tokens", sigmas)?;
+    let total_steps = schedule.num_steps();
     let rope_epoch = Some(dit.next_rope_epoch());
-    for i in 0..sigmas.len() - 1 {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+
+    let driver = LtxMlxAvDistilledDriver::new(
+        "mlx_ltx_denoise_av_tokens",
+        schedule,
+        MlxVideoLayout::Tokens {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        Some(audio_layout),
+        |vtok: &Array,
+         vts: &Array,
+         audio_in: Option<(&Array, &Array)>,
+         _sigma: f32,
+         _kind: DriverEvaluationKind| {
+            let (aflat, ats) = audio_in.expect("audio stream active in denoise_av_tokens");
+            let (vvel, avel) = dit.forward_controlled_with_scales(
+                vtok,
+                vts,
+                video_ctx,
+                None,
+                &video.positions,
+                aflat,
+                ats,
+                audio_ctx,
+                None,
+                audio_pos,
+                video.keyframes_mask.as_ref(),
+                rope_epoch,
+                AvPerturbation::NONE,
+                adapter_scales,
+            )?;
+            Ok((vvel, Some(avel)))
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        // Video already token-native (B, Sv, C). Audio (B,C,T,F) → (B,T,C·F).
-        let aflat = alat
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[ab, at, ac * af])?;
-        // Video per-token σ = σ·mask (conditioning tokens get σ·(1−strength)); audio uniform σ. The
-        // timesteps depend only on the fixed denoise_mask + dtype, so call the free fn directly
-        // instead of rebuilding a throwaway VideoTokenState each step (F-060).
-        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
-        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-        let (vvel, avel) = dit.forward_controlled_with_scales(
-            &vtok,
-            &vts,
-            video_ctx,
-            None,
-            &video.positions,
-            &aflat,
-            &ats,
-            audio_ctx,
-            None,
-            audio_pos,
-            video.keyframes_mask.as_ref(),
-            rope_epoch,
-            AvPerturbation::NONE,
-            adapter_scales,
-        )?;
-        let avel = avel
-            .reshape(&[ab, at, ac, af])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let sig = scalar(sigma).as_dtype(dt)?;
-        // Pin conditioning tokens to their clean latent (token-native apply_denoise_mask).
-        let vden = apply_denoise_mask(
-            &to_denoised(&vtok, &vvel, &sig)?,
-            &video.clean_latent,
-            &video.denoise_mask,
-        )?;
-        let aden = to_denoised(&alat, &avel, &sig)?;
-        vtok = euler_step(&vtok, &vden, sigma, sigma_next)?;
-        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
-        mlx_rs::transforms::eval([&vtok, &alat])?;
-        on_step(i + 1);
-    }
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(MlxAvState::av(video.latent.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let (vtok, alat) = unwrap_xsigma_av(out);
     Ok((
         VideoTokenState {
             latent: vtok,
@@ -1310,7 +1426,7 @@ pub(crate) fn denoise_av_tokens_with_scales(
             keyframes_mask: video.keyframes_mask.clone(),
             generated_keyframe_layout: video.generated_keyframe_layout.clone(),
         },
-        alat,
+        alat.expect("audio stream preserved in denoise_av_tokens"),
     ))
 }
 
@@ -1371,89 +1487,108 @@ pub(crate) fn denoise_av_tokens_dev_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise_av_tokens_dev", sigmas);
-    let dt = video.latent.dtype();
-    let a = audio.shape();
-    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
-    let mut vtok = video.latent.clone();
-    let mut alat = audio.clone();
+    let audio_layout = MlxAudioLayout::from_array(audio);
+    let [ab, ac, at, af] = audio_layout.shape;
+    let schedule = resolve_mlx_schedule("ltx_denoise_av_tokens_dev", sigmas)?;
+    let total_steps = schedule.num_steps();
     let rope_epoch = Some(dit.next_rope_epoch());
 
-    for i in 0..sigmas.len() - 1 {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        let aflat = alat
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[ab, at, ac * af])?;
-        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
-        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-        let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
-            dit.forward_controlled_with_scales(
-                &vtok,
-                &vts,
-                vctx,
-                None,
-                &video.positions,
-                &aflat,
-                &ats,
-                actx,
-                None,
-                audio_pos,
-                video.keyframes_mask.as_ref(),
-                rope_epoch,
-                perturbation,
-                adapter_scales,
-            )
-        };
-        let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
-        let (uncond_v, uncond_a) =
-            forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
-        let (perturbed_v, perturbed_a) = forward(
-            video_ctx,
-            audio_ctx,
-            AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS),
-        )?;
-        let (isolated_v, isolated_a) =
-            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
-
-        let to_stream_denoised = |vvel: Array, avel: Array| -> Result<(Array, Array)> {
-            let avel = avel
-                .reshape(&[ab, at, ac, af])?
-                .transpose_axes(&[0, 2, 1, 3])?;
+    let driver = LtxMlxDevGuidedDriver::new(
+        "mlx_ltx_denoise_av_tokens_dev",
+        schedule,
+        MlxVideoLayout::Tokens {
+            clean_latent: &video.clean_latent,
+            denoise_mask: &video.denoise_mask,
+        },
+        Some(audio_layout),
+        |cur: &MlxAvState,
+         vtok: &Array,
+         vts: &Array,
+         audio_in: Option<(&Array, &Array)>,
+         sigma: f32,
+         _kind: DriverEvaluationKind| {
+            let alat = cur.audio.as_ref().expect("audio stream active");
+            let (aflat, ats) = audio_in.expect("audio flattened");
+            let dt = cur.video.dtype();
+            let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
+                dit.forward_controlled_with_scales(
+                    vtok,
+                    vts,
+                    vctx,
+                    None,
+                    &video.positions,
+                    aflat,
+                    ats,
+                    actx,
+                    None,
+                    audio_pos,
+                    video.keyframes_mask.as_ref(),
+                    rope_epoch,
+                    perturbation,
+                    adapter_scales,
+                )
+            };
+            let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
+            let (uncond_v, uncond_a) =
+                forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
+            let (perturbed_v, perturbed_a) = forward(
+                video_ctx,
+                audio_ctx,
+                AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS),
+            )?;
+            let (isolated_v, isolated_a) =
+                forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
             let sig = scalar(sigma).as_dtype(dt)?;
-            Ok((
-                to_denoised(&vtok, &vvel, &sig)?,
-                to_denoised(&alat, &avel, &sig)?,
-            ))
-        };
-        let (cond_v, cond_a) = to_stream_denoised(cond_v, cond_a)?;
-        let (uncond_v, uncond_a) = to_stream_denoised(uncond_v, uncond_a)?;
-        let (perturbed_v, perturbed_a) = to_stream_denoised(perturbed_v, perturbed_a)?;
-        let (isolated_v, isolated_a) = to_stream_denoised(isolated_v, isolated_a)?;
-        let vden = apply_denoise_mask(
-            &crate::dev_sampler::combine_guidance(
+            let to_stream_denoised = |vvel: Array, avel: Array| -> Result<(Array, Array)> {
+                let avel = avel
+                    .reshape(&[ab, at, ac, af])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                Ok((
+                    to_denoised(&cur.video, &vvel, &sig)?,
+                    to_denoised(alat, &avel, &sig)?,
+                ))
+            };
+            let (cond_v, cond_a) = to_stream_denoised(cond_v, cond_a)?;
+            let (uncond_v, uncond_a) = to_stream_denoised(uncond_v, uncond_a)?;
+            let (perturbed_v, perturbed_a) = to_stream_denoised(perturbed_v, perturbed_a)?;
+            let (isolated_v, isolated_a) = to_stream_denoised(isolated_v, isolated_a)?;
+            let vden = crate::dev_sampler::combine_guidance(
                 &cond_v,
                 &uncond_v,
                 &perturbed_v,
                 &isolated_v,
                 crate::params::LTX_2_5_PARAMS.video_guider,
-            )?,
-            &video.clean_latent,
-            &video.denoise_mask,
-        )?;
-        let aden = crate::dev_sampler::combine_guidance(
-            &cond_a,
-            &uncond_a,
-            &perturbed_a,
-            &isolated_a,
-            crate::params::LTX_2_5_PARAMS.audio_guider,
-        )?;
-        vtok = euler_step(&vtok, &vden, sigma, sigma_next)?;
-        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
-        mlx_rs::transforms::eval([&vtok, &alat])?;
-        on_step(i + 1);
-    }
+            )?;
+            let aden = crate::dev_sampler::combine_guidance(
+                &cond_a,
+                &uncond_a,
+                &perturbed_a,
+                &isolated_a,
+                crate::params::LTX_2_5_PARAMS.audio_guider,
+            )?;
+            Ok((vden, Some(aden), 4))
+        },
+    );
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
+        }
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(MlxAvState::av(video.latent.clone(), audio.clone())),
+        total_steps,
+        0,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let (vtok, alat) = unwrap_xsigma_av(out);
     Ok((
         VideoTokenState {
             latent: vtok,
@@ -1464,7 +1599,7 @@ pub(crate) fn denoise_av_tokens_dev_with_scales(
             keyframes_mask: video.keyframes_mask.clone(),
             generated_keyframe_layout: video.generated_keyframe_layout.clone(),
         },
-        alat,
+        alat.expect("audio stream preserved in denoise_av_tokens_dev"),
     ))
 }
 
@@ -1540,52 +1675,33 @@ pub(crate) fn denoise_tokens_rf_ancestral_with_scales(
         serde_json::json!({}),
     );
     mlx_gen::video_execution::schedule("ltx_denoise_tokens_rf_ancestral", sigmas);
-    let dt = video.latent.dtype();
-    let mut vtok = video.latent.clone();
-    let mut alat = audio.as_ref().map(|a| a.latent.clone());
-    let audio_dims = audio.as_ref().map(|a| {
-        let s = a.latent.shape();
-        (s[0], s[1], s[2], s[3])
-    });
+    let audio_layout = audio.as_ref().map(|a| MlxAudioLayout::from_array(a.latent));
+    let schedule = resolve_mlx_schedule("ltx_denoise_tokens_rf_ancestral", sigmas)?;
+    let total_steps = schedule.num_steps();
     let rope_epoch = Some(dit.next_rope_epoch());
-    let seeded_normal = |shape: &[i32], step: usize, modality: u64| -> Result<Array> {
-        mlx_gen::video_execution::draw(
-            0,
-            &format!("ltx_dfr_ancestral_modality_{modality}"),
-            noise_seed
-                .wrapping_add(2 * step as u64)
-                .wrapping_add(modality),
-        );
-        let key = mlx_rs::random::key(
-            noise_seed
-                .wrapping_add(2 * step as u64)
-                .wrapping_add(modality),
-        )?;
-        Ok(mlx_rs::random::normal::<f32>(shape, None, None, Some(&key))?.as_dtype(dt)?)
-    };
 
-    for i in 0..sigmas.len() - 1 {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
-        let sig = scalar(sigma).as_dtype(dt)?;
-
-        let (vvel, avel) = match (&alat, &audio, audio_dims) {
-            (Some(al), Some(a), Some((ab, ac, at, af))) => {
-                let aflat = al
-                    .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[ab, at, ac * af])?;
-                let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+    let driver = LtxMlxRfAncestralDriver::new(
+        "mlx_ltx_denoise_tokens_rf_ancestral",
+        schedule,
+        &video.clean_latent,
+        &video.denoise_mask,
+        audio_layout,
+        eta,
+        s_noise,
+        |vtok: &Array,
+         vts: &Array,
+         audio_in: Option<(&Array, &Array)>,
+         _sigma: f32,
+         _kind: DriverEvaluationKind| match (audio_in, &audio) {
+            (Some((aflat, ats)), Some(a)) => {
                 let (vv, av) = dit.forward_controlled_with_scales(
-                    &vtok,
-                    &vts,
+                    vtok,
+                    vts,
                     video_ctx,
                     None,
                     &video.positions,
-                    &aflat,
-                    &ats,
+                    aflat,
+                    ats,
                     a.ctx,
                     None,
                     a.positions,
@@ -1594,15 +1710,12 @@ pub(crate) fn denoise_tokens_rf_ancestral_with_scales(
                     AvPerturbation::NONE,
                     adapter_scales,
                 )?;
-                let av = av
-                    .reshape(&[ab, at, ac, af])?
-                    .transpose_axes(&[0, 2, 1, 3])?;
-                (vv, Some(av))
+                Ok((vv, Some(av)))
             }
-            _ => (
-                dit.forward_video_only_controlled_with_scales(
-                    &vtok,
-                    &vts,
+            _ => {
+                let vv = dit.forward_video_only_controlled_with_scales(
+                    vtok,
+                    vts,
                     video_ctx,
                     None,
                     &video.positions,
@@ -1610,66 +1723,36 @@ pub(crate) fn denoise_tokens_rf_ancestral_with_scales(
                     rope_epoch,
                     AvPerturbation::NONE,
                     adapter_scales,
-                )?,
-                None,
-            ),
-        };
-
-        // Mask-corrected x0 (reference `post_process_latent` on the denoised prediction).
-        let vden = apply_denoise_mask(
-            &to_denoised(&vtok, &vvel, &sig)?,
-            &video.clean_latent,
-            &video.denoise_mask,
-        )?;
-        let aden = match (&alat, &avel) {
-            (Some(al), Some(av)) => Some(to_denoised(al, av, &sig)?),
-            _ => None,
-        };
-
-        if sigma_next <= 0.0 {
-            vtok = vden;
-            if let Some(ad) = aden {
-                alat = Some(ad);
+                )?;
+                Ok((vv, None))
             }
-        } else {
-            let coeffs =
-                gen_core_ltx::ltx_dfr::RfAncestralCoeffs::new(sigma, sigma_next, eta, s_noise)?;
-            let ratio = scalar(coeffs.sigma_down_ratio).as_dtype(dt)?;
-            let one_minus = scalar(1.0 - coeffs.sigma_down_ratio).as_dtype(dt)?;
-            let step_rf =
-                |x: &Array, x0: &Array, step_idx: usize, modality: u64| -> Result<Array> {
-                    let mut next = add(&multiply(x, &ratio)?, &multiply(x0, &one_minus)?)?;
-                    if eta > 0.0 {
-                        // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 — the
-                        // reference does not fall back to the noise-free branch when eta > 0).
-                        let ar = scalar(coeffs.alpha_ratio).as_dtype(dt)?;
-                        next = multiply(&next, &ar)?;
-                        if coeffs.renoise_coeff > 0.0 {
-                            let noise = seeded_normal(next.shape(), step_idx, modality)?;
-                            let rc = scalar(coeffs.renoise_coeff).as_dtype(dt)?;
-                            next = add(&next, &multiply(&noise, &rc)?)?;
-                        }
-                    }
-                    Ok(next)
-                };
-            let mut vnext = step_rf(&vtok, &vden, i, 0)?;
-            if eta > 0.0 {
-                // Injected noise reached the conditioning tokens; re-pin them (the reference
-                // re-applies `post_process_latent` after noise injection).
-                vnext = apply_denoise_mask(&vnext, &video.clean_latent, &video.denoise_mask)?;
-            }
-            vtok = vnext;
-            if let (Some(al), Some(ad)) = (&alat, &aden) {
-                alat = Some(step_rf(al, ad, i, 1)?);
-            }
+        },
+        MlxSeededKeyNoise { noise_seed },
+    );
+    let initial = match &audio {
+        Some(a) => MlxAvState::av(video.latent.clone(), a.latent.clone()),
+        None => MlxAvState::video_only(video.latent.clone()),
+    };
+    let mut run_state = DriverRunState::new();
+    let mut on_progress = |event: Progress| {
+        if let Progress::Step { current, .. } = event {
+            on_step(current as usize);
         }
-
-        match &alat {
-            Some(al) => mlx_rs::transforms::eval([&vtok, al])?,
-            None => mlx_rs::transforms::eval([&vtok])?,
-        }
-        on_step(i + 1);
-    }
+    };
+    let mut hooks = StepHooks::new(&mut on_progress);
+    let out = mlx_gen::run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(total_steps)],
+        BoundaryState::XSigma(initial),
+        total_steps,
+        noise_seed,
+        cancel,
+        None,
+        &mut run_state,
+        &mut hooks,
+        |_, s, _| Ok(s),
+    )?;
+    let (vtok, alat) = unwrap_xsigma_av(out);
 
     Ok((
         VideoTokenState {
@@ -1868,17 +1951,55 @@ pub fn generate_av_latents_for_variant(
             )?,
         },
     };
-    let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
-    // Stage 2: re-noise / re-condition the upscaled video; re-noise audio (never upsampled).
-    let (vlat2, vstate2): (Array, Option<I2vConditioning>) =
-        match stage_keyframe_state(&v, video_keyframes, false)? {
-            Some(st) => {
-                let st = st.noised(video_s2_noise, STAGE2_SIGMAS[0])?;
-                (st.latent.clone(), Some(st))
-            }
-            None => (renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?, None),
-        };
-    let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
+    // Guard stage transitions per stream: video spatially upsamples + renoises; audio renoises only (PIPE-4).
+    let v_tr = stage2_video_transition(384 * 1024 * 1024)?;
+    let a_tr = stage2_audio_transition()?;
+    let (vlat2, vstate2): (Array, Option<I2vConditioning>) = match TransitionBoundaryGuard::new(
+        StreamId::Video,
+        BoundaryState::CleanEstimate {
+            latent: v,
+            source: EstimateSource::EndpointEvaluation,
+        },
+    )
+    .apply(&v_tr, |state| match state {
+        BoundaryState::CleanEstimate { latent: clean, .. } => {
+            let v = upsample_latents(&clean, upsampler, latent_mean, latent_std)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            let out = match stage_keyframe_state(&v, video_keyframes, false)
+                .map_err(mlx_gen::gen_core::Error::from)?
+            {
+                Some(st) => {
+                    let st = st
+                        .noised(video_s2_noise, STAGE2_SIGMAS[0])
+                        .map_err(mlx_gen::gen_core::Error::from)?;
+                    (st.latent.clone(), Some(st))
+                }
+                None => (
+                    renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])
+                        .map_err(mlx_gen::gen_core::Error::from)?,
+                    None,
+                ),
+            };
+            Ok(BoundaryState::XSigma(out))
+        }
+        _ => unreachable!(),
+    }) {
+        Ok(BoundaryState::XSigma(out)) => out,
+        Err(err) => return Err(err.into()),
+        _ => unreachable!(),
+    };
+    let BoundaryState::XSigma(a) = apply_mlx_stream_transition(
+        StreamId::Audio,
+        &a_tr,
+        BoundaryState::CleanEstimate {
+            latent: a,
+            source: EstimateSource::EndpointEvaluation,
+        },
+        |clean_a| renoise(&clean_a, audio_s2_noise, STAGE2_SIGMAS[0]),
+    )?
+    else {
+        unreachable!();
+    };
     let stage_two_scales = ScaleContext::new().with_pass(1);
     match (sampler, vstate2.as_ref()) {
         (Some(name), None) => denoise_av_curated_with_scales(
@@ -2053,10 +2174,36 @@ pub fn generate_av_latents_iclora(
         .take_axis(Array::from_slice(&tgt_idx, &[vstate.target_tokens]), 1)?;
     let v = unpatchify_grid(&gen_tokens, c, f, h1, w1)?;
 
-    // Stage 2: plain grid denoise (no clips; reference re-applies only image conditioning here).
-    let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
-    let vlat2 = renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?;
-    let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
+    // Stage 2: plain grid denoise through stream-targeted transitions (no clips; audio renoises only).
+    let v_tr = stage2_video_transition(384 * 1024 * 1024)?;
+    let a_tr = stage2_audio_transition()?;
+    let BoundaryState::XSigma(vlat2) = apply_mlx_stream_transition(
+        StreamId::Video,
+        &v_tr,
+        BoundaryState::CleanEstimate {
+            latent: v,
+            source: EstimateSource::EndpointEvaluation,
+        },
+        |clean| {
+            let v = upsample_latents(&clean, upsampler, latent_mean, latent_std)?;
+            renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])
+        },
+    )?
+    else {
+        unreachable!();
+    };
+    let BoundaryState::XSigma(a) = apply_mlx_stream_transition(
+        StreamId::Audio,
+        &a_tr,
+        BoundaryState::CleanEstimate {
+            latent: a,
+            source: EstimateSource::EndpointEvaluation,
+        },
+        |clean_a| renoise(&clean_a, audio_s2_noise, STAGE2_SIGMAS[0]),
+    )?
+    else {
+        unreachable!();
+    };
     let stage_two_scales = ScaleContext::new().with_pass(1);
     denoise_av_with_scales(
         dit,

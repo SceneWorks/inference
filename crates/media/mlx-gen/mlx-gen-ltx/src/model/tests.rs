@@ -1359,3 +1359,178 @@ fn validate_request_rejects_late_conditioning_shape_errors_preflight() {
     ]);
     assert!(err.contains("replace_person latent frame index 7"), "{err}");
 }
+
+#[test]
+fn validate_refuses_invalid_render_plan_combinations_without_loading_weights() {
+    let img = Image {
+        width: 4,
+        height: 4,
+        pixels: vec![0u8; 4 * 4 * 3],
+    };
+    let ltx23_caps = descriptor().capabilities;
+    let base_23 = GenerationRequest {
+        prompt: "a paper kite".into(),
+        width: 512,
+        height: 512,
+        frames: Some(17),
+        ..Default::default()
+    };
+    assert!(validate_request(
+        &ltx23_caps,
+        &GenerationRequest {
+            sampler: Some("heun".into()),
+            ..base_23.clone()
+        }
+    )
+    .is_ok());
+    assert!(validate_request(
+        &ltx23_caps,
+        &GenerationRequest {
+            sampler: Some("euler".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: img.clone(),
+                strength: Some(1.0),
+            }],
+            ..base_23.clone()
+        }
+    )
+    .is_ok());
+    for invalid_23 in [
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: img.clone(),
+                strength: Some(1.0),
+            }],
+            ..base_23.clone()
+        },
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            conditioning: vec![Conditioning::Keyframe {
+                image: img.clone(),
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..base_23.clone()
+        },
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![img.clone()],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..base_23
+        },
+    ] {
+        assert!(
+            matches!(
+                validate_request(&ltx23_caps, &invalid_23),
+                Err(Error::Unsupported(_))
+            ),
+            "2.3 pre-load validate must refuse {invalid_23:?}"
+        );
+    }
+
+    let distilled = weights_free_ltx25(TransformerVariant::Distilled);
+    let base_25 = ltx25_request("a quiet moonlit harbor");
+    for invalid_distilled in [
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: img.clone(),
+                strength: Some(1.0),
+            }],
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            num_generated_keyframes: Some(1),
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            sampler: Some("heun".into()),
+            temporal_upsample_rounds: Some(1),
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            num_generated_keyframes: Some(1),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![img.clone()],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            frames: Some(1),
+            num_generated_keyframes: Some(1),
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            frames: None,
+            auto_duration: None,
+            num_generated_keyframes: Some(1),
+            ..base_25.clone()
+        },
+        GenerationRequest {
+            frames: Some(1),
+            temporal_upsample_rounds: Some(1),
+            ..base_25.clone()
+        },
+    ] {
+        assert!(
+            Generator::validate(&distilled, &invalid_distilled).is_err(),
+            "2.5 distilled pre-load validate must refuse {invalid_distilled:?}"
+        );
+    }
+
+    // Auto-duration without explicit frames still validates DFR while rejecting curated non-Euler
+    // samplers pre-load.
+    let auto_dfr = GenerationRequest {
+        frames: None,
+        auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+            min_seconds: 1.0,
+            max_seconds: 2.0,
+        }),
+        num_generated_keyframes: Some(1),
+        ..base_25.clone()
+    };
+    assert!(Generator::validate(&distilled, &auto_dfr).is_ok());
+    assert!(Generator::validate(
+        &distilled,
+        &GenerationRequest {
+            sampler: Some("heun".into()),
+            ..auto_dfr
+        }
+    )
+    .is_err());
+
+    let dev = weights_free_ltx25(TransformerVariant::Dev);
+    assert!(Generator::validate(
+        &dev,
+        &GenerationRequest {
+            steps: Some(30),
+            negative_prompt: Some("blurry".into()),
+            ..base_25.clone()
+        }
+    )
+    .is_ok());
+    assert!(Generator::validate(
+        &dev,
+        &GenerationRequest {
+            sampler: Some("heun".into()),
+            steps: Some(30),
+            ..base_25.clone()
+        }
+    )
+    .is_err());
+    assert!(Generator::validate(
+        &dev,
+        &GenerationRequest {
+            steps: Some(NATIVE_STEPS),
+            ..base_25
+        }
+    )
+    .is_err());
+}

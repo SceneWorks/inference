@@ -156,7 +156,8 @@ pub mod driver;
 pub use driver::{
     run_candle_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
     DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, GlobalRngTrajectoryGate,
-    GlobalRngTrajectoryLease, SliceInput, SliceSpec, SliceTransition, StepHooks,
+    GlobalRngTrajectoryLease, MultiStreamStepInfo, SliceInput, SliceSpec, SliceTransition,
+    StepHooks, StreamId, StreamObserveHook, StreamStepSigma,
 };
 
 /// Attempt-local observations of completed provider execution.

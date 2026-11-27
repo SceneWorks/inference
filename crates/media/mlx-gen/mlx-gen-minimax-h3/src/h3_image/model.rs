@@ -259,6 +259,7 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
     } else {
         caps.validate_request(IMAGE_MODEL_ID, req)?;
     }
+    let _plan = crate::drivers::render_image_plan_for_request(req)?;
     Ok(())
 }
 

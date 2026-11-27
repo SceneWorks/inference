@@ -27,7 +27,13 @@
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::driver::{
+    run_mlx_driver_slices, DriverEvaluationKind, DriverHistoryPolicy, DriverRefusalReasons,
+    DriverRunState, DriverStepInfo, DriverSupport, FamilyDriver, SliceInput, SliceSpec,
+    SliceTransition, StepHooks,
+};
+use mlx_gen::gen_core::BoundaryState;
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 
 use crate::clip_diff::DiffLossFm;
 use crate::connector::MlpConnector;
@@ -251,6 +257,282 @@ fn stream_for_vit(
     connector.for_vit(&take_seq(&hidden, &s.gen_idx)?)
 }
 
+/// Forward-evaluation seam for [`BerniniMarPlannerDriver`] (`PIPE-7`, `DEC-13`).
+pub trait BerniniMarForward {
+    /// Run the 3 planner streams `[cond, uncond, imgcond]` over the current partially-filled
+    /// `target` `[1, n_query, H]` and return `[cond_vit, uncond_vit, imgcond_vit]`.
+    fn forward_streams(&self, target: &Array) -> Result<[Array; 3]>;
+
+    /// Run triple-CFG `clip_diff.sample` on `z` `[3 * np, H_vit]` with base noise `noise`.
+    fn sample_clip_diff(
+        &self,
+        z: &Array,
+        txt_cfg: f32,
+        steps: usize,
+        img_cfg: Option<f32>,
+        noise: &Array,
+    ) -> Result<Array>;
+}
+
+struct PlannerMarForward<'a> {
+    backbone: &'a Qwen25VlText,
+    connector: &'a MlpConnector,
+    clip_diff: std::cell::RefCell<&'a mut DiffLossFm>,
+    cond: &'a StreamState,
+    uncond: &'a StreamState,
+    imgcond: &'a StreamState,
+}
+
+impl BerniniMarForward for PlannerMarForward<'_> {
+    fn forward_streams(&self, target: &Array) -> Result<[Array; 3]> {
+        Ok([
+            stream_for_vit(self.backbone, self.connector, self.cond, target)?,
+            stream_for_vit(self.backbone, self.connector, self.uncond, target)?,
+            stream_for_vit(self.backbone, self.connector, self.imgcond, target)?,
+        ])
+    }
+
+    fn sample_clip_diff(
+        &self,
+        z: &Array,
+        txt_cfg: f32,
+        steps: usize,
+        img_cfg: Option<f32>,
+        noise: &Array,
+    ) -> Result<Array> {
+        self.clip_diff
+            .borrow_mut()
+            .sample(z, txt_cfg, steps, img_cfg, noise)
+    }
+}
+
+struct BerniniMarHistory {
+    n_query: i32,
+    planning_step: usize,
+    order: Vec<i32>,
+    hidden: i32,
+    expected_next_step: usize,
+}
+
+/// Typed [`FamilyDriver`] for Bernini's MaskGIT/MAR semantic planning stage (`PIPE-7`, `DEC-13`).
+pub struct BerniniMarPlannerDriver<F> {
+    n_query: i32,
+    hidden: i32,
+    cfg: VitCfg,
+    order: Vec<i32>,
+    schedule: Vec<Vec<i32>>,
+    step_noise: Vec<Array>,
+    forward: F,
+    support: DriverSupport,
+}
+
+impl<F: BerniniMarForward> BerniniMarPlannerDriver<F> {
+    fn build_support(driver_id: &'static str) -> DriverSupport {
+        DriverSupport {
+            driver_id,
+            arbitrary_slice: true,
+            carry_history: true,
+            reset_history: true,
+            renoise_from_clean: false,
+            geometry_change: false,
+            read_only_boundary_estimate: false,
+            previous_estimate_capture: false,
+            uses_global_rng: false,
+            refusal_reasons: DriverRefusalReasons {
+                renoise_from_clean:
+                    "native MLX Bernini MAR driver does not re-noise from clean estimates",
+                geometry_change:
+                    "native MLX Bernini MAR driver does not support geometry-changing phase boundaries",
+                read_only_boundary_estimate:
+                    "native MLX Bernini MAR driver does not expose read-only boundary clean estimates",
+                ..DriverRefusalReasons::default()
+            },
+        }
+    }
+
+    pub fn new(
+        driver_id: &'static str,
+        n_query: i32,
+        hidden: i32,
+        cfg: VitCfg,
+        order: Vec<i32>,
+        step_noise: Vec<Array>,
+        forward: F,
+    ) -> Result<Self> {
+        if n_query <= 0 || order.len() != n_query as usize {
+            return Err(Error::Msg(format!(
+                "{driver_id}: order len {} must match positive n_query {n_query}",
+                order.len()
+            )));
+        }
+        if cfg.planning_step == 0 || step_noise.len() < cfg.planning_step {
+            return Err(Error::Msg(format!(
+                "{driver_id}: step_noise len {} must cover planning_step={}",
+                step_noise.len(),
+                cfg.planning_step
+            )));
+        }
+        let schedule = mar_schedule(n_query, cfg.planning_step, &order);
+        Ok(Self {
+            n_query,
+            hidden,
+            cfg,
+            order,
+            schedule,
+            step_noise,
+            forward,
+            support: Self::build_support(driver_id),
+        })
+    }
+
+    fn mask_ratio(planning_step: usize, step: usize) -> f32 {
+        (std::f64::consts::PI / 2.0 * step as f64 / planning_step.max(1) as f64).cos() as f32
+    }
+}
+
+impl<F: BerniniMarForward> FamilyDriver<Array> for BerniniMarPlannerDriver<F> {
+    fn support(&self) -> &DriverSupport {
+        &self.support
+    }
+
+    fn run_slice(
+        &self,
+        input: SliceInput<'_, Array>,
+        state: &mut DriverRunState,
+        hooks: &mut StepHooks<'_, Array>,
+    ) -> mlx_gen::gen_core::Result<BoundaryState<Array>> {
+        self.support.validate_slice(&input, state)?;
+        let total_steps = self.cfg.planning_step;
+        if input.total_steps != total_steps || input.span.end > total_steps {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: slice {:?} / total_steps={} disagrees with MAR planning steps {total_steps}",
+                self.support.driver_id, input.span, input.total_steps
+            )));
+        }
+
+        let carrying = input.transition == SliceTransition::Continue
+            && input.history == DriverHistoryPolicy::Carry;
+        if carrying {
+            let Some(existing) = state.history_ref::<BerniniMarHistory>() else {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry requested without prior Bernini MAR history in DriverRunState",
+                    self.support.driver_id
+                )));
+            };
+            if existing.n_query != self.n_query
+                || existing.planning_step != self.cfg.planning_step
+                || existing.order != self.order
+                || existing.hidden != self.hidden
+            {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused across incompatible Bernini MAR schedule or permutation",
+                    self.support.driver_id
+                )));
+            }
+            if existing.expected_next_step != input.span.start {
+                return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{}: Carry refused at non-contiguous MAR step {} (expected {})",
+                    self.support.driver_id, input.span.start, existing.expected_next_step
+                )));
+            }
+        }
+
+        state.enter_slice(&input)?;
+        if !carrying {
+            state.set_history(BerniniMarHistory {
+                n_query: self.n_query,
+                planning_step: self.cfg.planning_step,
+                order: self.order.clone(),
+                hidden: self.hidden,
+                expected_next_step: input.span.start,
+            });
+        }
+
+        let mut target = match input.state {
+            BoundaryState::XSigma(x)
+            | BoundaryState::CleanEstimate { latent: x, .. }
+            | BoundaryState::RouteSpecific { state: x, .. } => x,
+        };
+        if target.shape() != [1, self.n_query, self.hidden] {
+            return Err(mlx_gen::gen_core::Error::Msg(format!(
+                "{}: expected MAR target shape [1, {}, {}], got {:?}",
+                self.support.driver_id,
+                self.n_query,
+                self.hidden,
+                target.shape()
+            )));
+        }
+
+        for step in input.span.clone() {
+            if input.cancel.is_cancelled() {
+                return Err(mlx_gen::gen_core::Error::Canceled);
+            }
+            let info = DriverStepInfo {
+                pass: input.pass,
+                phase: input.phase,
+                outer_step: step,
+                total_outer_steps: input.total_steps,
+                eval_in_step: 0,
+                kind: DriverEvaluationKind::Trajectory,
+                sigma: Self::mask_ratio(total_steps, step),
+                next_sigma: Self::mask_ratio(total_steps, step + 1),
+            };
+            hooks.observe(&info, &target)?;
+
+            let [cond_vit, uncond_vit, imgcond_vit] = self
+                .forward
+                .forward_streams(&target)
+                .map_err(mlx_gen::gen_core::Error::from)?;
+            state.record_evaluation(DriverEvaluationKind::Trajectory);
+
+            let revealed = &self.schedule[step];
+            // `nonzero().sum() == 0` -> nothing to predict this step (empty, or {token 0} only).
+            if revealed.iter().sum::<i32>() != 0 {
+                let np = revealed.len() as i32;
+                let hv = cond_vit.shape()[2];
+                let c = take_seq(&cond_vit, revealed).map_err(mlx_gen::gen_core::Error::from)?;
+                let u = take_seq(&uncond_vit, revealed).map_err(mlx_gen::gen_core::Error::from)?;
+                let ic =
+                    take_seq(&imgcond_vit, revealed).map_err(mlx_gen::gen_core::Error::from)?;
+                let z = concatenate_axis(&[&c, &u, &ic], 1)
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?
+                    .reshape(&[3 * np, hv])
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+
+                let sampled = self
+                    .forward
+                    .sample_clip_diff(
+                        &z,
+                        self.cfg.vit_txt_cfg,
+                        self.cfg.vit_denoising_step,
+                        Some(self.cfg.vit_img_cfg),
+                        &self.step_noise[step],
+                    )
+                    .map_err(mlx_gen::gen_core::Error::from)?;
+                let cur = take_first_rows(&sampled, np)
+                    .map_err(mlx_gen::gen_core::Error::from)?
+                    .reshape(&[1, np, self.hidden])
+                    .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+                target = scatter_rows(&target, revealed, &cur)
+                    .map_err(mlx_gen::gen_core::Error::from)?;
+            }
+
+            target = hooks.post_step(&info, target)?;
+            mlx_rs::transforms::eval([&target])
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+            hooks.materialize(&info, &target)?;
+            if let Some(history) = state.history_mut::<BerniniMarHistory>() {
+                history.expected_next_step = step + 1;
+            }
+            state.record_outer_step(step);
+            hooks.emit_progress(&info);
+        }
+
+        state.finish_slice(input.span.end);
+        Ok(BoundaryState::XSigma(target))
+    }
+}
+
 /// The MAR planning loop (`sample_vit_embed`): fill the target ViT tokens over `cfg.planning_step`
 /// MaskGIT steps, then run the planner→renderer handoff ([`four_streams`]).
 ///
@@ -288,50 +570,51 @@ pub fn sample_vit_embed(
     );
 
     // Single shared target buffer, init = mask_token broadcast over the n_query target slots.
-    let mut target = mlx_rs::ops::broadcast_to(mask_token, &[1, n_query, h])?;
-
-    for (step, revealed) in schedule.iter().enumerate() {
-        // Honor the engine cancellation contract (F-003): the MAR planning loop runs 3 backbone
-        // passes per step over `planning_step` (default 25) steps — check before each.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    let initial_target = mlx_rs::ops::broadcast_to(mask_token, &[1, n_query, h])?;
+    let forward = PlannerMarForward {
+        backbone,
+        connector,
+        clip_diff: std::cell::RefCell::new(clip_diff),
+        cond,
+        uncond,
+        imgcond,
+    };
+    let driver = BerniniMarPlannerDriver::new(
+        "bernini_mlx_mar_planner_driver",
+        n_query,
+        h,
+        VitCfg {
+            planning_step: cfg.planning_step,
+            vit_denoising_step: cfg.vit_denoising_step,
+            vit_txt_cfg: cfg.vit_txt_cfg,
+            vit_img_cfg: cfg.vit_img_cfg,
+        },
+        order.to_vec(),
+        step_noise.to_vec(),
+        forward,
+    )?;
+    let mut state = DriverRunState::new();
+    let mut progress_adapter = |progress: Progress| {
+        if let Progress::Step { current, .. } = progress {
+            on_step(current as usize);
         }
-        // 1-based planner-stage progress (F-038) — emitted for every iteration (skipped-reveal
-        // steps still run the 3 backbone forwards below).
-        on_step(step + 1);
-        // Every step runs all 3 backbones over the current (partially-filled) embeds.
-        let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
-        let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;
-        let imgcond_vit = stream_for_vit(backbone, connector, imgcond, &target)?;
-
-        // `nonzero().sum() == 0` → nothing to predict this step (empty, or {token 0} only).
-        if revealed.iter().sum::<i32>() == 0 {
-            continue;
-        }
-        let np = revealed.len() as i32;
-        let hv = cond_vit.shape()[2];
-
-        // z = cat([cond, uncond, imgcond], dim=1)[0] → [3·np, H_vit] (pre-tiled triple-CFG cond).
-        let c = take_seq(&cond_vit, revealed)?;
-        let u = take_seq(&uncond_vit, revealed)?;
-        let ic = take_seq(&imgcond_vit, revealed)?;
-        let z = concatenate_axis(&[&c, &u, &ic], 1)?.reshape(&[3 * np, hv])?;
-
-        // Triple-CFG denoise; take the first third (the cond tile) → [1, np, H].
-        let sampled = clip_diff.sample(
-            &z,
-            cfg.vit_txt_cfg,
-            cfg.vit_denoising_step,
-            Some(cfg.vit_img_cfg),
-            &step_noise[step],
-        )?;
-        let cur = take_first_rows(&sampled, np)?.reshape(&[1, np, h])?;
-
-        target = scatter_rows(&target, revealed, &cur)?;
-        // Bound the planner graph per step (the MAR loop has no other per-step eval) so the next
-        // iteration's cancel check sees realized compute and in-flight work is freed (F-003).
-        mlx_rs::transforms::eval([&target])?;
-    }
+    };
+    let mut hooks = StepHooks::new(&mut progress_adapter);
+    let out = run_mlx_driver_slices(
+        &driver,
+        [SliceSpec::full(cfg.planning_step)],
+        BoundaryState::XSigma(initial_target),
+        cfg.planning_step,
+        0,
+        cancel,
+        None,
+        &mut state,
+        &mut hooks,
+        |_, out, _| Ok(out),
+    )?;
+    let BoundaryState::XSigma(target) = out else {
+        unreachable!("BerniniMarPlannerDriver always emits BoundaryState::XSigma");
+    };
 
     // ---- handoff: final cond + uncond forwards → feat_from_planner_to_renderer → 4 streams ----
     let cond_embeds = splice_target(cond, &target)?;
@@ -410,5 +693,173 @@ mod tests {
         let order = [4, 0, 2, 5, 1, 3];
         let sched = mar_schedule(6, 4, &order);
         assert_eq!(sched[0], vec![3]); // order[5] = 3, sorted singleton
+    }
+
+    struct MockMarForward {
+        forward_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        clip_diff_calls: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl BerniniMarForward for MockMarForward {
+        fn forward_streams(&self, target: &Array) -> Result<[Array; 3]> {
+            self.forward_calls.set(self.forward_calls.get() + 1);
+            let c = add(target, Array::from_f32(0.1))?;
+            let u = multiply(target, Array::from_f32(0.5))?;
+            let ic = subtract(target, Array::from_f32(0.05))?;
+            Ok([c, u, ic])
+        }
+
+        fn sample_clip_diff(
+            &self,
+            z: &Array,
+            txt_cfg: f32,
+            steps: usize,
+            img_cfg: Option<f32>,
+            noise: &Array,
+        ) -> Result<Array> {
+            let np = z.shape()[0] / 3;
+            let hv = z.shape()[1];
+            self.clip_diff_calls.borrow_mut().push(np as usize);
+            let cond = take_first_rows(z, np)?;
+            let scale = txt_cfg + img_cfg.unwrap_or(1.0) + steps as f32 * 0.01;
+            let blended = add(
+                &multiply(&cond, Array::from_f32(0.25))?,
+                &multiply(&noise.reshape(&[np, hv])?, Array::from_f32(0.1 * scale))?,
+            )?;
+            concatenate_axis(&[&blended, &blended, &blended], 0).map_err(Into::into)
+        }
+    }
+
+    fn mlx_bit_equal(a: &Array, b: &Array) -> bool {
+        let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&af, &bf]).unwrap();
+        if af.shape() != bf.shape() {
+            return false;
+        }
+        af.as_slice::<f32>()
+            .iter()
+            .zip(bf.as_slice::<f32>().iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn mar_planner_driver_passes_conformance_and_preserves_zero_skip_quirk() {
+        use mlx_gen::driver::conformance::{verify_driver_conformance, ConformanceCase};
+
+        // Include lone token 0 at step 0 (order tail = 0) to prove `{token 0}` skip quirk skips
+        // `sample_clip_diff` without crashing conformance or consuming noise.
+        let order = vec![4, 1, 5, 2, 3, 0];
+        let n_query = order.len() as i32;
+        let hidden = 4i32;
+        let planning_step = 4usize;
+        let schedule = mar_schedule(n_query, planning_step, &order);
+        assert_eq!(schedule[0], vec![0]);
+
+        let mask_token = Array::from_slice(&[-1.0f32, -0.5, 0.5, 1.0], &[1, 1, hidden]);
+        let init_target = mlx_rs::ops::broadcast_to(&mask_token, &[1, n_query, hidden]).unwrap();
+        let step_noise: Vec<Array> = schedule
+            .iter()
+            .enumerate()
+            .map(|(s, rev)| {
+                let np = rev.len().max(1) as i32;
+                let vals: Vec<f32> = (0..(np * hidden))
+                    .map(|k| 0.01 * (s as f32 + 1.0) + 0.001 * k as f32)
+                    .collect();
+                Array::from_slice(&vals, &[np, hidden])
+            })
+            .collect();
+
+        let report = verify_driver_conformance(ConformanceCase {
+            total_steps: planning_step,
+            split_at: 2,
+            seed: 42,
+            base_geometry: (256, 256),
+            alt_geometry: (512, 512),
+            make_driver: || {
+                let forward = MockMarForward {
+                    forward_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    clip_diff_calls: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                };
+                Box::new(
+                    BerniniMarPlannerDriver::new(
+                        "bernini_mlx_mar_test",
+                        n_query,
+                        hidden,
+                        VitCfg {
+                            planning_step,
+                            vit_denoising_step: 3,
+                            vit_txt_cfg: 1.4,
+                            vit_img_cfg: 1.2,
+                        },
+                        order.clone(),
+                        step_noise.clone(),
+                        forward,
+                    )
+                    .unwrap(),
+                )
+            },
+            make_initial: || init_target.clone(),
+            latents_equal: mlx_bit_equal,
+        })
+        .unwrap();
+        assert_eq!(report.total_steps, planning_step);
+        assert!(report.verified_inert_split);
+
+        // Verify lone `{token 0}` skip quirk runs backbone forwards but skips `sample_clip_diff`.
+        let sentinel = Array::zeros::<f32>(&[1, 1]).unwrap();
+        let mut poison_noise = step_noise;
+        poison_noise[0] = sentinel;
+        let forward_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clip_diff_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = MockMarForward {
+            forward_calls: forward_calls.clone(),
+            clip_diff_calls: clip_diff_calls.clone(),
+        };
+        let drv = BerniniMarPlannerDriver::new(
+            "bernini_mlx_mar_skip_probe",
+            n_query,
+            hidden,
+            VitCfg {
+                planning_step,
+                vit_denoising_step: 3,
+                vit_txt_cfg: 1.4,
+                vit_img_cfg: 1.2,
+            },
+            order,
+            poison_noise,
+            probe,
+        )
+        .unwrap();
+        let mut st = DriverRunState::new();
+        let cancel = CancelFlag::default();
+        let mut progress = Vec::new();
+        let mut on_p = |p: Progress| progress.push(p);
+        let mut hooks = StepHooks::new(&mut on_p);
+        let out = run_mlx_driver_slices(
+            &drv,
+            [SliceSpec::full(planning_step)],
+            BoundaryState::XSigma(init_target),
+            planning_step,
+            0,
+            &cancel,
+            None,
+            &mut st,
+            &mut hooks,
+            |_, out, _| Ok(out),
+        )
+        .unwrap();
+        let BoundaryState::XSigma(final_target) = out else {
+            panic!("expected XSigma");
+        };
+        mlx_rs::transforms::eval([&final_target]).unwrap();
+        // Step 0 (`{0}`) was skipped so slot 0 still holds `mask_token` verbatim.
+        assert_eq!(
+            &final_target.as_slice::<f32>()[..4],
+            mask_token.as_slice::<f32>()
+        );
+        assert_eq!(progress.len(), planning_step);
+        assert_eq!(forward_calls.get(), planning_step);
+        assert_eq!(clip_diff_calls.borrow().len(), planning_step - 1);
     }
 }

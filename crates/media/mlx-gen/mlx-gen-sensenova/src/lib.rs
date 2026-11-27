@@ -68,8 +68,12 @@ pub use model::{
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
 pub use t2i::{
-    interleave_resolution_for, smart_resize, CfgNorm, InterleaveOutput, T2iModel, T2iOptions,
-    T2iOutput, INTERLEAVE_RESOLUTIONS,
+    compile_interleave_conditional_plan, compile_interleave_conditional_plan_from_shape,
+    default_interleave_ceilings, interleave_resolution_for, pre_load_interleave_conditional_plan,
+    run_sensenova_interleave_ops, smart_resize, source_image_geometry, CfgNorm, InterleaveContext,
+    InterleaveOutput, InterleavePrefill, SenseNovaCfgMode, SenseNovaFmDriver,
+    SenseNovaInterleaveExecutor, SenseNovaInterleaveOps, SenseNovaVelocityForward, T2iModel,
+    T2iOptions, T2iOutput, INTERLEAVE_RESOLUTIONS,
 };
 pub use text::{
     build_neo1_query, image_indexes, load_tokenizer, text_indexes, INTERLEAVE_SYSTEM_MESSAGE,

@@ -62,6 +62,7 @@ pub mod dev_sampler;
 pub mod dfr;
 pub mod diff_vae;
 pub mod dit_train;
+pub mod drivers;
 pub mod duration_head;
 pub mod gemma;
 pub mod gemma4_te;
@@ -1157,6 +1158,19 @@ impl Pipeline {
             &mut predict,
         )?
         .unwrap_or(DEFAULT_FRAMES);
+        let family = if self.split_bundle.is_some() {
+            gen_core_ltx::LtxModelFamily::Ltx25
+        } else {
+            gen_core_ltx::LtxModelFamily::Ltx23
+        };
+        let _render_plan = drivers::render_plan_for_request(
+            family,
+            self.transformer_variant,
+            req,
+            frames,
+            fps as f32,
+            comps.temporal_upsampler.is_some(),
+        )?;
         let uses_dfr = req.num_generated_keyframes.is_some_and(|count| count > 0)
             || req
                 .temporal_upsample_rounds
@@ -1382,14 +1396,38 @@ impl Pipeline {
 
         // The denoised half-resolution latent enters the learned upsampler in
         // VAE space, then returns to DiT-normalized space before fresh stage-two
-        // video/audio re-noise. Never substitute interpolation or a second pass
-        // on the stage-one model output.
+        // video/audio re-noise. Guard both boundaries with explicit `StreamTransition`
+        // contracts (`PIPE-4`) alongside `TwoStageOrchestration`.
+        let v_upsample_tr = pipeline::stage2_video_upsample_transition(384 * 1024 * 1024)?;
+        let v_renoise_tr = pipeline::stage2_stream_renoise_transition(
+            candle_gen::driver::StreamId::Video,
+            "stage1_to_stage2_video_renoise",
+        )?;
+        let a_renoise_tr = pipeline::stage2_stream_renoise_transition(
+            candle_gen::driver::StreamId::Audio,
+            "stage1_to_stage2_audio_renoise",
+        )?;
         let upsampled = orchestration.learned_upsample(|| {
-            Ok(comps.vae.normalize_latents(
-                &comps
-                    .upsampler
-                    .forward(&comps.vae.denormalize_latents(&vlat)?)?,
-            )?)
+            let candle_gen::gen_core::BoundaryState::CleanEstimate { latent, .. } =
+                drivers::apply_candle_stream_transition(
+                    candle_gen::driver::StreamId::Video,
+                    &v_upsample_tr,
+                    candle_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: vlat,
+                        source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                    },
+                    |clean| {
+                        Ok(comps.vae.normalize_latents(
+                            &comps
+                                .upsampler
+                                .forward(&comps.vae.denormalize_latents(&clean)?)?,
+                        )?)
+                    },
+                )?
+            else {
+                unreachable!();
+            };
+            Ok(latent)
         })?;
         let stage2_video_noise = pipeline::create_noise(
             stage_seeds.video_stage2,
@@ -1409,10 +1447,45 @@ impl Pipeline {
         )?;
         let (stage2_initial, stage2_scales) =
             orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
-                Ok(AvLatents {
-                    video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
-                    audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
-                })
+                let candle_gen::gen_core::BoundaryState::XSigma(video) =
+                    drivers::apply_candle_stream_transition(
+                        candle_gen::driver::StreamId::Video,
+                        &v_renoise_tr,
+                        candle_gen::gen_core::BoundaryState::CleanEstimate {
+                            latent: upsampled.clone(),
+                            source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                        },
+                        |clean| {
+                            Ok(pipeline::renoise(
+                                &clean,
+                                &stage2_video_noise,
+                                STAGE2_SIGMAS[0],
+                            )?)
+                        },
+                    )?
+                else {
+                    unreachable!();
+                };
+                let candle_gen::gen_core::BoundaryState::XSigma(audio) =
+                    drivers::apply_candle_stream_transition(
+                        candle_gen::driver::StreamId::Audio,
+                        &a_renoise_tr,
+                        candle_gen::gen_core::BoundaryState::CleanEstimate {
+                            latent: alat,
+                            source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                        },
+                        |clean| {
+                            Ok(pipeline::renoise(
+                                &clean,
+                                &stage2_audio_noise,
+                                STAGE2_SIGMAS[0],
+                            )?)
+                        },
+                    )?
+                else {
+                    unreachable!();
+                };
+                Ok(AvLatents { video, audio })
             })?;
         let mut stage2_fold = pipeline::StageProgressFold::new(stage1_steps, 3, total_steps);
         let mut stage2_progress = |event: Progress| {
@@ -1596,22 +1669,25 @@ fn needs_ltx_vae_encoder(req: &GenerationRequest) -> bool {
     !req.conditioning.is_empty()
 }
 
-impl Generator for LtxGenerator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
-        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
-        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
-        // same way).
-        //
-        // These run BEFORE the shared floor on purpose (sc-18778) — see the matching comment in
-        // `mlx-gen-ltx`'s `validate_request`. The floor refuses the same knobs from this
-        // descriptor's (defaulted-off) `supports_generated_keyframes` /
-        // `max_temporal_upsample_rounds`; going first only preserves the message that names the
-        // checkpoint generation which does support them.
+fn validate_ltx_request(
+    model_id: &str,
+    caps: &Capabilities,
+    family: gen_core_ltx::LtxModelFamily,
+    variant: TransformerVariant,
+    has_temporal_upsampler: bool,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+    // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
+    // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
+    // same way).
+    //
+    // These run BEFORE the shared floor on purpose (sc-18778) — see the matching comment in
+    // `mlx-gen-ltx`'s `validate_request`. The floor refuses the same knobs from this
+    // descriptor's (defaulted-off) `supports_generated_keyframes` /
+    // `max_temporal_upsample_rounds`; going first only preserves the message that names the
+    // checkpoint generation which does support them.
+    if family == gen_core_ltx::LtxModelFamily::Ltx23 {
         if req.num_generated_keyframes.is_some_and(|n| n > 0) {
             return Err(gen_core::Error::Unsupported(
                 "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
@@ -1626,207 +1702,229 @@ impl Generator for LtxGenerator {
                     .into(),
             ));
         }
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg("ltx: prompt must not be empty".into()));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+    }
+    caps.validate_request(model_id, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: prompt must not be empty"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if let Some(f) = req.frames {
+        if f == 0 || f % config::TEMPORAL_SCALE as u32 != 1 {
             return Err(gen_core::Error::Msg(format!(
-                "ltx: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
+                "{model_id}: frames must satisfy frames % {} == 1 (got {f})",
+                config::TEMPORAL_SCALE
             )));
         }
-        if let Some(f) = req.frames {
-            if f == 0 || f % config::TEMPORAL_SCALE as u32 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "ltx: frames must satisfy frames % {} == 1 (got {f})",
-                    config::TEMPORAL_SCALE
-                )));
-            }
+    }
+    let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: {label} strength must be finite and in [0,1] (got {strength})"
+            )));
         }
-        let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
-            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
-                return Err(gen_core::Error::Msg(format!(
-                    "ltx: {label} strength must be finite and in [0,1] (got {strength})"
-                )));
-            }
-            Ok(())
-        };
-        if let Some(strength) = req.strength {
-            check_strength("image", strength)?;
-        }
-        for entry in &req.conditioning {
-            match entry {
-                Conditioning::Reference {
-                    strength: Some(strength),
-                    ..
-                } => check_strength("reference", *strength)?,
-                Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
-                Conditioning::VideoClip {
-                    frames, strength, ..
-                } => {
-                    check_strength("clip", *strength)?;
-                    if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
-                        return Err(gen_core::Error::Msg(format!(
-                            "ltx: conditioning clip frame count must equal 1 + k*{} (got {})",
-                            config::TEMPORAL_SCALE,
-                            frames.len()
-                        )));
-                    }
-                }
-                Conditioning::ControlClip {
-                    frames,
-                    mask,
-                    masking_strength,
-                    ..
-                } => {
-                    check_strength("replace-person masking", *masking_strength)?;
-                    if frames.len() != mask.len() {
-                        return Err(gen_core::Error::Msg(format!(
-                            "ltx: replace-person frame count {} does not match mask count {}",
-                            frames.len(),
-                            mask.len()
-                        )));
-                    }
-                    if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
-                        return Err(gen_core::Error::Msg(format!(
-                            "ltx: replace-person clip frame count must equal 1 + k*{} (got {})",
-                            config::TEMPORAL_SCALE,
-                            frames.len()
-                        )));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !req.conditioning.is_empty()
-            && !matches!(
-                req.sampler.as_deref(),
-                None | Some("euler") | Some("rectified-flow")
-            )
-        {
-            return Err(gen_core::Error::Unsupported(
-                "ltx conditioned video uses native distilled Euler; choose euler/rectified-flow or leave sampler unset"
-                    .into(),
-            ));
-        }
-        // Bound the AvDiT denoise sequence length (F-131, sc-11234). The checks above bound only the
-        // frame *shape*, never its magnitude, so a huge frame count (e.g. `frames: 2001`, which
-        // satisfies `% 8 == 1`) at a large resolution produced ~400k latent tokens and OOM'd deep in
-        // the 22B denoise loop rather than failing catchably here. The video latent token count
-        // `t_lat · h_lat · w_lat` is the memory driver (self-attn working set + per-token q/k/v across
-        // 48 layers); cap it against the GPU envelope. Uses the effective frame count (the render
-        // default when `None`) and the already-validated (mult-of-32) width/height.
-        let eff_frames = req.frames.unwrap_or(DEFAULT_FRAMES);
-        let (t_lat, h_lat, w_lat) = pipeline::latent_dims(eff_frames, req.width, req.height);
-        let resolve_idx = |raw: i32, label: &str| -> gen_core::Result<()> {
-            let resolved = if raw < 0 { t_lat as i32 + raw } else { raw };
-            if resolved < 0 || resolved >= t_lat as i32 {
-                return Err(gen_core::Error::Msg(format!(
-                    "ltx: {label} latent frame index {raw} is out of bounds for {t_lat} frames"
-                )));
-            }
-            Ok(())
-        };
-        let mut reference_count = 0usize;
-        let mut multi_references: Option<&[Image]> = None;
-        let mut control_clip_count = 0usize;
-        let mut appended_frames = 0usize;
-        for entry in &req.conditioning {
-            match entry {
-                Conditioning::Reference { .. } => reference_count += 1,
-                Conditioning::MultiReference { images } => {
-                    if multi_references.replace(images.as_slice()).is_some() {
-                        return Err(gen_core::Error::Msg(
-                            "ltx: replace_person accepts exactly one ordered MultiReference carrier"
-                                .into(),
-                        ));
-                    }
-                }
-                Conditioning::Keyframe { frame_idx, .. } => resolve_idx(*frame_idx, "keyframe")?,
-                Conditioning::VideoClip {
-                    frames, frame_idx, ..
-                } => {
-                    resolve_idx(*frame_idx, "clip")?;
-                    appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
-                }
-                Conditioning::ControlClip {
-                    frames,
-                    start_frame,
-                    ..
-                } => {
-                    control_clip_count += 1;
-                    resolve_idx(*start_frame, "replace-person")?;
-                    appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
-                }
-                _ => {}
-            }
-        }
-        if reference_count > 1 {
-            return Err(gen_core::Error::Msg(
-                "ltx: multiple Reference images are not supported; use Keyframe entries".into(),
-            ));
-        }
-        if control_clip_count > 1 {
-            return Err(gen_core::Error::Msg(
-                "ltx: exactly one ControlClip can be applied per request".into(),
-            ));
-        }
-        let replace_person = control_clip_count == 1 || multi_references.is_some();
-        if replace_person {
-            if control_clip_count != 1 {
-                return Err(gen_core::Error::Msg(
-                    "ltx: replace_person requires exactly one ControlClip".into(),
-                ));
-            }
-            let Some(images) = multi_references else {
-                return Err(gen_core::Error::Msg(
-                    "ltx: replace_person requires exactly one ordered MultiReference carrier"
-                        .into(),
-                ));
-            };
-            if reference_count != 0
-                || req.conditioning.iter().any(|entry| {
-                    matches!(
-                        entry,
-                        Conditioning::Keyframe { .. } | Conditioning::VideoClip { .. }
-                    )
-                })
-            {
-                return Err(gen_core::Error::Msg(
-                    "ltx: replace_person cannot be mixed with Reference, Keyframe, or VideoClip conditioning"
-                        .into(),
-                ));
-            }
-            conditioning::compose_ordered_character_references(images, req.width, req.height)
-                .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
-            if let Some(control) = req.control_clip() {
-                if control.start_frame != 0 {
+        Ok(())
+    };
+    if let Some(strength) = req.strength {
+        check_strength("image", strength)?;
+    }
+    for entry in &req.conditioning {
+        match entry {
+            Conditioning::Reference {
+                strength: Some(strength),
+                ..
+            } => check_strength("reference", *strength)?,
+            Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
+            Conditioning::VideoClip {
+                frames, strength, ..
+            } => {
+                check_strength("clip", *strength)?;
+                if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
                     return Err(gen_core::Error::Msg(format!(
-                        "ltx: replace_person ControlClip must start at latent frame 0 (got {})",
-                        control.start_frame
+                        "{model_id}: conditioning clip frame count must equal 1 + k*{} (got {})",
+                        config::TEMPORAL_SCALE,
+                        frames.len()
                     )));
                 }
             }
+            Conditioning::ControlClip {
+                frames,
+                mask,
+                masking_strength,
+                ..
+            } => {
+                check_strength("replace-person masking", *masking_strength)?;
+                if frames.len() != mask.len() {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: replace-person frame count {} does not match mask count {}",
+                        frames.len(),
+                        mask.len()
+                    )));
+                }
+                if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: replace-person clip frame count must equal 1 + k*{} (got {})",
+                        config::TEMPORAL_SCALE,
+                        frames.len()
+                    )));
+                }
+            }
+            _ => {}
         }
-        let tokens = (t_lat + appended_frames) * h_lat * w_lat;
-        let max_tokens = config::max_latent_tokens();
-        if tokens > max_tokens {
+    }
+    if !req.conditioning.is_empty()
+        && !matches!(
+            req.sampler.as_deref(),
+            None | Some("euler") | Some("rectified-flow")
+        )
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id} conditioned video uses native distilled Euler; choose euler/rectified-flow or leave sampler unset"
+        )));
+    }
+    // Bound the AvDiT denoise sequence length (F-131, sc-11234). The checks above bound only the
+    // frame *shape*, never its magnitude, so a huge frame count (e.g. `frames: 2001`, which
+    // satisfies `% 8 == 1`) at a large resolution produced ~400k latent tokens and OOM'd deep in
+    // the 22B denoise loop rather than failing catchably here. The video latent token count
+    // `t_lat · h_lat · w_lat` is the memory driver (self-attn working set + per-token q/k/v across
+    // 48 layers); cap it against the GPU envelope. Uses the effective frame count (the render
+    // default when `None`) and the already-validated (mult-of-32) width/height.
+    let eff_frames = req.frames.unwrap_or(DEFAULT_FRAMES);
+    let (t_lat, h_lat, w_lat) = pipeline::latent_dims(eff_frames, req.width, req.height);
+    let resolve_idx = |raw: i32, label: &str| -> gen_core::Result<()> {
+        let resolved = if raw < 0 { t_lat as i32 + raw } else { raw };
+        if resolved < 0 || resolved >= t_lat as i32 {
             return Err(gen_core::Error::Msg(format!(
-                "ltx: request too large — {eff_frames} frames at {}x{} is {tokens} latent tokens, \
-                 over the {max_tokens}-token cap (the 22B AvDiT denoise loop would exceed the GPU \
-                 memory envelope). Reduce the frame count or resolution, or raise \
-                 LTX_MAX_LATENT_TOKENS for a larger-VRAM device.",
-                req.width, req.height
+                "{model_id}: {label} latent frame index {raw} is out of bounds for {t_lat} frames"
             )));
         }
-        // `req.steps` (sc-9027 / F-043) is enforced by the shared floor above, from
-        // `Capabilities::supported_steps` — NOT by an `if` here. It used to be one, and that is
-        // exactly how the two lanes drifted: candle refused `steps: 30` while mlx never read the
-        // field (sc-19502). One declaration, one enforcement site, both lanes.
         Ok(())
+    };
+    let mut reference_count = 0usize;
+    let mut multi_references: Option<&[Image]> = None;
+    let mut control_clip_count = 0usize;
+    let mut appended_frames = 0usize;
+    for entry in &req.conditioning {
+        match entry {
+            Conditioning::Reference { .. } => reference_count += 1,
+            Conditioning::MultiReference { images } => {
+                if multi_references.replace(images.as_slice()).is_some() {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: replace_person accepts exactly one ordered MultiReference carrier"
+                    )));
+                }
+            }
+            Conditioning::Keyframe { frame_idx, .. } => resolve_idx(*frame_idx, "keyframe")?,
+            Conditioning::VideoClip {
+                frames, frame_idx, ..
+            } => {
+                resolve_idx(*frame_idx, "clip")?;
+                appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
+            }
+            Conditioning::ControlClip {
+                frames,
+                start_frame,
+                ..
+            } => {
+                control_clip_count += 1;
+                resolve_idx(*start_frame, "replace-person")?;
+                appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
+            }
+            _ => {}
+        }
+    }
+    if reference_count > 1 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: multiple Reference images are not supported; use Keyframe entries"
+        )));
+    }
+    if control_clip_count > 1 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: exactly one ControlClip can be applied per request"
+        )));
+    }
+    let replace_person = control_clip_count == 1 || multi_references.is_some();
+    if replace_person {
+        if control_clip_count != 1 {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: replace_person requires exactly one ControlClip"
+            )));
+        }
+        let Some(images) = multi_references else {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: replace_person requires exactly one ordered MultiReference carrier"
+            )));
+        };
+        if reference_count != 0
+            || req.conditioning.iter().any(|entry| {
+                matches!(
+                    entry,
+                    Conditioning::Keyframe { .. } | Conditioning::VideoClip { .. }
+                )
+            })
+        {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: replace_person cannot be mixed with Reference, Keyframe, or VideoClip conditioning"
+            )));
+        }
+        conditioning::compose_ordered_character_references(images, req.width, req.height)
+            .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+        if let Some(control) = req.control_clip() {
+            if control.start_frame != 0 {
+                return Err(gen_core::Error::Msg(format!(
+                    "{model_id}: replace_person ControlClip must start at latent frame 0 (got {})",
+                    control.start_frame
+                )));
+            }
+        }
+    }
+    let tokens = (t_lat + appended_frames) * h_lat * w_lat;
+    let max_tokens = config::max_latent_tokens();
+    if tokens > max_tokens {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: request too large — {eff_frames} frames at {}x{} is {tokens} latent tokens, \
+             over the {max_tokens}-token cap (the 22B AvDiT denoise loop would exceed the GPU \
+             memory envelope). Reduce the frame count or resolution, or raise \
+             LTX_MAX_LATENT_TOKENS for a larger-VRAM device.",
+            req.width, req.height
+        )));
+    }
+    drivers::render_plan_for_request(
+        family,
+        variant,
+        req,
+        eff_frames,
+        req.fps.unwrap_or(DEFAULT_FPS) as f32,
+        has_temporal_upsampler,
+    )
+    .map_err(gen_core::Error::from)?;
+    // `req.steps` (sc-9027 / F-043) is enforced by the shared floor above, from
+    // `Capabilities::supported_steps` — NOT by an `if` here. It used to be one, and that is
+    // exactly how the two lanes drifted: candle refused `steps: 30` while mlx never read the
+    // field (sc-19502). One declaration, one enforcement site, both lanes.
+    Ok(())
+}
+
+impl Generator for LtxGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_ltx_request(
+            MODEL_ID,
+            &self.descriptor.capabilities,
+            gen_core_ltx::LtxModelFamily::Ltx23,
+            TransformerVariant::Distilled,
+            false,
+            req,
+        )
     }
 
     fn generate_with_execution_report(
@@ -2533,28 +2631,14 @@ impl Generator for Ltx25Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_25_ID, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "ltx_2_5_distilled: prompt must not be empty".into(),
-            ));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "ltx_2_5_distilled: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if let Some(frames) = req.frames {
-            if frames == 0 || frames % config::TEMPORAL_SCALE as u32 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "ltx_2_5_distilled: frames must satisfy frames % {} == 1 (got {frames})",
-                    config::TEMPORAL_SCALE
-                )));
-            }
-        }
+        validate_ltx_request(
+            MODEL_25_ID,
+            &self.descriptor.capabilities,
+            gen_core_ltx::LtxModelFamily::Ltx25,
+            self.transformer_variant,
+            self.descriptor.capabilities.max_temporal_upsample_rounds > 0,
+            req,
+        )?;
         memory_strategy_2_5::transformer_execution(
             req,
             self.memory_strategy.as_ref(),
@@ -2914,6 +2998,249 @@ mod tests {
             &[Quant::Q4, Quant::Q8],
             "both released packed tiers are catalog surface; unmeasured nvfp4 stays out"
         );
+    }
+
+    fn weights_free_ltx25_generator(variant: TransformerVariant) -> Ltx25Generator {
+        Ltx25Generator {
+            descriptor: descriptor_25_for_variant(variant),
+            bundle: LtxBundleBuilder::new()
+                .build()
+                .expect("empty validation-only bundle"),
+            device: Device::Cpu,
+            use_diffusion_decoder: false,
+            transformer_variant: variant,
+            quant_mode: Ltx25QuantMode::Bf16,
+            adapters: Vec::new(),
+            memory_strategy: None,
+            memory_tier: None,
+            components: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn validate_enforces_render_plan_and_conditioning_across_both_generators_weights_free() {
+        let img = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![127; 32 * 32 * 3],
+        };
+        let control = Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![img.clone()],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: gen_core::ReplacementMode::FaceOnly,
+        };
+        let ltx23 = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let base_23 = GenerationRequest {
+            prompt: "a quiet moonlit harbor".into(),
+            width: 512,
+            height: 512,
+            frames: Some(49),
+            ..Default::default()
+        };
+        assert!(ltx23
+            .validate(&GenerationRequest {
+                sampler: Some("heun".into()),
+                ..base_23.clone()
+            })
+            .is_ok());
+        for invalid_23 in [
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                conditioning: vec![Conditioning::Reference {
+                    image: img.clone(),
+                    strength: Some(1.0),
+                }],
+                ..base_23.clone()
+            },
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                conditioning: vec![Conditioning::Keyframe {
+                    image: img.clone(),
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base_23.clone()
+            },
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![img.clone()],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base_23.clone()
+            },
+            GenerationRequest {
+                width: 64,
+                height: 64,
+                frames: Some(1033),
+                ..base_23
+            },
+        ] {
+            assert!(
+                ltx23.validate(&invalid_23).is_err(),
+                "2.3 pre-load validate must refuse {invalid_23:?}"
+            );
+        }
+
+        let distilled = weights_free_ltx25_generator(TransformerVariant::Distilled);
+        let base_25 = GenerationRequest {
+            prompt: "a quiet moonlit harbor".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            ..Default::default()
+        };
+        for invalid_25 in [
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                conditioning: vec![Conditioning::Reference {
+                    image: img.clone(),
+                    strength: Some(1.0),
+                }],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                num_generated_keyframes: Some(1),
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                temporal_upsample_rounds: Some(1),
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                num_generated_keyframes: Some(1),
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![img.clone()],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                frames: Some(1),
+                num_generated_keyframes: Some(1),
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                frames: Some(1),
+                temporal_upsample_rounds: Some(1),
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::Keyframe {
+                    image: img.clone(),
+                    frame_idx: 99,
+                    strength: 1.0,
+                }],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::Keyframe {
+                    image: img.clone(),
+                    frame_idx: 0,
+                    strength: 1.5,
+                }],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![img.clone(), img.clone()],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![control.clone()],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![
+                    Conditioning::ControlClip {
+                        frames: vec![img.clone()],
+                        mask: vec![img.clone()],
+                        masking_strength: 1.0,
+                        start_frame: 1,
+                        mode: gen_core::ReplacementMode::FaceOnly,
+                    },
+                    Conditioning::MultiReference {
+                        images: vec![img.clone()],
+                    },
+                ],
+                ..base_25.clone()
+            },
+            GenerationRequest {
+                width: 1280,
+                height: 1280,
+                frames: Some(2001),
+                ..base_25.clone()
+            },
+        ] {
+            assert!(
+                Generator::validate(&distilled, &invalid_25).is_err(),
+                "2.5 distilled pre-load validate must refuse {invalid_25:?}"
+            );
+        }
+
+        // Omitted frames fall back to DEFAULT_FRAMES (49) pre-load for auto-duration + DFR, while
+        // curated non-Euler samplers are still refused pre-load.
+        let auto_dfr = GenerationRequest {
+            frames: None,
+            auto_duration: Some(gen_core::duration_head::AutoDurationRange {
+                min_seconds: 1.0,
+                max_seconds: 2.0,
+            }),
+            num_generated_keyframes: Some(1),
+            ..base_25.clone()
+        };
+        assert!(Generator::validate(&distilled, &auto_dfr).is_ok());
+        assert!(Generator::validate(
+            &distilled,
+            &GenerationRequest {
+                sampler: Some("heun".into()),
+                ..auto_dfr
+            }
+        )
+        .is_err());
+
+        let dev = weights_free_ltx25_generator(TransformerVariant::Dev);
+        assert!(Generator::validate(
+            &dev,
+            &GenerationRequest {
+                steps: Some(30),
+                negative_prompt: Some("blurry".into()),
+                ..base_25.clone()
+            }
+        )
+        .is_ok());
+        assert!(Generator::validate(
+            &dev,
+            &GenerationRequest {
+                sampler: Some("heun".into()),
+                steps: Some(30),
+                ..base_25.clone()
+            }
+        )
+        .is_err());
+        assert!(Generator::validate(
+            &dev,
+            &GenerationRequest {
+                steps: Some(NATIVE_STEPS),
+                ..base_25
+            }
+        )
+        .is_err());
     }
 
     #[test]

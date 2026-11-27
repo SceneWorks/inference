@@ -195,6 +195,23 @@ impl Weights {
         Ok(Linear::new(weight, bias))
     }
 
+    /// `name`'s stored dtype and shape, read from the safetensors header (mmap) or the live tensor
+    /// (owned) without loading or casting it. `None` when the tensor is absent or its stored dtype
+    /// has no Candle equivalent.
+    pub fn native_header(&self, name: &str) -> Option<(DType, Vec<usize>)> {
+        match &self.storage {
+            WeightStorage::Mmap(st) => {
+                let view = st.mmap().get(name).ok()?;
+                let dtype = DType::try_from(view.dtype()).ok()?;
+                Some((dtype, view.shape().to_vec()))
+            }
+            WeightStorage::Owned(tensors) => {
+                let t = tensors.get(name)?;
+                Some((t.dtype(), t.dims().to_vec()))
+            }
+        }
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         match &self.storage {
             WeightStorage::Mmap(st) => st.mmap().get(name).is_ok(),

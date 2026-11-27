@@ -1416,7 +1416,12 @@ pub fn repack_packed_weight(
     })
 }
 
-fn repack_packed_weight_uncached(
+/// [`repack_packed_weight`] without the saved-quantization cache: the same Q4 → `Q4_1` / Q8 →
+/// `Q8_0` dispatch, computed every call and never persisted. Public for **offline converters**
+/// that write a Candle-native tier (`candle-gen-minimax-h3`'s GGML tier), whose published blocks
+/// must be byte-for-byte what the load-time repack builds — and which must not populate a runtime
+/// cache while doing it.
+pub fn repack_packed_weight_uncached(
     wq: &Tensor,
     scales: &Tensor,
     biases: &Tensor,

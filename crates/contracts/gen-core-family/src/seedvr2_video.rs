@@ -26,7 +26,10 @@
 //! `safe_budget_gib`), falls back to per-frame (`T=1`) when even 8 frames won't fit, and reports an
 //! over-budget condition catchably when a single frame won't fit (extreme HD → the spatial tiler).
 
-use gen_core::Image;
+use gen_core::{
+    default_seed, Conditioning, Error, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    ModelDescriptor, Result, WeightsSource,
+};
 
 /// Default temporal chunk = 16 pixel frames (latentT=4 = exactly one `(4,3,3)` window).
 pub const DEFAULT_CHUNK_FRAMES: i32 = 16;
@@ -326,6 +329,465 @@ fn axis_ramp(len: i32, fade_start: bool, fade_end: bool, overlap: i32) -> Vec<f3
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Pre-load SeedVR2 render plan across all 5 routes (E6 / AC1)
+// ---------------------------------------------------------------------------
+
+/// Default SeedVR2 video fps when a request omits `fps`.
+pub const DEFAULT_OUTPUT_FPS: u32 = 24;
+
+/// Conservative resident-bytes estimates used for pre-load route planning before checkpoint files
+/// are opened.
+pub const ESTIMATED_3B_DENSE_BYTES: usize = 7_500_000_000;
+pub const ESTIMATED_7B_DENSE_BYTES: usize = 16_500_000_000;
+
+/// Conservative pre-load resident-bytes estimate for `seedvr2` / `seedvr2_3b` / `seedvr2_7b`.
+pub fn estimated_weights_bytes(model_id: &str) -> usize {
+    if model_id.contains("7b") {
+        ESTIMATED_7B_DENSE_BYTES
+    } else {
+        ESTIMATED_3B_DENSE_BYTES
+    }
+}
+
+/// Clamp an explicit temporal chunk request down to the live budget-safe chunk size. A request
+/// cannot bypass `PerFrame` or `OverBudget` fallbacks.
+pub fn resolve_chunk_plan(plan: ChunkPlan, chunk_override: Option<i32>) -> ChunkPlan {
+    match (plan, chunk_override) {
+        (ChunkPlan::Chunked(safe), Some(requested)) => {
+            ChunkPlan::Chunked(pad_to_valid_chunk(requested).min(safe))
+        }
+        (plan, _) => plan,
+    }
+}
+
+/// Resolved SeedVR2 still-image execution route and its budget/VAE-cap flags.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedSeedvr2StillRoute {
+    pub route: Seedvr2Route,
+    pub over_budget: bool,
+    pub over_vae_cap: bool,
+}
+
+/// Resolved SeedVR2 video execution route and its VAE-cap / chunk-plan diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedSeedvr2VideoRoute {
+    pub route: Seedvr2Route,
+    pub over_vae_cap: bool,
+    pub chunk_plan: Option<ChunkPlan>,
+}
+
+/// Resolve the still-image SeedVR2 execution route for `width × height` under `safe_gib`.
+pub fn resolve_still_route(
+    width: i32,
+    height: i32,
+    weights_bytes: usize,
+    safe_gib: f64,
+) -> ResolvedSeedvr2StillRoute {
+    let over_budget = matches!(
+        plan_chunk_size_with(weights_bytes, height, width, safe_gib),
+        ChunkPlan::OverBudget { .. }
+    );
+    let over_vae_cap = width.max(height) > VAE_SAFE_DECODE_EDGE_PX;
+    let route = if over_budget || over_vae_cap {
+        let tile_edge_px = plan_spatial_tile_px(weights_bytes, safe_gib);
+        let overlap_px = SPATIAL_OVERLAP.min(tile_edge_px / 2);
+        let tiles = plan_spatial_tiles(height, width, tile_edge_px, overlap_px);
+        Seedvr2Route::StillSpatialTiled {
+            tile_edge_px,
+            overlap_px,
+            tiles,
+        }
+    } else {
+        Seedvr2Route::StillSinglePass
+    };
+    ResolvedSeedvr2StillRoute {
+        route,
+        over_budget,
+        over_vae_cap,
+    }
+}
+
+/// Resolve the video SeedVR2 execution route for `frame_count` frames at `width × height` under `safe_gib`.
+pub fn resolve_video_route(
+    frame_count: usize,
+    width: i32,
+    height: i32,
+    weights_bytes: usize,
+    safe_gib: f64,
+    chunk_override: Option<i32>,
+) -> ResolvedSeedvr2VideoRoute {
+    let over_vae_cap = width.max(height) > VAE_SAFE_DECODE_EDGE_PX;
+    if over_vae_cap {
+        let tile_edge_px = plan_spatial_tile_px(weights_bytes, safe_gib);
+        let overlap_px = SPATIAL_OVERLAP.min(tile_edge_px / 2);
+        let tiles_per_frame = plan_spatial_tiles(height, width, tile_edge_px, overlap_px);
+        return ResolvedSeedvr2VideoRoute {
+            route: Seedvr2Route::VideoSpatialTiled {
+                frame_count,
+                tile_edge_px,
+                overlap_px,
+                tiles_per_frame,
+            },
+            over_vae_cap: true,
+            chunk_plan: None,
+        };
+    }
+    let selected = resolve_chunk_plan(
+        plan_chunk_size_with(weights_bytes, height, width, safe_gib),
+        chunk_override,
+    );
+    let route = match selected {
+        ChunkPlan::Chunked(chunk_frames) => {
+            let chunks = plan_chunks(frame_count as i32, chunk_frames, DEFAULT_OVERLAP);
+            Seedvr2Route::VideoTemporalChunked {
+                chunk_frames,
+                overlap_frames: DEFAULT_OVERLAP,
+                chunks,
+            }
+        }
+        ChunkPlan::PerFrame => Seedvr2Route::VideoPerFrame { frame_count },
+        ChunkPlan::OverBudget { .. } => {
+            let tile_edge_px = plan_spatial_tile_px(weights_bytes, safe_gib);
+            let overlap_px = SPATIAL_OVERLAP.min(tile_edge_px / 2);
+            let tiles_per_frame = plan_spatial_tiles(height, width, tile_edge_px, overlap_px);
+            Seedvr2Route::VideoSpatialTiled {
+                frame_count,
+                tile_edge_px,
+                overlap_px,
+                tiles_per_frame,
+            }
+        }
+    };
+    ResolvedSeedvr2VideoRoute {
+        route,
+        over_vae_cap: false,
+        chunk_plan: Some(selected),
+    }
+}
+
+/// All five SeedVR2 upscale execution routes resolved before weight/inference execution (`E6`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Seedvr2Route {
+    /// Still image single full-frame pass (`!over_budget && max(w, h) <= VAE_SAFE_DECODE_EDGE_PX`).
+    StillSinglePass,
+    /// Still image spatial-tiled pass (`over_budget || max(w, h) > VAE_SAFE_DECODE_EDGE_PX`).
+    StillSpatialTiled {
+        tile_edge_px: i32,
+        overlap_px: i32,
+        tiles: Vec<SpatialTile>,
+    },
+    /// Video temporal-chunked pass (`DEFAULT_OVERLAP` frame cross-fade).
+    VideoTemporalChunked {
+        chunk_frames: i32,
+        overlap_frames: i32,
+        chunks: Vec<Chunk>,
+    },
+    /// Video per-frame (`T = 1`) memory-fallback pass (`ChunkPlan::PerFrame`).
+    VideoPerFrame { frame_count: usize },
+    /// Video HD per-frame spatial-tiled pass (`ChunkPlan::OverBudget` or `max(w, h) > VAE_SAFE_DECODE_EDGE_PX`).
+    VideoSpatialTiled {
+        frame_count: usize,
+        tile_edge_px: i32,
+        overlap_px: i32,
+        tiles_per_frame: Vec<SpatialTile>,
+    },
+}
+
+/// Expected [`GenerationOutput`] contract bound before execution (`E6`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seedvr2OutputLifecycle {
+    Images {
+        count: u32,
+        width: u32,
+        height: u32,
+    },
+    Video {
+        frame_count: usize,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
+}
+
+impl Seedvr2OutputLifecycle {
+    /// Verify that a produced [`GenerationOutput`] matches the planned modality, count, fps, and
+    /// dimensions before returning it across Stage 10 Output lifecycle.
+    pub fn validate_output(&self, output: &GenerationOutput) -> Result<()> {
+        match (self, output) {
+            (
+                Self::Images {
+                    count,
+                    width,
+                    height,
+                },
+                GenerationOutput::Images(images),
+            ) => {
+                if images.len() != *count as usize
+                    || images
+                        .iter()
+                        .any(|img| img.width != *width || img.height != *height)
+                {
+                    return Err(Error::Unsupported(format!(
+                        "seedvr2 output lifecycle mismatch: expected {count} image(s) at {width}x{height}"
+                    )));
+                }
+                Ok(())
+            }
+            (
+                Self::Video {
+                    frame_count,
+                    width,
+                    height,
+                    fps,
+                },
+                GenerationOutput::Video {
+                    frames,
+                    fps: got_fps,
+                    audio,
+                },
+            ) => {
+                if frames.len() != *frame_count
+                    || *got_fps != *fps
+                    || audio.is_some()
+                    || frames
+                        .iter()
+                        .any(|img| img.width != *width || img.height != *height)
+                {
+                    return Err(Error::Unsupported(format!(
+                        "seedvr2 output lifecycle mismatch: expected {frame_count} video frame(s) at {width}x{height}@{fps}fps"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(Error::Unsupported(
+                "seedvr2 output lifecycle mismatch: output modality differs from compiled plan"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// Pre-load validated SeedVR2 render plan covering admission, all 5 still/video routes, and
+/// `GenerationOutput` lifecycle (`E6 / AC1`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seedvr2RenderPlan {
+    pub model_id: String,
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub base_seed: u64,
+    pub softness: f32,
+    pub over_vae_cap: bool,
+    pub weights_bytes: usize,
+    pub safe_gib: f64,
+    pub route: Seedvr2Route,
+    pub output_lifecycle: Seedvr2OutputLifecycle,
+}
+
+fn validate_rgb_image(id: &str, image: &Image, label: &str) -> Result<()> {
+    let expected = usize::try_from(image.width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(image.height)
+                .ok()
+                .and_then(|h| w.checked_mul(h))
+        })
+        .and_then(|px| px.checked_mul(3));
+    if image.width == 0 || image.height == 0 || expected != Some(image.pixels.len()) {
+        return Err(Error::Unsupported(format!(
+            "{id}: {label} needs width × height × 3 RGB bytes (got {}x{}, {} bytes)",
+            image.width,
+            image.height,
+            image.pixels.len()
+        )));
+    }
+    Ok(())
+}
+
+impl Seedvr2RenderPlan {
+    /// Validate pre-load model `LoadSpec` constraints before opening weights or building pipelines.
+    pub fn validate_load_spec(id: &str, spec: &LoadSpec) -> Result<()> {
+        if let WeightsSource::File(_) = &spec.weights {
+            return Err(Error::Msg(format!(
+                "{id}: expects a numz/SeedVR2_comfyUI checkpoint directory, not a single file"
+            )));
+        }
+        if !spec.adapters.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{id}: LoRA/LoKr adapters are not part of SeedVR2"
+            )));
+        }
+        if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{id}: ControlNet / IP-Adapter conditioning is not part of SeedVR2"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Compile and validate a SeedVR2 route plan before loading weights or running inference.
+    pub fn compile(
+        descriptor: &ModelDescriptor,
+        req: &GenerationRequest,
+        weights_bytes: usize,
+        safe_gib: f64,
+        chunk_override: Option<i32>,
+    ) -> Result<Self> {
+        if !safe_gib.is_finite() || safe_gib <= 0.0 {
+            return Err(Error::Unsupported(format!(
+                "{}: safe memory budget must be finite and positive (got {safe_gib})",
+                descriptor.id
+            )));
+        }
+        descriptor
+            .capabilities
+            .validate_request(descriptor.id, req)?;
+        let align = SPATIAL_ALIGN as u32;
+        if req.width == 0
+            || req.height == 0
+            || !req.width.is_multiple_of(align)
+            || !req.height.is_multiple_of(align)
+        {
+            return Err(Error::Msg(format!(
+                "{}: width/height must be multiples of {align} (got {}x{})",
+                descriptor.id, req.width, req.height
+            )));
+        }
+        for clip in req.video_clips() {
+            if clip.strength != 1.0 {
+                return Err(Error::Unsupported(format!(
+                    "{} does not implement VideoClip strength (got {}); remove it or leave it at the \
+                     default 1.0 — SeedVR2 is a one-step upscale with no denoise mask to weight",
+                    descriptor.id, clip.strength
+                )));
+            }
+            if clip.frame_idx != 0 {
+                return Err(Error::Unsupported(format!(
+                    "{} does not implement VideoClip frame_idx (got {}); remove it or leave it at \
+                     the default 0 — SeedVR2 upscales the clip in order and has no output timeline to \
+                     offset it against",
+                    descriptor.id, clip.frame_idx
+                )));
+            }
+        }
+        let softness = req.softness.unwrap_or(0.0);
+        if !softness.is_finite() {
+            return Err(Error::Unsupported(format!(
+                "{}: softness must be finite",
+                descriptor.id
+            )));
+        }
+
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+
+        if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
+            for (idx, frame) in clip.frames.iter().enumerate() {
+                validate_rgb_image(descriptor.id, frame, &format!("video frame {idx}"))?;
+            }
+            let frame_count = clip.frames.len();
+            let resolved = resolve_video_route(
+                frame_count,
+                req.width as i32,
+                req.height as i32,
+                weights_bytes,
+                safe_gib,
+                chunk_override,
+            );
+            let fps = req.fps.unwrap_or(DEFAULT_OUTPUT_FPS);
+            return Ok(Self {
+                model_id: descriptor.id.to_owned(),
+                backend: descriptor.backend.to_owned(),
+                width: req.width,
+                height: req.height,
+                base_seed,
+                softness,
+                over_vae_cap: resolved.over_vae_cap,
+                weights_bytes,
+                safe_gib,
+                route: resolved.route,
+                output_lifecycle: Seedvr2OutputLifecycle::Video {
+                    frame_count,
+                    width: req.width,
+                    height: req.height,
+                    fps,
+                },
+            });
+        }
+
+        let Some(ref_image) = req.conditioning.iter().find_map(|c| match c {
+            Conditioning::Reference { image, .. } => Some(image),
+            _ => None,
+        }) else {
+            return Err(Error::Msg(format!(
+                "{}: requires a Reference image (image upscale) or a non-empty VideoClip frame \
+                 sequence (video upscale)",
+                descriptor.id
+            )));
+        };
+        validate_rgb_image(descriptor.id, ref_image, "reference image")?;
+
+        let resolved =
+            resolve_still_route(req.width as i32, req.height as i32, weights_bytes, safe_gib);
+
+        Ok(Self {
+            model_id: descriptor.id.to_owned(),
+            backend: descriptor.backend.to_owned(),
+            width: req.width,
+            height: req.height,
+            base_seed,
+            softness,
+            over_vae_cap: resolved.over_vae_cap,
+            weights_bytes,
+            safe_gib,
+            route: resolved.route,
+            output_lifecycle: Seedvr2OutputLifecycle::Images {
+                count: req.count,
+                width: req.width,
+                height: req.height,
+            },
+        })
+    }
+
+    /// Re-evaluate the planned route with resolved runtime weight size and live budget ceiling,
+    /// enforcing consistent output lifecycle, model id, and dimensions.
+    pub fn with_live_budget(
+        &self,
+        descriptor: &ModelDescriptor,
+        req: &GenerationRequest,
+        weights_bytes: usize,
+        safe_gib: f64,
+        chunk_override: Option<i32>,
+    ) -> Result<Self> {
+        let compiled = Self::compile(descriptor, req, weights_bytes, safe_gib, chunk_override)?;
+        if compiled.output_lifecycle != self.output_lifecycle
+            || compiled.model_id != self.model_id
+            || compiled.width != self.width
+            || compiled.height != self.height
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: live-budget SeedVR2 render plan ({}x{}, {:?}) does not match pre-load plan \
+                 ({}: {}x{}, {:?})",
+                compiled.model_id,
+                compiled.width,
+                compiled.height,
+                compiled.output_lifecycle,
+                self.model_id,
+                self.width,
+                self.height,
+                self.output_lifecycle,
+            )));
+        }
+        Ok(compiled)
+    }
+
+    /// Validate that `output` conforms to this plan's output lifecycle before returning it.
+    pub fn finish_output(&self, output: GenerationOutput) -> Result<GenerationOutput> {
+        self.output_lifecycle.validate_output(&output)?;
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +1037,319 @@ mod tests {
         assert!((w[0] - 1.0).abs() < 1e-6); // top-left corner: both outer edges → 1
         assert!(w[(8 * 8 - 1) as usize] < 0.5); // bottom-right: fades on both inner edges
         assert!(w.iter().all(|&v| v > 0.0)); // strictly positive → weight-sum never zero
+    }
+
+    fn seedvr2_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "seedvr2",
+            backend: "mock",
+            family: "seedvr2",
+            modality: gen_core::Modality::Both,
+            capabilities: gen_core::Capabilities {
+                supports_guidance: false,
+                supports_true_cfg: false,
+                conditioning: vec![
+                    gen_core::ConditioningKind::Reference,
+                    gen_core::ConditioningKind::VideoClip,
+                ],
+                samplers: vec!["seedvr2_euler"],
+                schedulers: vec!["seedvr2_euler"],
+                min_size: 16,
+                max_size: 4096,
+                max_count: 8,
+                ..Default::default()
+            },
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        }
+    }
+
+    #[test]
+    fn seedvr2_render_plan_covers_all_five_routes_and_output_lifecycles() {
+        let desc = seedvr2_descriptor();
+        let lr = img(16, 16, 7);
+        let wb = (7.3 * GIB) as usize;
+
+        // 1. Still single-pass
+        let still_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 2,
+            seed: Some(9),
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let p1 = Seedvr2RenderPlan::compile(&desc, &still_req, wb, 64.0, None).unwrap();
+        assert_eq!(p1.route, Seedvr2Route::StillSinglePass);
+        assert_eq!(
+            p1.output_lifecycle,
+            Seedvr2OutputLifecycle::Images {
+                count: 2,
+                width: 512,
+                height: 512
+            }
+        );
+        p1.finish_output(GenerationOutput::Images(vec![
+            img(512, 512, 1),
+            img(512, 512, 2),
+        ]))
+        .unwrap();
+        assert!(p1
+            .finish_output(GenerationOutput::Images(vec![img(512, 512, 1)]))
+            .is_err());
+
+        // 2a. Still spatial-tiled via memory OverBudget
+        let p2a = Seedvr2RenderPlan::compile(&desc, &still_req, wb, 7.35, None).unwrap();
+        assert!(matches!(
+            p2a.route,
+            Seedvr2Route::StillSpatialTiled { tile_edge_px, tiles, .. }
+                if tile_edge_px == MIN_TILE_PX && tiles.len() > 1
+        ));
+
+        // 2b. Still spatial-tiled via VAE_SAFE_DECODE_EDGE_PX (>1536) even with huge memory
+        let large_still = GenerationRequest {
+            width: 2048,
+            height: 2048,
+            ..still_req
+        };
+        let p2b = Seedvr2RenderPlan::compile(&desc, &large_still, wb, 512.0, None).unwrap();
+        assert!(p2b.over_vae_cap);
+        assert!(matches!(
+            p2b.route,
+            Seedvr2Route::StillSpatialTiled { tile_edge_px, tiles, .. }
+                if tile_edge_px <= VAE_SAFE_DECODE_EDGE_PX && !tiles.is_empty()
+        ));
+
+        // 3. Video temporal-chunked (DEFAULT_OVERLAP = 4)
+        let clip_frames = vec![lr; 20];
+        let vid_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            fps: Some(30),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: clip_frames,
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        let p3 = Seedvr2RenderPlan::compile(&desc, &vid_req, wb, 41.0, None).unwrap();
+        assert!(matches!(
+            p3.route,
+            Seedvr2Route::VideoTemporalChunked { overlap_frames, ref chunks, .. }
+                if overlap_frames == DEFAULT_OVERLAP && chunks.len() >= 2
+        ));
+        assert_eq!(
+            p3.output_lifecycle,
+            Seedvr2OutputLifecycle::Video {
+                frame_count: 20,
+                width: 512,
+                height: 512,
+                fps: 30,
+            }
+        );
+
+        // 4. Video per-frame fallback (ChunkPlan::PerFrame)
+        let vid_1024 = GenerationRequest {
+            width: 1024,
+            height: 1024,
+            ..vid_req.clone()
+        };
+        let p4 = Seedvr2RenderPlan::compile(&desc, &vid_1024, wb, 20.0, None).unwrap();
+        assert_eq!(p4.route, Seedvr2Route::VideoPerFrame { frame_count: 20 });
+
+        // 5. Video HD spatial-tiled (> VAE_SAFE_DECODE_EDGE_PX or OverBudget)
+        let vid_4k = GenerationRequest {
+            width: 2048,
+            height: 2048,
+            ..vid_req.clone()
+        };
+        let p5 = Seedvr2RenderPlan::compile(&desc, &vid_4k, wb, 512.0, None).unwrap();
+        assert!(matches!(
+            p5.route,
+            Seedvr2Route::VideoSpatialTiled { frame_count: 20, tile_edge_px, .. }
+                if tile_edge_px <= VAE_SAFE_DECODE_EDGE_PX
+        ));
+        let p5_budget = Seedvr2RenderPlan::compile(&desc, &vid_req, wb, 7.35, None).unwrap();
+        assert!(matches!(
+            p5_budget.route,
+            Seedvr2Route::VideoSpatialTiled {
+                frame_count: 20,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn seedvr2_render_plan_refuses_invalid_inputs_and_load_specs() {
+        let desc = seedvr2_descriptor();
+        let lr = img(16, 16, 7);
+
+        // Invalid load specs fail pre-load
+        assert!(Seedvr2RenderPlan::validate_load_spec(
+            "seedvr2",
+            &LoadSpec::new(WeightsSource::File("/single.safetensors".into())),
+        )
+        .is_err());
+        let mut adapted = LoadSpec::new(WeightsSource::Dir("/dir".into()));
+        adapted.adapters.push(gen_core::AdapterSpec::new(
+            "/a".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        assert!(matches!(
+            Seedvr2RenderPlan::validate_load_spec("seedvr2", &adapted),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Unaligned target
+        let bad_align = GenerationRequest {
+            width: 520,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(Seedvr2RenderPlan::compile(&desc, &bad_align, 0, 64.0, None).is_err());
+
+        // Missing conditioning
+        let missing = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        assert!(Seedvr2RenderPlan::compile(&desc, &missing, 0, 64.0, None).is_err());
+
+        // Non-finite safe budget / softness
+        let valid = GenerationRequest {
+            width: 512,
+            height: 512,
+            softness: Some(f32::NAN),
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(Seedvr2RenderPlan::compile(&desc, &valid, 0, 64.0, None).is_err());
+        let valid_ok = GenerationRequest {
+            softness: None,
+            ..valid
+        };
+        assert!(matches!(
+            Seedvr2RenderPlan::compile(&desc, &valid_ok, 0, 0.0, None),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Bad clip knobs
+        let bad_clip = GenerationRequest {
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![lr],
+                frame_idx: 2,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            Seedvr2RenderPlan::compile(&desc, &bad_clip, 0, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn seedvr2_render_plan_with_live_budget_enforces_lifecycle_model_and_geometry() {
+        let desc = seedvr2_descriptor();
+        let lr = img(16, 16, 7);
+        let wb = (7.3 * GIB) as usize;
+        let still_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            seed: Some(11),
+            conditioning: vec![Conditioning::Reference {
+                image: lr.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let pre = Seedvr2RenderPlan::compile(&desc, &still_req, wb, 64.0, None).unwrap();
+        assert_eq!(pre.route, Seedvr2Route::StillSinglePass);
+
+        // Compatible live re-budget may adapt route (e.g. single-pass -> spatial-tiled) while
+        // keeping model_id, width, height, and output_lifecycle identical.
+        let adapted = pre
+            .with_live_budget(&desc, &still_req, wb, 7.35, None)
+            .unwrap();
+        assert!(matches!(
+            adapted.route,
+            Seedvr2Route::StillSpatialTiled { .. }
+        ));
+        assert_eq!(adapted.output_lifecycle, pre.output_lifecycle);
+
+        // Mismatched count -> output_lifecycle mismatch refusal.
+        let diff_count = GenerationRequest {
+            count: 2,
+            ..still_req.clone()
+        };
+        assert!(matches!(
+            pre.with_live_budget(&desc, &diff_count, wb, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Mismatched geometry -> width/height + output_lifecycle mismatch refusal.
+        let diff_size = GenerationRequest {
+            width: 528,
+            height: 512,
+            ..still_req.clone()
+        };
+        assert!(matches!(
+            pre.with_live_budget(&desc, &diff_size, wb, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Mismatched model_id -> refusal.
+        let mut other_desc = seedvr2_descriptor();
+        other_desc.id = "seedvr2_7b";
+        assert!(matches!(
+            pre.with_live_budget(&other_desc, &still_req, wb, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Mismatched modality / fps -> refusal.
+        let vid_req = GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 1,
+            fps: Some(24),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![lr; 8],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            pre.with_live_budget(&desc, &vid_req, wb, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
+        let pre_vid = Seedvr2RenderPlan::compile(&desc, &vid_req, wb, 64.0, None).unwrap();
+        let diff_fps = GenerationRequest {
+            fps: Some(30),
+            ..vid_req
+        };
+        assert!(matches!(
+            pre_vid.with_live_budget(&desc, &diff_fps, wb, 64.0, None),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

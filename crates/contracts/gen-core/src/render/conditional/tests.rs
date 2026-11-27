@@ -529,3 +529,200 @@ fn output_cell_must_match_verified_patch_times_merge_without_sources() {
     assert!(result.is_err());
     assert!(mock.calls().is_empty());
 }
+
+#[test]
+fn compile_admits_fast_variant_and_refuses_foreign_provider() {
+    let mut fast = input();
+    fast.provider_id = "sensenova_u1_8b_fast".into();
+    assert!(ConditionalPlan::compile(fast, ceilings()).is_ok());
+
+    let mut foreign = input();
+    foreign.provider_id = "other_provider".into();
+    assert!(ConditionalPlan::compile(foreign, ceilings()).is_err());
+}
+
+#[test]
+fn conditional_output_converts_into_generation_output_interleaved() {
+    let p = plan();
+    let img = crate::Image {
+        width: 2,
+        height: 2,
+        pixels: vec![9; 12],
+    };
+    let output = ConditionalOutput {
+        text: "before<image>after".into(),
+        images: vec![img.clone()],
+        receipt: ConditionalReceipt {
+            stages: p
+                .cache_lifetimes()
+                .iter()
+                .map(|_| RealizedStage::Terminal {
+                    reason: TerminalReason::EndToken,
+                })
+                .collect(),
+            text_draws: 3,
+            images: 1,
+            feedback_calls: 1,
+            actual_outer_steps: 4,
+            reported_final_steps: Some(12),
+            terminal: TerminalReason::EndToken,
+        },
+    };
+    let gen_out: crate::GenerationOutput = output.into();
+    match gen_out {
+        crate::GenerationOutput::Interleaved { text, images } => {
+            assert_eq!(text, "before<image>after");
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].pixels, img.pixels);
+        }
+        other => panic!("expected Interleaved output, got {other:?}"),
+    }
+}
+
+#[test]
+fn conditional_guard_pins_owner_thread() {
+    let p = plan();
+    let guard = ConditionalGuard::new(&p).unwrap();
+    assert_eq!(guard.owner_thread(), std::thread::current().id());
+    guard.assert_owner_thread().unwrap();
+}
+
+#[test]
+fn progress_hooks_image_placeholder_and_shared_compiler_work() {
+    struct ProgressMock(Mock);
+
+    impl ConditionalExecutor for ProgressMock {
+        type Cache = Cache;
+        type Context = ();
+        type Image = u32;
+
+        fn source_images(&self) -> Result<Vec<SourceImageGeometry>> {
+            self.0.source_images()
+        }
+        fn prefill_model_shape(&self) -> Result<PrefillModelShape> {
+            self.0.prefill_model_shape()
+        }
+        fn prefill_token_counts(&self) -> Result<[u32; CACHE_COUNT]> {
+            self.0.prefill_token_counts()
+        }
+        fn image_placeholder(&self) -> &'static str {
+            "<image>"
+        }
+        fn prefill(&mut self, plan: &ConditionalPlan) -> Result<((), [Cache; CACHE_COUNT])> {
+            self.0.prefill(plan)
+        }
+        fn prefill_with_progress(
+            &mut self,
+            plan: &ConditionalPlan,
+            progress: &mut dyn FnMut(Progress),
+        ) -> Result<((), [Cache; CACHE_COUNT])> {
+            progress(Progress::Loading(crate::LoadPhase::EncodingPrompt));
+            let res = self.0.prefill(plan)?;
+            progress(Progress::PromptEncodingComplete);
+            Ok(res)
+        }
+        fn rollout(
+            &mut self,
+            context: &mut (),
+            caches: &mut [Cache; CACHE_COUNT],
+            granted_draws: u32,
+        ) -> Result<TextRollout> {
+            self.0.rollout(context, caches, granted_draws)
+        }
+        fn denoise_step(
+            &mut self,
+            context: &mut (),
+            caches: &mut [Cache; CACHE_COUNT],
+            image: u32,
+            step: u32,
+        ) -> Result<()> {
+            self.0.denoise_step(context, caches, image, step)
+        }
+        fn finish_image(&mut self, context: &mut (), image: u32) -> Result<u32> {
+            self.0.finish_image(context, image)
+        }
+        fn feedback(
+            &mut self,
+            context: &mut (),
+            caches: &mut [Cache; CACHE_COUNT],
+            image: u32,
+            output: &u32,
+        ) -> Result<()> {
+            self.0.feedback(context, caches, image, output)
+        }
+        fn feedback_with_progress(
+            &mut self,
+            context: &mut (),
+            caches: &mut [Cache; CACHE_COUNT],
+            image: u32,
+            output: &u32,
+            progress: &mut dyn FnMut(Progress),
+        ) -> Result<()> {
+            progress(Progress::Loading(crate::LoadPhase::EncodingPrompt));
+            self.0.feedback(context, caches, image, output)?;
+            progress(Progress::PromptEncodingComplete);
+            Ok(())
+        }
+    }
+
+    let base = input();
+    let shape = PrefillModelShape {
+        hidden_width: base.prefill_hidden_width,
+        intermediate_width: base.prefill_intermediate_width,
+        vision_hidden_width: base.prefill_vision_hidden_width,
+        source_patch_size: base.source_patch_size,
+        source_merge_size: base.source_merge_size,
+        attention_heads: base.prefill_attention_heads,
+        kv_heads: base.prefill_kv_heads,
+        head_dim: base.prefill_head_dim,
+        layers: base.prefill_layers,
+        vocab_size: base.prefill_vocab_size,
+    };
+    let (compiled_in, compiled_plan) = ConditionalPlan::compile_sensenova_interleave(
+        "sensenova_u1_8b",
+        "two pics",
+        base.seed,
+        base.width,
+        base.height,
+        Vec::new(),
+        base.prefill_tokens,
+        shape,
+        base.max_new_tokens as usize,
+        base.max_images as usize,
+        base.steps_per_image as usize,
+        base.model_resident_bytes,
+        shape.cache_token_bytes_bound(),
+        None,
+    )
+    .unwrap();
+    let mut mock = ProgressMock(Mock::new(vec![
+        TextRollout {
+            text: "A:".into(),
+            emitted: 2,
+            stop: RolloutStop::Image,
+        },
+        TextRollout {
+            text: ":B".into(),
+            emitted: 2,
+            stop: RolloutStop::End,
+        },
+    ]));
+    let cancel = mock.0.cancel.clone();
+    let mut events = Vec::new();
+    let out = run_conditional(&compiled_plan, &compiled_in, &cancel, &mut mock, &mut |e| {
+        events.push(e);
+    })
+    .unwrap();
+    assert_eq!(out.text, "A:<image>:B");
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.receipt.actual_outer_steps, 4);
+    assert_eq!(out.receipt.reported_final_steps, Some(12));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Progress::PromptEncodingComplete))
+            .count(),
+        2
+    );
+    assert_eq!(events.last(), Some(&Progress::Decoding));
+}
