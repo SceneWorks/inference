@@ -159,15 +159,6 @@ const SITE_MODULATE: &str = "ltx::transformer::modulate";
 const SITE_GATED: &str = "ltx::transformer::gated";
 const SITE_GELU_FFN: &str = "ltx::transformer::gelu_ffn";
 
-fn modulate_impl(
-    (x, scale, shift): (&Array, &Array, &Array),
-) -> std::result::Result<Array, Exception> {
-    add(
-        &multiply(x, &add(scale, &scalar(1.0).as_dtype(scale.dtype())?)?)?,
-        shift,
-    )
-}
-
 thread_local! {
     static RETAINED_COMPILE_GLUE: RefCell<Option<DitCompileGlue>> = const { RefCell::new(None) };
 }
@@ -179,9 +170,12 @@ thread_local! {
 /// far the biggest per-step glue cost at video sequence (the FFN expansion runs on `[B, S, ffn]`
 /// tensors of tens-to-hundreds of millions of elements); off ⇒ core `gelu_tanh`, byte-for-byte the
 /// previous behaviour.
+///
+/// The modulate body is the shared [`mlx_gen::nn::modulate_matching_one_impl`] (SW-6140): the `1`
+/// cast to `scale`'s dtype, the same three-op graph this crate's private copy traced.
 static GLUE: DitGlue = DitGlue::new(
     [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN],
-    modulate_impl,
+    mlx_gen::nn::modulate_matching_one_impl,
     &RETAINED_COMPILE_GLUE,
 );
 

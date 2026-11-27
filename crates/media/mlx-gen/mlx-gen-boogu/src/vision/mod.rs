@@ -40,7 +40,7 @@ use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{gelu_exact, gelu_tanh, rotate_half};
+use mlx_gen::nn::{gelu_exact, gelu_tanh};
 use mlx_gen::quant::lin;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -155,10 +155,20 @@ impl Block {
         // 2-D NeoX rope in f32; cos/sin broadcast over heads ([seq, 1, head_dim]).
         let cos = cos.reshape(&[seq, 1, hd])?;
         let sin = sin.reshape(&[seq, 1, hd])?;
+        // The rotation is the shared eager cos/sin route (SW-6140): the f32 stream viewed as
+        // token-major `[1, seq, nh, hd]`, `RopeStyle::RotateHalf`, no further casts — the same
+        // `f·cos + rotate_half(f)·sin` chain as the private closure this replaced — then cast back.
+        // 2-D (row/column) positions, so there is no fused `fast::rope` route.
         let rope = |t: &Array| -> Result<Array> {
-            let f = t.as_dtype(Dtype::Float32)?;
-            let r = add(&multiply(&f, &cos)?, &multiply(&rotate_half(&f)?, &sin)?)?;
-            Ok(r.as_dtype(dtype)?)
+            let r = mlx_gen::qkv::apply_rope_eager(
+                &t.as_dtype(Dtype::Float32)?.reshape(&[1, seq, nh, hd])?,
+                mlx_gen::qkv::RopeTables::new(&cos, &sin),
+                mlx_gen::qkv::RopeStyle::RotateHalf,
+                mlx_gen::qkv::RotationAxes::TokenMajor,
+                None,
+                mlx_gen::qkv::RopeDtype::Promoted,
+            )?;
+            Ok(r.reshape(&[seq, nh, hd])?.as_dtype(dtype)?)
         };
         // [seq, nh, hd] → [nh, seq, hd].
         let q = rope(&q)?.transpose_axes(&[1, 0, 2])?;

@@ -118,10 +118,10 @@ impl FlowMatchScheduler {
 // SimpleMLPAdaLN building blocks.
 // ---------------------------------------------------------------------------
 
-/// `x*(1+scale) + shift` (DiT adaLN modulation).
+/// `x*(1+scale) + shift` (DiT adaLN modulation), strong-f32 `1`: the shared eager
+/// [`mlx_gen::nn::modulate_eager`] (SW-6140), the same three-op chain as this crate's private copy.
 fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array> {
-    let scaled = multiply(x, &add(scale, Array::from_f32(1.0))?)?;
-    add(&scaled, shift).map_err(Error::from)
+    mlx_gen::nn::modulate_eager(x, scale, shift, false)
 }
 
 /// GLIDE sinusoidal timestep embedding `[N, dim]` (f32): `half = dim/2`,

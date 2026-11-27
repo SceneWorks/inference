@@ -105,30 +105,19 @@ fn process_qkv(
     Ok((q, k, v))
 }
 
-/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`. Forwards to
-/// the shared [`mlx_gen::nn::rope_rotate`].
-fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    mlx_gen::nn::rope_rotate(real, imag, cos, sin)
-}
-
 /// Interleaved RoPE (`AttentionUtils.apply_rope_bshd`): pairs `(x[2i], x[2i+1])` rotated by
-/// `cos/sin[i]`. `cos`/`sin`: `[S, head_dim/2]`; `q`/`k`: `[B,H,S,head_dim]`.
+/// `cos/sin[i]`. `cos`/`sin`: `[S, head_dim/2]`; `q`/`k`: `[B,H,S,head_dim]`. The shared
+/// [`mlx_gen::qkv::apply_rope`] (SW-6140): the same `nn::rope_rotate` glue kernel over the same
+/// `[1, 1, S, head_dim/2]` table broadcast, no casts (`Promoted`), as this crate's private copy.
 fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let s = cos.shape()[0];
-    let half = cos.shape()[1];
-    let cos = cos.reshape(&[1, 1, s, half])?;
-    let sin = sin.reshape(&[1, 1, s, half])?;
     let one = |x: &Array| -> Result<Array> {
-        let sh = x.shape();
-        let (b, h, seq, hd) = (sh[0], sh[1], sh[2], sh[3]);
-        let x5 = x.reshape(&[b, h, seq, hd / 2, 2])?;
-        let p = split(&x5, 2, 4)?;
-        let real = p[0].reshape(&[b, h, seq, hd / 2])?;
-        let imag = p[1].reshape(&[b, h, seq, hd / 2])?;
-        let (out0, out1) = rope_rotate(&real, &imag, &cos, &sin)?;
-        Ok(
-            concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-                .reshape(&[b, h, seq, hd])?,
+        mlx_gen::qkv::apply_rope(
+            x,
+            mlx_gen::qkv::RopeTables::new(cos, sin),
+            mlx_gen::qkv::RopeStyle::AdjacentPair,
+            mlx_gen::qkv::RotationAxes::HeadMajor,
+            None,
+            mlx_gen::qkv::RopeDtype::Promoted,
         )
     };
     Ok((one(q)?, one(k)?))
@@ -909,10 +898,9 @@ impl Flux2Transformer {
         let scale = parts[0].expand_dims(1)?; // [B,1,dim]
         let shift = parts[1].expand_dims(1)?;
         let normed = layer_norm(x, None, None, LN_EPS)?;
-        Ok(add(
-            &multiply(&normed, &add(&scale, scalar(1.0))?)?,
-            &shift,
-        )?)
+        // Strong-f32 `1`, eager: the shared `nn::modulate_eager` (SW-6140), the same three-op
+        // chain as the inline affine it replaced (`norm_out` never joined the compiled glue).
+        mlx_gen::nn::modulate_eager(&normed, &scale, &shift, false)
     }
 
     /// `hidden_states`: `[B, seq_img, in_channels]`; `encoder_hidden_states`: `[B, seq_txt,

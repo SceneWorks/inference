@@ -325,14 +325,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 169
+              "line": 158
             }
           ],
           "reference_slice": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686::bound_skv",
-              "line": 172
+              "line": 161
             },
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
@@ -344,7 +344,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686_joint_read",
-              "line": 448
+              "line": 437
             }
           ],
           "release": [
@@ -441,7 +441,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [
@@ -490,7 +490,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [
@@ -548,7 +548,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [

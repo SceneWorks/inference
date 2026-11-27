@@ -321909,5 +321909,117 @@
       "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+    "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic bf16 weights (256x512, 128x256) and random / outlier-heavy bf16 activations (64 and 3 rows) for Fp8Linear::new on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+    "required_environment": [],
+    "device_witness": "Each Fp8Linear dynamic E4M3 forward with the act_quant_fp8 switch on records one fused call and no reference; with it off one disabled reference; both outputs bit-identical.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; every case's fused and reference outputs are bit-identical.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Fp8Linear::forward fused and reference for every case; assert the path counters and bit-identical bf16 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+    "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic bf16 weights quantized per output channel (256x512, 128x256) and random / outlier-heavy bf16 activations (64 and 3 rows) for Int8Linear::from_per_channel_parts on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+    "required_environment": [],
+    "device_witness": "Each resident per-channel Int8Linear forward with the act_quant_int8 switch on records one fused call and no reference; with it off one disabled reference; both outputs bit-identical.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; every case's fused and reference outputs are bit-identical.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Int8Linear::forward fused and reference for every case; assert the path counters and bit-identical bf16 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+      "requirements": []
+    }
   }
 ]
