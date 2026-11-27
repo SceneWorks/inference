@@ -1,8 +1,18 @@
 //! **SW-6135 — the Krea 2 Turbo W4A8 tier, end to end, on real weights** (feature SW-F287).
 //!
 //! The tier is built offline from the bf16 master by `examples/krea-w4a8-pack.rs`
-//! (`candle_gen_krea::w4a8_tier::build_w4a8_tier`) and loaded through the production native
-//! single-file route — the same entry a SceneWorks install of the tier takes. Two ignored proofs:
+//! (`candle_gen_krea::w4a8_tier::build_w4a8_tier`) and every render loads through a production
+//! `LoadSpec` entry point — the route a SceneWorks install takes:
+//!
+//! * a native single-file tier (W4A8, NVFP4) through [`candle_gen_krea::load_from_native_dit_file`]:
+//!   `LoadSpec { weights: File(native DiT), components[BASE_SNAPSHOT_COMPONENT]: Dir(bf16 base) }`,
+//!   prepared (`LoadSpec::prepare_file_sources`) and built by the registered provider, which reads
+//!   the pinned file batch through `LoadSpec::read_files_unchanged` (the validated-content receipt
+//!   these proofs register);
+//! * a snapshot tier (bf16, q8, q4) through the `krea_2_turbo` registry provider with
+//!   `LoadSpec { weights: Dir(snapshot) }`.
+//!
+//! Two ignored proofs:
 //!
 //! 1. [`w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16`] — fixed-seed 1024² 8-step Turbo renders on
 //!    the bf16 snapshot and on the W4A8 tier (plus, when their fixtures are set, the q8 / q4
@@ -29,11 +39,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
+    WeightsSource,
+};
 use candle_gen::testkit::{save_image_png, VramProbe};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::native_mapping::DeclaredLogicalShapes;
-use candle_gen_krea::pipeline;
 use candle_gen_krea::{Krea2Config, Krea2Transformer};
 
 const PROMPT: &str =
@@ -85,6 +97,9 @@ struct Measured {
     image: Image,
     sec_per_step: f64,
     peak_gb: f64,
+    /// `generate` start to the end of conditioning (the generator loads lazily, so this is the
+    /// component load plus the prompt encode), or to the first step when no conditioning boundary
+    /// is reported.
     load_s: f64,
 }
 
@@ -99,36 +114,53 @@ fn request(edge: u32, steps: u32) -> GenerationRequest {
     }
 }
 
-/// One load + render in its own scope (the components drop before the next tier loads), with the
-/// device peak over the idle baseline and the median inter-step interval.
+/// One production load + render in its own scope (the generator drops before the next tier
+/// loads), with the device peak over the idle baseline and the median inter-step interval.
 fn render(tier: Tier<'_>, adapters: &[AdapterSpec], req: &GenerationRequest) -> Measured {
-    let device = Device::new_cuda(0).expect("CUDA device 0");
     let mut probe = VramProbe::start_rendered();
-    let load_started = Instant::now();
     let phase = probe.phase();
-    let components = match tier {
-        Tier::Snapshot(root) => pipeline::load_components(root, &device, adapters, None),
-        Tier::Native { base, dit } => {
-            pipeline::load_components_native(base, dit, &device, adapters)
-        }
+    let generator = match tier {
+        Tier::Snapshot(root) => candle_gen_krea::provider_registry()
+            .expect("the Krea provider registry")
+            .load(
+                "krea_2_turbo",
+                &LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+                    .with_adapters(adapters.to_vec()),
+            ),
+        Tier::Native { base, dit } => candle_gen_krea::load_from_native_dit_file(
+            dit,
+            base,
+            adapters,
+            candle_gen_krea::descriptor(),
+        ),
     }
-    .expect("the tier loads");
-    device.synchronize().unwrap();
+    .expect("the tier loads through its production LoadSpec route");
     probe.end_load(phase);
-    let load_s = load_started.elapsed().as_secs_f64();
 
     let mut steps: Vec<Instant> = Vec::new();
+    let mut conditioned: Option<Instant> = None;
     let phase = probe.phase();
-    let images = pipeline::render(&components, req, &device, &mut |p| {
-        if let Progress::Step { .. } = p {
-            steps.push(Instant::now());
-        }
-    })
-    .expect("the tier renders");
-    device.synchronize().unwrap();
+    let started = Instant::now();
+    let output = generator
+        .generate(req, &mut |p| match p {
+            Progress::Step { .. } => steps.push(Instant::now()),
+            Progress::ConditioningComplete => {
+                conditioned.get_or_insert_with(Instant::now);
+            }
+            _ => {}
+        })
+        .expect("the tier renders");
     probe.end_gen(phase);
-    drop(components);
+    drop(generator);
+    let GenerationOutput::Images(images) = output else {
+        panic!("expected image output")
+    };
+    assert_eq!(images.len(), 1, "one image per request");
+    assert_eq!(steps.len(), STEPS as usize, "every denoising step ran");
 
+    let load_s = conditioned
+        .or_else(|| steps.first().copied())
+        .map_or(f64::NAN, |t| (t - started).as_secs_f64());
     let mut intervals: Vec<f64> = steps
         .windows(2)
         .map(|w| (w[1] - w[0]).as_secs_f64())
@@ -262,7 +294,9 @@ fn w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16() {
     println!(
         "\n[sw-6135] Krea 2 Turbo, {EDGE}x{EDGE}, {STEPS} steps, seed {SEED:#x}, sm_120 (RTX PRO 6000 Blackwell Max-Q, GPU 0)"
     );
-    println!("| tier | PSNR vs bf16 (dB) | s/step | peak VRAM over idle (GB) | load (s) |");
+    println!(
+        "| tier | PSNR vs bf16 (dB) | s/step | peak VRAM over idle (GB) | load + encode (s) |"
+    );
     println!("|---|---:|---:|---:|---:|");
     println!(
         "| bf16 | — | {:.3} | {:.1} | {:.1} |",
