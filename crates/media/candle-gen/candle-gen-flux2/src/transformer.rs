@@ -1696,12 +1696,14 @@ mod tests {
         // budget forces multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116
         // test-hardening ask (a single-row chunk can hide an off-by-one the multi-row path would trip).
         let single =
-            candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, usize::MAX).unwrap();
+            candle_gen::sdpa_budgeted_bhsd_materialized(&q, &k, &v, scale, None, sm, usize::MAX)
+                .unwrap();
         let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         // budget = b·h·s·block = 1·2·7·3 = 42 → block = 42/(1·2·7) = 3.
         for budget in [1usize, 42] {
             let chunked =
-                candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, budget).unwrap();
+                candle_gen::sdpa_budgeted_bhsd_materialized(&q, &k, &v, scale, None, sm, budget)
+                    .unwrap();
             assert_eq!(single.dims(), chunked.dims());
             let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             for (x, y) in a.iter().zip(&c) {

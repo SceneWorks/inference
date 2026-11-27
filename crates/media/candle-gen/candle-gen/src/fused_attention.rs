@@ -1,6 +1,36 @@
-//! Fused-attention dispatch (sc-26691): route an eligible `[B, H, S, D]` attention through the
-//! **FlashAttention-2** CUDA kernel, and everything else through the materialized, query-chunked
-//! [`crate::attention::sdpa_planned_bhsd`].
+//! Fused-attention dispatch (sc-26691, SW-6130): the one decision point that routes an eligible
+//! attention through the **FlashAttention-2** CUDA kernel, and everything else through the
+//! materialized, query-chunked path in [`crate::attention`].
+//!
+//! # One dispatch point for every model (SW-6130)
+//!
+//! The four shared helpers — [`crate::attention::sdpa_budgeted_bhsd`],
+//! [`crate::attention::sdpa_planned_bhsd`], [`crate::attention::sdpa_budgeted_flat`] and
+//! [`crate::attention::sdpa_planned_flat`] — consult [`route_attention_kernel`] on every call, so
+//! every provider that routes its attention through them takes the fused kernel when it can,
+//! without a per-model opt-in. The rule is, in order:
+//!
+//! 1. the caller did not ask for the materialized path (the `*_materialized` entry points, the
+//!    explicit opt-out for non-standard softmax, oracle tests and training-only code);
+//! 2. the build compiled the kernel (`candle-gen/flash-attn`);
+//! 3. the process-wide toggle ([`set_flash_attention_enabled`], default on) is on;
+//! 4. no gradient can flow through the call: no operand is on the autograd tape
+//!    ([`Tensor::track_op`]), and the thread is not inside a training scope
+//!    ([`with_materialized_attention`], entered by the shared training-job and gradient-checkpoint
+//!    drivers, whose detached stash forward would otherwise hide the tape from rule 4's first half);
+//! 5. [`select_attention_kernel`] accepts the operands (device, arch, dtype, mask, shape, ABI).
+//!
+//! Each call increments exactly one process-wide counter — the fused kernel, or the reason it was
+//! refused — readable through [`attention_path_counts`] / [`take_attention_path_counts`].
+//!
+//! ## The softmax contract
+//!
+//! The fused kernel computes the **plain last-axis softmax** of `q·kᵀ·scale` (in f32, with the
+//! probabilities rounded to the value dtype for `P·V`). When it is taken, the caller's `softmax`
+//! closure is **not called**. So the flash-eligible helpers are only correct for a closure that is
+//! `softmax_last_dim`, the composable `softmax(_, D::Minus1)`, or an f32-upcast-then-cast-back
+//! variant of either. Any other closure — sinks, clamps, a temperature, masking or scaling inside
+//! the closure, a counting or sabotaging test wrapper — must call a `*_materialized` entry point.
 //!
 //! # Why this exists
 //!
@@ -49,14 +79,17 @@
 //!
 //! # Cancellation
 //!
-//! The fused kernel is one launch per call, so a cancel cannot land *inside* it. The dispatcher
-//! checks the plan's flag once before launching (returning [`crate::CandleError::Canceled`]); the
-//! budgeted path keeps its between-chunk checks. Long sequences should additionally check between
-//! layers, which is where a fused forward's cancel latency is bounded.
+//! The fused kernel is one launch per call, so a cancel cannot land *inside* it. The planned
+//! helpers check the plan's flag once before launching (returning [`crate::CandleError::Canceled`]);
+//! the budgeted path keeps its between-chunk checks. Long sequences should additionally check
+//! between layers, which is where a fused forward's cancel latency is bounded.
+
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use candle_core::{DType, Tensor};
 
-use crate::attention::{sdpa_planned_bhsd, AttentionPlan};
+use crate::attention::{sdpa_budgeted_bhsd, sdpa_planned_bhsd, AttentionPlan};
 
 /// Candidate-only seam for callers owning a separate replay/tape fallback.
 /// Select outside the tape fold: `Some` carries the native custom backward;
@@ -79,6 +112,11 @@ pub fn try_training_sdpa_bhsd(
 /// must supply ordinary last-axis softmax (possibly upcast to f32), with no
 /// dropout, softcap or other score transform. Masks always retain the reference.
 /// Cancellation is checked before launch; a native launch cannot be interrupted.
+///
+/// Several providers also run their *inference* attention through this entry point, so the
+/// fallback is the flash-eligible [`sdpa_planned_bhsd`]: under autograd (an operand on the tape)
+/// or inside a training scope ([`with_materialized_attention`]) the router refuses the fused
+/// kernel, so a training step is exactly the materialized path it always was.
 pub fn training_sdpa_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -94,12 +132,19 @@ pub fn training_sdpa_bhsd(
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
     }
+    if q.track_op() || k.track_op() || v.track_op() {
+        // A real training call: the materialized path, counted as such (not as a leak).
+        return with_materialized_attention(|| {
+            sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
+        });
+    }
     sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
 }
 
 /// Legacy-budget overload of [`training_sdpa_bhsd`], retaining the exact
 /// composable fallback. GQA inputs must be expanded by the caller when the
 /// reference requires it; the candidate itself can sum grouped KV gradients.
+/// The fallback routes like [`training_sdpa_bhsd`]'s: fused only when no gradient can flow.
 pub fn training_sdpa_budgeted_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -112,7 +157,12 @@ pub fn training_sdpa_budgeted_bhsd(
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
     }
-    crate::attention::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+    if q.track_op() || k.track_op() || v.track_op() {
+        return with_materialized_attention(|| {
+            sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+        });
+    }
+    sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
 }
 
 /// The most score elements one [`training_sdpa_standard_bhsd`] call's reference owner holds at
@@ -123,7 +173,9 @@ pub const TRAINING_SCORE_TILE_ELEMENTS: u64 =
 
 /// Known standard composable-softmax training contract. Reference uses a single
 /// dense autograd owner instead of retaining every score intermediate per layer.
-/// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above.
+/// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above. An untracked call the router would
+/// fuse (an inference forward) takes the fused kernel; every other call keeps the streaming / reference
+/// owners and the always-materialized [`crate::attention::sdpa_planned_bhsd_materialized`] fallback.
 pub fn training_sdpa_standard_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -135,6 +187,20 @@ pub fn training_sdpa_standard_bhsd(
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
     }
+    // An inference forward through this training-shaped entry point (Krea control runs its frozen
+    // DiT and branch through it): when the shared router would fuse the call, do so. Under autograd
+    // or a training scope the router refuses and the owners below run exactly as before.
+    if route_attention_kernel(q, k, v, mask) == AttentionKernel::Flash {
+        return sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            mask,
+            |s| candle_nn::ops::softmax(s, candle_core::D::Minus1),
+            plan,
+        );
+    }
     if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
         return Ok(out);
     }
@@ -142,7 +208,7 @@ pub fn training_sdpa_standard_bhsd(
     {
         return Ok(out);
     }
-    sdpa_planned_bhsd(
+    crate::attention::sdpa_planned_bhsd_materialized(
         q,
         k,
         v,
@@ -186,6 +252,13 @@ pub enum FlashRefusal {
     MixedDevice,
     /// A stride or extent the kernel would receive exceeds `u32::MAX` (its parameter ABI).
     IndexOverflow,
+    /// The process-wide toggle ([`set_flash_attention_enabled`]) is off.
+    Disabled,
+    /// The caller asked for the materialized path: a `*_materialized` entry point, or a call
+    /// inside a training scope ([`with_materialized_attention`]).
+    Materialized,
+    /// An operand is on the autograd tape, and the fused kernel has no backward.
+    GradTracked,
 }
 
 /// One attention operand as [`flash_eligibility`] sees it: dtype, `[B, H, S, D]` dims and element
@@ -399,39 +472,387 @@ pub fn flash_device(device: &candle_core::Device) -> FlashDevice {
     }
 }
 
-/// Scaled-dot-product attention over `q,k,v: [B, H, S, D]` (any strides whose last dim is
-/// unit-stride), returning a contiguous `[B, H, Sq, D]`.
+// ---------------------------------------------------------------------------------------------
+// The process-wide toggle (SW-6130 E3).
+// ---------------------------------------------------------------------------------------------
+
+static FLASH_ATTENTION_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable the fused attention kernel for every subsequent call in this process (the
+/// one toggle; default **on**). Off, every shared helper takes the materialized path and counts
+/// [`FlashRefusal::Disabled`]. It has no effect on a build without `candle-gen/flash-attn`.
 ///
-/// Takes the fused FlashAttention-2 kernel when [`select_attention_kernel`] says so, otherwise
-/// exactly [`sdpa_planned_bhsd`] with the caller's `mask`, `softmax` and `plan` — so CPU, Metal,
-/// non-flash builds, f32 and masked calls are byte-identical to calling that directly.
+/// Read per call, so flipping it between requests takes effect at the next attention call — no
+/// pipeline reload. The SDXL `set_flash_attn` and Z-Image `set_accel_attn` knobs are thin wrappers
+/// over this one switch.
+pub fn set_flash_attention_enabled(on: bool) {
+    FLASH_ATTENTION_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the fused attention kernel is currently allowed ([`set_flash_attention_enabled`]).
+pub fn flash_attention_enabled() -> bool {
+    FLASH_ATTENTION_ENABLED.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The training scope (SW-6130 E2/E5).
+// ---------------------------------------------------------------------------------------------
+
+thread_local! {
+    static MATERIALIZED_SCOPE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` with every shared attention helper on this thread forced onto the materialized path
+/// (counted as [`FlashRefusal::Materialized`]). Nests, and restores on unwind.
 ///
-/// The fused path is **not** bitwise equal to the materialized one (different reduction order,
-/// bf16 probabilities); the `#[ignore]`d `flash_matches_budgeted_on_cuda` measures the gap.
-pub fn sdpa_dispatch_bhsd(
+/// The autograd check ([`Tensor::track_op`]) alone cannot see a training forward that runs on
+/// *detached* operands and recomputes later under the tape — the gradient-checkpoint stash forward,
+/// a tape fold, a custom-backward reference owner. The shared training-job scope
+/// (`train::policy::with_job_policy`) and the checkpointed backward driver enter this scope, so a
+/// training step is the materialized path it always was, bit for bit.
+pub fn with_materialized_attention<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = enter_materialized_attention();
+    f()
+}
+
+/// The guard form of [`with_materialized_attention`]: the scope lasts until the returned value
+/// drops (nesting, and unwinding, restore the previous depth). Thread-bound, so not `Send`. For a
+/// test or harness that pins a whole body to the materialized path.
+pub fn enter_materialized_attention() -> MaterializedAttentionScope {
+    let previous = MATERIALIZED_SCOPE.replace(MATERIALIZED_SCOPE.get().saturating_add(1));
+    MaterializedAttentionScope {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// An active [`enter_materialized_attention`] scope on this thread.
+#[must_use = "the materialized-attention scope ends when this guard drops"]
+pub struct MaterializedAttentionScope {
+    previous: u32,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for MaterializedAttentionScope {
+    fn drop(&mut self) {
+        MATERIALIZED_SCOPE.set(self.previous);
+    }
+}
+
+/// Whether this thread is inside [`with_materialized_attention`].
+pub fn in_materialized_attention_scope() -> bool {
+    MATERIALIZED_SCOPE.get() > 0
+}
+
+// ---------------------------------------------------------------------------------------------
+// The router (SW-6130 E1).
+// ---------------------------------------------------------------------------------------------
+
+/// The per-call inputs of the router that are not properties of the operands' shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashGate {
+    /// The caller asked for the materialized path (a `*_materialized` entry point or a training
+    /// scope).
+    pub materialized: bool,
+    /// The process-wide toggle ([`flash_attention_enabled`]).
+    pub enabled: bool,
+    /// Some operand is on the autograd tape.
+    pub grad_tracked: bool,
+}
+
+/// The pure front half of the router: the refusal that applies before any operand inspection, or
+/// `None` when the call may go on to [`flash_eligibility`]. The order is the module-level rule's.
+pub fn flash_gate_refusal(gate: FlashGate, compiled: bool) -> Option<FlashRefusal> {
+    if gate.materialized {
+        Some(FlashRefusal::Materialized)
+    } else if !compiled {
+        Some(FlashRefusal::NotCompiled)
+    } else if !gate.enabled {
+        Some(FlashRefusal::Disabled)
+    } else if gate.grad_tracked {
+        Some(FlashRefusal::GradTracked)
+    } else {
+        None
+    }
+}
+
+/// The full pure router: [`flash_gate_refusal`], then [`flash_eligibility`].
+#[allow(clippy::too_many_arguments)]
+pub fn flash_route(
+    gate: FlashGate,
+    compiled: bool,
+    device: FlashDevice,
+    same_device: bool,
+    q: FlashOperand<'_>,
+    k: FlashOperand<'_>,
+    v: FlashOperand<'_>,
+    masked: bool,
+) -> AttentionKernel {
+    match flash_gate_refusal(gate, compiled) {
+        Some(refusal) => AttentionKernel::Budgeted(refusal),
+        None => flash_eligibility(compiled, device, same_device, q, k, v, masked),
+    }
+}
+
+/// The kernel a flash-eligible shared helper takes for these `[B, H, S, D]` operands right now:
+/// [`flash_route`] for real tensors, the toggle, the training scope and the autograd state. Pure
+/// with respect to the counters — the helpers count; callers that only need to *know* the route
+/// (MiniMax-H3's execution receipt) may call this freely.
+pub fn route_attention_kernel(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    scale: f64,
     mask: Option<&Tensor>,
-    softmax: impl Fn(&Tensor) -> candle_core::Result<Tensor>,
-    plan: AttentionPlan<'_>,
-) -> crate::Result<Tensor> {
-    match select_attention_kernel(q, k, v, mask) {
-        AttentionKernel::Flash => {
-            if plan.is_cancelled() {
-                return Err(crate::CandleError::Canceled);
-            }
-            Ok(flash_bhsd(q, k, v, scale)?)
-        }
-        AttentionKernel::Budgeted(_) => sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan),
+) -> AttentionKernel {
+    let gate = FlashGate {
+        materialized: in_materialized_attention_scope(),
+        enabled: flash_attention_enabled(),
+        grad_tracked: q.track_op() || k.track_op() || v.track_op(),
+    };
+    match flash_gate_refusal(gate, FLASH_ATTN_COMPILED) {
+        Some(refusal) => AttentionKernel::Budgeted(refusal),
+        // The device classification only runs once the cheap gate passed.
+        None => select_attention_kernel(q, k, v, mask),
     }
+}
+
+/// Which flash-eligible helper a call came through: the category the `GradTracked` leak warning is
+/// throttled by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionSite {
+    BudgetedBhsd = 0,
+    PlannedBhsd = 1,
+    BudgetedFlat = 2,
+    PlannedFlat = 3,
+}
+
+const ATTENTION_SITES: usize = 4;
+static GRAD_TRACKED_WARNED: [AtomicBool; ATTENTION_SITES] =
+    [const { AtomicBool::new(false) }; ATTENTION_SITES];
+
+/// Whether this `GradTracked` refusal is the first for `site` in the process (then the caller
+/// warns). One relaxed load once a site has warned.
+fn first_grad_tracked_refusal(site: AttentionSite) -> bool {
+    let flag = &GRAD_TRACKED_WARNED[site as usize];
+    !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::Relaxed)
+}
+
+/// A `GradTracked` refusal outside a training scope means an inference path leaked autograd-tracked
+/// tensors (a `Var` built at inference, an un-detached adapter) and silently lost the fused kernel.
+#[cold]
+fn warn_grad_tracked(site: AttentionSite, caller: &'static std::panic::Location<'static>) {
+    tracing::warn!(
+        target: "candle_gen::fused_attention",
+        ?site,
+        %caller,
+        "attention operands are on the autograd tape outside a training scope: the call takes the \
+         materialized path instead of FlashAttention-2 (counted as grad_tracked). Detach inference \
+         tensors, or pin a training call with with_materialized_attention. Warned once per helper \
+         kind per process."
+    );
+}
+
+/// Route one helper call and count it. `true` = take the fused kernel.
+#[track_caller]
+pub(crate) fn take_flash(
+    site: AttentionSite,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> bool {
+    let kernel = route_attention_kernel(q, k, v, mask);
+    record_attention_path(kernel);
+    // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
+    // `Materialized` first.
+    if kernel == AttentionKernel::Budgeted(FlashRefusal::GradTracked)
+        && first_grad_tracked_refusal(site)
+    {
+        warn_grad_tracked(site, std::panic::Location::caller());
+    }
+    kernel == AttentionKernel::Flash
+}
+
+/// Count one explicitly materialized helper call.
+pub(crate) fn record_materialized_call() {
+    record_attention_path(AttentionKernel::Budgeted(FlashRefusal::Materialized));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The path counters (SW-6130 E4).
+// ---------------------------------------------------------------------------------------------
+
+/// Process-wide count of shared-helper attention calls by the path they took: the fused kernel,
+/// or the budgeted path with the reason the fused kernel was refused. A cheap `Copy` snapshot —
+/// read it with [`attention_path_counts`], or drain it per job with [`take_attention_path_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttentionPathCounts {
+    /// Calls that ran the FlashAttention-2 kernel.
+    pub flash: u64,
+    /// Budgeted: the build does not compile the kernel.
+    pub not_compiled: u64,
+    /// Budgeted: the operands are not on a CUDA device.
+    pub not_cuda: u64,
+    /// Budgeted: the CUDA device's compute capability is not served.
+    pub unsupported_arch: u64,
+    /// Budgeted: the dtype has no fused kernel (only bf16 / f16 do).
+    pub dtype: u64,
+    /// Budgeted: q / k / v disagree on dtype or device.
+    pub mixed_dtype_or_device: u64,
+    /// Budgeted: the call carries an additive mask.
+    pub masked: u64,
+    /// Budgeted: rank, batch, K/V shape or head-group mismatch.
+    pub shape: u64,
+    /// Budgeted: the head dim is unsupported.
+    pub head_dim: u64,
+    /// Budgeted: a stride or extent exceeds the kernel's `u32` ABI.
+    pub index_overflow: u64,
+    /// Budgeted: the process-wide toggle is off.
+    pub disabled: u64,
+    /// Budgeted: an operand is on the autograd tape.
+    pub grad_tracked: u64,
+    /// Budgeted: the caller asked for the materialized path.
+    pub materialized: u64,
+}
+
+impl AttentionPathCounts {
+    /// Every budgeted (non-fused) call, whatever the reason.
+    pub fn budgeted(&self) -> u64 {
+        self.not_compiled
+            + self.not_cuda
+            + self.unsupported_arch
+            + self.dtype
+            + self.mixed_dtype_or_device
+            + self.masked
+            + self.shape
+            + self.head_dim
+            + self.index_overflow
+            + self.disabled
+            + self.grad_tracked
+            + self.materialized
+    }
+
+    /// Every counted call.
+    pub fn total(&self) -> u64 {
+        self.flash + self.budgeted()
+    }
+
+    /// The field-wise difference `self - earlier` (saturating), for a window between two snapshots.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        Self {
+            flash: d(self.flash, earlier.flash),
+            not_compiled: d(self.not_compiled, earlier.not_compiled),
+            not_cuda: d(self.not_cuda, earlier.not_cuda),
+            unsupported_arch: d(self.unsupported_arch, earlier.unsupported_arch),
+            dtype: d(self.dtype, earlier.dtype),
+            mixed_dtype_or_device: d(self.mixed_dtype_or_device, earlier.mixed_dtype_or_device),
+            masked: d(self.masked, earlier.masked),
+            shape: d(self.shape, earlier.shape),
+            head_dim: d(self.head_dim, earlier.head_dim),
+            index_overflow: d(self.index_overflow, earlier.index_overflow),
+            disabled: d(self.disabled, earlier.disabled),
+            grad_tracked: d(self.grad_tracked, earlier.grad_tracked),
+            materialized: d(self.materialized, earlier.materialized),
+        }
+    }
+}
+
+/// One counter slot per [`AttentionPathCounts`] field, in field order.
+const PATH_SLOTS: usize = 13;
+static PATH_COUNTS: [AtomicU64; PATH_SLOTS] = [const { AtomicU64::new(0) }; PATH_SLOTS];
+
+/// The counter slot a routed call lands in.
+fn path_slot(kernel: AttentionKernel) -> usize {
+    use FlashRefusal as R;
+    match kernel {
+        AttentionKernel::Flash => 0,
+        AttentionKernel::Budgeted(reason) => match reason {
+            R::NotCompiled => 1,
+            R::NotCuda => 2,
+            R::UnsupportedArch(_) => 3,
+            R::Dtype(_) => 4,
+            R::MixedDtype | R::MixedDevice => 5,
+            R::Masked => 6,
+            R::Shape => 7,
+            R::HeadDim(_) => 8,
+            R::IndexOverflow => 9,
+            R::Disabled => 10,
+            R::GradTracked => 11,
+            R::Materialized => 12,
+        },
+    }
+}
+
+/// Count one routed call. A single relaxed increment: no logging, no allocation.
+pub fn record_attention_path(kernel: AttentionKernel) {
+    PATH_COUNTS[path_slot(kernel)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn counts_from(read: impl Fn(&AtomicU64) -> u64) -> AttentionPathCounts {
+    let c: [u64; PATH_SLOTS] = std::array::from_fn(|i| read(&PATH_COUNTS[i]));
+    counts_from_slots(&c)
+}
+
+fn counts_from_slots(c: &[u64; PATH_SLOTS]) -> AttentionPathCounts {
+    AttentionPathCounts {
+        flash: c[0],
+        not_compiled: c[1],
+        not_cuda: c[2],
+        unsupported_arch: c[3],
+        dtype: c[4],
+        mixed_dtype_or_device: c[5],
+        masked: c[6],
+        shape: c[7],
+        head_dim: c[8],
+        index_overflow: c[9],
+        disabled: c[10],
+        grad_tracked: c[11],
+        materialized: c[12],
+    }
+}
+
+/// A snapshot of the process-wide attention path counters.
+pub fn attention_path_counts() -> AttentionPathCounts {
+    counts_from(|a| a.load(Ordering::Relaxed))
+}
+
+/// Drain the process-wide attention path counters: return their values and reset them to zero
+/// (each slot atomically; a call racing the drain lands in this snapshot or the next, never lost).
+pub fn take_attention_path_counts() -> AttentionPathCounts {
+    counts_from(|a| a.swap(0, Ordering::Relaxed))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fused forward.
+// ---------------------------------------------------------------------------------------------
+
+/// `[N, S, D]` as the `[B = N, H = 1, S, D]` view the router and kernel see: a free `unsqueeze`,
+/// no copy. The flat helpers fold heads into the batch (SDXL) or run single-head (a VAE mid
+/// block), and every one of the `N` rows is its own independent attention, so `N` is the batch.
+pub(crate) fn flat_as_bhsd(t: &Tensor) -> candle_core::Result<Tensor> {
+    t.unsqueeze(1)
+}
+
+/// The pure dims/strides of [`flat_as_bhsd`]'s view, for the routing unit tests.
+#[cfg(test)]
+fn flat_as_bhsd_layout(dims: [usize; 3], strides: [usize; 3]) -> ([usize; 4], [usize; 4]) {
+    let [n, s, d] = dims;
+    let [sn, ss, sd] = strides;
+    // candle's `unsqueeze(1)` gives the new unit dim the stride of the dim it displaces (`ss`); any
+    // stride is valid for an extent-1 dim, and this one keeps a contiguous view contiguous.
+    ([n, 1, s, d], [sn, ss, ss, sd])
 }
 
 /// The fused forward. The kernel wants `[B, S, H, D]`, which is a free transpose of a `[B, H, S, D]`
 /// view (only the last dim must be unit-stride; the batch/row/head strides are passed through).
 #[cfg(feature = "flash-attn")]
-fn flash_bhsd(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
+pub(crate) fn flash_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+) -> candle_core::Result<Tensor> {
     let unit_last = |t: &Tensor| -> candle_core::Result<Tensor> {
         let t = t.transpose(1, 2)?;
         if t.stride().last() == Some(&1) {
@@ -451,7 +872,12 @@ fn flash_bhsd(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> candle_core::Re
 }
 
 #[cfg(not(feature = "flash-attn"))]
-fn flash_bhsd(_q: &Tensor, _k: &Tensor, _v: &Tensor, _scale: f64) -> candle_core::Result<Tensor> {
+pub(crate) fn flash_bhsd(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _scale: f64,
+) -> candle_core::Result<Tensor> {
     // Unreachable: `flash_eligibility` refuses with `NotCompiled` first.
     candle_core::bail!("candle-gen: the fused attention kernel is not compiled into this build")
 }
@@ -718,10 +1144,336 @@ mod tests {
         );
     }
 
-    /// On the CPU every call refuses (`NotCuda` or `NotCompiled`), and the dispatcher is then the
-    /// planned budgeted path verbatim — the same values, and the same typed cancel.
+    // -----------------------------------------------------------------------------------------
+    // SW-6130 routing: pure decisions and counters. None of these runs attention (or any learned)
+    // computation: they drive the pure router, record counts, or build zero-filled operands only to
+    // read their layout / autograd state, and the entry-point probes fail on the operand rank before
+    // a single matmul.
+    // -----------------------------------------------------------------------------------------
+
+    const OPEN: FlashGate = FlashGate {
+        materialized: false,
+        enabled: true,
+        grad_tracked: false,
+    };
+
+    #[test]
+    fn the_gate_refuses_in_rule_order() {
+        let r = |materialized, enabled, grad_tracked, compiled| {
+            flash_gate_refusal(
+                FlashGate {
+                    materialized,
+                    enabled,
+                    grad_tracked,
+                },
+                compiled,
+            )
+        };
+        assert_eq!(r(false, true, false, true), None);
+        // An explicit materialized request wins over everything, even a non-flash build.
+        assert_eq!(
+            r(true, false, true, false),
+            Some(FlashRefusal::Materialized)
+        );
+        assert_eq!(
+            r(false, false, true, false),
+            Some(FlashRefusal::NotCompiled)
+        );
+        assert_eq!(r(false, false, true, true), Some(FlashRefusal::Disabled));
+        assert_eq!(r(false, true, true, true), Some(FlashRefusal::GradTracked));
+    }
+
+    #[test]
+    fn the_route_is_the_gate_then_the_eligibility_rule() {
+        use AttentionKernel::Budgeted;
+        let st = contiguous(&H3);
+        let op = FlashOperand {
+            dtype: DType::BF16,
+            dims: &H3,
+            strides: &st,
+        };
+        let route = |gate, masked| flash_route(gate, true, SM120, true, op, op, op, masked);
+        assert_eq!(route(OPEN, false), AttentionKernel::Flash);
+        // The toggle off, a materialized request and a taped operand each refuse a call that
+        // would otherwise take the kernel.
+        let off = FlashGate {
+            enabled: false,
+            ..OPEN
+        };
+        assert_eq!(route(off, false), Budgeted(FlashRefusal::Disabled));
+        let mat = FlashGate {
+            materialized: true,
+            ..OPEN
+        };
+        assert_eq!(route(mat, false), Budgeted(FlashRefusal::Materialized));
+        let taped = FlashGate {
+            grad_tracked: true,
+            ..OPEN
+        };
+        assert_eq!(route(taped, false), Budgeted(FlashRefusal::GradTracked));
+        // An open gate defers to the eligibility rule: a mask still refuses.
+        assert_eq!(route(OPEN, true), Budgeted(FlashRefusal::Masked));
+        // A non-flash build refuses before any operand inspection.
+        assert_eq!(
+            flash_route(OPEN, false, SM120, true, op, op, op, false),
+            Budgeted(FlashRefusal::NotCompiled)
+        );
+    }
+
+    /// Every routed kernel lands in exactly one counter, the one its reason names.
+    #[test]
+    fn every_route_increments_exactly_its_own_counter() {
+        use AttentionKernel::Budgeted;
+        use FlashRefusal as R;
+        type Field = fn(&AttentionPathCounts) -> u64;
+        let cases: [(AttentionKernel, Field); 16] = [
+            (AttentionKernel::Flash, |c| c.flash),
+            (Budgeted(R::NotCompiled), |c| c.not_compiled),
+            (Budgeted(R::NotCuda), |c| c.not_cuda),
+            (Budgeted(R::UnsupportedArch(Some(75))), |c| {
+                c.unsupported_arch
+            }),
+            (Budgeted(R::UnsupportedArch(None)), |c| c.unsupported_arch),
+            (Budgeted(R::Dtype(DType::F32)), |c| c.dtype),
+            (Budgeted(R::MixedDtype), |c| c.mixed_dtype_or_device),
+            (Budgeted(R::MixedDevice), |c| c.mixed_dtype_or_device),
+            (Budgeted(R::Masked), |c| c.masked),
+            (Budgeted(R::Shape), |c| c.shape),
+            (Budgeted(R::HeadDim(100)), |c| c.head_dim),
+            (Budgeted(R::IndexOverflow), |c| c.index_overflow),
+            (Budgeted(R::Disabled), |c| c.disabled),
+            (Budgeted(R::GradTracked), |c| c.grad_tracked),
+            (Budgeted(R::Materialized), |c| c.materialized),
+            (Budgeted(R::Materialized), |c| c.materialized),
+        ];
+        for (kernel, field) in cases {
+            let before = attention_path_counts();
+            record_attention_path(kernel);
+            let delta = attention_path_counts().since(&before);
+            assert_eq!(field(&delta), 1, "{kernel:?} missed its counter");
+            assert_eq!(
+                delta.total(),
+                1,
+                "{kernel:?} landed in more than one counter"
+            );
+            let budgeted = u64::from(kernel != AttentionKernel::Flash);
+            assert_eq!(delta.budgeted(), budgeted, "{kernel:?}");
+        }
+    }
+
+    #[test]
+    fn take_drains_the_counters() {
+        record_attention_path(AttentionKernel::Flash);
+        record_attention_path(AttentionKernel::Budgeted(FlashRefusal::Masked));
+        let drained = take_attention_path_counts();
+        assert!(drained.flash >= 1 && drained.masked >= 1, "{drained:?}");
+        // Serial test threads (`.cargo/config.toml`): nothing ran in between.
+        assert_eq!(attention_path_counts(), AttentionPathCounts::default());
+    }
+
+    /// Zero-filled `[1, 2, 16, 8]` operands: an allocation, never an attention computation.
+    fn zero_operands(dtype: DType) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+        let z = || Tensor::zeros((1, 2, 16, 8), dtype, &Device::Cpu);
+        Ok((z()?, z()?, z()?))
+    }
+
+    /// What a CPU call reports once the gate is open: the build's first eligibility refusal.
+    fn cpu_refusal() -> FlashRefusal {
+        if FLASH_ATTN_COMPILED {
+            FlashRefusal::NotCuda
+        } else {
+            FlashRefusal::NotCompiled
+        }
+    }
+
+    #[test]
+    fn the_toggle_round_trips_and_refuses_as_disabled() -> candle_core::Result<()> {
+        let (q, k, v) = zero_operands(DType::BF16)?;
+        assert!(flash_attention_enabled(), "the toggle defaults on");
+        assert_eq!(
+            route_attention_kernel(&q, &k, &v, None),
+            AttentionKernel::Budgeted(cpu_refusal())
+        );
+        set_flash_attention_enabled(false);
+        let off = route_attention_kernel(&q, &k, &v, None);
+        set_flash_attention_enabled(true);
+        // A non-flash build reports the missing kernel first; a flash build the switch.
+        let want = if FLASH_ATTN_COMPILED {
+            FlashRefusal::Disabled
+        } else {
+            FlashRefusal::NotCompiled
+        };
+        assert_eq!(off, AttentionKernel::Budgeted(want));
+        assert!(flash_attention_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn a_training_scope_routes_materialized_and_nests() -> candle_core::Result<()> {
+        let (q, k, v) = zero_operands(DType::BF16)?;
+        let mat = AttentionKernel::Budgeted(FlashRefusal::Materialized);
+        assert!(!in_materialized_attention_scope());
+        let (outer, inner, after_inner) = with_materialized_attention(|| {
+            let outer = route_attention_kernel(&q, &k, &v, None);
+            let inner = with_materialized_attention(|| route_attention_kernel(&q, &k, &v, None));
+            (outer, inner, in_materialized_attention_scope())
+        });
+        assert_eq!((outer, inner), (mat, mat));
+        assert!(
+            after_inner,
+            "leaving the inner scope must keep the outer one"
+        );
+        assert!(!in_materialized_attention_scope());
+        {
+            let _guard = enter_materialized_attention();
+            assert_eq!(route_attention_kernel(&q, &k, &v, None), mat);
+        }
+        assert!(
+            !in_materialized_attention_scope(),
+            "the guard restores on drop"
+        );
+        assert_eq!(
+            route_attention_kernel(&q, &k, &v, None),
+            AttentionKernel::Budgeted(cpu_refusal())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_operand_on_the_tape_refuses_the_fused_kernel() -> candle_core::Result<()> {
+        let (q, k, v) = zero_operands(DType::BF16)?;
+        let taped = candle_core::Var::zeros((1, 2, 16, 8), DType::BF16, &Device::Cpu)?;
+        let want = if FLASH_ATTN_COMPILED {
+            FlashRefusal::GradTracked
+        } else {
+            FlashRefusal::NotCompiled
+        };
+        for (q, k, v) in [
+            (taped.as_tensor(), &k, &v),
+            (&q, taped.as_tensor(), &v),
+            (&q, &k, taped.as_tensor()),
+        ] {
+            assert_eq!(
+                route_attention_kernel(q, k, v, None),
+                AttentionKernel::Budgeted(want)
+            );
+        }
+        // A detached view of the same storage is off the tape again.
+        assert_eq!(
+            route_attention_kernel(&taped.as_tensor().detach(), &k, &v, None),
+            AttentionKernel::Budgeted(cpu_refusal())
+        );
+        Ok(())
+    }
+
+    /// The `*_materialized` entry points count `Materialized` without consulting the router, and
+    /// the flash-eligible ones count the router's reason. Rank-2 operands fail every helper at its
+    /// first `dims4` / `dims3`, so no attention is computed.
+    #[test]
+    fn each_entry_point_counts_its_route() {
+        use crate::attention::{
+            sdpa_budgeted_bhsd_materialized, sdpa_budgeted_flat, sdpa_budgeted_flat_materialized,
+            sdpa_planned_bhsd_materialized, sdpa_planned_flat, sdpa_planned_flat_materialized,
+        };
+        let bad = Tensor::zeros((4, 8), DType::F32, &Device::Cpu).unwrap();
+        let sm = |s: &Tensor| softmax_last_dim(s);
+        let plan = AttentionPlan::UNBOUNDED;
+        let count = |f: &dyn Fn() -> bool| {
+            let before = attention_path_counts();
+            assert!(f(), "the probe call must fail on its operand rank");
+            attention_path_counts().since(&before)
+        };
+        let materialized = [
+            count(&|| sdpa_budgeted_bhsd_materialized(&bad, &bad, &bad, 1.0, None, sm, 8).is_err()),
+            count(&|| {
+                sdpa_planned_bhsd_materialized(&bad, &bad, &bad, 1.0, None, sm, plan).is_err()
+            }),
+            count(&|| sdpa_budgeted_flat_materialized(&bad, &bad, &bad, 1.0, sm, 8).is_err()),
+            count(&|| sdpa_planned_flat_materialized(&bad, &bad, &bad, 1.0, sm, plan).is_err()),
+        ];
+        for delta in materialized {
+            assert_eq!(delta.materialized, 1, "{delta:?}");
+            assert_eq!(delta.total(), 1, "{delta:?}");
+        }
+        // The flash-eligible bhsd helpers route first: on the CPU the refusal is the build's.
+        let routed = [
+            count(&|| sdpa_budgeted_bhsd(&bad, &bad, &bad, 1.0, None, sm, 8).is_err()),
+            count(&|| sdpa_planned_bhsd(&bad, &bad, &bad, 1.0, None, sm, plan).is_err()),
+        ];
+        for delta in routed {
+            assert_eq!(delta.total(), 1, "{delta:?}");
+            assert_eq!(delta.flash, 0, "{delta:?}");
+            assert_eq!(delta.materialized, 0, "{delta:?}");
+        }
+        // The flat helpers refuse a non-rank-3 operand as a shape mismatch before any view.
+        for delta in [
+            count(&|| sdpa_budgeted_flat(&bad, &bad, &bad, 1.0, sm, 8).is_err()),
+            count(&|| sdpa_planned_flat(&bad, &bad, &bad, 1.0, sm, plan).is_err()),
+        ] {
+            assert_eq!(delta.shape, 1, "{delta:?}");
+            assert_eq!(delta.total(), 1, "{delta:?}");
+        }
+    }
+
+    /// The flat `[N, S, D]` helpers route the free `[N, 1, S, D]` view: the pure layout map agrees
+    /// with candle's own `unsqueeze` (so the router judges exactly what the kernel receives), and
+    /// the kernel's view of it needs no copy.
+    #[test]
+    fn the_flat_layout_maps_to_n_single_head_rows_without_a_copy() -> candle_core::Result<()> {
+        // SDXL's heads-into-batch self-attention at 1024² (N = B·H = 2·10, S = 4096, d = 64), and a
+        // strided (sliced) operand.
+        let base = Tensor::zeros((20, 4096, 64), DType::BF16, &Device::Cpu)?;
+        let sliced = Tensor::zeros((20, 4096, 128), DType::BF16, &Device::Cpu)?.narrow(2, 0, 64)?;
+        for t in [&base, &sliced] {
+            let view = flat_as_bhsd(t)?;
+            let dims: [usize; 3] = t.dims().try_into().unwrap();
+            let strides: [usize; 3] = t.stride().try_into().unwrap();
+            let (want_dims, want_strides) = flat_as_bhsd_layout(dims, strides);
+            assert_eq!(view.dims(), want_dims);
+            assert_eq!(view.stride(), want_strides);
+            // The kernel's `[N, S, 1, D]` transpose keeps a unit last stride: passed through as-is.
+            assert_eq!(view.transpose(1, 2)?.stride().last(), Some(&1));
+        }
+        let (dims, strides) = flat_as_bhsd_layout([20, 4096, 64], [4096 * 64, 64, 1]);
+        let op = FlashOperand {
+            dtype: DType::BF16,
+            dims: &dims,
+            strides: &strides,
+        };
+        assert_eq!(
+            flash_eligibility(true, SM120, true, op, op, op, false),
+            AttentionKernel::Flash
+        );
+        // A single-head 512-channel VAE mid block keeps the materialized path (head dim > 256).
+        let (dims, strides) = flat_as_bhsd_layout([1, 16384, 512], [16384 * 512, 512, 1]);
+        let vae = FlashOperand {
+            dtype: DType::BF16,
+            dims: &dims,
+            strides: &strides,
+        };
+        assert_eq!(
+            flash_eligibility(true, SM120, true, vae, vae, vae, false),
+            AttentionKernel::Budgeted(FlashRefusal::HeadDim(512))
+        );
+        Ok(())
+    }
+
+    /// The inference-leak warning fires once per helper kind, then costs one relaxed load.
+    #[test]
+    fn the_grad_tracked_leak_warning_is_throttled_per_site() {
+        // A dedicated site so other tests' routing cannot pre-arm it.
+        let site = AttentionSite::PlannedFlat;
+        GRAD_TRACKED_WARNED[site as usize].store(false, Ordering::Relaxed);
+        assert!(first_grad_tracked_refusal(site));
+        assert!(!first_grad_tracked_refusal(site));
+        assert!(!first_grad_tracked_refusal(site));
+    }
+
+    /// On the CPU every call refuses (`NotCuda` or `NotCompiled`), and the flash-eligible helper is
+    /// then the materialized path verbatim — the same values, and the same typed cancel.
     #[test]
     fn the_cpu_path_is_the_planned_budgeted_path() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
         let dev = Device::Cpu;
         let q = Tensor::randn(0f32, 1.0, (1, 2, 16, 8), &dev)?;
         let k = Tensor::randn(0f32, 1.0, (1, 2, 16, 8), &dev)?;
@@ -733,8 +1485,8 @@ mod tests {
         let plan = AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(
             ATTN_SCORES_BUDGET,
         ));
-        let got = sdpa_dispatch_bhsd(&q, &k, &v, 0.35, None, softmax_last_dim, plan)?;
-        let want = sdpa_planned_bhsd(&q, &k, &v, 0.35, None, softmax_last_dim, plan)?;
+        let got = sdpa_planned_bhsd(&q, &k, &v, 0.35, None, softmax_last_dim, plan)?;
+        let want = sdpa_planned_bhsd_materialized(&q, &k, &v, 0.35, None, softmax_last_dim, plan)?;
         let d = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(d, 0.0);
 
@@ -743,20 +1495,44 @@ mod tests {
         cancel.cancel();
         let tiny = AttentionPlan::budgeted(AttentionBudget::from_score_elements(64, false))
             .with_cancel(&cancel);
-        let err = sdpa_dispatch_bhsd(&q, &k, &v, 0.35, None, softmax_last_dim, tiny).unwrap_err();
+        let err = sdpa_planned_bhsd(&q, &k, &v, 0.35, None, softmax_last_dim, tiny).unwrap_err();
         assert!(matches!(err, crate::CandleError::Canceled), "{err:?}");
         Ok(())
     }
 
-    /// **Inference compute — `#[ignore]`d, never part of normal CI.** Flash vs the materialized
-    /// path on small random bf16 tensors on CUDA ordinal 0 of the visible set (run with
-    /// `CUDA_VISIBLE_DEVICES` pinned to the validation GPU):
+    // -----------------------------------------------------------------------------------------
+    // Inference compute — `#[ignore]`d, never part of normal CI. Run on a pinned validation GPU:
+    //
+    // CUDA_VISIBLE_DEVICES=<gpu> cargo test -p candle-gen --features flash-attn --lib \
+    //   fused_attention::tests::cuda_ -- --ignored --nocapture --test-threads=1
+    // -----------------------------------------------------------------------------------------
+
+    /// `(max |a - b|, ‖a - b‖₂ / ‖b‖₂)` in f32.
+    #[cfg(feature = "flash-attn")]
+    fn errors(a: &Tensor, b: &Tensor) -> crate::Result<(f32, f32)> {
+        let a = a.to_dtype(DType::F32)?;
+        let b = b.to_dtype(DType::F32)?;
+        let d = (&a - &b)?;
+        let max = d.abs()?.max_all()?.to_scalar::<f32>()?;
+        let num = d.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        let den = b.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        Ok((max, num / den.max(f32::MIN_POSITIVE)))
+    }
+
+    /// Flash vs the materialized path, through the **shared helpers themselves**, at head dims 64,
+    /// 128 and 256, with and without GQA, bf16, on the 4-D and the flat helpers.
     ///
-    /// `cargo test -p candle-gen --features flash-attn --lib fused_attention::tests::flash_matches -- --ignored --nocapture`
+    /// The reference is the materialized path entirely in f32 (GQA expanded with `repeat_kv`).
+    /// Tolerance, declared: **max |Δ| ≤ 2e-2 and rel-L2 ≤ 1e-2** against that reference. The output
+    /// is a convex combination of unit-variance bf16 values (|v| ≲ 5), so rounding the output alone
+    /// to bf16 (8 significant bits, a half-ULP of 2^-9 relative) costs up to ~1e-2 absolute; the
+    /// kernel adds its bf16 probabilities on top. The bf16 materialized path is printed beside it
+    /// as the yardstick: flash must sit at the same order, not merely under the ceiling.
     #[cfg(feature = "flash-attn")]
     #[test]
     #[ignore = "CUDA compute: run by the validation workflow, not CI"]
-    fn flash_matches_budgeted_on_cuda() -> crate::Result<()> {
+    fn cuda_flash_matches_budgeted() -> crate::Result<()> {
+        use crate::attention::{repeat_kv, sdpa_budgeted_flat, sdpa_planned_bhsd_materialized};
         let dev = Device::new_cuda(0)?;
         let plan = AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(
             ATTN_SCORES_BUDGET,
@@ -764,48 +1540,227 @@ mod tests {
         let f32_softmax = |s: &Tensor| -> candle_core::Result<Tensor> {
             softmax_last_dim(&s.to_dtype(DType::F32)?)?.to_dtype(s.dtype())
         };
-        let mut worst = 0f32;
-        for (b, h, sq, sk, d) in [
-            (1, 4, 256, 256, 128),
-            (2, 8, 333, 333, 128),
-            (1, 56, 1024, 1024, 128),
-            (1, 16, 300, 300, 72),
-            (1, 4, 128, 517, 64),
+        let (mut worst_max, mut worst_rel) = (0f32, 0f32);
+        // (b, q heads, kv heads, sq, sk, d)
+        for (b, h, hk, sq, sk, d) in [
+            (1, 8, 8, 1024, 1024, 64),
+            (2, 8, 2, 333, 517, 64),
+            (1, 24, 24, 1024, 1024, 128),
+            (1, 32, 8, 777, 777, 128),
+            (1, 8, 8, 512, 512, 256),
+            (1, 8, 4, 300, 600, 256),
         ] {
             let q = Tensor::randn(0f32, 1.0, (b, h, sq, d), &dev)?.to_dtype(DType::BF16)?;
-            let k = Tensor::randn(0f32, 1.0, (b, h, sk, d), &dev)?.to_dtype(DType::BF16)?;
-            let v = Tensor::randn(0f32, 1.0, (b, h, sk, d), &dev)?.to_dtype(DType::BF16)?;
+            let k = Tensor::randn(0f32, 1.0, (b, hk, sk, d), &dev)?.to_dtype(DType::BF16)?;
+            let v = Tensor::randn(0f32, 1.0, (b, hk, sk, d), &dev)?.to_dtype(DType::BF16)?;
             assert_eq!(
-                select_attention_kernel(&q, &k, &v, None),
+                route_attention_kernel(&q, &k, &v, None),
                 AttentionKernel::Flash
             );
             let scale = 1.0 / (d as f64).sqrt();
-            let fused = sdpa_dispatch_bhsd(&q, &k, &v, scale, None, f32_softmax, plan)?;
-            // The reference: the materialized path entirely in f32.
-            let want = sdpa_planned_bhsd(
+            let before = attention_path_counts();
+            let fused = sdpa_planned_bhsd(&q, &k, &v, scale, None, f32_softmax, plan)?;
+            assert_eq!(attention_path_counts().since(&before).flash, 1);
+            let (ke, ve) = (repeat_kv(&k, h / hk)?, repeat_kv(&v, h / hk)?);
+            let want = sdpa_planned_bhsd_materialized(
                 &q.to_dtype(DType::F32)?,
-                &k.to_dtype(DType::F32)?,
-                &v.to_dtype(DType::F32)?,
+                &ke.to_dtype(DType::F32)?,
+                &ve.to_dtype(DType::F32)?,
                 scale,
                 None,
                 softmax_last_dim,
                 plan,
             )?;
-            let old = sdpa_planned_bhsd(&q, &k, &v, scale, None, f32_softmax, plan)?;
-            let diff = |a: &Tensor| -> crate::Result<f32> {
-                Ok((a.to_dtype(DType::F32)? - &want)?
-                    .abs()?
-                    .max_all()?
-                    .to_scalar::<f32>()?)
-            };
-            let (df, db) = (diff(&fused)?, diff(&old)?);
+            let old = sdpa_planned_bhsd_materialized(&q, &ke, &ve, scale, None, f32_softmax, plan)?;
+            let (fm, fr) = errors(&fused, &want)?;
+            let (bm, br) = errors(&old, &want)?;
             println!(
-                "flash parity b={b} h={h} sq={sq} sk={sk} d={d}: max|flash - f32 ref| = {df:.3e}, \
-                 max|bf16 budgeted - f32 ref| = {db:.3e}"
+                "flash parity bhsd b={b} h={h} hk={hk} sq={sq} sk={sk} d={d}: flash max|Δ| {fm:.3e} \
+                 rel-L2 {fr:.3e}; bf16 budgeted max|Δ| {bm:.3e} rel-L2 {br:.3e}"
             );
-            worst = worst.max(df);
+            worst_max = worst_max.max(fm);
+            worst_rel = worst_rel.max(fr);
+
+            // The flat helper on the same rows (heads folded into the batch, no GQA there).
+            if hk == h {
+                let flat = |t: &Tensor| t.reshape((b * h, t.dim(2)?, d));
+                let before = attention_path_counts();
+                let fused_flat = sdpa_budgeted_flat(
+                    &flat(&q)?,
+                    &flat(&k)?,
+                    &flat(&v)?,
+                    scale,
+                    f32_softmax,
+                    ATTN_SCORES_BUDGET,
+                )?;
+                assert_eq!(attention_path_counts().since(&before).flash, 1);
+                let (fm, fr) = errors(&fused_flat, &flat(&want)?)?;
+                println!(
+                    "flash parity flat n={} s={sq} d={d}: max|Δ| {fm:.3e} rel-L2 {fr:.3e}",
+                    b * h
+                );
+                worst_max = worst_max.max(fm);
+                worst_rel = worst_rel.max(fr);
+            }
         }
-        assert!(worst < 2e-2, "flash vs f32 reference max|Δ| = {worst}");
+        println!("flash parity worst: max|Δ| {worst_max:.3e}, rel-L2 {worst_rel:.3e}");
+        assert!(
+            worst_max <= 2e-2,
+            "flash vs f32 reference max|Δ| = {worst_max}"
+        );
+        assert!(
+            worst_rel <= 1e-2,
+            "flash vs f32 reference rel-L2 = {worst_rel}"
+        );
+        Ok(())
+    }
+
+    /// A masked call through the flash-eligible helper must be the materialized path exactly —
+    /// the router refuses the kernel, which cannot express an additive bias. (The SW-6130 mutation
+    /// check forced the kernel on this call and watched the comparison fail.)
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_masked_calls_keep_the_materialized_path() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
+        let dev = Device::new_cuda(0)?;
+        let (b, h, s, d) = (1, 8, 512, 128);
+        let q = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        // A key-padding mask hiding the last quarter of the keys.
+        let keep: Vec<f32> = (0..s)
+            .map(|i| if i < 3 * s / 4 { 0.0 } else { -1e9 })
+            .collect();
+        let mask = Tensor::from_vec(keep, (1, 1, 1, s), &dev)?.to_dtype(DType::BF16)?;
+        let plan = AttentionPlan::UNBOUNDED;
+        let scale = 1.0 / (d as f64).sqrt();
+        let before = attention_path_counts();
+        let got = sdpa_planned_bhsd(&q, &k, &v, scale, Some(&mask), softmax_last_dim, plan)?;
+        let delta = attention_path_counts().since(&before);
+        let want =
+            sdpa_planned_bhsd_materialized(&q, &k, &v, scale, Some(&mask), softmax_last_dim, plan)?;
+        let (max, rel) = errors(&got, &want)?;
+        println!("masked parity: max|Δ| {max:.3e} rel-L2 {rel:.3e}, counts {delta:?}");
+        assert_eq!(delta.masked, 1, "{delta:?}");
+        assert_eq!(max, 0.0, "a masked call left the materialized path");
+        Ok(())
+    }
+
+    /// SW-6130: a key-padding mask expressed as per-row valid key prefixes runs the fused kernel
+    /// over each row's valid keys, and matches the masked materialized call on **every** query row
+    /// (padded rows included): Lens's CFG batch, with an empty negative keeping only its image keys.
+    /// Same declared tolerance as [`cuda_flash_matches_budgeted`], against the f32 masked reference.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_key_prefix_matches_the_masked_call() -> crate::Result<()> {
+        use crate::attention::{sdpa_planned_bhsd_key_prefix, sdpa_planned_bhsd_materialized};
+        let dev = Device::new_cuda(0)?;
+        let (b, h, img, txt, d) = (2usize, 8usize, 1024usize, 77usize, 128usize);
+        let s = img + txt;
+        let valid_keys = [s, img + 31];
+        let mut additive = Vec::with_capacity(b * s);
+        for &n in &valid_keys {
+            additive.extend((0..s).map(|i| if i < n { 0f32 } else { -1e9 }));
+        }
+        let mask = Tensor::from_vec(additive, (b, 1, 1, s), &dev)?;
+        let q = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let scale = 1.0 / (d as f64).sqrt();
+        let plan = AttentionPlan::UNBOUNDED;
+        let before = attention_path_counts();
+        let fused = sdpa_planned_bhsd_key_prefix(
+            &q,
+            &k,
+            &v,
+            scale,
+            &mask.to_dtype(DType::BF16)?,
+            &valid_keys,
+            softmax_last_dim,
+            plan,
+        )?;
+        assert_eq!(attention_path_counts().since(&before).flash, 1);
+        let f32 = |t: &Tensor| t.to_dtype(DType::F32);
+        let want = sdpa_planned_bhsd_materialized(
+            &f32(&q)?,
+            &f32(&k)?,
+            &f32(&v)?,
+            scale,
+            Some(&mask),
+            softmax_last_dim,
+            plan,
+        )?;
+        let old = sdpa_planned_bhsd_materialized(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&mask.to_dtype(DType::BF16)?),
+            |s: &Tensor| softmax_last_dim(&s.to_dtype(DType::F32)?)?.to_dtype(s.dtype()),
+            plan,
+        )?;
+        let (fm, fr) = errors(&fused, &want)?;
+        let (bm, br) = errors(&old, &want)?;
+        println!(
+            "key-prefix parity b={b} h={h} s={s} valid={valid_keys:?} d={d}: fused max|d| {fm:.3e} \
+             rel-L2 {fr:.3e}; bf16 masked materialized max|d| {bm:.3e} rel-L2 {br:.3e}"
+        );
+        assert!(
+            fm <= 2e-2 && fr <= 1e-2,
+            "key-prefix fused vs f32 masked: {fm} / {fr}"
+        );
+        Ok(())
+    }
+
+    /// The fused path never allocates the `[B, H, Sq, Sk]` scores. At S = 16384 (8 heads, d = 128,
+    /// bf16) the materialized scores alone would be 4 GiB; the measured live-byte peak of the call
+    /// (the stream-ordered pool's `USED_MEM_HIGH`, [`crate::cuda_mempool::MemPool`]) must stay
+    /// under 1/16 of that — in practice it is the output and its transposed copy.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_flash_peak_memory_has_no_score_matrix() -> crate::Result<()> {
+        use crate::cuda_mempool::MemPool;
+        let dev = Device::new_cuda(0)?;
+        let (b, h, s, d) = (1usize, 8usize, 16384usize, 128usize);
+        let q = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)?.to_dtype(DType::BF16)?;
+        let scale = 1.0 / (d as f64).sqrt();
+        dev.synchronize()?;
+        let pool = MemPool::device_current(0).expect("the CUDA device's current pool");
+        let baseline = pool.used().expect("pool USED");
+        assert!(pool.reset_used_high_water(), "reset USED_MEM_HIGH");
+        let before = attention_path_counts();
+        let out = sdpa_planned_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            None,
+            softmax_last_dim,
+            AttentionPlan::UNBOUNDED,
+        )?;
+        dev.synchronize()?;
+        assert_eq!(attention_path_counts().since(&before).flash, 1);
+        let peak = pool
+            .used_high()
+            .expect("pool USED_MEM_HIGH")
+            .saturating_sub(baseline);
+        let scores = (b * h * s * s * DType::BF16.size_in_bytes()) as u64;
+        let operand = (b * h * s * d * DType::BF16.size_in_bytes()) as u64;
+        println!(
+            "flash peak at S={s}: {peak} bytes above baseline ({:.1} MiB); one operand {:.1} MiB; \
+             the materialized [B,H,S,S] bf16 scores would be {scores} bytes ({:.1} MiB)",
+            peak as f64 / 1048576.0,
+            operand as f64 / 1048576.0,
+            scores as f64 / 1048576.0
+        );
+        assert!(peak < scores / 16, "peak {peak} vs scores {scores}");
+        assert!(peak <= 4 * operand, "peak {peak} vs operand {operand}");
+        drop(out);
         Ok(())
     }
 
@@ -816,6 +1771,7 @@ mod tests {
     #[test]
     #[ignore = "CUDA compute benchmark: run by hand, not CI"]
     fn h3_shaped_attention_flash_vs_budgeted_timing() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
         let dev = Device::new_cuda(0)?;
         let s: usize = std::env::var("H3_ATTN_BENCH_SEQ")
             .ok()
@@ -838,9 +1794,10 @@ mod tests {
             Ok((t.elapsed().as_secs_f64(), out))
         };
         let (tf, of) =
-            time(&|| sdpa_dispatch_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan))?;
-        let (tb, ob) =
             time(&|| sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan))?;
+        let (tb, ob) = time(&|| {
+            sdpa_planned_bhsd_materialized(&q, &k, &v, scale, None, softmax_last_dim, plan)
+        })?;
         let diff = (of.to_dtype(DType::F32)? - ob.to_dtype(DType::F32)?)?
             .abs()?
             .max_all()?

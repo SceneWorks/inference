@@ -124,6 +124,20 @@ pub fn checkpointed_backward_with_input_grad(
     inputs: &[Tensor],
     trainable: &[Var],
 ) -> Result<(f32, GradStore, Vec<Tensor>)> {
+    // The stash forward runs on detached boundary states, so a block whose attention projections
+    // carry no adapter would look tape-free to the per-call autograd check and take the fused
+    // kernel, while its recompute took the materialized one. Keep both phases materialized, exactly
+    // as before the shared fused dispatch (SW-6130).
+    crate::fused_attention::with_materialized_attention(|| {
+        checkpointed_backward_impl(segments, inputs, trainable)
+    })
+}
+
+fn checkpointed_backward_impl(
+    segments: &[Segment],
+    inputs: &[Tensor],
+    trainable: &[Var],
+) -> Result<(f32, GradStore, Vec<Tensor>)> {
     if segments.is_empty() {
         return Err(CandleError::Msg(
             "checkpointed_backward: at least one segment is required".into(),

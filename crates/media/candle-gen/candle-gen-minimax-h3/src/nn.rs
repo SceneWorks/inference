@@ -115,7 +115,9 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
 /// Unmasked scaled-dot-product attention over `[B, H, S, D]` q/k/v (sc-26691).
 ///
 /// * **CUDA + `flash-attn` build + bf16/f16** — the fused FlashAttention-2 kernel
-///   ([`candle_gen::sdpa_dispatch_bhsd`]). No `[B, H, Sq, Sk]` scores tensor exists, so the i32
+///   (the shared [`candle_gen::sdpa_planned_bhsd`], when the shared router
+///   [`candle_gen::fused_attention::route_attention_kernel`] selects it — which also honours the
+///   process-wide toggle). No `[B, H, Sq, Sk]` scores tensor exists, so the i32
 ///   hazard below does not arise; the cancel flag is checked once per call (one call = one layer).
 /// * **everything else** (CPU, Metal, a non-flash build, f32) — the materialized, query-chunked
 ///   fallback (`sdpa_materialized`) under the shared i32-overflow-safe budget (sc-9116): with
@@ -142,9 +144,14 @@ pub fn sdpa_planned(
         return differentiable_sdpa(q, k, v, scale, plan);
     }
     let force_materialized = force_materialized_attention();
-    let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
-    let materialized =
-        force_materialized || matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
+    // The shared router's decision (toggle, autograd, eligibility). The flash branch below calls
+    // the shared helper, which re-derives the same decision and counts the call.
+    let kernel = if force_materialized {
+        candle_gen::AttentionKernel::Budgeted(candle_gen::FlashRefusal::Materialized)
+    } else {
+        candle_gen::fused_attention::route_attention_kernel(q, k, v, None)
+    };
+    let materialized = matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
     tracing::debug!(
         route = if materialized {
             "materialized-query-chunked"
@@ -157,10 +164,10 @@ pub fn sdpa_planned(
         score_elements = plan.budget.max_score_elements(),
         "minimax-h3: attention route"
     );
-    let out = if materialized {
-        sdpa_materialized(q, k, v, scale, plan)
+    let out = if let candle_gen::AttentionKernel::Budgeted(refusal) = kernel {
+        sdpa_materialized(q, k, v, scale, plan, refusal)
     } else {
-        candle_gen::sdpa_dispatch_bhsd(
+        candle_gen::sdpa_planned_bhsd(
             q,
             k,
             v,
@@ -202,9 +209,11 @@ fn sdpa_materialized(
     v: &Tensor,
     scale: f64,
     plan: AttentionPlan<'_>,
+    refusal: candle_gen::FlashRefusal,
 ) -> Result<Tensor> {
     use candle_gen::candle_nn::ops::softmax_last_dim;
     if q.dtype() == DType::F32 {
+        // Routed (and counted) by the shared helper; f32 never takes the fused kernel.
         return candle_gen::attention::sdpa_planned_bhsd(
             q,
             k,
@@ -215,6 +224,10 @@ fn sdpa_materialized(
             plan,
         );
     }
+    // This half-dtype route bypasses the shared helpers, so count it here (SW-6130 E4).
+    candle_gen::fused_attention::record_attention_path(candle_gen::AttentionKernel::Budgeted(
+        refusal,
+    ));
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
     // A cast writes a contiguous tensor, so the f32 `kᵀ` and each f32 query chunk are their own
@@ -421,7 +434,7 @@ fn differentiable_sdpa(
 ) -> Result<Tensor> {
     let dtype = q.dtype();
     if COMPOSABLE_TRAINING_ATTENTION.get() {
-        let out = candle_gen::attention::sdpa_planned_bhsd(
+        let out = candle_gen::attention::sdpa_planned_bhsd_materialized(
             &q.to_dtype(DType::F32)?,
             &k.to_dtype(DType::F32)?,
             &v.to_dtype(DType::F32)?,
@@ -549,7 +562,7 @@ mod tests {
             candle_gen::AttentionKernel::Budgeted(_)
         ));
         let got = sdpa_planned(&qh, &kh, &vh, 0.35, None).unwrap();
-        let want = candle_gen::sdpa_budgeted_bhsd(
+        let want = candle_gen::sdpa_budgeted_bhsd_materialized(
             &qh.contiguous().unwrap(),
             &kh.contiguous().unwrap(),
             &vh.contiguous().unwrap(),
@@ -601,7 +614,7 @@ mod tests {
                 .zip(&want)
                 .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
         };
-        let half_scores = candle_gen::attention::sdpa_planned_bhsd(
+        let half_scores = candle_gen::attention::sdpa_planned_bhsd_materialized(
             &q,
             &k,
             &v,
@@ -617,6 +630,7 @@ mod tests {
             &v,
             scale,
             AttentionPlan::budgeted(AttentionBudget::from_score_elements(1 << 20, false)),
+            candle_gen::FlashRefusal::Materialized,
         )
         .unwrap();
         // 2 heads x 9 keys = 18 elements per query row: 2-row chunks plus a one-row tail.
@@ -626,6 +640,7 @@ mod tests {
             &v,
             scale,
             AttentionPlan::budgeted(AttentionBudget::from_score_elements(36, false)),
+            candle_gen::FlashRefusal::Materialized,
         )
         .unwrap();
         assert_eq!(whole.dtype(), DType::F16);
@@ -645,7 +660,14 @@ mod tests {
         let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(36, false))
             .with_cancel(&cancel);
         assert!(matches!(
-            sdpa_materialized(&q, &k, &v, scale, plan),
+            sdpa_materialized(
+                &q,
+                &k,
+                &v,
+                scale,
+                plan,
+                candle_gen::FlashRefusal::Materialized
+            ),
             Err(candle_gen::CandleError::Canceled)
         ));
     }

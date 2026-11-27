@@ -603,7 +603,11 @@ impl MageVae {
     /// the depth-anchoring training loss (epic 2123, sc-24830): the gradient flows from the pixels
     /// back to `latent`. Same values as `decode` up to softmax rounding.
     pub fn decode_differentiable(&self, latent: &Tensor) -> Result<Tensor> {
-        self.decode_with(latent, DIFFERENTIABLE_SOFTMAX)
+        // A gradient path: pinned to the materialized attention (SW-6130; the fused kernel has no
+        // backward and would not call the composable softmax).
+        candle_gen::fused_attention::with_materialized_attention(|| {
+            self.decode_with(latent, DIFFERENTIABLE_SOFTMAX)
+        })
     }
 
     fn decode_with(&self, latent: &Tensor, softmax: SoftmaxFn) -> Result<Tensor> {

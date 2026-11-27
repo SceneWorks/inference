@@ -37,6 +37,23 @@
 //! or an f32-upcast variant — unchanged. The helpers only wrap the scores matmul + softmax + value matmul
 //! in the budgeted query-row chunking; the numerics of a single block are exactly the caller's.
 //!
+//! ## The fused kernel, and the materialized entry points (SW-6130)
+//!
+//! [`sdpa_budgeted_bhsd`], [`sdpa_planned_bhsd`], [`sdpa_budgeted_flat`] and [`sdpa_planned_flat`]
+//! are **flash-eligible**: each asks [`crate::fused_attention::route_attention_kernel`] first and runs
+//! the FlashAttention-2 kernel when it may (a flash build, the toggle on, CUDA sm_80+, bf16/f16, no
+//! mask, a supported head dim, no gradient through the call). The fused path never materializes the
+//! scores, ignores the budget (the i32 hazard it guards does not arise) and **does not call
+//! `softmax`**: it computes the plain last-axis softmax. Everything else — CPU, Metal, a non-flash
+//! build, f32, masked, unsupported shapes — is byte-identical to the materialized path above.
+//!
+//! So a flash-eligible helper's `softmax` must be the plain last-axis softmax (`softmax_last_dim`,
+//! `softmax(_, D::Minus1)`, or either wrapped in an f32 upcast and cast back). A call site whose
+//! closure is anything else, a parity / reference oracle, and training-only code call the
+//! `*_materialized` twins ([`sdpa_budgeted_bhsd_materialized`], [`sdpa_planned_bhsd_materialized`],
+//! [`sdpa_budgeted_flat_materialized`], [`sdpa_planned_flat_materialized`]), which never take the
+//! fused kernel and are exactly the pre-SW-6130 helpers.
+//!
 //! ## The boundaries come from the shared rung-3 planner (SC-15796)
 //!
 //! Rung 3 of the SC-15448 memory ladder splits into a backend-neutral **planner** — measured budgets
@@ -170,7 +187,40 @@ pub fn attention_budget_from_usize(budget: usize) -> AttentionBudget {
 /// different order at a different `M`; the two agree to a tolerance (~1 ULP in practice, `1e-5` in this
 /// crate's tests) rather than exactly. SC-15943 is the defect a sibling crate hit by asserting `== 0.0`
 /// on that difference. Do not build an exact-equality assertion on this path.
+#[track_caller]
 pub fn sdpa_budgeted_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: usize,
+) -> Result<Tensor> {
+    use crate::fused_attention::AttentionSite;
+    if crate::fused_attention::take_flash(AttentionSite::BudgetedBhsd, q, k, v, mask) {
+        return crate::fused_attention::flash_bhsd(q, k, v, scale);
+    }
+    budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+}
+
+/// [`sdpa_budgeted_bhsd`] that never takes the fused kernel: the materialized, query-chunked path
+/// with the caller's exact `softmax`. For a non-standard softmax closure, a parity / reference
+/// oracle, and training-only code (see the module docs).
+pub fn sdpa_budgeted_bhsd_materialized(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: usize,
+) -> Result<Tensor> {
+    crate::fused_attention::record_materialized_call();
+    budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+}
+
+fn budgeted_bhsd(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -193,7 +243,10 @@ pub fn sdpa_budgeted_bhsd(
 
 /// Request-scoped variant of [`sdpa_budgeted_bhsd`]. A bounded plan checks its cancel flag before
 /// every chunk launch and returns [`crate::CandleError::Canceled`] when tripped. An unbounded plan is
-/// exactly the historical one-call fast path and does not inspect the flag.
+/// exactly the historical one-call fast path and does not inspect the flag. When the call takes the
+/// fused kernel (see the module docs) the flag is checked once, before the single launch, whatever
+/// the plan's budget.
+#[track_caller]
 pub fn sdpa_planned_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -204,6 +257,41 @@ pub fn sdpa_planned_bhsd(
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
+    use crate::fused_attention::AttentionSite;
+    if crate::fused_attention::take_flash(AttentionSite::PlannedBhsd, q, k, v, mask) {
+        if plan.is_cancelled() {
+            return Err(crate::CandleError::Canceled);
+        }
+        return Ok(crate::fused_attention::flash_bhsd(q, k, v, scale)?);
+    }
+    planned_bhsd(q, k, v, scale, mask, softmax, plan)
+}
+
+/// [`sdpa_planned_bhsd`] that never takes the fused kernel (see
+/// [`sdpa_budgeted_bhsd_materialized`]).
+pub fn sdpa_planned_bhsd_materialized(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
+    crate::fused_attention::record_materialized_call();
+    planned_bhsd(q, k, v, scale, mask, softmax, plan)
+}
+
+fn planned_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
     sdpa_bhsd_impl(q, k, v, scale, mask, softmax, plan.budget, || {
         if plan.is_cancelled() {
             Err(crate::CandleError::Canceled)
@@ -268,12 +356,145 @@ where
     Ok(Tensor::cat(&blocks, 2)?) // [B,H,Sq,D]
 }
 
+/// How [`sdpa_planned_bhsd_key_prefix`] serves one call, from the per-row valid key counts alone (a
+/// pure function of host data, unit-tested without tensors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPrefixPlan {
+    /// The counts do not describe this call (wrong batch, a zero or an over-long prefix): keep the
+    /// caller's additive mask on the flash-eligible helper, which then refuses as `Masked`.
+    Masked,
+    /// Every key of every row is valid: no mask at all.
+    Unmasked,
+    /// Every row has the same `n < Sk` valid leading keys: one unmasked call over `k/v[.., ..n, ..]`.
+    SharedPrefix(usize),
+    /// Rows differ: one unmasked call per batch row over its own key prefix.
+    PerRow,
+}
+
+/// The pure decision behind [`sdpa_planned_bhsd_key_prefix`].
+pub fn key_prefix_plan(valid_keys: &[usize], batch: usize, sk: usize) -> KeyPrefixPlan {
+    if batch == 0 || valid_keys.len() != batch || valid_keys.iter().any(|&n| n == 0 || n > sk) {
+        return KeyPrefixPlan::Masked;
+    }
+    match valid_keys {
+        [first, rest @ ..] if rest.iter().all(|n| n == first) => {
+            if *first == sk {
+                KeyPrefixPlan::Unmasked
+            } else {
+                KeyPrefixPlan::SharedPrefix(*first)
+            }
+        }
+        _ => KeyPrefixPlan::PerRow,
+    }
+}
+
+/// [`sdpa_planned_bhsd`] for a **key-padding** additive mask whose row `b` leaves exactly the first
+/// `valid_keys[b]` keys valid (`0`) and masks every later key with a large negative term (SW-6130).
+///
+/// Such a mask is the same attention as an unmasked call over each row's valid key prefix: a masked
+/// key's softmax weight is exactly zero (the f32 `exp` underflows), for padded and valid query rows
+/// alike. So when the shared router would send the *unmasked* call to the fused kernel, this runs the
+/// kernel over the narrowed (view, no copy) keys — once, or once per batch row when the prefixes
+/// differ — and otherwise calls [`sdpa_planned_bhsd`] with `mask`, byte-identical to before.
+///
+/// `valid_keys` is host data the caller derives once per forward (or request) from the same source
+/// as `mask`; this helper never reads a tensor back. The cancel flag is checked once before launch.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_planned_bhsd_key_prefix(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: &Tensor,
+    valid_keys: &[usize],
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    use crate::fused_attention::{
+        flash_bhsd, record_attention_path, route_attention_kernel, AttentionKernel,
+    };
+    let (batch, _, _, _) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let prefix = key_prefix_plan(valid_keys, batch, sk);
+    match prefix {
+        KeyPrefixPlan::Masked => {
+            return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan)
+        }
+        KeyPrefixPlan::Unmasked => return sdpa_planned_bhsd(q, k, v, scale, None, softmax, plan),
+        KeyPrefixPlan::SharedPrefix(_) | KeyPrefixPlan::PerRow => {}
+    }
+    if route_attention_kernel(q, k, v, None) != AttentionKernel::Flash {
+        return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan);
+    }
+    crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
+    record_attention_path(AttentionKernel::Flash);
+    if plan.is_cancelled() {
+        return Err(crate::CandleError::Canceled);
+    }
+    if let KeyPrefixPlan::SharedPrefix(n) = prefix {
+        return Ok(flash_bhsd(
+            q,
+            &k.narrow(2, 0, n)?,
+            &v.narrow(2, 0, n)?,
+            scale,
+        )?);
+    }
+    let rows = valid_keys
+        .iter()
+        .enumerate()
+        .map(|(row, &n)| {
+            flash_bhsd(
+                &q.narrow(0, row, 1)?,
+                &k.narrow(0, row, 1)?.narrow(2, 0, n)?,
+                &v.narrow(0, row, 1)?.narrow(2, 0, n)?,
+                scale,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Tensor::cat(&rows, 0)?)
+}
+
 /// i32-overflow-safe SDPA over the 3-D shape `q,k,v: [N, Sq, D]`, returning `[N, Sq, D]`. `N` folds the
 /// leading dims — `B·H` for SDXL's head-into-batch attention, or `B` for a single-head VAE spatial
 /// self-attention where `Sq = H·W`. `scale`/`softmax` behave as in [`sdpa_budgeted_bhsd`]; there is no
 /// mask parameter (none of the flat-shape call sites use one). A drop-in around an existing
 /// `q.matmul(kᵀ)·scale → softmax → ·v` on the 3-D tensors.
+///
+/// Flash-eligible like [`sdpa_budgeted_bhsd`]: the `N` independent rows are routed as the free
+/// `[B = N, H = 1, S, D]` view (no copy), so the same rule applies — including the head-dim
+/// ceiling, which keeps a 512-channel single-head VAE attention on the materialized path.
+#[track_caller]
 pub fn sdpa_budgeted_flat(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: usize,
+) -> Result<Tensor> {
+    if let Some((q4, k4, v4)) =
+        flat_flash_operands(crate::fused_attention::AttentionSite::BudgetedFlat, q, k, v)?
+    {
+        return crate::fused_attention::flash_bhsd(&q4, &k4, &v4, scale)?.squeeze(1);
+    }
+    budgeted_flat(q, k, v, scale, softmax, budget)
+}
+
+/// [`sdpa_budgeted_flat`] that never takes the fused kernel (see
+/// [`sdpa_budgeted_bhsd_materialized`]).
+pub fn sdpa_budgeted_flat_materialized(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    budget: usize,
+) -> Result<Tensor> {
+    crate::fused_attention::record_materialized_call();
+    budgeted_flat(q, k, v, scale, softmax, budget)
+}
+
+fn budgeted_flat(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -292,9 +513,67 @@ pub fn sdpa_budgeted_flat(
     )
 }
 
+/// Route a flat call (counting it) as the `[N, 1, S, D]` views of its operands, returning those
+/// views when it takes the fused kernel. `None` = run the materialized path. A non-rank-3 operand is
+/// not this helper's shape: it is counted as a shape refusal and the materialized path raises its
+/// own error.
+#[track_caller]
+fn flat_flash_operands(
+    site: crate::fused_attention::AttentionSite,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    use crate::fused_attention::{flat_as_bhsd, take_flash};
+    if q.rank() != 3 || k.rank() != 3 || v.rank() != 3 {
+        crate::fused_attention::record_attention_path(
+            crate::fused_attention::AttentionKernel::Budgeted(
+                crate::fused_attention::FlashRefusal::Shape,
+            ),
+        );
+        return Ok(None);
+    }
+    let (q4, k4, v4) = (flat_as_bhsd(q)?, flat_as_bhsd(k)?, flat_as_bhsd(v)?);
+    Ok(take_flash(site, &q4, &k4, &v4, None).then_some((q4, k4, v4)))
+}
+
 /// Request-scoped variant of [`sdpa_budgeted_flat`], with the same typed between-chunk cancellation
-/// contract as [`sdpa_planned_bhsd`].
+/// contract as [`sdpa_planned_bhsd`] (including the single pre-launch check on the fused path).
+#[track_caller]
 pub fn sdpa_planned_flat(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    if let Some((q4, k4, v4)) =
+        flat_flash_operands(crate::fused_attention::AttentionSite::PlannedFlat, q, k, v)?
+    {
+        if plan.is_cancelled() {
+            return Err(crate::CandleError::Canceled);
+        }
+        return Ok(crate::fused_attention::flash_bhsd(&q4, &k4, &v4, scale)?.squeeze(1)?);
+    }
+    planned_flat(q, k, v, scale, softmax, plan)
+}
+
+/// [`sdpa_planned_flat`] that never takes the fused kernel (see
+/// [`sdpa_budgeted_bhsd_materialized`]).
+pub fn sdpa_planned_flat_materialized(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    softmax: impl Fn(&Tensor) -> Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    crate::fused_attention::record_materialized_call();
+    planned_flat(q, k, v, scale, softmax, plan)
+}
+
+fn planned_flat(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -731,6 +1010,22 @@ mod tests {
                 .any(|c| c.budget == ATTN_SCORES_BUDGET as u64),
             "the shared cross-backend table no longer covers ATTN_SCORES_BUDGET ({ATTN_SCORES_BUDGET})"
         );
+    }
+
+    #[test]
+    fn the_key_prefix_plan_reads_only_the_host_counts() {
+        use KeyPrefixPlan::*;
+        // Z-Image / Lens shapes: an image block always valid, a padded caption after it.
+        assert_eq!(key_prefix_plan(&[4128, 4128], 2, 4128), Unmasked);
+        assert_eq!(key_prefix_plan(&[4100], 1, 4128), SharedPrefix(4100));
+        assert_eq!(key_prefix_plan(&[4100, 4100], 2, 4128), SharedPrefix(4100));
+        // CFG with an empty negative: the uncond row keeps only the image keys.
+        assert_eq!(key_prefix_plan(&[4128, 4096], 2, 4128), PerRow);
+        // Counts that do not describe the call keep the caller's mask.
+        assert_eq!(key_prefix_plan(&[4100], 2, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[4100, 0], 2, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[4129], 1, 4128), Masked);
+        assert_eq!(key_prefix_plan(&[], 0, 4128), Masked);
     }
 
     #[test]

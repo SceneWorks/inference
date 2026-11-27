@@ -128,6 +128,10 @@ fn parity_metrics(reference: &[u8], candidate: &[u8]) -> (f64, u8, f64, f64, f64
 #[test]
 #[ignore = "requires CANDLE_MAGE_SNAPSHOT and a physical idle CUDA runner"]
 fn representative_route_exercises_advertised_rung() {
+    // The ladder's bounded-attention rung is the materialized head/query chunking this harness
+    // measures and asserts: pin it there, so a FlashAttention build (whose fused kernel skips the
+    // chunking) still exercises and calibrates the advertised rung (SW-6130).
+    let _materialized = candle_gen::fused_attention::enter_materialized_attention();
     let root = std::env::var_os("CANDLE_MAGE_SNAPSHOT")
         .map(Into::into)
         .expect("set CANDLE_MAGE_SNAPSHOT to a complete Mage-Flow snapshot");

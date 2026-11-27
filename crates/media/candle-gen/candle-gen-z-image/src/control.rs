@@ -261,12 +261,14 @@ struct PreparedControlConditioning {
     img_seq_len: usize,
     x_cos: Tensor,
     x_sin: Tensor,
-    x_attn_mask: Tensor,
+    /// `None`: the image stream is all-valid by construction.
+    x_attn_mask: Option<Tensor>,
     control: Tensor,
     cap: Tensor,
     unified_cos: Tensor,
     unified_sin: Tensor,
-    unified_attn_mask: Tensor,
+    /// `None` when the caption padding was trimmed exactly ([`crate::dit::caption_padding_trim`]).
+    unified_attn_mask: Option<Tensor>,
 }
 
 enum ControlLayers {
@@ -333,7 +335,7 @@ impl ZImageControlTransformer {
         &self,
         c: Tensor,
         x_base: &Tensor,
-        attn_mask: &Tensor,
+        attn_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
@@ -385,7 +387,7 @@ impl ZImageControlTransformer {
                             }
                             state = block.base.forward_with_attention_plan(
                                 &state,
-                                Some(attn_mask),
+                                attn_mask,
                                 cos,
                                 sin,
                                 Some(adaln),
@@ -410,7 +412,7 @@ impl ZImageControlTransformer {
         blocks: &[ZImageControlBlock],
         c: Tensor,
         x_base: &Tensor,
-        attn_mask: &Tensor,
+        attn_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
@@ -427,7 +429,7 @@ impl ZImageControlTransformer {
             }
             c = block.base.forward_with_attention_plan(
                 &c,
-                Some(attn_mask),
+                attn_mask,
                 cos,
                 sin,
                 Some(adaln),
@@ -479,16 +481,35 @@ impl ZImageControlTransformer {
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let (c_patches, _) = patchify(control_context, patch_size, f_patch_size)?;
         let control = __model_proof_output!(c_patches.apply(&self.control_x_embedder))?;
-        let mut cap = self.base.embed_caption(cap_feats)?;
-        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let mut cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+        // The base DiT's exact caption-padding trim (SW-6130): positions above use the padded
+        // length; a trimmed caption keeps its leading grid rows and needs no attention mask.
+        let trim = crate::dit::caption_padding_trim(&cap_attn_mask.to_vec2::<u8>()?);
+        let mut cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let cap_feats = match trim {
+            Some(valid) => {
+                cap_pos_ids = cap_pos_ids.narrow(0, 0, valid)?;
+                cap_attn_mask = cap_attn_mask.narrow(1, 0, valid)?;
+                cap_feats.narrow(1, 0, valid)?
+            }
+            None => cap_feats.clone(),
+        };
+        let mut cap = self.base.embed_caption(&cap_feats)?;
         let (cap_cos, cap_sin) = self.base.control_rope(&cap_pos_ids)?;
-        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        cap = self
-            .base
-            .refine_caption(cap, &cap_attn_mask, &cap_cos, &cap_sin, attention_plan)?;
+        cap = self.base.refine_caption(
+            cap,
+            trim.is_none().then_some(&cap_attn_mask),
+            &cap_cos,
+            &cap_sin,
+            attention_plan,
+        )?;
         let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
         let (unified_cos, unified_sin) = self.base.control_rope(&unified_pos_ids)?;
-        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        let unified_attn_mask = trim
+            .is_none()
+            .then(|| Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1))
+            .transpose()?;
+        let x_attn_mask: Option<Tensor> = None;
         Ok(PreparedControlConditioning {
             geometry: (b, c, f, h, w),
             dtype: x.dtype(),
@@ -563,7 +584,7 @@ impl ZImageControlTransformer {
             &self.control_noise_refiner,
             prepared.control.clone(),
             &x_emb,
-            &prepared.x_attn_mask,
+            prepared.x_attn_mask.as_ref(),
             &prepared.x_cos,
             &prepared.x_sin,
             &adaln,
@@ -573,7 +594,7 @@ impl ZImageControlTransformer {
         // 6. Base noise refiner, injecting the control refiner hints.
         x_emb = base.refine_image(
             x_emb,
-            &prepared.x_attn_mask,
+            prepared.x_attn_mask.as_ref(),
             &prepared.x_cos,
             &prepared.x_sin,
             &adaln,
@@ -593,7 +614,7 @@ impl ZImageControlTransformer {
         let (main_hints, _) = self.run_control_main(
             control_unified,
             &unified,
-            &prepared.unified_attn_mask,
+            prepared.unified_attn_mask.as_ref(),
             &prepared.unified_cos,
             &prepared.unified_sin,
             &adaln,
@@ -605,7 +626,7 @@ impl ZImageControlTransformer {
         // 10. Base main layers, injecting the control hints at CONTROL_LAYERS_PLACES.
         unified = base.control_run_layers(
             unified,
-            &prepared.unified_attn_mask,
+            prepared.unified_attn_mask.as_ref(),
             &prepared.unified_cos,
             &prepared.unified_sin,
             &adaln,
