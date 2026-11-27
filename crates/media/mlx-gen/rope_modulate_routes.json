@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "about": "SW-6140 per-crate RoPE / adaLN-modulate route table, enforced by scripts/check_mlx_rope_modulate_routes.py (a pure source scan). Shared RoPE: mlx_gen::qkv::{apply_rope (pair rotation through the compiled-glue nn::rope_rotate), apply_rope_eager (always-eager pair rotation), apply_rope_1d (fused fast::rope route, opt-in via qkv::set_fused_rope, default off = the cos/sin route)} and nn::apply_text_rope / nn::apply_rope_rotate_half_f32. Shared modulate: mlx_gen::nn::{modulate (compiled glue), modulate_eager, scale_shift} and the provider glue bodies nn::modulate_matching_one_impl / nn::modulate_f32_one_impl. 'cos/sin' = the layout is not a contiguous 1-D position sequence (multi-axis image/video ids, explicit/left-padded positions, M-RoPE, amplitude-scaled YaRN tables), so fast::rope cannot express it. 'fused-eligible' = routed through apply_rope_1d. 'scale-only' = a norm·(1+scale) factor with no shift, which is not the modulate affine.",
+  "crates": {
+    "mlx-gen-anima": {
+      "rope": "shared: qkv::prepare RotateHalf (DiT, conditioner) + nn::apply_text_rope (text encoder); cos/sin (Cosmos 3-axis)",
+      "modulate": "shared: nn::modulate (compiled glue, one_matches_scale=true)"
+    },
+    "mlx-gen-bernini": {
+      "rope": "shared: nn::apply_text_rope (Qwen2.5-VL M-RoPE apply_mrope, SW-6140) + qkv::apply_rope_eager RotateHalf (vision tower, SW-6140); cos/sin (M-RoPE / 2-D vision)",
+      "modulate": "shared: nn::modulate_eager strong-f32 1 (clip_diff SimpleMLPAdaLN, SW-6140)"
+    },
+    "mlx-gen-boogu": {
+      "rope": "shared: qkv::prepare / qkv::apply_rope AdjacentPair (DiT) + qkv::apply_rope_eager RotateHalf (vision tower, SW-6140); cos/sin (3-axis)",
+      "modulate": "local scale-only one_plus(scale) (Lumina RMSNorm·(1+scale), no shift) - not the modulate affine"
+    },
+    "mlx-gen-chroma": {
+      "rope": "shared: qkv::prepare + qkv::apply_rope AdjacentPair (concat-then-RoPE); cos/sin (3-axis)",
+      "modulate": "shared: nn::modulate (compiled glue, strong-f32 1)"
+    },
+    "mlx-gen-flux": {
+      "rope": "shared: qkv::apply_rope AdjacentPair head-major over the f32 stream (SW-6140); cos/sin (3-axis)",
+      "modulate": "shared: nn::modulate (compiled glue, one_matches_scale=true)"
+    },
+    "mlx-gen-flux2": {
+      "rope": "shared: qkv::apply_rope AdjacentPair (DiT, SW-6140) + nn::apply_rope_rotate_half_f32 (Pixtral vision) + nn::apply_text_rope (text encoder); cos/sin (4-axis)",
+      "modulate": "shared: nn::modulate (compiled glue, strong-f32 1) in the blocks; nn::modulate_eager in norm_out (SW-6140)"
+    },
+    "mlx-gen-flux3": {
+      "rope": "shared: qkv::apply_rope_eager AdjacentPair after the f32 q/k RMSNorm (rmsnorm_rope, SW-6140); cos/sin (4-axis ids)",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true (layernorm_modulation, SW-6140)"
+    },
+    "mlx-gen-ideogram": {
+      "rope": "shared: qkv::prepare / qkv::apply_rope RotateHalf; cos/sin (3-D MRoPE, per-batch tables)",
+      "modulate": "local scale-only one_plus(scale) (no shift) - not the modulate affine"
+    },
+    "mlx-gen-iris": {
+      "rope": "shared: qkv::apply_rope_eager AdjacentPair RestoreInput (DiT Rope::apply, SW-6140) + mlx-llm primitives::rope (Qwen3-VL tower); cos/sin (2-D grid; the 1-D text table built by Rope::line_1d is a fused-eligible candidate not yet routed through apply_rope_1d)",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true (nn::modulate, SW-6140)"
+    },
+    "mlx-gen-kolors": {
+      "rope": "shared: qkv::apply_rope_eager AdjacentPair, rot_dims=rotary_dim (ChatGLM3, SW-6140); cos/sin (explicit left-padded positions)",
+      "modulate": "n/a (SDXL UNet, no adaLN)"
+    },
+    "mlx-gen-krea": {
+      "rope": "shared: qkv::apply_rope_eager AdjacentPair RestoreInput (DiT, SW-6140) + nn::apply_text_rope (Qwen3-VL encoder); cos/sin (3-axis)",
+      "modulate": "shared: nn::modulate_eager strong-f32 1 (final layer, SW-6140); blocks use a +1-centred RmsScale (scale-only, qkv::EXEMPTIONS)"
+    },
+    "mlx-gen-lens": {
+      "rope": "shared: qkv::prepare AdjacentPair (DiT) + qkv::apply_rope_eager HalvesPaired (gpt-oss text encoder, SW-6140); cos/sin (DiT 3-axis; text encoder YaRN tables scaled by mscale, which fast::rope cannot apply)",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true (DiT block, SW-6140)"
+    },
+    "mlx-gen-ltx": {
+      "rope": "shared: qkv::prepare HalvesPaired (DiT); rope::apply_split_rotary_emb = rank-agnostic layout wrapper over nn::rope_rotate (connector); Gemma text encoder calls MLX fast::rope directly (fused, pre-existing: the reference nn.RoPE wraps the same primitive); diff_vae rank-6 per-axis rotation over nn::rope_rotate_eager (SW-6140)",
+      "modulate": "shared: DitGlue over the nn::modulate_matching_one_impl body (SW-6140); diff_vae nn::modulate_eager strong-f32 1 (SW-6140)"
+    },
+    "mlx-gen-mage": {
+      "rope": "shared: qkv::prepare / qkv::apply_rope AdjacentPair (DiT) + nn::apply_text_rope (Qwen2.5-VL encoder M-RoPE); cos/sin (multi-axis)",
+      "modulate": "shared: nn::modulate (compiled glue, one_matches_scale=true)"
+    },
+    "mlx-gen-minimax-h3": {
+      "rope": "shared: qkv::apply_rope_eager RotateHalf partial, RopeDtype::Stream (DiT MmRope::apply and VAE Rope3d::apply, SW-6140); cos/sin (3-axis)",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true over the gathered per-token rows (block + output heads, SW-6140)"
+    },
+    "mlx-gen-mochi": {
+      "rope": "shared kernel: MochiRope::apply is a layout wrapper over nn::rope_rotate (per-head tables); cos/sin (3-axis)",
+      "modulate": "local scale-only MochiRMSNormZero x·(1+scale) (no shift) - not the modulate affine"
+    },
+    "mlx-gen-moss-image": {
+      "rope": "shared: qkv::apply_rope_eager RotateHalf over the unpacked [sin|cos] table (rotate, SW-6140); cos/sin (4-axis)",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true (block affines, SW-6140)"
+    },
+    "mlx-gen-pid": {
+      "rope": "shared: qkv::prepare / qkv::apply_rope AdjacentPair (backbone); Gemma-2 text encoder qkv::apply_rope_1d RotateHalf RopeDtype::Stream - FUSED-ELIGIBLE: fast::rope when qkv::set_fused_rope is on, the cos/sin route (default) otherwise (SW-6140)",
+      "modulate": "shared: nn::modulate (compiled glue, strong-f32 1)"
+    },
+    "mlx-gen-pulid": {
+      "rope": "shared: qkv::apply_rope_eager InterleavedFull RestoreInput (EVA-CLIP VisionRope::apply, SW-6140); cos/sin (2-D)",
+      "modulate": "n/a (FLUX.1 host via mlx-gen-flux)"
+    },
+    "mlx-gen-qwen-image": {
+      "rope": "shared: qkv::apply_rope AdjacentPair token-major (DiT apply_rope_qwen, SW-6140) + nn::apply_rope_rotate_half_f32 (vision tower) + nn::apply_text_rope (text encoder); cos/sin (3-axis)",
+      "modulate": "shared: the block's own retained glue over the nn::modulate_f32_one_impl body (SW-6140); the per-token zero_cond_t form nn::modulate_eager strong-f32 1 (SW-6140)"
+    },
+    "mlx-gen-qwen-image-2-1": {
+      "rope": "shared: qkv::apply_rope AdjacentPair RestoreInput (SW-6140); cos/sin (3-axis layout ids)",
+      "modulate": "local scale-only scale_residual x·(1+scale) (no shift) - not the modulate affine"
+    },
+    "mlx-gen-sam2": {
+      "rope": "shared: qkv::apply_rope_eager AdjacentPair head-major (memory attention, SW-6140); cos/sin (2-D axial)",
+      "modulate": "none (no adaLN in this model)"
+    },
+    "mlx-gen-sam3": {
+      "rope": "shared: qkv::apply_rope_eager InterleavedFull (vision + tracker memory attention, SW-6140); cos/sin (2-D axial)",
+      "modulate": "none (no adaLN in this model)"
+    },
+    "mlx-gen-sana": {
+      "rope": "n/a in the DiT (ReLU linear attention, no RoPE); Gemma-2 text encoder via mlx-gen-pid",
+      "modulate": "shared: nn::modulate_eager one_matches_scale=true (blocks + final layer, SW-6140)"
+    },
+    "mlx-gen-scail2": {
+      "rope": "shared: mlx-gen-wan rope_apply (qkv::apply_rope); cos/sin (3-axis)",
+      "modulate": "shared: nn::modulate_eager strong-f32 1 (SW-6140)"
+    },
+    "mlx-gen-sd3": {
+      "rope": "n/a (SD3 has no RoPE: qkv::prepare with RopeStyle::None)",
+      "modulate": "shared: nn::modulate (compiled glue, strong-f32 1)"
+    },
+    "mlx-gen-seedvr2": {
+      "rope": "shared: qkv::apply_rope_eager InterleavedFull, rot_dims, RestoreInput (SW-6140); cos/sin (3-axis)",
+      "modulate": "shared: nn::scale_shift adaLN-single x·scale+shift (modulate_in + final layer, SW-6140); output gate kept (exception)"
+    },
+    "mlx-gen-sensenova": {
+      "rope": "shared: mlx-llm primitives::rope::apply_rope (Qwen3 / MRoPE) + qkv::apply_rope_eager AdjacentPair (vision 1-D interleaved, SW-6140); cos/sin (explicit positions)",
+      "modulate": "none (no adaLN in this model)"
+    },
+    "mlx-gen-supra2": {
+      "rope": "none (no RoPE in this model)",
+      "modulate": "shared: nn::modulate_eager strong-f32 1 (SW-6140)"
+    },
+    "mlx-gen-wan": {
+      "rope": "shared: qkv::apply_rope AdjacentPair token-major over the rotated prefix (rope_apply, SW-6140); cos/sin (3-axis)",
+      "modulate": "shared: DitGlue over the nn::modulate_f32_one_impl body (SW-6140); VACE nn::modulate_eager strong-f32 1 (SW-6140)"
+    },
+    "mlx-gen-z-image": {
+      "rope": "shared: qkv::apply_rope AdjacentPair token-major (DiT, SW-6140) + nn::apply_text_rope (Qwen3 text encoder, SW-6140); cos/sin (DiT 3-axis; the text encoder is 1-D but its f32 tables promote a bf16 stream into an f32 SDPA, which fast::rope would not reproduce)",
+      "modulate": "local scale-only x·(1+scale) (no shift) - not the modulate affine"
+    }
+  },
+  "exceptions": [
+    {
+      "file": "crates/media/mlx-gen/mlx-gen-ltx/src/diff_vae.rs",
+      "fn": "rotate_axis",
+      "route": "table",
+      "reason": "Builds this VAE's per-axis angles inline (positions along one of the three axes of a rank-6 tile, pos·inv_freq); the pair rotation itself is the shared nn::rope_rotate_eager."
+    },
+    {
+      "file": "crates/media/mlx-gen/mlx-gen-seedvr2/src/dit.rs",
+      "fn": "modulate_out",
+      "route": "kept",
+      "reason": "The adaLN-single output gate x·(emb_gate + p_gate): a single multiply, not a modulation affine, so there is nothing to share."
+    }
+  ]
+}
