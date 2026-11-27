@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::flux3::{BASE_MODEL_ID, DISTILLED_MODEL_ID};
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, SizeFloor,
+    self, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
@@ -49,82 +49,195 @@ fn fenced_image_load<T>(device: &Device, load: impl FnOnce() -> Result<T>) -> Re
     primary
 }
 
-/// Identity + capabilities, constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // The packed 16× latent space of FLUX 3's own autoencoder (BatchNorm-stat tokens): no
-        // shared decoder consumes it, so nothing is advertised and every decoder swap fails closed.
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        // Both components default to the package's bundled copies; neither is required.
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle distilled FLUX 3 Klein (`SW-6979`, `REG-1`).
+pub(crate) fn route_distilled() -> gen_core::RouteRecord {
+    // Native Candle tiers (sc-26241): q4 = GGML Q4_1 and q8 = GGML Q8_0 packages converted from
+    // the ORIGINAL dense checkpoint (`crate::convert`). The CUDA build also loads publisher
+    // FP8R / NVFP4 artifacts as shipped onto their frozen-recipe kernels.
+    #[cfg(not(feature = "cuda"))]
+    let supported_quants: &'static [gen_core::Quant] = &[gen_core::Quant::Q4, gen_core::Quant::Q8];
+    #[cfg(feature = "cuda")]
+    let supported_quants: &'static [gen_core::Quant] = &[
+        gen_core::Quant::Q4,
+        gen_core::Quant::Q8,
+        gen_core::Quant::Fp8Rowwise,
+        gen_core::Quant::Nvfp4,
+    ];
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // A flow map: no CFG, so no negative prompt and no guidance scale (upstream refuses
-            // a guidance on the distilled checkpoint).
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            // The one integrator, the flow-map Euler step; the schedule has no name and its
-            // alpha is fixed, so no scheduler is advertised.
-            samplers: SAMPLERS.to_vec(),
-            schedulers: Vec::new(),
-            // Compatible LoRA stacks are admitted by exact base/revision, rank/alpha and target mapping (S6).
-            supports_lora: true,
-            supports_lokr: false,
-            // No per-step preview: the packed latent has no fitted RGB projection and the
-            // autoencoder decode is the only exact view of a step.
-            supports_preview: false,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_4b", None)],
+                encoder_contract: None,
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: false,
+                // The optional native VLM resolves the effective caption before encoding.
+                supports_prompt_enhancement: true,
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    gen_core::ConditioningKind::Reference,
+                    gen_core::ConditioningKind::ReferenceRgba,
+                    gen_core::ConditioningKind::MultiReference,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // A flow map: no CFG, so no negative prompt and no guidance scale.
+                supports_negative_prompt: false,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                // The one integrator, the flow-map Euler step; the schedule has no name and its
+                // alpha is fixed, so no scheduler is advertised.
+                samplers: SAMPLERS.to_vec(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(
+                gen_core::FamilyDriverSpec::new(crate::pipeline::flux3_driver_support(
+                    "candle_flux3_flow_map",
+                ))
+                .with_pag(gen_core_flux3::flux3_pag_capability(true)),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux3_ae"),
+                // The packed 16× latent space of FLUX 3's own autoencoder (BatchNorm-stat tokens):
+                // no shared decoder consumes it, so nothing is advertised and every decoder swap
+                // fails closed.
+                output_latent_space: None,
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            // Compatible LoRA stacks are admitted by exact base/revision, rank/alpha and target
+            // mapping (S6).
+            adapters: gen_core::AdapterSurface {
+                supports_lora: true,
+                supports_lokr: false,
+                install_policy: gen_core::AdapterInstallPolicy::ForwardResidual,
+            },
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_4b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["flux3_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux3_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants,
+                component_precision_floors: &[],
+                // Both components default to the package's bundled copies; neither is required.
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                // No per-step preview: the packed latent has no fitted RGB projection and the
+                // autoencoder decode is the only exact view of a step.
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
-            max_count: MAX_COUNT,
-            mac_only: false,
-            // Native Candle tiers (sc-26241): q4 = GGML Q4_1 and q8 = GGML Q8_0 packages converted
-            // from the ORIGINAL dense checkpoint (`crate::convert`). Distinct from the MLX twin's
-            // affine q4/q8: no cross-backend artifact reuse. Publisher FP8R/NVFP4 have no Candle
-            // FLUX3 kernel on this build and are therefore not advertised.
-            #[cfg(not(feature = "cuda"))]
-            supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
-            // The CUDA build also loads the publisher FP8R / NVFP4 artifacts as shipped onto
-            // their frozen-recipe kernels (device floors are checked at load).
-            #[cfg(feature = "cuda")]
-            supported_quants: &[
-                gen_core::Quant::Q4,
-                gen_core::Quant::Q8,
-                gen_core::Quant::Fp8Rowwise,
-                gen_core::Quant::Nvfp4,
-            ],
-            supports_sequential_offload: true,
-            // The optional native VLM resolves the effective caption before encoding.
-            supports_prompt_enhancement: true,
-            conditioning: vec![
-                gen_core::ConditioningKind::Reference,
-                gen_core::ConditioningKind::ReferenceRgba,
-                gen_core::ConditioningKind::MultiReference,
-            ],
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
-            pag: Some(gen_core_flux3::flux3_pag_capability(true)),
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(gen_core_flux3::DEFAULT_STEPS),
+            guidance: None,
+            sampler: Some(SAMPLERS[0]),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
             ..Default::default()
         },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_reference_workspace(
+                crate::memory_strategy::REFERENCE_WORKSPACE_REGISTRATION.reference_workspace_bytes,
+            )
+            .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                crate::memory_strategy::MEMORY_BEHAVIOR_REGISTRATION,
+            ),
     }
 }
 
-/// Base checkpoint public surface: CFG and independently encoded negative conditioning.
+/// Primary typed route declaration for Candle base FLUX 3 Klein (`SW-6979`, `REG-1`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    let mut route = route_distilled();
+    route.route_id = BASE_MODEL_ID;
+    route.structure.conditioning.supports_negative_prompt = true;
+    route.structure.sampling.supports_guidance = true;
+    route.structure.sampling.supports_true_cfg = false;
+    route.structure.denoiser = gen_core::ModelBinding::family_driver(
+        gen_core::FamilyDriverSpec::new(crate::pipeline::flux3_driver_support(
+            "candle_flux3_base_euler",
+        ))
+        .with_pag(gen_core_flux3::flux3_pag_capability(false)),
+    );
+    route.defaults.steps = Some(gen_core_flux3::BASE_DEFAULT_STEPS);
+    route.defaults.guidance = Some(gen_core_flux3::BASE_DEFAULT_GUIDANCE);
+    route.bindings = gen_core::RouteBindings::generator(descriptor_base, load_base)
+        .with_reference_workspace(
+            crate::memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION.reference_workspace_bytes,
+        )
+        .with_memory_registration(crate::memory_strategy::BASE_MEMORY_REGISTRATION)
+        .with_memory_fixture_registration(crate::memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
+        .with_memory_behavior_registration(
+            crate::memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION,
+        );
+    route
+}
+
+/// Identity + capabilities, constructible without weights, computed from [`route_distilled`].
+pub fn descriptor() -> ModelDescriptor {
+    route_distilled().compute_descriptor()
+}
+
+/// Base checkpoint public surface, computed from [`route_base`].
 pub fn descriptor_base() -> ModelDescriptor {
-    let mut descriptor = descriptor();
-    descriptor.id = gen_core::flux3::BASE_MODEL_ID;
-    descriptor.capabilities.supports_guidance = true;
-    // CFG uses the standard guidance axis; the separate true_cfg control is not consumed.
-    descriptor.capabilities.supports_true_cfg = false;
-    descriptor.capabilities.supports_negative_prompt = true;
-    descriptor.capabilities.pag = Some(gen_core_flux3::flux3_pag_capability(false));
-    descriptor
+    route_base().compute_descriptor()
 }
 
 /// The heavy half: the DiT and the autoencoder.
@@ -803,14 +916,6 @@ impl Generator for Flux3Klein {
             );
         })
     }
-}
-
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
 #[cfg(test)]

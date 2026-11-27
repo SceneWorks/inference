@@ -129,9 +129,9 @@ use candle_gen::candle_core::{Device, Tensor};
 #[cfg(test)]
 use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    self, AdapterSpec, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -1507,126 +1507,233 @@ pub fn raw_pag_capability() -> gen_core::PagCapability {
     }
 }
 
-/// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
-/// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
-/// distillation baked the guided velocity into the weights, so no guidance / unconditional branch), no
-/// user negative prompt. Accepts reference-guided **img2img** latent-init (sc-10134) — a single
-/// `Conditioning::Reference` — but no control conditioning on the Turbo checkpoint.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: KREA_2_TURBO_ID,
+/// Primary typed route declaration for Candle Krea 2 Turbo (`SW-6979`, `REG-1`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load)
+        .with_render_plan(compile_turbo_render_plan);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_nvfp4_memory_contract_surface_specs,
+                weights_free_krea_turbo_memory_strategy_contract,
+            )
+            .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: KREA_2_TURBO_ID,
         family: "krea_2",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
-            supports_guidance: true,
-            supports_negative_prompt: true,
-            // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
-            // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
-            // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
-            // `krea_2_edit` Kontext surface); control conditioning stays unsupported. `raw_descriptor`
-            // KEEPS this single Reference — Raw serves its own full-CFG `render_base_img2img` (sc-10226).
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr wired (sc-7836): a trained `krea_2_raw` adapter merges into the dense DiT
-            // attention projections at load ([`adapters::merge_into_weights`]), closing the candle
-            // train→infer loop.
-            supports_lora: true,
-            supports_lokr: true,
-            // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
-            // native distilled loop stays the byte-exact default (`req.sampler == None`).
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            // Advertise packed turnkey tiers plus the native Kitchen NVFP4 file encoding. The
-            // resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
-            // sc-9411); imported native NVFP4 is selected explicitly by its stamped source format.
-            supported_quants: &[Quant::Q4, Quant::Q8, Quant::Nvfp4],
-            // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
-            // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
-            // the worker's fit-gate reads. `raw_descriptor` inherits this for its CFG twin, and
-            // `edit_descriptor` keeps it after sc-12129 moved grounded conditioning into KreaText.
-            //
-            // Provider + advertisement move in LOCKSTEP (the sc-10840 correctness contract): this bit
-            // going true is what lets a consumer predict the staged peak, and `OffloadPolicy::Sequential`
-            // is advisory (an unwired engine silently stays resident). Advertising a lane that would
-            // actually run resident makes the gate under-predict its real peak — an admitted job that
-            // then OOMs. Never flip this on ahead of the wiring.
-            supports_sequential_offload: true,
-            // Every shipped Krea route passes a PreviewHook to the shared sampler, including
-            // the shared Turbo t2i/img2img path. The trainer's periodic sample render carries no
-            // sink. The catalog's preview_advertising guard checks this capability against the code.
-            supports_preview: true,
-            pag: Some(turbo_pag_capability()),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl_4b", None)],
+                encoder_contract: Some(ENCODER_CONTRACT),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
+                // `Conditioning::Reference { image, strength }` seeds the denoise from the
+                // VAE-encoded reference (`pipeline::render_img2img`).
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("krea2_dit").with_pag(turbo_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_4b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["krea2_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8, Quant::Nvfp4],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(TURBO_STEPS as u32),
+            guidance: Some(0.0),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: Some(TURBO_MU as f32),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
 }
 
-/// Krea 2 **Raw** identity + capabilities (sc-9994 / epic 9992) — the undistilled 12B DiT run with
-/// **true classifier-free guidance** (two DiT forwards/step: cond vs uncond) at 52 steps, unlike the
-/// CFG-free distilled Turbo. Same architecture / snapshot layout as Turbo (only the DiT weights differ,
-/// distilled vs base), so it shares `build` + the whole [`pipeline`]. Exposes a real guidance scale
-/// AND a user negative prompt (unlike Turbo / Boogu base, which fixes the uncond to the empty prompt).
-/// NOT guidance-distilled, so `supports_true_cfg` stays false — the two-forward CFG IS the guidance
-/// (the Boogu-base precedent). Derived from [`descriptor`] so the shared surface (family / backend /
-/// samplers / quants / size / LoRA) stays in lockstep with Turbo.
-pub fn raw_descriptor() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = KREA_2_RAW_ID;
-    d.capabilities.supports_negative_prompt = true;
-    d.capabilities.supports_guidance = true;
-    d.capabilities.supports_true_cfg = false;
-    d.capabilities.supports_phases = true;
-    d.capabilities.pag = Some(raw_pag_capability());
-    // Raw img2img reference-guided latent-init (sc-10226, epic 8588): keep the single
-    // `ConditioningKind::Reference` inherited from `descriptor` (Turbo). Raw serves it through the
-    // undistilled full-CFG `pipeline::render_base_img2img` (the CFG sibling of Turbo's `render_img2img`),
-    // so the surface is honored, not silently dropped to txt2img. A MultiReference stays the `krea_2_edit`
-    // Kontext surface; `edit_descriptor` (derived from this) extends to Reference + MultiReference.
-    d
+/// Primary typed route declaration for Candle Krea 2 Raw (`SW-6979`, `REG-1`).
+pub(crate) fn route_raw() -> gen_core::RouteRecord {
+    let mut route = route_turbo();
+    route.route_id = KREA_2_RAW_ID;
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("krea2_dit")
+            .with_multiphase_denoise()
+            .with_pag(raw_pag_capability()),
+    );
+    route.defaults.steps = Some(pipeline::RAW_STEPS as u32);
+    route.defaults.guidance = Some(pipeline::RAW_GUIDANCE);
+    route.defaults.shift = None;
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(raw_descriptor, load_raw)
+        .with_render_plan(compile_raw_render_plan);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(RAW_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                weights_free_krea_request_scoped_contract(KREA_2_RAW_ID, spec, spec.quantize)
+            })
+            .with_memory_surface_resolver(weights_free_krea_raw_surface_contract)
+            .with_memory_behavior_registration(RAW_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
 }
 
-/// Krea 2 **Edit** identity + capabilities (epic 10871 / sc-11085) — the Kontext-style instruction-edit
-/// variant. Derived from [`raw_descriptor`] (the edit runs the undistilled **full-CFG** loop from pure
-/// noise, with the references as in-context conditioning), so it inherits the Raw surface — real
-/// guidance + a user negative prompt, packed quants, LoRA/LoKr (the edit LoRA merges through the shared
-/// `build` adapter path) — and additionally advertises the source-reference conditioning:
-/// [`ConditioningKind::Reference`] for a single source and [`ConditioningKind::MultiReference`] for two
-/// (image 1, then image 2; [`pipeline::MAX_EDIT_REFERENCES`]).
-pub fn edit_descriptor() -> ModelDescriptor {
-    let mut d = raw_descriptor();
-    d.id = KREA_2_EDIT_ID;
-    d.capabilities.supports_phases = false;
-    d.capabilities.conditioning = vec![
+/// Primary typed route declaration for Candle Krea 2 Edit (`SW-6979`, `REG-1`).
+pub(crate) fn route_edit() -> gen_core::RouteRecord {
+    let mut route = route_raw();
+    route.route_id = KREA_2_EDIT_ID;
+    route.structure.conditioning.kinds = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
-    // sc-12129: grounded Qwen3-VL conditioning now completes inside the `KreaText` phase, including a
-    // lazily loaded vision tower. The returned edit context owns its tensors, so the full text phase
-    // drops before the DiT/VAE bundle loads. Keep this advertisement in lockstep with that route: the
-    // worker uses it to decide whether a staged peak is safe to admit.
-    d.capabilities.supports_sequential_offload = true;
-    d
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("krea2_dit").with_pag(raw_pag_capability()),
+    );
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(edit_descriptor, load_edit);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(EDIT_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                weights_free_krea_request_scoped_contract(KREA_2_EDIT_ID, spec, spec.quantize)
+            })
+            .with_memory_surface_resolver(weights_free_krea_edit_surface_contract)
+            .with_memory_behavior_registration(EDIT_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
 }
 
-/// Distilled CFG-free-by-default twin of [`edit_descriptor`], routed through the same grounded edit
-/// pipeline using Turbo's few-step schedule (guidance defaults to `0.0`, while allowing experimental
-/// guidance overrides like [`descriptor`]).
+/// Primary typed route declaration for Candle Krea 2 Turbo Edit (`SW-6979`, `REG-1`).
+pub(crate) fn route_turbo_edit() -> gen_core::RouteRecord {
+    let mut route = route_edit();
+    route.route_id = KREA_2_TURBO_EDIT_ID;
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("krea2_dit").with_pag(turbo_pag_capability()),
+    );
+    route.defaults.steps = Some(TURBO_STEPS as u32);
+    route.defaults.guidance = Some(0.0);
+    route.defaults.shift = Some(TURBO_MU as f32);
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(turbo_edit_descriptor, load_turbo_edit);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(TURBO_EDIT_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                weights_free_krea_request_scoped_contract(KREA_2_TURBO_EDIT_ID, spec, spec.quantize)
+            })
+            .with_memory_surface_resolver(weights_free_krea_turbo_edit_surface_contract)
+            .with_memory_behavior_registration(TURBO_EDIT_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
+/// Krea 2 Turbo identity + capabilities, computed from [`route_turbo`].
+pub fn descriptor() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
+}
+
+/// Krea 2 **Raw** identity + capabilities, computed from [`route_raw`].
+pub fn raw_descriptor() -> ModelDescriptor {
+    route_raw().compute_descriptor()
+}
+
+/// Krea 2 **Edit** identity + capabilities, computed from [`route_edit`].
+pub fn edit_descriptor() -> ModelDescriptor {
+    route_edit().compute_descriptor()
+}
+
+/// Krea 2 **Turbo Edit** identity + capabilities, computed from [`route_turbo_edit`].
 pub fn turbo_edit_descriptor() -> ModelDescriptor {
-    let mut d = edit_descriptor();
-    d.id = KREA_2_TURBO_EDIT_ID;
-    d.capabilities.supports_negative_prompt = true;
-    d.capabilities.supports_guidance = true;
-    d.capabilities.supports_true_cfg = false;
-    d.capabilities.pag = Some(turbo_pag_capability());
-    d
+    route_turbo_edit().compute_descriptor()
 }
 
 /// Whether the resolved request enables classifier-free guidance (`guidance != 0.0`) for `id`,
@@ -2238,22 +2345,6 @@ pub fn load_from_native_dit_file(
         .with_adapters(adapters.to_vec());
     spec.prepare_file_sources()?;
     build(&spec, descriptor)
-}
-
-// Link-time registration: all three variants register here — `krea_2_turbo` (distilled, CFG-free),
-// `krea_2_raw` (undistilled, full-CFG; sc-9994 / epic 9992), and `krea_2_edit` (Kontext instruction
-// edit over 1-2 references; epic 10871 / sc-11085).
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw
-}
-candle_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
 }
 
 /// Activation dtype every Krea route computes the DiT in. `pipeline.rs` pins `DIT_DTYPE =
@@ -4165,32 +4256,18 @@ fn compile_raw_render_plan(
     pipeline::compile_multiphase_plan(&raw_descriptor(), spec, req).map(Some)
 }
 
-/// Add all Candle Krea generators and trainers to an explicit media registry builder.
+/// Add all Candle Krea generators and trainers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(TURBO_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: KREA_2_TURBO_ID,
-            compile: compile_turbo_render_plan,
-        })
-        .register_generator(RAW_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: KREA_2_RAW_ID,
-            compile: compile_raw_render_plan,
-        })
-        .register_generator(EDIT_REGISTRATION)
-        .register_generator(TURBO_EDIT_REGISTRATION)
-        .register_generator(control_registry::REGISTRATION);
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(RAW_MEMORY_BEHAVIOR)
-        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
-        .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
+        .register_route(route_turbo())
+        .register_route(route_raw())
+        .register_route(route_edit())
+        .register_route(route_turbo_edit())
+        .register_route(control_registry::route_control())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 gen_core::CheckpointBackendBindingRegistration {
@@ -4307,6 +4384,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Krea provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 5);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 /// sc-22735 (epic sc-22723 E1/E4): the request-scoped calibration identities are the key a captured

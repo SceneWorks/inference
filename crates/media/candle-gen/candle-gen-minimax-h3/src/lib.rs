@@ -299,19 +299,15 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(model::REGISTRATION)
-        // SW-7091: MiniMax-H3-Image text-to-image, its own engine id and image descriptor.
-        .register_generator(image_model::IMAGE_REGISTRATION)
-        // SW-7098: the MiniMax-H3-Image LoRA/LoKr trainer, at the generator's id.
-        .register_trainer(training::TRAINER_REGISTRATION);
-    // The fleet shape (see candle-gen-flux): the memory route rides `register_providers` only on
-    // the build that can execute it; every other platform appends the same weights-free surfaces
-    // through `register_memory_contract_surfaces` from the catalog, and registering both would be
-    // a duplicate.
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry);
+    // The fleet shape (see candle-gen-flux): each route attaches its memory surface only on CUDA
+    // builds; every other platform appends the same weights-free surfaces through
+    // `register_memory_contract_surfaces` from the catalog.
     registry
+        .register_route(model::route_video())
+        // SW-7091: MiniMax-H3-Image text-to-image, its own engine id and image descriptor.
+        .register_route(image_model::route_image())
+        // SW-7098: the MiniMax-H3-Image LoRA/LoKr trainer, at the generator's id.
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Register only weights-free memory-contract surfaces; safe on every build platform.
@@ -330,6 +326,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle MiniMax-H3 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

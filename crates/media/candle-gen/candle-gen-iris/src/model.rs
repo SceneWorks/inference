@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, default_seed, AdapterApplyReport, AdapterSpec, Capabilities, GenerationOutput,
-    GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, SizeFloor,
+    self, default_seed, AdapterApplyReport, AdapterSpec, GenerationOutput, GenerationReport,
+    GenerationRequest, GenerationWarning, Generator, LoadSpec, Modality, ModelDescriptor,
+    Precision, Progress, Quant, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
@@ -35,59 +35,131 @@ pub const MAX_SIZE: u32 = 2048;
 /// Images per request.
 pub const MAX_COUNT: u32 = 8;
 
-/// Identity + capabilities, constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // Pixel space: there is no latent and no VAE.
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        // The Qwen3-VL text encoder is a load-time component (`components["text_encoder"]`);
-        // `load` refuses without it.
-        required_components: &[TEXT_ENCODER_COMPONENT],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Iris-3B generation (`SW-6979`, `REG-1`).
+pub(crate) fn route_generation() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // CFG against the negative prompt run through the same template (default "").
-            supports_negative_prompt: true,
-            // `guidance` is upstream's `cfg_scale` (default 3.0; 1.0 = CFG off).
-            supports_guidance: true,
-            supports_true_cfg: false,
-            // The FlowDPM-Solver++ in its two upstream orders: `dpmpp_2m` (order 2, the default)
-            // and `euler` (order 1 — the first-order DPM-Solver++ step IS the flow Euler step).
-            // There is one schedule (the shifted linear grid), so no scheduler name is advertised;
-            // `scheduler_shift` is upstream's `shift`.
-            samplers: SAMPLERS.to_vec(),
-            schedulers: Vec::new(),
-            // upstream `cfg_interval`, a prompt list, and `text_encoder.on_caption_overflow`.
-            supports_cfg_interval: true,
-            supports_prompt_batch: true,
-            supports_caption_overflow_policy: true,
-            // LoRA / LoKr (and LyCORIS-layout LoHa) as forward-time residuals on the projections;
-            // every file must carry the Iris `family` / `irisTask` stamps.
-            supports_lora: true,
-            supports_lokr: true,
-            // Pixel space: every step's predicted clean image is the preview, decoded exactly.
-            supports_preview: true,
-            min_size: MIN_SIZE,
-            max_size: MAX_SIZE,
-            max_count: MAX_COUNT,
-            mac_only: false,
-            // sc-26266: q8 / q4, quantized at load from the dense release (GGML Q8_0 / Q4_0,
-            // dequantized per forward) — the backbone's projections (the SwiGLU down projections
-            // zero-padded to a group multiple) and the Qwen3-VL tower's attention/MLP projections.
-            // Embeddings, norms, the text position table and the sub-group-wide pixel heads stay
-            // dense; the same tiers and the same packing rule as the MLX twin.
-            supported_quants: &[Quant::Q8, Quant::Q4],
-            supports_sequential_offload: true,
-            size_floor: SizeFloor::RangeCheckedOnGrid {
-                multiple: SIZE_MULTIPLE,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl", None)],
+                encoder_contract: None,
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: true,
+                supports_prompt_enhancement: false,
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // CFG against the negative prompt run through the same template (default "").
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                // The FlowDPM-Solver++ in its two upstream orders: `dpmpp_2m` (order 2, the
+                // default) and `euler` (order 1).
+                samplers: SAMPLERS.to_vec(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                // `guidance` is upstream's `cfg_scale` (default 3.0; 1.0 = CFG off).
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: true,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                crate::solver::flow_dpm_driver_support(false),
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: None,
+                // Pixel space: there is no latent and no VAE.
+                output_latent_space: None,
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            // LoRA / LoKr (and LyCORIS-layout LoHa) as forward-time residuals on the projections.
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["iris_dit"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // sc-26266: q8 / q4, quantized at load from the dense release (GGML Q8_0 / Q4_0).
+                supported_quants: &[Quant::Q8, Quant::Q4],
+                component_precision_floors: &[],
+                // The Qwen3-VL text encoder is a load-time component
+                // (`components["text_encoder"]`); `load` refuses without it.
+                required_components: &[TEXT_ENCODER_COMPONENT],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                // Pixel space: every step's predicted clean image is the preview, decoded exactly.
+                preview: gen_core::PreviewSupport::PixelSpace,
+                supports_hdr: false,
+                supports_alpha_output: false,
             },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: true,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(gen_core_iris::DEFAULT_STEPS),
+            guidance: Some(gen_core_iris::DEFAULT_CFG_SCALE),
+            sampler: Some(SAMPLERS[0]),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                crate::memory_strategy::MEMORY_BEHAVIOR_REGISTRATION,
+            ),
     }
+}
+
+/// Identity + capabilities, constructible without weights, computed from [`route_generation`].
+pub fn descriptor() -> ModelDescriptor {
+    route_generation().compute_descriptor()
 }
 
 /// The backbone half of the generation task.
@@ -508,10 +580,6 @@ impl Generator for Iris3b {
     ) -> gen_core::Result<GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
-}
-
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

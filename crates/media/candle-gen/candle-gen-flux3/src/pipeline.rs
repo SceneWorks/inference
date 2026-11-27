@@ -128,7 +128,7 @@ where
     }
 }
 
-fn flux3_driver_support(driver_id: &'static str) -> candle_gen::driver::DriverSupport {
+pub(crate) fn flux3_driver_support(driver_id: &'static str) -> candle_gen::driver::DriverSupport {
     candle_gen::driver::DriverSupport {
         driver_id,
         arbitrary_slice: true,
