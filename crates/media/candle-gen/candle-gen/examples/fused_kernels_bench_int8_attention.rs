@@ -25,7 +25,7 @@ fn main() {
 #[cfg(feature = "flash-attn")]
 #[derive(Debug, Clone)]
 pub struct AttentionRow {
-    /// `budgeted`, `flash` or `int8`.
+    /// `budgeted`, `flash`, `int8` (16-bit P.V) or `int8_pv8` (INT8 P.V).
     pub kernel: &'static str,
     /// The shape label.
     pub shape: String,
@@ -59,7 +59,9 @@ pub fn attention_rows(ordinal: usize) -> candle_gen::Result<Vec<AttentionRow>> {
     use candle_gen::candle_core::{DType, Device, Tensor};
     use candle_gen::candle_nn::ops::softmax_last_dim;
     use candle_gen::cuda_mempool::MemPool;
-    use candle_gen::fused_attention::{attention_path_counts, with_int8_attention};
+    use candle_gen::fused_attention::{
+        attention_path_counts, with_int8_attention_config, Int8AttentionConfig, PvPrecision,
+    };
     use candle_gen::gen_core::attention_budget::AttentionPlan;
 
     let dev = Device::new_cuda(ordinal)?;
@@ -85,20 +87,29 @@ pub fn attention_rows(ordinal: usize) -> candle_gen::Result<Vec<AttentionRow>> {
         };
         let (q, k, v) = (operand()?, operand()?, operand()?);
         let scale = 1.0 / (d as f64).sqrt();
+        let int8 = |pv| {
+            with_int8_attention_config(
+                Int8AttentionConfig {
+                    pv,
+                    ..Default::default()
+                },
+                || sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan),
+            )
+        };
         let run = |kernel: &str| -> candle_gen::Result<Tensor> {
             match kernel {
                 "budgeted" => {
                     sdpa_planned_bhsd_materialized(&q, &k, &v, scale, None, softmax_last_dim, plan)
                 }
                 "flash" => sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan),
-                _ => with_int8_attention(|| {
-                    sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan)
-                }),
+                "int8" => int8(PvPrecision::ValueDtype),
+                _ => int8(PvPrecision::Int8),
             }
         };
-        const KERNELS: [&str; 3] = ["budgeted", "flash", "int8"];
-        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
-        let mut peaks = [0u64; 3];
+        // `int8`: INT8 Q.K^T, 16-bit P.V; `int8_pv8`: comfy-kitchen's INT8 P.V as well.
+        const KERNELS: [&str; 4] = ["budgeted", "flash", "int8", "int8_pv8"];
+        let mut samples = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut peaks = [0u64; 4];
         for kernel in KERNELS {
             drop(run(kernel)?); // compile / warm
         }
@@ -117,24 +128,25 @@ pub fn attention_rows(ordinal: usize) -> candle_gen::Result<Vec<AttentionRow>> {
             let delta = attention_path_counts().since(&before);
             let routed = match kernel {
                 "flash" => delta.flash,
-                "int8" => delta.int8,
-                _ => delta.materialized,
+                "budgeted" => delta.materialized,
+                _ => delta.int8,
             };
             assert_eq!(routed, 1, "{kernel} did not take its path: {delta:?}");
             Ok(())
         };
         // The materialized reference is ~10x slower: one call per round.
         const BURST: usize = 28;
-        let mut bursts = [Vec::new(), Vec::new(), Vec::new()];
+        let mut bursts = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for _ in 0..rounds {
             timed(0)?;
-            // Flash and INT8 alternate call by call, so clock and power drift on this power-capped
-            // board lands on both alike.
+            // The fused kernels alternate call by call, so clock and power drift on this
+            // power-capped board lands on each alike.
             for _ in 0..iters {
-                timed(1)?;
-                timed(2)?;
+                for i in 1..KERNELS.len() {
+                    timed(i)?;
+                }
             }
-            for i in [1, 2] {
+            for i in 1..KERNELS.len() {
                 dev.synchronize()?;
                 let t = std::time::Instant::now();
                 let mut outs = Vec::with_capacity(BURST);
@@ -145,32 +157,33 @@ pub fn attention_rows(ordinal: usize) -> candle_gen::Result<Vec<AttentionRow>> {
                 bursts[i].push(t.elapsed().as_secs_f64() * 1e3 / BURST as f64);
             }
         }
-        let flash = run("flash")?;
-        let int8 = run("int8")?;
-        let (a, b) = (
-            int8.to_dtype(DType::F32)?.flatten_all()?,
-            flash.to_dtype(DType::F32)?.flatten_all()?,
-        );
-        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
-        let na = a.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
-        let nb = b.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
-        let rel = (&a - &b)?.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()? / nb;
+        let flash = run("flash")?.to_dtype(DType::F32)?.flatten_all()?;
+        let vs_flash = |kernel: &str| -> candle_gen::Result<(f32, f32)> {
+            let a = run(kernel)?.to_dtype(DType::F32)?.flatten_all()?;
+            let b = &flash;
+            let dot = (&a * b)?.sum_all()?.to_scalar::<f32>()?;
+            let na = a.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            let nb = b.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            let rel = (&a - b)?.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()? / nb;
+            Ok((dot / (na * nb), rel))
+        };
         let median = |v: &[f64]| {
             let mut s = v.to_vec();
             s.sort_by(f64::total_cmp);
             s.get(s.len() / 2).copied().unwrap_or(f64::NAN)
         };
         for (i, kernel) in KERNELS.iter().enumerate() {
-            let mut s = samples[i].clone();
-            s.sort_by(f64::total_cmp);
-            let burst_ms = median(&bursts[i]);
             rows.push(AttentionRow {
                 kernel,
                 shape: shape.clone(),
-                ms: s[s.len() / 2],
+                ms: median(&samples[i]),
                 peak_mib: peaks[i] as f64 / 1048576.0,
-                burst_ms,
-                vs_flash: (*kernel == "int8").then_some((dot / (na * nb), rel)),
+                burst_ms: median(&bursts[i]),
+                vs_flash: if kernel.starts_with("int8") {
+                    Some(vs_flash(kernel)?)
+                } else {
+                    None
+                },
                 device: device.clone(),
             });
         }

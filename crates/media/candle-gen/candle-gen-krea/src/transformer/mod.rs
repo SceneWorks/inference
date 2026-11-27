@@ -33,6 +33,7 @@ use crate::loader::{linear_detect, linear_detect_planned, Weights};
 use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
 use crate::quant::QLinear;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
+use candle_gen::fused_attention::PvPrecision;
 use rope::RopeTables;
 
 fn request_attention_plan<'a>(
@@ -69,30 +70,33 @@ pub struct Krea2Transformer {
     /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
     /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
     rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
-    /// The `int8_attention` engine option (SW-6131): run the single-stream blocks' attention
-    /// through the opt-in, lossy INT8 QK kernel ([`candle_gen::fused_attention::with_int8_attention`])
-    /// instead of FlashAttention. Off by default; see [`Self::set_int8_attention`].
-    int8_attention: bool,
+    /// The `int8_attention` engine option (SW-6131): `Some(pv)` runs the single-stream blocks'
+    /// attention through the opt-in, lossy INT8 QK kernel
+    /// ([`candle_gen::fused_attention::with_int8_attention_config`]) with that `P·V` mode instead
+    /// of FlashAttention. `None` (the default) is off; see [`Self::set_int8_attention`].
+    int8_attention: Option<PvPrecision>,
 }
 
 thread_local! {
     /// The generator-level `int8_attention` engine option for the render running on this thread
-    /// (see [`with_dit_int8_attention`]); OR-ed with the DiT's own [`Krea2Transformer::set_int8_attention`].
-    static DIT_INT8_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (see [`with_dit_int8_attention`]); the DiT's own [`Krea2Transformer::set_int8_attention`]
+    /// takes precedence when set.
+    static DIT_INT8_ATTENTION: std::cell::Cell<Option<PvPrecision>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Run `f` (one render) with the `int8_attention` engine option set to `on` for every
+/// Run `f` (one render) with the `int8_attention` engine option set to `mode` for every
 /// [`Krea2Transformer`] denoise forward on this thread; restores the previous value on exit and
 /// unwind. Only the single-stream block attention is affected — the text encoder, the
 /// request-once text fusion and the VAE keep their attention routes.
-pub(crate) fn with_dit_int8_attention<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+pub(crate) fn with_dit_int8_attention<T>(mode: Option<PvPrecision>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PvPrecision>);
     impl Drop for Restore {
         fn drop(&mut self) {
             DIT_INT8_ATTENTION.set(self.0);
         }
     }
-    let _restore = Restore(DIT_INT8_ATTENTION.replace(on));
+    let _restore = Restore(DIT_INT8_ATTENTION.replace(mode));
     f()
 }
 
@@ -376,29 +380,32 @@ impl Krea2Transformer {
             final_sstable,
             phase_adapters: PhaseAdapterBindings::default(),
             rope_cache: RopeCache::new(ROPE_CACHE_CAP),
-            int8_attention: false,
+            int8_attention: None,
         })
     }
 
-    /// The `int8_attention` engine option (SW-6131, default off): when on, every denoise forward
-    /// runs its single-stream block attention inside
-    /// [`candle_gen::fused_attention::enter_int8_attention`] (adaptive K centering), so eligible
-    /// calls take the INT8 QK kernel and the rest keep FlashAttention / the budgeted path, counted.
-    /// Lossy (epic E2): an explicit choice, never a default.
-    pub fn set_int8_attention(&mut self, on: bool) {
-        self.int8_attention = on;
+    /// The `int8_attention` engine option (SW-6131, default `None` = off): `Some(pv)` runs every
+    /// denoise forward's single-stream block attention inside
+    /// [`candle_gen::fused_attention::enter_int8_attention`] (adaptive K centering, `pv` as the
+    /// `P·V` mode), so eligible calls take the INT8 QK kernel and the rest keep FlashAttention /
+    /// the budgeted path, counted. Lossy (epic E2): an explicit choice, never a default.
+    pub fn set_int8_attention(&mut self, mode: Option<PvPrecision>) {
+        self.int8_attention = mode;
     }
 
-    /// Whether this forward requests the INT8 QK kernel (the DiT's option or the render's).
-    pub fn int8_attention(&self) -> bool {
-        self.int8_attention || DIT_INT8_ATTENTION.get()
+    /// The INT8 mode this forward requests (the DiT's option, else the render's).
+    pub fn int8_attention(&self) -> Option<PvPrecision> {
+        self.int8_attention.or_else(|| DIT_INT8_ATTENTION.get())
     }
 
     /// The INT8 attention scope for one denoise forward, when requested.
     fn int8_scope(&self) -> Option<candle_gen::fused_attention::Int8AttentionScope> {
-        self.int8_attention().then(|| {
+        self.int8_attention().map(|pv| {
             candle_gen::fused_attention::enter_int8_attention(
-                candle_gen::fused_attention::KCentering::Adaptive,
+                candle_gen::fused_attention::Int8AttentionConfig {
+                    k_centering: candle_gen::fused_attention::KCentering::Adaptive,
+                    pv,
+                },
             )
         })
     }

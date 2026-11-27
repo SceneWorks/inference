@@ -1,9 +1,10 @@
 //! SW-6131 (SW-F287 S6) — the opt-in INT8 QK attention engine option on real Krea 2 Turbo weights.
 //!
 //! Fixed-seed renders through the registered generator, `KreaEngineOptions::default()` (the
-//! FlashAttention engine) vs `int8_attention: true`, at 1024² (8 steps) and 2048² (4 steps):
+//! FlashAttention engine) vs `int8_attention: Some(pv)` for both `P·V` modes (16-bit, and
+//! comfy-kitchen's INT8 `P·V`), at 1024² (8 steps) and 2048² (4 steps):
 //!
-//! - **AC2** the 1024² INT8 render is >= 35 dB PSNR against the flash render, and the default
+//! - **AC2** each 1024² INT8 render is >= 35 dB PSNR against the flash render, and the default
 //!   engine takes no INT8 route at all (zero INT8 calls and zero INT8 refusals in the counters);
 //! - the s/step of both engines at both sizes (the POC gate's step-time question), from the renders
 //!   and, more precisely, from alternating synchronized DiT forwards on one resident trunk;
@@ -23,7 +24,7 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::fused_attention::{
     arm_int8_operand_capture, attention_path_counts, enter_int8_attention,
-    take_int8_operand_capture, AttentionPathCounts, KCentering,
+    take_int8_operand_capture, AttentionPathCounts, Int8AttentionConfig, KCentering, PvPrecision,
 };
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
@@ -144,8 +145,8 @@ fn similarity(a: &Tensor, b: &Tensor) -> (f32, f32) {
     (dot / (na * nb), diff / nb)
 }
 
-/// Replay one captured production call through the INT8 kernel (each centering mode) against
-/// the f32 materialized reference; cosine >= 0.999 each.
+/// Replay one captured production call through the INT8 kernel (each `P·V` mode and centering
+/// mode) against the f32 materialized reference; cosine >= 0.999 each.
 fn replay_captured(label: &str) {
     use candle_gen::attention::{sdpa_planned_bhsd, sdpa_planned_bhsd_materialized};
     use candle_gen::candle_nn::ops::softmax_last_dim;
@@ -185,23 +186,30 @@ fn replay_captured(label: &str) {
         "[captured {label}] S={s} H={h}/{hk} d={d} {:?}: flash cosine {fc:.6} rel-L2 {fr:.3e}",
         call.q.dtype()
     );
-    for centering in [KCentering::Off, KCentering::Always, KCentering::Adaptive] {
-        let got = {
-            let _scope = enter_int8_attention(centering);
-            sdpa_planned_bhsd(
-                &call.q,
-                &call.k,
-                &call.v,
-                call.scale,
-                None,
-                softmax_last_dim,
-                plan,
-            )
-            .unwrap()
-        };
-        let (cos, rel) = similarity(&got, &want);
-        eprintln!("[captured {label}] int8 {centering:?}: cosine {cos:.6} rel-L2 {rel:.3e}");
-        assert!(cos >= 0.999, "captured {label} {centering:?}: cosine {cos}");
+    for pv in [PvPrecision::ValueDtype, PvPrecision::Int8] {
+        for k_centering in [KCentering::Off, KCentering::Always, KCentering::Adaptive] {
+            let got = {
+                let _scope = enter_int8_attention(Int8AttentionConfig { k_centering, pv });
+                sdpa_planned_bhsd(
+                    &call.q,
+                    &call.k,
+                    &call.v,
+                    call.scale,
+                    None,
+                    softmax_last_dim,
+                    plan,
+                )
+                .unwrap()
+            };
+            let (cos, rel) = similarity(&got, &want);
+            eprintln!(
+                "[captured {label}] int8 {pv:?} {k_centering:?}: cosine {cos:.6} rel-L2 {rel:.3e}"
+            );
+            assert!(
+                cos >= 0.999,
+                "captured {label} {pv:?} {k_centering:?}: cosine {cos}"
+            );
+        }
     }
 }
 
@@ -221,56 +229,71 @@ fn assert_default_engine(r: &Render) {
     assert!(r.counts.flash > 0, "{:?}", r.counts);
 }
 
-/// One size, rendered flash -> INT8 -> flash (the board is power-capped, so the INT8 step time is
-/// compared with the mean of the two flash renders around it). Captures one mid-trajectory block
-/// call of the INT8 render. Returns the INT8-vs-flash PSNR.
-fn compare(size: u32, steps: u32, blocks: u64) -> f64 {
+/// One size, rendered flash -> INT8 (16-bit P.V) -> INT8 (INT8 P.V) -> flash (the board is
+/// power-capped, so step times are compared with the mean of the two flash renders around them).
+/// Captures one mid-trajectory block call of the first INT8 render. Returns the INT8-vs-flash PSNR
+/// per P.V mode.
+fn compare(size: u32, steps: u32, blocks: u64) -> [f64; 2] {
     let flash = render(KreaEngineOptions::default(), size, steps, None);
     assert_default_engine(&flash);
-    // Capture the middle block of the middle step (one INT8 call per block per step).
-    let skip = (steps as u64 / 2) * blocks + blocks / 2;
-    let int8 = render(
-        KreaEngineOptions {
-            int8_attention: true,
-        },
-        size,
-        steps,
-        Some(skip),
-    );
-    assert!(
-        int8.counts.int8 >= steps as u64 * blocks,
-        "every denoise block attention should take INT8: {:?}",
-        int8.counts
-    );
+    let mut int8 = Vec::new();
+    for (i, pv) in [PvPrecision::ValueDtype, PvPrecision::Int8]
+        .into_iter()
+        .enumerate()
+    {
+        // Capture the middle block of the middle step (one INT8 call per block per step).
+        let skip = (i == 0).then_some((steps as u64 / 2) * blocks + blocks / 2);
+        let r = render(
+            KreaEngineOptions {
+                int8_attention: Some(pv),
+            },
+            size,
+            steps,
+            skip,
+        );
+        assert!(
+            r.counts.int8 >= steps as u64 * blocks,
+            "every denoise block attention should take INT8: {:?}",
+            r.counts
+        );
+        int8.push((pv, r));
+    }
     let flash_again = render(KreaEngineOptions::default(), size, steps, None);
     assert_default_engine(&flash_again);
     // The option off is the flash engine, run to run: FlashAttention's forward is deterministic.
     let control = psnr(&flash_again.image, &flash.image);
-    let db = psnr(&int8.image, &flash.image);
     save(&flash.image, &format!("fox_{size}_s{steps}_flash"));
-    save(&int8.image, &format!("fox_{size}_s{steps}_int8"));
     let flash_s = (flash.s_per_step + flash_again.s_per_step) / 2.0;
-    eprintln!(
-        "[krea_2_turbo {size}x{size} {steps}-step seed 7] flash {:.3} / {:.3} s/step (mean {flash_s:.3}), \
-         int8 {:.3} s/step ({:+.1}%); PSNR int8 vs flash {db:.2} dB, flash vs flash {control:.2} dB; \
-         int8 counts {:?}",
-        flash.s_per_step,
-        flash_again.s_per_step,
-        int8.s_per_step,
-        (int8.s_per_step / flash_s - 1.0) * 100.0,
-        int8.counts
-    );
+    let mut dbs = [0.0; 2];
+    for (i, (pv, r)) in int8.iter().enumerate() {
+        let db = psnr(&r.image, &flash.image);
+        dbs[i] = db;
+        save(&r.image, &format!("fox_{size}_s{steps}_int8_{pv:?}"));
+        eprintln!(
+            "[krea_2_turbo {size}x{size} {steps}-step seed 7] flash {:.3} / {:.3} s/step (mean \
+             {flash_s:.3}), int8 {pv:?} {:.3} s/step ({:+.1}%); PSNR vs flash {db:.2} dB; \
+             int8 calls {}, refusals {}",
+            flash.s_per_step,
+            flash_again.s_per_step,
+            r.s_per_step,
+            (r.s_per_step / flash_s - 1.0) * 100.0,
+            r.counts.int8,
+            r.counts.int8_refusals.total()
+        );
+    }
+    eprintln!("[krea_2_turbo {size}x{size}] flash vs flash {control:.2} dB");
     assert!(
         control.is_infinite(),
         "two default-engine renders differ ({control:.2} dB)"
     );
     replay_captured(&format!("{size}x{size}"));
-    db
+    dbs
 }
+
 /// The DiT step-time A/B with one resident real-weight trunk: one denoise forward with the INT8
-/// option off, then on, alternating (`rounds` pairs per size after a warm pair), each synchronized
-/// and timed — the board is power-capped, so render-to-render step times drift by more than the
-/// effect. Prints the median seconds per forward (= per Turbo step) of each.
+/// option off, then each INT8 P.V mode, alternating (`rounds` rounds per size after a warm round),
+/// each synchronized and timed — the board is power-capped, so render-to-render step times drift
+/// by more than the effect. Prints the median seconds per forward (= per Turbo step) of each.
 fn dit_forward_ab(sizes: &[usize], rounds: usize) {
     use candle_gen::candle_core::Device;
     use candle_gen_krea::loader::Weights;
@@ -290,12 +313,13 @@ fn dit_forward_ab(sizes: &[usize], rounds: usize) {
     )
     .unwrap();
     let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+    let modes = [None, Some(PvPrecision::ValueDtype), Some(PvPrecision::Int8)];
     for &edge in sizes {
         let x = Tensor::randn(0f32, 1.0, (1, 16, edge / 8, edge / 8), &dev).unwrap();
-        let mut times = [Vec::new(), Vec::new()];
+        let mut times = [Vec::new(), Vec::new(), Vec::new()];
         for round in 0..=rounds {
-            for (i, on) in [false, true].into_iter().enumerate() {
-                dit.set_int8_attention(on);
+            for (i, mode) in modes.into_iter().enumerate() {
+                dit.set_int8_attention(mode);
                 dev.synchronize().unwrap();
                 let before = attention_path_counts();
                 let start = Instant::now();
@@ -303,7 +327,7 @@ fn dit_forward_ab(sizes: &[usize], rounds: usize) {
                 dev.synchronize().unwrap();
                 let s = start.elapsed().as_secs_f64();
                 let counts = attention_path_counts().since(&before);
-                assert_eq!(counts.int8 > 0, on, "{counts:?}");
+                assert_eq!(counts.int8 > 0, mode.is_some(), "{counts:?}");
                 if round > 0 {
                     times[i].push(s);
                 }
@@ -313,11 +337,14 @@ fn dit_forward_ab(sizes: &[usize], rounds: usize) {
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
-        let (off, on) = (median(&mut times[0]), median(&mut times[1]));
+        let off = median(&mut times[0]);
+        let i16 = median(&mut times[1]);
+        let i8 = median(&mut times[2]);
         eprintln!(
-            "[krea DiT forward {edge}x{edge}, real weights, {rounds} alternating pairs] flash {off:.3} s, \
-             int8 {on:.3} s ({:+.1}%)",
-            (on / off - 1.0) * 100.0
+            "[krea DiT forward {edge}x{edge}, real weights, {rounds} alternating rounds] flash \
+             {off:.3} s, int8 16-bit P.V {i16:.3} s ({:+.1}%), int8 INT8 P.V {i8:.3} s ({:+.1}%)",
+            (i16 / off - 1.0) * 100.0,
+            (i8 / off - 1.0) * 100.0
         );
     }
 }
@@ -326,17 +353,37 @@ fn dit_forward_ab(sizes: &[usize], rounds: usize) {
 #[ignore = "model inference; explicit model-proof workflow"]
 fn krea_turbo_int8_attention_matches_flash_render() {
     let blocks = 28; // Krea 2's single-stream blocks: one attention call each per forward.
-    let db_1024 = compare(1024, 8, blocks);
+    let [v16_1024, v8_1024] = compare(1024, 8, blocks);
     assert!(
-        db_1024 >= 35.0,
-        "1024x1024 INT8 vs flash PSNR {db_1024:.2} dB < 35"
+        v16_1024 >= 35.0,
+        "1024x1024 INT8 (16-bit P.V) vs flash PSNR {v16_1024:.2} dB < 35"
     );
-    let db_2048 = compare(2048, 4, blocks);
-    eprintln!("PSNR 1024x1024 {db_1024:.2} dB, 2048x2048 {db_2048:.2} dB");
+    assert!(
+        v8_1024 >= 35.0,
+        "1024x1024 INT8 (INT8 P.V) vs flash PSNR {v8_1024:.2} dB < 35"
+    );
+    let [v16_2048, v8_2048] = compare(2048, 4, blocks);
+    eprintln!(
+        "PSNR vs flash: 1024x1024 {v16_1024:.2} / {v8_1024:.2} dB, 2048x2048 {v16_2048:.2} / \
+         {v8_2048:.2} dB (16-bit / INT8 P.V)"
+    );
     dit_forward_ab(&[1024, 2048], 5);
 
     #[cfg(feature = "model-inference-proof")]
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render"
+    );
+}
+
+/// The POC gate's step-time question on its own: the alternating synchronized DiT-forward A/B
+/// (flash vs both INT8 P.V modes) with more rounds, for a quiet-GPU rerun without the renders.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn krea_turbo_int8_dit_step_time_ab() {
+    dit_forward_ab(&[1024, 2048], 9);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab"
     );
 }

@@ -407,12 +407,13 @@ pub struct KreaGenerator {
 /// historical engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KreaEngineOptions {
-    /// SW-6131: run the DiT's single-stream block attention through the opt-in SageAttention-style
-    /// INT8 QK kernel (CUDA sm_80+; lossy — a measured >= 35 dB PSNR against the FlashAttention
-    /// render at 1024², see the story evidence) instead of FlashAttention. Calls the kernel cannot
-    /// serve keep FlashAttention / the budgeted path, counted in
-    /// `candle_gen::AttentionPathCounts::int8_refusals`. Off by default (epic E2).
-    pub int8_attention: bool,
+    /// SW-6131: `Some(pv)` runs the DiT's single-stream block attention through the opt-in
+    /// SageAttention-style INT8 QK kernel (CUDA sm_80+; lossy) with `pv` as its `P·V` mode —
+    /// `PvPrecision::ValueDtype` (16-bit `P·V`, the accurate one) or `PvPrecision::Int8`
+    /// (comfy-kitchen's INT8 `P·V`) — instead of FlashAttention. Calls the kernel cannot serve keep
+    /// FlashAttention / the budgeted path, counted in
+    /// `candle_gen::AttentionPathCounts::int8_refusals`. `None`, the default, is off (epic E2).
+    pub int8_attention: Option<candle_gen::fused_attention::PvPrecision>,
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1162,7 +1163,7 @@ impl KreaGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         candle_gen::execution::policy(
             "krea/engine/int8_attention",
-            format!("{}", self.engine.int8_attention).into(),
+            format!("{:?}", self.engine.int8_attention).into(),
         );
         transformer::with_dit_int8_attention(self.engine.int8_attention, || {
             self.render_inner(req, plan, scope, on_progress)

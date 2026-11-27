@@ -2112,7 +2112,7 @@
       "target": "candle_quant_kernels",
       "test": "sage_attention::cuda_tests::cuda_sage_quantizer_codes_match_the_host_oracle",
       "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
-      "reason": "SW-6131 CUDA numerics (E2): the device Hadamard-rotated per-token INT8 quantizer's codes are byte-identical to the host oracle (scales within 1 ULP), d=64/128, bf16/f16, strided operands. Device::new_cuda(0).",
+      "reason": "SW-6131 CUDA numerics (E2): the device Hadamard-rotated per-token INT8 Q/K quantizer's codes and the per-channel 16-key-permuted INT8 V quantizer's codes are byte-identical to the host oracles (scales within 1 ULP), d=64/128, bf16/f16, strided operands. Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"
@@ -2127,7 +2127,7 @@
       "target": "candle_quant_kernels",
       "test": "sage_attention::cuda_tests::cuda_sage_attention_smoke_and_timing",
       "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
-      "reason": "SW-6131 CUDA attention: one Krea-shaped (48x128, S=4096) INT8 QK attention vs the f32 reference (cosine >= 0.999) and its ms/iter. Device::new_cuda(0).",
+      "reason": "SW-6131 CUDA attention: one Krea-shaped (48x128, S=4096) INT8 QK attention per P.V mode vs the f32 reference (cosine >= 0.999) and its ms/iter. Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"
@@ -2142,7 +2142,7 @@
       "target": "candle_gen",
       "test": "fused_attention::tests::cuda_int8_matches_the_f32_reference",
       "source": "crates/media/candle-gen/candle-gen/src/fused_attention.rs",
-      "reason": "SW-6131 CUDA numerical attention parity (AC1): the opt-in INT8 QK route through the shared helper vs the f32 materialized reference at S=4096/16384, d=64/128, bf16/f16, GQA, K centering off/on/adaptive, with and without a shared K offset; cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
+      "reason": "SW-6131 CUDA numerical attention parity (AC1): the opt-in INT8 QK route through the shared helper vs the f32 materialized reference at S=4096/16384, d=64/128, bf16/f16, GQA, both P.V modes (16-bit and comfy-kitchen INT8), K centering off/on/adaptive, with and without a shared K offset; cosine >= 0.999. cfg(cuda), Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"

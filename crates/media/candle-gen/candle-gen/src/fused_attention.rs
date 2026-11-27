@@ -500,7 +500,7 @@ pub fn flash_device(device: &candle_core::Device) -> FlashDevice {
 // The opt-in INT8 QK kernel (SW-6131).
 // ---------------------------------------------------------------------------------------------
 
-pub use candle_quant_kernels::sage_attention::KCentering;
+pub use candle_quant_kernels::sage_attention::{KCentering, PvPrecision};
 
 /// `true` when this build compiled the INT8 QK attention kernel in (`candle-gen/cuda`; it is
 /// nvrtc-compiled at first use, so it needs no `flash-attn`).
@@ -591,16 +591,37 @@ pub fn int8_eligibility(
         })
 }
 
+/// How an INT8-scope call runs the INT8 kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Int8AttentionConfig {
+    /// When K is centered (default adaptive).
+    pub k_centering: KCentering,
+    /// How `P·V` runs: [`PvPrecision::ValueDtype`] (default: P and V stay bf16/f16, only `Q·Kᵀ`
+    /// is lossy) or [`PvPrecision::Int8`] (comfy-kitchen's `qk_int_sv_i8`: INT8 V, U8 P).
+    pub pv: PvPrecision,
+}
+
 thread_local! {
     static INT8_SCOPE: Cell<u32> = const { Cell::new(0) };
-    static INT8_CENTERING: Cell<KCentering> = const { Cell::new(KCentering::Adaptive) };
+    static INT8_CONFIG: Cell<Int8AttentionConfig> = const {
+        Cell::new(Int8AttentionConfig {
+            k_centering: KCentering::Adaptive,
+            pv: PvPrecision::ValueDtype,
+        })
+    };
 }
 
 /// Run `f` with the opt-in INT8 QK kernel requested for every shared attention helper call on this
-/// thread (adaptive K centering). Nests, and restores on unwind. Lossy: callers opt in explicitly
-/// (an engine option), never by default.
+/// thread (the default [`Int8AttentionConfig`]). Nests, and restores on unwind. Lossy: callers opt
+/// in explicitly (an engine option), never by default.
 pub fn with_int8_attention<T>(f: impl FnOnce() -> T) -> T {
-    let _scope = enter_int8_attention(KCentering::Adaptive);
+    let _scope = enter_int8_attention(Int8AttentionConfig::default());
+    f()
+}
+
+/// [`with_int8_attention`] with an explicit configuration.
+pub fn with_int8_attention_config<T>(config: Int8AttentionConfig, f: impl FnOnce() -> T) -> T {
+    let _scope = enter_int8_attention(config);
     f()
 }
 
@@ -613,14 +634,14 @@ pub fn with_int8_attention_if<T>(on: bool, f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// The guard form of [`with_int8_attention`], with an explicit K-centering mode: the scope lasts
-/// until the returned value drops (restoring the previous depth and mode). Thread-bound.
-pub fn enter_int8_attention(centering: KCentering) -> Int8AttentionScope {
+/// The guard form of [`with_int8_attention_config`]: the scope lasts until the returned value
+/// drops (restoring the previous depth and configuration). Thread-bound.
+pub fn enter_int8_attention(config: Int8AttentionConfig) -> Int8AttentionScope {
     let previous = INT8_SCOPE.replace(INT8_SCOPE.get().saturating_add(1));
-    let previous_centering = INT8_CENTERING.replace(centering);
+    let previous_config = INT8_CONFIG.replace(config);
     Int8AttentionScope {
         previous,
-        previous_centering,
+        previous_config,
         _thread_bound: std::marker::PhantomData,
     }
 }
@@ -629,14 +650,14 @@ pub fn enter_int8_attention(centering: KCentering) -> Int8AttentionScope {
 #[must_use = "the INT8 attention scope ends when this guard drops"]
 pub struct Int8AttentionScope {
     previous: u32,
-    previous_centering: KCentering,
+    previous_config: Int8AttentionConfig,
     _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for Int8AttentionScope {
     fn drop(&mut self) {
         INT8_SCOPE.set(self.previous);
-        INT8_CENTERING.set(self.previous_centering);
+        INT8_CONFIG.set(self.previous_config);
     }
 }
 
@@ -645,11 +666,10 @@ pub fn in_int8_attention_scope() -> bool {
     INT8_SCOPE.get() > 0
 }
 
-/// The K-centering mode of the innermost active INT8 scope.
-pub fn int8_k_centering() -> KCentering {
-    INT8_CENTERING.get()
+/// The configuration of the innermost active INT8 scope.
+pub fn int8_attention_config() -> Int8AttentionConfig {
+    INT8_CONFIG.get()
 }
-
 // ---------------------------------------------------------------------------------------------
 // The process-wide toggle (SW-6130 E3).
 // ---------------------------------------------------------------------------------------------
@@ -875,7 +895,7 @@ fn warn_grad_tracked(site: AttentionSite, caller: &'static std::panic::Location<
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FusedKernel {
     Flash,
-    Int8(KCentering),
+    Int8(Int8AttentionConfig),
 }
 
 impl FusedKernel {
@@ -884,7 +904,7 @@ impl FusedKernel {
     pub(crate) fn of(kernel: AttentionKernel) -> Option<Self> {
         match kernel {
             AttentionKernel::Flash => Some(FusedKernel::Flash),
-            AttentionKernel::Int8 => Some(FusedKernel::Int8(int8_k_centering())),
+            AttentionKernel::Int8 => Some(FusedKernel::Int8(int8_attention_config())),
             AttentionKernel::Budgeted(_) => None,
         }
     }
@@ -967,9 +987,9 @@ pub(crate) fn fused_bhsd(
 ) -> candle_core::Result<Tensor> {
     match kernel {
         FusedKernel::Flash => flash_bhsd(q, k, v, scale),
-        FusedKernel::Int8(centering) => {
+        FusedKernel::Int8(config) => {
             capture_int8_call(q, k, v, scale);
-            int8_bhsd(q, k, v, scale, centering)
+            int8_bhsd(q, k, v, scale, config)
         }
     }
 }
@@ -1036,9 +1056,16 @@ pub(crate) fn int8_bhsd(
     k: &Tensor,
     v: &Tensor,
     scale: f64,
-    centering: KCentering,
+    config: Int8AttentionConfig,
 ) -> candle_core::Result<Tensor> {
-    candle_quant_kernels::sage_attention::sage_attention(q, k, v, scale, centering)
+    candle_quant_kernels::sage_attention::sage_attention(
+        q,
+        k,
+        v,
+        scale,
+        config.k_centering,
+        config.pv,
+    )
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1047,7 +1074,7 @@ pub(crate) fn int8_bhsd(
     _k: &Tensor,
     _v: &Tensor,
     _scale: f64,
-    _centering: KCentering,
+    _config: Int8AttentionConfig,
 ) -> candle_core::Result<Tensor> {
     // Unreachable: `int8_eligibility` refuses with `NotCompiled` first.
     candle_core::bail!("candle-gen: the INT8 attention kernel is not compiled into this build")
@@ -2387,13 +2414,22 @@ mod tests {
     fn the_int8_scope_nests_and_restores_its_centering() {
         assert!(!in_int8_attention_scope());
         {
-            let _outer = enter_int8_attention(KCentering::Always);
+            let outer = Int8AttentionConfig {
+                k_centering: KCentering::Always,
+                pv: PvPrecision::Int8,
+            };
+            let _outer = enter_int8_attention(outer);
             assert!(in_int8_attention_scope());
-            assert_eq!(int8_k_centering(), KCentering::Always);
+            assert_eq!(int8_attention_config(), outer);
             with_int8_attention(|| {
-                assert_eq!(int8_k_centering(), KCentering::Adaptive);
+                assert_eq!(int8_attention_config(), Int8AttentionConfig::default());
+                assert_eq!(
+                    int8_attention_config().pv,
+                    PvPrecision::ValueDtype,
+                    "the accurate P.V mode is the default"
+                );
             });
-            assert_eq!(int8_k_centering(), KCentering::Always);
+            assert_eq!(int8_attention_config(), outer);
             assert!(with_int8_attention_if(false, in_int8_attention_scope));
         }
         assert!(!in_int8_attention_scope());
@@ -2477,8 +2513,8 @@ mod tests {
     }
 
     /// **SW-6131 AC1.** INT8 attention through the shared helper (inside the INT8 scope) vs the
-    /// f32 materialized reference, at S = 4096 and 16384, d = 128 and 64, bf16 and f16, with the
-    /// K-centering path off, forced on and adaptive; plus a K carrying a large shared per-channel
+    /// f32 materialized reference, at S = 4096 and 16384, d = 128 and 64, bf16 and f16, in both P.V
+    /// modes (16-bit and comfy-kitchen's INT8), with the K-centering path off, forced on and adaptive; plus a K carrying a large shared per-channel
     /// offset (the case centering exists for), where the off/on contrast is printed.
     ///
     /// Declared criterion (the story's): **cosine ≥ 0.999** against the f32 reference on every
@@ -2529,21 +2565,23 @@ mod tests {
                 softmax_last_dim,
                 plan,
             )?;
-            for centering in [KCentering::Off, KCentering::Always, KCentering::Adaptive] {
-                let before = attention_path_counts();
-                let got = {
-                    let _scope = enter_int8_attention(centering);
-                    sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan)?
-                };
-                let delta = attention_path_counts().since(&before);
-                assert_eq!(delta.int8, 1, "{delta:?}");
-                let (cos, rel, max) = int8_errors(&got, &want)?;
-                println!(
-                    "int8 parity s={s} h={h} hk={hk} d={d} {dtype:?} k-offset={offset} \
-                     {centering:?}: cosine {cos:.6} rel-L2 {rel:.3e} max|d| {max:.3e}"
-                );
-                worst = worst.min(cos);
-                assert!(cos >= 0.999, "cosine {cos} < 0.999");
+            for pv in [PvPrecision::ValueDtype, PvPrecision::Int8] {
+                for k_centering in [KCentering::Off, KCentering::Always, KCentering::Adaptive] {
+                    let before = attention_path_counts();
+                    let got = {
+                        let _scope = enter_int8_attention(Int8AttentionConfig { k_centering, pv });
+                        sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan)?
+                    };
+                    let delta = attention_path_counts().since(&before);
+                    assert_eq!(delta.int8, 1, "{delta:?}");
+                    let (cos, rel, max) = int8_errors(&got, &want)?;
+                    println!(
+                        "int8 parity s={s} h={h} hk={hk} d={d} {dtype:?} k-offset={offset} \
+                         {pv:?} {k_centering:?}: cosine {cos:.6} rel-L2 {rel:.3e} max|d| {max:.3e}"
+                    );
+                    worst = worst.min(cos);
+                    assert!(cos >= 0.999, "{pv:?} cosine {cos} < 0.999");
+                }
             }
         }
         println!("int8 parity worst cosine: {worst:.6}");
