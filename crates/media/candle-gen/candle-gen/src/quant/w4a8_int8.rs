@@ -273,6 +273,141 @@ mod tests {
         }
     }
 
+    /// Upload `bytes` at byte offset `off` of a fresh device allocation and return the contiguous
+    /// `shape` view starting there (`narrow` of a flat buffer: `.contiguous()` does not copy it).
+    #[cfg(feature = "cuda")]
+    fn offset_u8_view(bytes: &[u8], off: usize, shape: (usize, usize), dev: &Device) -> Tensor {
+        let mut flat = vec![0xA5u8; off];
+        flat.extend_from_slice(bytes);
+        let n = flat.len();
+        let view = Tensor::from_vec(flat, n, dev)
+            .unwrap()
+            .narrow(0, off, bytes.len())
+            .unwrap()
+            .reshape(shape)
+            .unwrap();
+        assert!(view.is_contiguous());
+        assert_eq!(view.layout().start_offset(), off);
+        view
+    }
+
+    /// The fused GEMM's `uint4` staging needs the activation codes and the packed weight to start
+    /// 16-byte aligned. A contiguous `U8` view at an odd byte offset (finding 4717213323: a
+    /// `narrow` of a flat allocation from byte 1, reshaped) must be refused before launch with the
+    /// typed `misaligned` reason — never a misaligned-address fault — and
+    /// `w4a8_gemm_aligned` (what `W4A8Linear` applies to its resident weight at load) must make it
+    /// runnable with output bit-identical to the aligned baseline. A nonzero but 16-byte aligned
+    /// offset is served as is.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn w4a8_gemm_gpu_refuses_misaligned_operand_views_and_realigns_them() {
+        use candle_quant_kernels::w4a8_gemm::{
+            w4a8_gemm, w4a8_gemm_aligned, w4a8_quantize_activation, W4A8GemmError,
+            W4A8GemmOperands, W4A8GemmRefusal, W4A8VectorOperand,
+        };
+        let dev = Device::new_cuda(0).unwrap();
+        let (m, k, n) = (77usize, 1024usize, 272usize);
+        let p = packed_weight(n, k, 4242);
+        let packed = Tensor::from_vec(p.packed.clone(), (n, k / 2), &dev).unwrap();
+        let s_rel = Tensor::from_vec(p.s_rel.clone(), (n, k / 16), &dev).unwrap();
+        let codebook = Tensor::from_vec(p.codebook.to_vec(), 16, &dev).unwrap();
+        let s_channel = Tensor::from_vec(p.s_channel.clone(), n, &dev).unwrap();
+        let bias = Tensor::from_vec(gaussian(n, 17), n, &dev).unwrap();
+        let x = Tensor::from_vec(gaussian(m * k, 18), (m, k), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let (qx, xs) = w4a8_quantize_activation(&x).unwrap();
+        let gemm = |qx: &Tensor, packed: &Tensor| {
+            w4a8_gemm(
+                &W4A8GemmOperands {
+                    qx,
+                    xs: &xs,
+                    packed,
+                    s_rel: &s_rel,
+                    codebook: &codebook,
+                    s_channel: &s_channel,
+                    bias: Some(&bias),
+                },
+                DType::BF16,
+            )
+        };
+        let bits = |y: Tensor| {
+            y.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<u32>>()
+        };
+        let baseline = bits(gemm(&qx, &packed).unwrap());
+        let qx_bytes = qx.flatten_all().unwrap().to_vec1::<u8>().unwrap();
+
+        let mut cases = 0;
+        for (operand, off) in [
+            (W4A8VectorOperand::Activation, 1usize),
+            (W4A8VectorOperand::Activation, 8),
+            (W4A8VectorOperand::Activation, 16),
+            (W4A8VectorOperand::PackedWeight, 3),
+            (W4A8VectorOperand::PackedWeight, 32),
+        ] {
+            let (qx_v, packed_v) = match operand {
+                W4A8VectorOperand::Activation => {
+                    (offset_u8_view(&qx_bytes, off, (m, k), &dev), packed.clone())
+                }
+                W4A8VectorOperand::PackedWeight => {
+                    (qx.clone(), offset_u8_view(&p.packed, off, (n, k / 2), &dev))
+                }
+            };
+            if off % 16 == 0 {
+                // Aligned at a nonzero offset: admitted, no copy, same bits.
+                assert_eq!(
+                    bits(gemm(&qx_v, &packed_v).unwrap()),
+                    baseline,
+                    "{operand:?} +{off}"
+                );
+                let kept = match operand {
+                    W4A8VectorOperand::Activation => w4a8_gemm_aligned(&qx_v).unwrap(),
+                    W4A8VectorOperand::PackedWeight => w4a8_gemm_aligned(&packed_v).unwrap(),
+                };
+                assert_eq!(kept.layout().start_offset(), off, "aligned view was copied");
+            } else {
+                match gemm(&qx_v, &packed_v) {
+                    Err(W4A8GemmError::Refused(W4A8GemmRefusal::Misaligned {
+                        operand: got,
+                        addr_mod,
+                    })) => {
+                        assert_eq!(got, operand);
+                        assert_eq!(addr_mod, off as u64 % 16);
+                    }
+                    other => {
+                        panic!("{operand:?} +{off}: expected a misaligned refusal, got {other:?}")
+                    }
+                }
+                let (qx_a, packed_a) = match operand {
+                    W4A8VectorOperand::Activation => (w4a8_gemm_aligned(&qx_v).unwrap(), packed_v),
+                    W4A8VectorOperand::PackedWeight => {
+                        (qx_v, w4a8_gemm_aligned(&packed_v).unwrap())
+                    }
+                };
+                assert_eq!(
+                    bits(gemm(&qx_a, &packed_a).unwrap()),
+                    baseline,
+                    "{operand:?} +{off}"
+                );
+            }
+            cases += 1;
+            println!(
+                "w4a8 gemm {operand:?} view at +{off} bytes: refused/realigned, bit-identical"
+            );
+        }
+        assert_eq!(cases, 5);
+    }
+
     /// `W4A8Linear::forward` (fused path) against the **CPU dequant reference linear**
     /// `x · decode_dense(packed)ᵀ + bias` in F32 on DiT-shaped (Krea 2 Turbo) weights. The gap is
     /// the activation's per-row int8 quantization plus the bf16 output rounding, so cosine must be

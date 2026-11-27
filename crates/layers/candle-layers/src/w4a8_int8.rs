@@ -282,6 +282,17 @@ impl W4A8Linear {
                 "W4A8 CUDA output width must be a multiple of 16".into(),
             ));
         }
+        // The fused GEMM reads the packed codes through 16-byte vector loads. A contiguous view
+        // carved out of a larger device buffer can start at any byte, and `.contiguous()` does
+        // not copy it, so realign it once here (a fresh allocation only when misaligned) instead
+        // of letting every call refuse the fused kernel on alignment.
+        let packed = {
+            use candle_quant_kernels::w4a8_gemm::{w4a8_gemm_aligned, W4A8GemmError};
+            w4a8_gemm_aligned(&packed).map_err(|e| match e {
+                W4A8GemmError::Candle(e) => CandleError::from(e),
+                other => CandleError::Msg(format!("W4A8 packed weight: {other}")),
+            })?
+        };
         let device = packed.device().clone();
         let s_rel = Tensor::from_vec(
             s_rel,
