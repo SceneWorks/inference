@@ -18,7 +18,14 @@
 //!   `K % 256 == 0`) and `K <=` [`W4A8_GEMM_MAX_K`] (exact `i32` accumulation);
 //! * nonempty `M`/`N`, `M·K` and `M·N` within `i32::MAX` elements (epic E6), and a launch grid
 //!   inside the CUDA limits;
-//! * output dtype `F32`, `BF16` or `F16`.
+//! * output dtype `F32`, `BF16` or `F16`;
+//! * the int8 activation codes and the packed weight codes start on a
+//!   [`W4A8_GEMM_OPERAND_ALIGN`]-byte boundary ([`check_w4a8_gemm_alignment`]): the kernel stages
+//!   both through 16-byte `uint4` loads. A contiguous `U8` view can start at any byte (a `narrow`
+//!   of a flat allocation, a tensor carved out of a loaded file buffer) and `.contiguous()` does
+//!   not copy such a view, so this is checked on the real device address, never assumed. On CUDA
+//!   builds `w4a8_gemm_aligned` realigns an operand once into a fresh allocation; `W4A8Linear`
+//!   does that for its resident weight at load.
 //!
 //! A refusal is typed ([`W4A8GemmRefusal`], with a stable telemetry [`label`](W4A8GemmRefusal::label))
 //! and the caller runs the reference visibly; a compile failure is cached per device by the nvrtc
@@ -55,6 +62,13 @@ pub const W4A8_GEMM_TILE_K: usize = 64;
 pub const W4A8_GEMM_THREADS: u32 = 256;
 /// Largest contraction width whose int32 accumulation is exact: `K · 127 · 128 < 2³¹`.
 pub const W4A8_GEMM_MAX_K: usize = 131_072;
+/// Byte alignment the GEMM's vectorized (`uint4`) loads need on the start of the int8 activation
+/// codes and of the packed weight codes. Row strides stay aligned by construction: `K` is a
+/// multiple of [`W4A8_GEMM_TILE_K`], so an activation row (`K` bytes) and a packed weight row
+/// (`K / 2` bytes) are multiples of 16. Every other operand (scales, codebook, bias, `s_rel`, the
+/// activation-prep input) is read with scalar loads of its own element type, which a typed view
+/// always satisfies, and every output is a fresh allocation.
+pub const W4A8_GEMM_OPERAND_ALIGN: u64 = 16;
 /// The GEMM entry point.
 pub const W4A8_GEMM_FUNCTION: &str = "w4a8_int4_gemm";
 /// The fused activation prep entry point (ConvRot FHT + row-wise int8 quantizer).
@@ -86,6 +100,30 @@ pub enum W4A8GemmRefusal {
     Dtype(DType),
     /// An operand is not on a CUDA device, or the operands' devices/dtypes/shapes disagree.
     Operands,
+    /// A vector-loaded operand does not start on a [`W4A8_GEMM_OPERAND_ALIGN`]-byte boundary
+    /// (`addr_mod` is its device byte address modulo the alignment).
+    Misaligned {
+        operand: W4A8VectorOperand,
+        addr_mod: u64,
+    },
+}
+
+/// The operands the fused GEMM reads through 16-byte vector loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum W4A8VectorOperand {
+    /// The `U8 [m, k]` int8 activation codes.
+    Activation,
+    /// The `U8 [n, k/2]` packed int4 weight codes.
+    PackedWeight,
+}
+
+impl W4A8VectorOperand {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Activation => "activation codes",
+            Self::PackedWeight => "packed weight codes",
+        }
+    }
 }
 
 impl W4A8GemmRefusal {
@@ -99,6 +137,7 @@ impl W4A8GemmRefusal {
             Self::TooLarge => "too_large",
             Self::Dtype(_) => "dtype",
             Self::Operands => "operands",
+            Self::Misaligned { .. } => "misaligned",
         }
     }
 }
@@ -123,6 +162,12 @@ impl fmt::Display for W4A8GemmRefusal {
             Self::TooLarge => write!(f, "fused W4A8 GEMM: shape exceeds the i32 / grid limits"),
             Self::Dtype(d) => write!(f, "fused W4A8 GEMM: unsupported output dtype {d:?}"),
             Self::Operands => write!(f, "fused W4A8 GEMM: operand device/dtype/shape mismatch"),
+            Self::Misaligned { operand, addr_mod } => write!(
+                f,
+                "fused W4A8 GEMM: {} start {addr_mod} bytes past a \
+                 {W4A8_GEMM_OPERAND_ALIGN}-byte boundary (16-byte vector loads)",
+                operand.name()
+            ),
         }
     }
 }
@@ -232,6 +277,24 @@ pub fn check_w4a8_gemm(
     })
 }
 
+/// Pure admission of the fused GEMM's operand placement: `qx_addr` and `packed_addr` are the
+/// device byte addresses of the first int8 activation code and the first packed weight byte (the
+/// allocation base plus the view's start offset). The kernel reads both through `uint4` loads, so
+/// each must be a multiple of [`W4A8_GEMM_OPERAND_ALIGN`]; a misaligned start would fault
+/// (`misaligned address`) rather than produce a wrong answer, so it is refused before launch.
+pub fn check_w4a8_gemm_alignment(qx_addr: u64, packed_addr: u64) -> Result<(), W4A8GemmRefusal> {
+    for (operand, addr) in [
+        (W4A8VectorOperand::Activation, qx_addr),
+        (W4A8VectorOperand::PackedWeight, packed_addr),
+    ] {
+        let addr_mod = addr % W4A8_GEMM_OPERAND_ALIGN;
+        if addr_mod != 0 {
+            return Err(W4A8GemmRefusal::Misaligned { operand, addr_mod });
+        }
+    }
+    Ok(())
+}
+
 /// Pure admission of the fused activation prep for `[m, k]` activations of `dtype`: returns the
 /// kernel's dtype code (0 = F32, 1 = BF16, 2 = F16).
 pub fn check_w4a8_quantize(
@@ -305,7 +368,7 @@ pub struct W4A8GemmOperands<'a> {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{w4a8_gemm, w4a8_quantize_activation};
+pub use cuda_impl::{w4a8_gemm, w4a8_gemm_aligned, w4a8_quantize_activation};
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
@@ -313,7 +376,9 @@ mod cuda_impl {
     use candle_core::cuda_backend::cudarc;
     use candle_core::op::BackpropOp;
     use candle_core::{CudaDevice, CudaStorage, Device, Storage, Tensor};
-    use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{
+        CudaFunction, CudaStream, CudaView, DevicePtr, LaunchConfig, PushKernelArg,
+    };
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 
@@ -420,6 +485,47 @@ mod cuda_impl {
         Ok(c.as_cuda_slice::<T>()?.slice(layout.start_offset()..))
     }
 
+    /// Device byte address of a view's first element (allocation base + start offset).
+    fn byte_addr<T>(v: &CudaView<'_, T>, stream: &CudaStream) -> u64 {
+        let (ptr, _record) = v.device_ptr(stream);
+        ptr
+    }
+
+    /// `t` (a `U8` CUDA tensor) as a contiguous tensor whose first byte satisfies the fused GEMM's
+    /// vector-load alignment ([`check_w4a8_gemm_alignment`]): `t` itself (no copy) when it
+    /// already does, otherwise one copy into a fresh allocation. The bytes, and so the GEMM's
+    /// output, are unchanged; only the placement moves. `W4A8Linear` applies this once to its
+    /// resident packed weight at load so a weight carved out of a larger device buffer at an odd
+    /// offset still runs the fused kernel instead of refusing it on every call.
+    pub fn w4a8_gemm_aligned(t: &Tensor) -> Result<Tensor, W4A8GemmError> {
+        let Device::Cuda(dev) = t.device() else {
+            return Err(W4A8GemmRefusal::Operands.into());
+        };
+        if t.dtype() != DType::U8 {
+            return Err(W4A8GemmRefusal::Operands.into());
+        }
+        let stream = dev.cuda_stream();
+        let addr_mod = |t: &Tensor| -> Result<u64, W4A8GemmError> {
+            let (g, l) = t.storage_and_layout();
+            Ok(byte_addr(&view::<u8>(&g, l)?, &stream) % W4A8_GEMM_OPERAND_ALIGN)
+        };
+        let t = t.contiguous()?;
+        if addr_mod(&t)? == 0 {
+            return Ok(t);
+        }
+        let fresh = t.force_contiguous()?;
+        let addr_mod = addr_mod(&fresh)?;
+        if addr_mod != 0 {
+            // A CUDA allocation is at least 256-byte aligned; unreachable in practice.
+            return Err(W4A8GemmRefusal::Misaligned {
+                operand: W4A8VectorOperand::PackedWeight,
+                addr_mod,
+            }
+            .into());
+        }
+        Ok(fresh)
+    }
+
     fn operand_shape(t: &Tensor, dtype: DType, elems: usize) -> Result<(), W4A8GemmRefusal> {
         if t.dtype() != dtype || t.elem_count() != elems || !t.is_contiguous() {
             return Err(W4A8GemmRefusal::Operands);
@@ -429,7 +535,9 @@ mod cuda_impl {
 
     /// Launch the fused W4A8 GEMM: `[m, k]` activation codes against the resident packed weight,
     /// returning `[m, n]` in `out_dtype`. Every operand must already be contiguous on one CUDA
-    /// device; a violation is a typed [`W4A8GemmRefusal::Operands`].
+    /// device; a violation is a typed [`W4A8GemmRefusal::Operands`]. The activation and packed
+    /// weight codes must also start 16-byte aligned (a typed [`W4A8GemmRefusal::Misaligned`]
+    /// otherwise; see [`w4a8_gemm_aligned`]).
     pub fn w4a8_gemm(
         ops: &W4A8GemmOperands<'_>,
         out_dtype: DType,
@@ -471,6 +579,7 @@ mod cuda_impl {
             operand_shape(b, DType::F32, n)?;
         }
         let func = &functions(dev)?.gemm;
+        let stream = dev.cuda_stream();
         let guards = [
             ops.qx.storage_and_layout(),
             ops.xs.storage_and_layout(),
@@ -482,6 +591,9 @@ mod cuda_impl {
         let qx = view::<u8>(&guards[0].0, guards[0].1)?;
         let xs = view::<f32>(&guards[1].0, guards[1].1)?;
         let packed = view::<u8>(&guards[2].0, guards[2].1)?;
+        // `operand_shape` proved both are contiguous, which says nothing about where they start:
+        // check the real device addresses the `uint4` loads will use.
+        check_w4a8_gemm_alignment(byte_addr(&qx, &stream), byte_addr(&packed, &stream))?;
         let s_rel = view::<u8>(&guards[3].0, guards[3].1)?;
         let codebook = view::<f32>(&guards[4].0, guards[4].1)?;
         let s_channel = view::<f32>(&guards[5].0, guards[5].1)?;
@@ -499,7 +611,6 @@ mod cuda_impl {
             block_dim: (W4A8_GEMM_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stream = dev.cuda_stream();
         let storage = match out_dtype {
             DType::F32 => {
                 let mut y = unsafe { dev.alloc::<f32>(m * n) }?;
@@ -599,9 +710,64 @@ mod tests {
             (R::TooLarge, "too_large"),
             (R::Dtype(DType::U8), "dtype"),
             (R::Operands, "operands"),
+            (
+                R::Misaligned {
+                    operand: W4A8VectorOperand::Activation,
+                    addr_mod: 1,
+                },
+                "misaligned",
+            ),
         ] {
             assert_eq!(r.label(), label);
             assert_eq!(W4A8GemmError::Refused(r).label(), label);
+        }
+    }
+
+    /// The GEMM stages the activation and packed weight through `uint4` loads: a start that is
+    /// not 16-byte aligned (e.g. a `narrow` from byte 1 of a flat allocation, which
+    /// `.contiguous()` does not copy) is refused before launch, naming the operand.
+    #[test]
+    fn alignment_plan_refuses_a_misaligned_vector_operand() {
+        use W4A8GemmRefusal as R;
+        use W4A8VectorOperand as O;
+        let base = 0x7f00_0000_0000_u64; // a 256-byte aligned CUDA allocation
+        assert_eq!(check_w4a8_gemm_alignment(base, base + 4096), Ok(()));
+        assert_eq!(check_w4a8_gemm_alignment(base + 16, base + 48), Ok(()));
+        assert_eq!(
+            check_w4a8_gemm_alignment(base + 1, base),
+            Err(R::Misaligned {
+                operand: O::Activation,
+                addr_mod: 1
+            })
+        );
+        assert_eq!(
+            check_w4a8_gemm_alignment(base, base + 8),
+            Err(R::Misaligned {
+                operand: O::PackedWeight,
+                addr_mod: 8
+            })
+        );
+        // Both misaligned: the activation is reported first.
+        assert_eq!(
+            check_w4a8_gemm_alignment(base + 4, base + 12),
+            Err(R::Misaligned {
+                operand: O::Activation,
+                addr_mod: 4
+            })
+        );
+        let msg = R::Misaligned {
+            operand: O::PackedWeight,
+            addr_mod: 3,
+        }
+        .to_string();
+        assert!(
+            msg.contains("packed weight") && msg.contains("16-byte"),
+            "{msg}"
+        );
+        // Every K the plan admits keeps each row of both operands 16-byte aligned.
+        for k in (W4A8_GEMM_TILE_K..=4 * W4A8_GEMM_TILE_K).step_by(W4A8_GEMM_TILE_K) {
+            assert_eq!(k as u64 % W4A8_GEMM_OPERAND_ALIGN, 0);
+            assert_eq!((k / 2) as u64 % W4A8_GEMM_OPERAND_ALIGN, 0);
         }
     }
 

@@ -2129,6 +2129,21 @@
       ]
     },
     {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::w4a8_int8::tests::w4a8_gemm_gpu_refuses_misaligned_operand_views_and_realigns_them",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+      "reason": "SW-6134 CUDA W4A8 GEMM operand-alignment regression (review finding 4717213323): contiguous U8 activation / packed-weight views at non-16-byte offsets are refused with the typed misaligned reason before launch (no misaligned-address fault), w4a8_gemm_aligned realigns them, and the output is bit-identical to the aligned baseline; 16-byte aligned nonzero offsets are served uncopied. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-llm",
       "kind": "lib",
       "target": "candle_llm",
