@@ -35,6 +35,26 @@ pub struct IrisFlowDpmDriver<F> {
     forward: RefCell<F>,
 }
 
+pub(crate) fn flow_dpm_driver_support(first_order_only: bool) -> DriverSupport {
+    DriverSupport {
+        driver_id: "candle_iris_flow_dpm",
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: first_order_only,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: true,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            reset_history: "Iris FlowDPM-Solver++ 2nd-order multistep plan requires carrying prev_x0 history across slices",
+            renoise_from_clean: "Iris FlowDPM-Solver++ is a deterministic pixel-space ODE solver and refuses external Renoise transitions",
+            geometry_change: "Iris FlowDPM-Solver++ does not support mid-trajectory spatial resampling",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F> IrisFlowDpmDriver<F>
 where
     F: FnMut(&Tensor, &DpmStep) -> Result<Tensor>,
@@ -45,23 +65,7 @@ where
             .iter()
             .all(|step| matches!(step.update, DpmUpdate::First { .. }));
         Self {
-            support: DriverSupport {
-                driver_id: "candle_iris_flow_dpm",
-                arbitrary_slice: true,
-                carry_history: true,
-                reset_history: first_order_only,
-                renoise_from_clean: false,
-                geometry_change: false,
-                read_only_boundary_estimate: true,
-                previous_estimate_capture: false,
-                uses_global_rng: false,
-                refusal_reasons: DriverRefusalReasons {
-                    reset_history: "Iris FlowDPM-Solver++ 2nd-order multistep plan requires carrying prev_x0 history across slices",
-                    renoise_from_clean: "Iris FlowDPM-Solver++ is a deterministic pixel-space ODE solver and refuses external Renoise transitions",
-                    geometry_change: "Iris FlowDPM-Solver++ does not support mid-trajectory spatial resampling",
-                    ..DriverRefusalReasons::default()
-                },
-            },
+            support: flow_dpm_driver_support(first_order_only),
             plan,
             prediction,
             forward: RefCell::new(forward),

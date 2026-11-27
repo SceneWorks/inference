@@ -37,9 +37,8 @@ use image::RgbImage;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, CancelFlag, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    WeightsSource,
+    self, CancelFlag, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use gen_core_tokenizer::TextTokenizer;
@@ -554,35 +553,141 @@ fn vit_mode_from_plan(mode: BerniniFullVitMode) -> VitMode {
     }
 }
 
-/// Stable identity + advertised capabilities for the full Bernini pipeline.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for the full Bernini pipeline (`SW-6979`, `REG-1`).
+pub(crate) fn route_full() -> gen_core::RouteRecord {
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load);
+    #[cfg(any(feature = "cuda", test))]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::memory_strategy::FULL_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::FULL_MEMORY_FIXTURE)
+            .with_memory_behavior_registration(crate::memory_strategy::FULL_MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "bernini",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-                ConditioningKind::VideoClip,
-            ],
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: vec!["uni_pc", "unipc"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            supported_quants: &[Quant::Q4, Quant::Q8],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![
+                    gen_core::TextEncoderDeclaration::new("qwen2_5_vl_7b", None),
+                    gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512)),
+                ],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                    ConditioningKind::VideoClip,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["bernini_mar_planner"],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["uni_pc", "unipc"],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(
+                gen_core::FamilyDriverSpec::new(crate::pipeline::stage2_driver_support(
+                    "candle_bernini_full",
+                ))
+                .with_expert_switching(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(16),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["qwen2_5_vl_7b", "bernini_mar_planner"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["wan_a14b_high_expert", "wan_a14b_low_expert"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(crate::config::Defaults::STEPS as u32),
+            guidance: Some(crate::config::Defaults::OMEGA_TXT),
+            sampler: Some("uni_pc"),
+            schedule: None,
+            shift: Some(BerniniKnobs::default().shift),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Stable identity + advertised capabilities for the full Bernini pipeline, computed from
+/// [`route_full`].
+pub fn descriptor() -> ModelDescriptor {
+    route_full().compute_descriptor()
 }
 
 /// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer knobs, with the heavy
@@ -693,10 +798,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         memory_refusal,
         loaded_spec: spec.clone(),
     }))
-}
-
-candle_gen::register_generators! {
-    pub(crate) const FULL_REGISTRATION = descriptor => load
 }
 
 impl Generator for Bernini {

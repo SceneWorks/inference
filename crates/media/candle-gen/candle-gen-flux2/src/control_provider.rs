@@ -134,13 +134,30 @@ pub struct Flux2Control {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
+pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
+    let mut route = crate::route_base(Flux2Variant::Dev);
+    route.route_id = crate::config::FLUX2_DEV_CONTROL_ID;
+    route.structure.conditioning.kinds = vec![candle_gen::gen_core::ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Any);
+    route.structure.conditioning.pass0_requirement =
+        candle_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["flux2_controlnet_union"];
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.structure.denoiser = candle_gen::gen_core::ModelBinding::family_model(
+        candle_gen::gen_core::FamilyModelSpec::new("flux2_mmdit")
+            .with_pag(Flux2Variant::Dev.pag_capability()),
+    );
+    route.bindings = candle_gen::gen_core::RouteBindings::feature_route(
+        Some(crate::config::FLUX2_DEV_ID),
+        control_report_descriptor,
+    )
+    .with_render_plan(compile_control_feature_route)
+    .with_encoder_contract_parent(crate::config::FLUX2_DEV_ID);
+    route
+}
+
 pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
-    let mut descriptor = crate::descriptor_dev();
-    descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
-    descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
-    descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Any);
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route_control().compute_descriptor()
 }
 
 pub(crate) fn compile_control_feature_route(

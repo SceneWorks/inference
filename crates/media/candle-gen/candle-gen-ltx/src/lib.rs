@@ -1992,103 +1992,222 @@ impl Generator for LtxGenerator {
 /// An explicit non-native `req.steps` is rejected in `validate` rather than silently ignored (sc-9027 /
 /// F-043). Synchronized audio is produced (sc-5495, the joint video+audio streams); on-the-fly quant
 /// remains deferred. AudioVideo projection adapters are supported through the shared additive adapter core.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::LTX_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle LTX-2.3 distilled (`SW-6979`, `REG-1`).
+pub(crate) fn route_ltx_2_3() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load)
+        .with_footprint(component_footprint);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(memory_strategy::MEMORY_FIXTURE)
+            .with_memory_behavior_registration(memory_strategy::MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "ltx",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-                ConditioningKind::Keyframe,
-                ConditioningKind::VideoClip,
-                ConditioningKind::ControlClip,
-            ],
-            supports_lora: true,
-            supports_lokr: true,
-            // Unified curated SAMPLER menu (epic 7114 P4, sc-7125) over the joint video+audio streams +
-            // the legacy `rectified-flow` alias (falls back to euler). Per decision 3b: sampler-only, NO
-            // scheduler axis — LTX is distilled with the fixed `STAGE1_SIGMAS` schedule; `euler` is the
-            // recommended default (the byte-faithful N1 path). The rest are exposed for ComfyUI parity.
-            samplers: candle_gen::menu_with_aliases(
-                candle_gen::curated_sampler_names(),
-                &["rectified-flow"],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "gemma3",
+                    Some(TEXT_MAX_LENGTH as u32),
+                )],
+                encoder_contract: None,
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: false,
+                // sc-18764 / R2: this crate has no `enhance` module on either checkpoint generation.
+                supports_prompt_enhancement: false,
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                    ConditioningKind::Keyframe,
+                    ConditioningKind::VideoClip,
+                    ConditioningKind::ControlClip,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &["rectified-flow"],
+                ),
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                drivers::ltx_driver_support("candle_ltx_2_3"),
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("ltx_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::LTX_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["ltx_spatial_upsampler"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
             ),
-            min_size: SIZE_MULTIPLE,
-            max_size: 1280,
-            max_count: 1,
-            // The distilled σ waypoints are baked into training, so 8 is not a default — it is the
-            // ONLY renderable count (sc-9027 / F-043). Advertised rather than re-checked in
-            // `validate` (sc-19502): the shared floor now owns the rejection, so `mlx-gen-ltx`
-            // enforces the identical constraint from the identical declaration instead of, as it
-            // did, never reading `req.steps` and silently rendering this same schedule anyway.
-            //
-            // Derived from the σ table rather than written as `vec![8]`, so re-baking the schedule
-            // moves the advertised surface with it instead of leaving a stale literal behind.
-            supported_steps: StepSupport::Exact(vec![NATIVE_STEPS]),
-            // The practical CUDA route is the pre-packed split q4 tier. Dense and q8 remain
-            // loadable compatibility paths but are deliberately not advertised as this provider's
-            // request-scoped I2V memory surface.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // sc-18764 / R2 (per-backend capability honesty). Stated EXPLICITLY rather than left to
-            // `Default`, because it is a load-bearing negative: this crate has no `enhance` module
-            // on either checkpoint generation, so `enhance_prompt` must be refused by the shared
-            // floor, never silently ignored. `ltx_2_5_enhance_capability.rs` asserts both the flag
-            // and the refusal it produces; flipping this literal to `true` is the mutation that
-            // must make that test fail.
-            supports_prompt_enhancement: false,
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["gemma3"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["ltx_av_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Upsample,
+                        ["ltx_spatial_upsampler"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["ltx_video_vae", "ltx_audio_vae", "ltx_vocoder"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: SIZE_MULTIPLE,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Exact(vec![NATIVE_STEPS]),
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(NATIVE_STEPS),
+            guidance: None,
+            sampler: Some("euler"),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((768, 512)),
+            ..Default::default()
+        },
+        bindings,
     }
 }
 
-/// The ordinary Candle provider descriptor for LTX-2.5's split Gemma-4 bundle.  Axes that are not
-/// materialised by this route stay explicitly closed; they are never accepted as inert metadata.
+/// Primary typed route declaration for Candle LTX-2.5 split Gemma-4 bundle (`SW-6979`, `REG-1`).
+pub(crate) fn route_ltx_2_5_for_variant(
+    transformer_variant: TransformerVariant,
+) -> gen_core::RouteRecord {
+    let mut route = route_ltx_2_3();
+    route.route_id = MODEL_25_ID;
+    route.structure.text_encoders.encoders = vec![gen_core::TextEncoderDeclaration::new(
+        "gemma4",
+        Some(TEXT_MAX_LENGTH as u32),
+    )];
+    route.structure.text_encoders.supports_prompt_enhancement = false;
+    route.structure.adapters = gen_core::AdapterSurface {
+        supports_lora: true,
+        supports_lokr: false,
+        install_policy: gen_core::AdapterInstallPolicy::ForwardResidual,
+    };
+    route.structure.video = gen_core::VideoSurface {
+        supports_auto_duration: true,
+        supports_generated_keyframes: true,
+    };
+    route.structure.upsamplers.max_temporal_upsample_rounds = 2;
+    route.structure.latent_codec.supports_diffusion_decoder = true;
+    route.structure.denoiser = gen_core::ModelBinding::family_driver(
+        gen_core::FamilyDriverSpec::new(drivers::ltx_driver_support("candle_ltx_2_5")),
+    );
+    route.structure.weight_plan.supported_quants = &[Quant::Q4, Quant::Q8];
+    match transformer_variant {
+        TransformerVariant::Distilled => {
+            route.limits.supported_steps = StepSupport::Exact(vec![NATIVE_STEPS]);
+            route.structure.conditioning.supports_negative_prompt = false;
+            route.defaults.steps = Some(NATIVE_STEPS);
+        }
+        TransformerVariant::Dev => {
+            route.limits.supported_steps = StepSupport::Exact(vec![30]);
+            route.structure.conditioning.supports_negative_prompt = true;
+            route.structure.sampling.samplers.clear();
+            route.defaults.steps = Some(30);
+            route.defaults.sampler = None;
+        }
+    }
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor_25, load_25);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_FIXTURE)
+            .with_memory_behavior_registration(
+                memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_BEHAVIOR,
+            );
+    }
+    route.bindings = bindings;
+    route
+}
+
+/// Primary typed route declaration for Candle LTX-2.5 distilled (`SW-6979`, `REG-1`).
+pub(crate) fn route_ltx_2_5() -> gen_core::RouteRecord {
+    route_ltx_2_5_for_variant(TransformerVariant::Distilled)
+}
+
+/// Stable identity + advertised capabilities for LTX-2.3, computed from [`route_ltx_2_3`].
+pub fn descriptor() -> ModelDescriptor {
+    route_ltx_2_3().compute_descriptor()
+}
+
+/// The ordinary Candle provider descriptor for LTX-2.5's split Gemma-4 bundle, computed from
+/// [`route_ltx_2_5`].
 pub fn descriptor_25() -> ModelDescriptor {
-    descriptor_25_for_variant(TransformerVariant::Distilled)
+    route_ltx_2_5().compute_descriptor()
 }
 
 /// The descriptor returned by an ordinary split-provider load after the transformer's safetensors
-/// identity has been parsed.  Catalog discovery remains conservative (`descriptor_25` advertises
-/// distilled), while a loaded dev checkpoint cannot accept the distilled 8-step / no-negative
-/// request surface.
+/// identity has been parsed.
 fn descriptor_25_for_variant(transformer_variant: TransformerVariant) -> ModelDescriptor {
-    let mut out = descriptor();
-    out.id = MODEL_25_ID;
-    out.capabilities.supports_lora = true;
-    out.capabilities.supports_lokr = false;
-    out.capabilities.supports_prompt_enhancement = false;
-    out.capabilities.supports_auto_duration = true;
-    out.capabilities.supports_generated_keyframes = true;
-    out.capabilities.max_temporal_upsample_rounds = 2;
-    out.capabilities.supports_diffusion_decoder = true;
-    // sc-18791: LTX-2.5 ships BOTH hosted packed tiers on Candle. The 2.3 descriptor this inherits
-    // from advertises q4 alone because 2.3 has no released q8 route; 2.5 converts `q4/` and `q8/`
-    // side by side, the q8 bundle additionally packing the Gemma 4 text encoder, and both load
-    // through the same MLX-affine packed path. Stated on the shared section rather than per variant:
-    // the numeric tier is a property of the converted bundle, not of distilled-vs-dev, and both
-    // variants have a published q8 conversion.
-    out.capabilities.supported_quants = &[Quant::Q4, Quant::Q8];
-    match transformer_variant {
-        TransformerVariant::Distilled => {
-            out.capabilities.supported_steps = StepSupport::Exact(vec![NATIVE_STEPS]);
-            out.capabilities.supports_negative_prompt = false;
-        }
-        TransformerVariant::Dev => {
-            out.capabilities.supported_steps = StepSupport::Exact(vec![30]);
-            out.capabilities.supports_negative_prompt = true;
-            // The dev transformer has one official guided Euler trajectory.  Leaving the curated
-            // distilled menu open would accept a knob that its variant cannot execute.
-            out.capabilities.samplers.clear();
-        }
-    }
-    out
+    route_ltx_2_5_for_variant(transformer_variant).compute_descriptor()
 }
 
 /// The single full **dense bf16** LTX-2.3 checkpoint in `root` — the 22B model bundling DiT + VAE +
@@ -2744,31 +2863,15 @@ impl Generator for Ltx25Generator {
     }
 }
 
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION_25 = descriptor_25 => load_25
-}
-
-/// Add the Candle LTX generator and trainer to an explicit media registry builder.
+/// Add the Candle LTX generator and trainer to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_generator(REGISTRATION_25);
-    #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_strategy(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_BEHAVIOR);
     registry
+        .register_route(route_ltx_2_3())
+        .register_route(route_ltx_2_5())
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
 }
@@ -2790,6 +2893,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle LTX provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 /// Resolve the load-bearing VAE geometry for a Candle LTX generator id.
@@ -2828,10 +2950,14 @@ mod explicit_registry_tests {
 
     #[test]
     fn weights_free_catalog_reaches_both_memory_registrations_and_behaviors() {
+        let mut r23 = super::route_ltx_2_3();
+        r23.bindings.memory = Default::default();
+        let mut r25 = super::route_ltx_2_5();
+        r25.bindings.memory = Default::default();
         let registry = super::register_memory_contract_surfaces(
             candle_gen::gen_core::ProviderRegistryBuilder::new()
-                .register_generator(super::REGISTRATION)
-                .register_generator(super::REGISTRATION_25),
+                .register_route(r23)
+                .register_route(r25),
         )
         .build()
         .unwrap();

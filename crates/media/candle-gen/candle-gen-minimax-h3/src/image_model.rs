@@ -49,9 +49,9 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
-    Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, SizeFloor, StepSupport, WeightsSource,
+    self, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape, LoadSpec,
+    MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use gen_core_h3::h3_schedule::SigmaSchedule;
@@ -110,58 +110,139 @@ pub const DEFAULT_SIZE: u32 = 2048;
 /// rather than a published limit.
 pub const MAX_EDGE: u32 = 16_384;
 
-/// The identity, modality and capability surface.
-pub fn image_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: IMAGE_MODEL_ID,
+/// Primary typed route declaration for Candle MiniMax-H3-Image (`SW-6979`, `REG-1`).
+pub(crate) fn route_image() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(image_descriptor, load_image);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::image_memory_strategy::IMAGE_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(
+                crate::image_memory_strategy::IMAGE_MEMORY_CONTRACT_FIXTURE,
+            )
+            .with_memory_behavior_registration(
+                crate::image_memory_strategy::IMAGE_MEMORY_BEHAVIOR,
+            );
+    }
+
+    gen_core::RouteRecord {
+        route_id: IMAGE_MODEL_ID,
         family: "minimax_h3_image",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Guidance-distilled: no negative prompt, no CFG (`gen_core::h3_image` refuses both).
-            // SW-7175: Perturbed-Attention Guidance (PAG) runs a second conditional pass on active
-            // steps without relaxing the guidance = 1 / no-negative-prompt contract.
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            pag: Some(contract::minimax_h3_image_pag_capability()),
-            // `edit` (SW-7092): 1..=16 reference images, as single references and/or a
-            // multi-reference list, in request order. No reference is `text2image`.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            // SW-7096: H3's adapter install over the image DiT's block/refiner surface --
-            // diffusers/PEFT, kohya `lora_unet_`, ComfyUI and LoKr, each at its own scale.
-            supports_lora: true,
-            supports_lokr: true,
-            // Pre-quantized MLX-affine tiers (SW-7093), the artifacts the MLX lane reads: staged as
-            // the DiT component; `spec.quantize` asserts which tier was staged.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // A staged request maps and releases its three components in turn (see the module docs).
-            supports_sequential_offload: true,
-            max_count: 1,
-            // PDD-distilled: one output head per step, so six is the only legal count.
-            supported_steps: StepSupport::Exact(vec![contract::FIXED_STEPS]),
-            component_precision_floors: &[],
-            // SW-7106: ComfyUI's stochastic LCM (the default, 1.1 → 0.9) or the released Euler on
-            // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
-            samplers: contract::SAMPLER_NAMES.to_vec(),
-            supports_h3_image_sampler: true,
-            // SW-7224: ComfyUI's schedulers over H3-Image's model sampling; no scheduler is the
-            // published grid.
-            schedulers: contract::SCHEDULER_NAMES.to_vec(),
-            min_size: 1,
-            max_size: MAX_EDGE,
-            // Any positive size: the canvas rounding is internal and resized back.
-            size_floor: SizeFloor::RangeChecked,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen3_vl_32b",
+                    Some(4096),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: contract::SAMPLER_NAMES.to_vec(),
+                schedulers: contract::SCHEDULER_NAMES.to_vec(),
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: true,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(
+                gen_core::FamilyDriverSpec::new(crate::drivers::h3_driver_support(
+                    "candle_minimax_h3_image",
+                ))
+                .with_pag(contract::minimax_h3_image_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("minimax_h3_image_vae"),
+                output_latent_space: None,
+                pixel_stride: None,
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_32b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["minimax_h3_image_dit"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["minimax_h3_image_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 1,
+            max_size: MAX_EDGE,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Exact(vec![contract::FIXED_STEPS]),
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(contract::FIXED_STEPS),
+            guidance: None,
+            sampler: Some(contract::SAMPLER_NAMES[0]),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((DEFAULT_SIZE, DEFAULT_SIZE)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// The identity, modality and capability surface, computed from [`route_image`].
+pub fn image_descriptor() -> ModelDescriptor {
+    route_image().compute_descriptor()
 }
 
 /// The components a resident request keeps on the device between requests.

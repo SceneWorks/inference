@@ -146,21 +146,47 @@ pub struct Flux2Edit {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
-pub fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
-    let mut descriptor = match variant {
-        Flux2Variant::Klein9b => crate::descriptor_klein(),
-        Flux2Variant::Dev => crate::descriptor_dev(),
-    };
-    descriptor.id = match variant {
+pub(crate) fn route_edit(variant: Flux2Variant) -> candle_gen::gen_core::RouteRecord {
+    let mut route = crate::route_base(variant);
+    route.route_id = match variant {
         Flux2Variant::Klein9b => crate::sc20686_observer::PRODUCT_ROUTE_ID,
         Flux2Variant::Dev => crate::config::FLUX2_DEV_EDIT_ID,
     };
-    descriptor.capabilities.conditioning = vec![
+    route.structure.conditioning.kinds = vec![
         candle_gen::gen_core::ConditioningKind::Reference,
         candle_gen::gen_core::ConditioningKind::MultiReference,
     ];
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route.structure.conditioning.pass0_requirement =
+        candle_gen::gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.denoiser = candle_gen::gen_core::ModelBinding::family_model(
+        candle_gen::gen_core::FamilyModelSpec::new("flux2_mmdit")
+            .with_pag(variant.pag_capability()),
+    );
+    route.bindings = match variant {
+        Flux2Variant::Klein9b => candle_gen::gen_core::RouteBindings::feature_route(
+            Some(crate::config::FLUX2_KLEIN_9B_ID),
+            edit_report_descriptor_klein,
+        )
+        .with_render_plan(|spec, req| compile_edit_feature_route(Flux2Variant::Klein9b, spec, req)),
+        Flux2Variant::Dev => candle_gen::gen_core::RouteBindings::feature_route(
+            Some(crate::config::FLUX2_DEV_ID),
+            edit_report_descriptor_dev,
+        )
+        .with_render_plan(|spec, req| compile_edit_feature_route(Flux2Variant::Dev, spec, req)),
+    };
+    route
+}
+
+fn edit_report_descriptor_klein() -> candle_gen::gen_core::ModelDescriptor {
+    edit_report_descriptor(Flux2Variant::Klein9b)
+}
+
+fn edit_report_descriptor_dev() -> candle_gen::gen_core::ModelDescriptor {
+    edit_report_descriptor(Flux2Variant::Dev)
+}
+
+pub fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
+    route_edit(variant).compute_descriptor()
 }
 
 pub(crate) fn compile_edit_feature_route(

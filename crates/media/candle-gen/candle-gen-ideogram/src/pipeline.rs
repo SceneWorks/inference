@@ -844,28 +844,32 @@ pub struct IdeogramEulerDriver<F> {
     support: DriverSupport,
 }
 
+pub(crate) fn euler_driver_support(driver_id: &'static str) -> DriverSupport {
+    DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean:
+                "native Candle Ideogram Euler driver does not re-noise from clean boundary estimates",
+            geometry_change:
+                "native Candle Ideogram Euler driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "native Candle Ideogram Euler driver does not expose read-only boundary clean estimates",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F: IdeogramVelocityForward> IdeogramEulerDriver<F> {
     fn build_support(driver_id: &'static str) -> DriverSupport {
-        DriverSupport {
-            driver_id,
-            arbitrary_slice: true,
-            carry_history: true,
-            reset_history: true,
-            renoise_from_clean: false,
-            geometry_change: false,
-            read_only_boundary_estimate: false,
-            previous_estimate_capture: false,
-            uses_global_rng: false,
-            refusal_reasons: DriverRefusalReasons {
-                renoise_from_clean:
-                    "native Candle Ideogram Euler driver does not re-noise from clean boundary estimates",
-                geometry_change:
-                    "native Candle Ideogram Euler driver does not support geometry-changing phase boundaries",
-                read_only_boundary_estimate:
-                    "native Candle Ideogram Euler driver does not expose read-only boundary clean estimates",
-                ..DriverRefusalReasons::default()
-            },
-        }
+        euler_driver_support(driver_id)
     }
 
     pub fn new(
