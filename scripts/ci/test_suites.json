@@ -1890,7 +1890,7 @@
       "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::checkpoint_kernel_per_token_states_match_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
-      "reason": "Five verify/batch/tiny geometries x three dtypes x two carried-state modes, comparing every per-token checkpoint as well as output/final state.",
+      "reason": "Eight verify/batch/tiny/Qwen-dims/reduction-class geometries x three dtypes x two carried-state modes, comparing every per-token checkpoint as well as output/final state bit for bit.",
       "platforms": [
         "darwin"
       ]
@@ -1934,7 +1934,18 @@
       "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::metal_kernel_matches_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
-      "reason": "Helper assert_matches_reference expands six shapes x three dtypes x zero/carried state; includes 512/2048-token prefill with 128x128 state compared to per-token ops reference.",
+      "reason": "Helper assert_bitwise_reference expands fifteen shapes (Qwen3.6/3.8 decode/verify dims, 512/2048-token prefill, every MLX row-reduction class) x three dtypes x zero/carried state; bitwise comparison to the per-token GPU ops reference.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::kernel_matches_each_reference_op_step_by_step",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6139 diagnostic: probe variant of the Metal GDN kernel vs the per-step GPU ops chain (kv_mem, delta, state, y from the kernel's own pre-step state) at Qwen3.8 verify dims and three reduction classes x two dtypes x two state modes, bitwise, printing first divergence and ULP distance.",
       "platforms": [
         "darwin"
       ]
