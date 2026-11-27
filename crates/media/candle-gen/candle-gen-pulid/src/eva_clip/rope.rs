@@ -83,7 +83,7 @@ impl VisionRope {
     /// Apply RoPE to patch-token q/k: `x·cos + rotate_half_interleaved(x)·sin`, computed in f32.
     /// `x`: `[B, heads, grid², head_dim]` (CLS token already sliced off by the caller).
     ///
-    /// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`EVA_ROPE`] — the fused strided kernel
+    /// SW-6129: the shared [`candle_gen::rope::apply_rope`] with `EVA_ROPE` — the fused strided kernel
     /// on CUDA, elsewhere the shared reference chain, op for op this method's former body
     /// (`shared_rope_matches_the_former_private_chain`).
     pub fn apply(&self, x: &Tensor) -> candle_core::Result<Tensor> {
