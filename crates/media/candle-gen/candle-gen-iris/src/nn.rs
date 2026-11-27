@@ -1941,6 +1941,7 @@ mod sw6129_adaln_route_tests {
     /// scale)` for f32 / bf16 / f16 `x` and both modulation forms (f32, and a bf16 table taking the
     /// torch promotion), at hidden 3072.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn rms_modulate_matches_the_former_norm_and_modulate() {
         let dev = Device::Cpu;
         let d = 3072;
@@ -1957,6 +1958,9 @@ mod sw6129_adaln_route_tests {
                 assert_eq!(bits(&got), bits(&want), "x {xd:?} mod {md:?}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate");
     }
 
     /// SW-6129 CUDA smoke: Iris `rms_modulate` (bf16 `[1, 4352, 3072]` stream, f32 and bf16

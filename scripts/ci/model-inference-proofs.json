@@ -294948,6 +294948,60 @@
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
+    "package": "candle-gen-lens",
+    "target": "candle_gen_lens",
+    "target_kind": "lib",
+    "fqn": "transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_lens",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Lens block RmsNorm gain and deterministic activations/modulation table on Device::Cpu; crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Block rms_modulate (learned RmsNorm) and NormOut layer_norm_modulate versus RmsNorm::forward + modulate and the former f32 LayerNorm + modulate, f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-ltx",
     "target": "integration",
     "target_kind": "test",
@@ -313091,6 +313145,60 @@
     }
   },
   {
+    "package": "candle-gen-mage",
+    "target": "candle_gen_mage",
+    "target_kind": "lib",
+    "fqn": "vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_mage",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Mage-VAE AffineNorm weight/bias (384 channels) with deterministic channel and token activations/modulation on Device::Cpu; crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: channel_ln_modulate and AffineNorm::ln_modulate_tokens (learned affine norm) versus the former layer_norm_channels / AffineNorm::layer + modulate chains, f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-moss-image",
     "target": "integration",
     "target_kind": "test",
@@ -314265,6 +314373,60 @@
           ]
         }
       }
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic MOSS Norm weight (hidden 3072, f32 and activation-dtype) with deterministic activations/modulation on Device::Cpu; crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Norm::norm_modulate (learned norm) versus the former Norm::forward + promotion casts + modulate, f32 / bf16 / f16 streams, f32 and native weights, every modulation/output dtype, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
     }
   },
   {
@@ -317051,6 +317213,60 @@
       "bespoke_acceptance/adapter_sample.png",
       "bespoke_acceptance/retained_export.json"
     ]
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "candle_gen_iris",
+    "target_kind": "lib",
+    "fqn": "nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Iris RmsNorm gain (hidden 3072) and deterministic activations/modulation rows on Device::Cpu; crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: rms_modulate on the learned RmsNorm versus the former RmsNorm::forward + modulate, f32 / bf16 / f16 x with f32 and bf16 modulation, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
+    }
   },
   {
     "package": "candle-gen-krea",
@@ -321378,6 +321594,60 @@
     }
   },
   {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic H3 DiT block RmsNorm gain at hidden 96 and 5376 with deterministic activations, modulation and per-token index on Device::Cpu; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: norm_modulate (learned RmsNorm) versus modulate(norm.forward(x)), f32 / bf16 / f16, at hidden 96 and 5376, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+      "requirements": []
+    }
+  },
+  {
     "package": "mlx-gen-minimax-h3",
     "target": "mlx_gen_minimax_h3",
     "target_kind": "lib",
@@ -321617,6 +321887,60 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-z-image",
+    "target": "candle_gen_z_image",
+    "target_kind": "lib",
+    "fqn": "dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_z_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Z-Image block RmsNorm gain and deterministic activations/modulation chunks on Device::Cpu; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale versus norm.forward(x) * (chunk + 1) and LayerNormNoParams(1e-6).forward(x) * (scale + 1), f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
       "requirements": []
     }
   },

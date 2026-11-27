@@ -865,6 +865,7 @@ mod sw6129_adaln_route_tests {
     /// CPU: the DConv-block channel AdaLN and the pixel-MLP token AdaLN are bit-identical to the
     /// former `layer_norm_channels` + modulate chains, f32 / bf16 / f16, the decoder's 384 channels.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn channel_and_token_adaln_match_the_former_chains() {
         let dev = Device::Cpu;
         let c = 384;
@@ -914,6 +915,9 @@ mod sw6129_adaln_route_tests {
             let got = n.ln_modulate_tokens(&t, &scale, &shift).unwrap();
             assert_eq!(bits(&got), bits(&want), "tokens {dtype:?}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains");
     }
 
     /// SW-6129 CUDA smoke: the Mage-VAE DConv channel AdaLN (bf16 `[1, 384, 64, 64]`) and the

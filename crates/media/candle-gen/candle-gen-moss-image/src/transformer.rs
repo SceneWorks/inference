@@ -1853,6 +1853,7 @@ mod sw6129_adaln_route_tests {
     /// CPU: bit-identical to the former norm + modulate for f32 / bf16 / f16 streams, bf16 and f32
     /// ("FP32 island") norm weights, f32 / activation-dtype modulation and an output cast, D 3072.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn norm_modulate_matches_the_former_norm_and_modulate() {
         let dev = Device::Cpu;
         let d = 3072;
@@ -1878,6 +1879,9 @@ mod sw6129_adaln_route_tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate");
     }
 
     /// SW-6129 CUDA smoke: MOSS-Image `norm_modulate` (bf16 `[1, 4352, 3072]`, a bf16 norm weight

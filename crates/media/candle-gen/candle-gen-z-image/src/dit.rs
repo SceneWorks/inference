@@ -3186,6 +3186,7 @@ mod adaln_route_tests {
     /// Both sites equal their former chains: `norm.forward(x) · (chunk + 1)` and
     /// `LayerNormNoParams(1e-6).forward(x) · (scale + 1)`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn fused_scale_only_sites_match_the_former_chains() {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let (x, m, norm) = operands(dtype, &Device::Cpu);
@@ -3207,6 +3208,9 @@ mod adaln_route_tests {
                 .unwrap();
             assert_eq!(bits(&got), bits(&want), "final {dtype:?}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains");
     }
 
     /// CUDA bf16: both sites take the fused AdaLN and are bit-identical to the same calls with the

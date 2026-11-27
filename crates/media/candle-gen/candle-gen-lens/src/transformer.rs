@@ -1342,6 +1342,7 @@ mod adaln_route_tests {
     /// The block `rms_modulate` and `NormOut`'s `layer_norm_modulate` equal `RmsNorm::forward` +
     /// `modulate` and the former f32 LayerNorm + `modulate`, bit for bit (CPU: the reference).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn fused_adaln_sites_match_the_former_chains() {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let (x, m, norm) = operands(dtype, &Device::Cpu);
@@ -1359,6 +1360,9 @@ mod adaln_route_tests {
                     .unwrap();
             assert_eq!(bits(&got), bits(&want), "norm_out {dtype:?}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains");
     }
 
     /// CUDA bf16: both sites take the fused AdaLN (2 block modulations + `NormOut`) and are

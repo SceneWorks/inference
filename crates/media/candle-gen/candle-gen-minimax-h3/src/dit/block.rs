@@ -1131,6 +1131,7 @@ mod adaln_route_tests {
     /// CPU: `norm_modulate` is bit-identical to `modulate(&norm.forward(x)?, ...)` (the former
     /// block site), f32 / bf16 / f16, at the H3 width (5376) and a small one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn norm_modulate_matches_the_former_chain() {
         for hidden in [96usize, 5376] {
             for dt in [DType::F32, DType::BF16, DType::F16] {
@@ -1141,6 +1142,9 @@ mod adaln_route_tests {
                 assert_eq!(bits(&got), bits(&former), "hidden={hidden} {dt:?}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain");
     }
 
     /// CUDA bf16: the block AdaLN takes the fused kernel, bit-identical to the switch-off
