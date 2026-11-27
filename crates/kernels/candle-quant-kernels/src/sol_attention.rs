@@ -793,7 +793,6 @@ mod cuda {
         l.arg(&ti).arg(&tpi).arg(&hi).arg(&vsb).arg(&vst).arg(&vsh);
         // SAFETY: matches `sol_vtranspose_*`; grid (ceil(T/256), BH) x 256.
         unsafe { l.launch(cfg((t.div_ceil(256), bh), 256, 0)?) }.map_err(drv)?;
-        drop((qv, kv, vv));
         drop((qs_st, ks_st, vs_st));
 
         let (sink_s, sink_e) = (config.sink_blocks.0 as i32, config.sink_blocks.1 as i32);

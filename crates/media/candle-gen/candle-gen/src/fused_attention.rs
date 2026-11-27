@@ -695,7 +695,7 @@ pub fn int8_attention_config() -> Int8AttentionConfig {
 // The opt-in Sol-Attn sparse kernel (SW-6137).
 // ---------------------------------------------------------------------------------------------
 
-pub use candle_quant_kernels::sol_attention::{SolConfig, SolSelection};
+pub use candle_quant_kernels::sol_attention::{SolConfig, SolSelection, SOL_HEAD_DIM};
 
 /// `true` when this build compiled the Sol-Attn kernel in (`candle-gen/cuda`; nvrtc at first use).
 pub const SOL_ATTN_COMPILED: bool = cfg!(feature = "cuda");
@@ -3229,7 +3229,7 @@ mod tests {
     /// **SW-6137, through the shared dispatch.** Inside a Sol-Attn scope, a Wan-shaped
     /// self-attention takes the Sol-Attn kernel (counted) and is bitwise the direct kernel call;
     /// `topk_ratio = 1.0` is dense attention within the kernel's declared INT8 tolerance (cosine
-    /// >= 0.999, rel-L2 < 0.016 against the f32 reference); the text cross-attention in the same
+    /// at least 0.999, rel-L2 under 0.016 against the f32 reference); the text cross-attention in the same
     /// scope falls through, counted as `cross_attention`; a training scope never takes it.
     #[cfg(feature = "cuda")]
     #[test]
