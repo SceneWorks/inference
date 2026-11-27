@@ -2084,6 +2084,35 @@ def _sample_split_note(judged: list[dict[str, Any]]) -> str:
     return "; " + "; ".join(notes) if notes else ""
 
 
+def _token_identity(
+    pairs: list[tuple[list[Process], list[Process], list[tuple[str, str]]]],
+) -> dict[str, Any]:
+    """SW-6139: greedy token-stream identity across an on/off twin pair. Every process of both
+    twins, every option (``off``, ``auto``, ``mtp``...), must stream the same token ids per prompt
+    (the row's ``token_digest``): a kernel that changes accepted tokens is a defect, whatever its
+    speed. Rows or documents without a digest, and non-greedy sampling, are not judged."""
+    checked, mismatches = 0, []
+    for on, off, _ in pairs:
+        if (on[0].document.get("sampling") or {}).get("temperature") != 0.0:
+            continue
+        by_prompt: dict[str, dict[str, list[str]]] = {}
+        for side, processes in (("on", on), ("off", off)):
+            for process in processes:
+                for (prompt_id, option), row in rows_by_key(process)[0].items():
+                    digest = row.get("token_digest")
+                    if isinstance(digest, str):
+                        label = f"{process.campaign}/{process.row}:{side}:{option}"
+                        by_prompt.setdefault(prompt_id, {}).setdefault(digest, []).append(label)
+        for prompt_id, digests in sorted(by_prompt.items()):
+            checked += 1
+            if len(digests) > 1:
+                mismatches.append(
+                    f"{prompt_id}: "
+                    + " != ".join(f"{d} ({', '.join(sorted(set(v)))})" for d, v in sorted(digests.items()))
+                )
+    return {"checked_prompts": checked, "mismatches": mismatches}
+
+
 def decide_defaults(
     entries: list[dict[str, Any]],
     groups: dict[tuple[str, str], list[Process]],
@@ -2179,10 +2208,21 @@ def decide_defaults(
                 f"; unpaired, no twin row identical but for {what}: "
                 + ", ".join(f"{p[0].campaign}/{p[0].row}" for p in unpaired)
             )
+        identity = (
+            _token_identity(pairs) if entry["kind"] == "switch" else None
+        )
+        if identity and identity["mismatches"]:
+            outcome = {
+                "outcome": "off",
+                "recommended_on": False,
+                "reason": "greedy token streams differ across the on/off twins: "
+                + "; ".join(identity["mismatches"]),
+            }
         recommended = outcome["recommended_on"]
         decisions.append(
             {
                 **entry,
+                "token_identity": identity,
                 "informational": not entry["provisional"],
                 "pairs": len(pairs),
                 "unpaired": [f"{p[0].campaign}/{p[0].row}" for p in unpaired],
