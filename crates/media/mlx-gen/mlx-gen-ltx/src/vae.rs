@@ -30,11 +30,12 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract, sum_axes};
+use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::array::{scalar, slice_range};
+use mlx_gen::array::slice_range;
 use mlx_gen::nn::{conv3d, silu};
+use mlx_gen::vae_norm_silu_pad::{self as norm_silu_pad, ChannelNorm, PadSpec, TemporalPad};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -58,21 +59,24 @@ fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
     slice_range(x, 2, start, end)
 }
 
-/// `x / sqrt(mean(x² over C, axis 1, keepdims) + eps)` — LTX PixelNorm (no √C scale, no γ).
-fn pixel_norm(x: &Array, eps: f32) -> Result<Array> {
-    // A zero-channel tensor (malformed checkpoint) would divide by `c = 0` and silently yield
-    // inf/nan; a rank<2 tensor would panic on `shape()[1]`. Reject both (F-049).
+/// A zero-channel tensor (malformed checkpoint) would divide by `c = 0` and silently yield inf/nan;
+/// a rank<2 tensor would panic on `shape()[1]`. Reject both (F-049).
+fn check_norm_input(x: &Array) -> Result<()> {
     if x.ndim() < 2 || x.shape()[1] == 0 {
         return Err(Error::Msg(format!(
             "ltx vae pixel_norm: expected a non-empty channel axis (dim 1), got shape {:?}",
             x.shape()
         )));
     }
-    let sumsq = sum_axes(&multiply(x, x)?, &[1], true)?;
-    let c = x.shape()[1] as f32;
-    let mean = divide(&sumsq, scalar(c))?;
-    let denom = add(&mean, scalar(eps))?.sqrt()?;
-    Ok(divide(x, &denom)?)
+    Ok(())
+}
+
+/// `x / sqrt(mean(x² over C, axis 1, keepdims) + eps)` — LTX PixelNorm (no √C scale, no γ). The
+/// op chain (`Σx²`, `/C`, `+eps`, `sqrt`, divide) lives in the shared [`ChannelNorm::Pixel`] so
+/// the fused conv input (SW-6142) divides by exactly this denominator.
+fn pixel_norm(x: &Array, eps: f32) -> Result<Array> {
+    check_norm_input(x)?;
+    ChannelNorm::Pixel { eps }.apply(x)
 }
 
 /// 3-D conv with frame-replication temporal padding + symmetric spatial zero-pad. NCTHW I/O; weight
@@ -138,9 +142,46 @@ impl CausalConv3d {
                 None,
             )?;
         }
-        let x = x.transpose_axes(&[0, 2, 3, 4, 1])?; // NDHWC
-        let y = conv3d(&x, &self.w, Some(&self.b), (1, 1, 1), (0, 0, 0))?;
+        self.conv_ndhwc(&x.transpose_axes(&[0, 2, 3, 4, 1])?) // NDHWC
+    }
+
+    /// The conv on an already padded channels-last input; NCTHW (a view of the NDHWC result) out.
+    fn conv_ndhwc(&self, x_ndhwc: &Array) -> Result<Array> {
+        let y = conv3d(x_ndhwc, &self.w, Some(&self.b), (1, 1, 1), (0, 0, 0))?;
         Ok(y.transpose_axes(&[0, 4, 1, 2, 3])?) // NCTHW
+    }
+
+    /// `self.forward(silu(pixel_norm(x, eps)), causal)` with the norm, SiLU, frame replication,
+    /// spatial zero pad and layout copy produced by the shared fused conv input when it serves
+    /// (SW-6142, [`norm_silu_pad::try_fused`]); otherwise exactly the eager chain.
+    fn forward_normed(&self, x: &Array, eps: f32, causal: bool) -> Result<Array> {
+        // An empty channel axis or a non-5-D input is refused by the fused plan, so it reaches
+        // `pixel_norm`'s F-049 rejection below exactly as before.
+        let norm = ChannelNorm::Pixel { eps };
+        let temporal = match (self.kt > 1, causal) {
+            (false, _) => TemporalPad::Replicate { front: 0, back: 0 },
+            (true, true) => TemporalPad::Replicate {
+                front: self.kt - 1,
+                back: 0,
+            },
+            (true, false) => {
+                let ps = (self.kt - 1) / 2;
+                TemporalPad::Replicate {
+                    front: ps,
+                    back: ps,
+                }
+            }
+        };
+        let spec = PadSpec {
+            temporal,
+            cache: None,
+            ph: self.ph,
+            pw: self.pw,
+        };
+        if let Some(fused) = norm_silu_pad::try_fused(x, &norm, &spec, 0)? {
+            return self.conv_ndhwc(&fused.ndhwc);
+        }
+        self.forward(&silu(&pixel_norm(x, eps)?)?, causal)
     }
 }
 
@@ -164,10 +205,8 @@ impl DecResBlock {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let h = silu(&pixel_norm(x, DEC_NORM_EPS)?)?;
-        let h = self.conv1.forward(&h, false)?;
-        let h = silu(&pixel_norm(&h, DEC_NORM_EPS)?)?;
-        let h = self.conv2.forward(&h, false)?;
+        let h = self.conv1.forward_normed(x, DEC_NORM_EPS, false)?;
+        let h = self.conv2.forward_normed(&h, DEC_NORM_EPS, false)?;
         Ok(add(&h, x)?)
     }
 }
@@ -267,9 +306,7 @@ impl VideoDecoder {
                 UpLayer::Up(u) => u.forward(&x)?,
             };
         }
-        let x = pixel_norm(&x, DEC_NORM_EPS)?;
-        let x = silu(&x)?;
-        let x = self.conv_out.forward(&x, false)?;
+        let x = self.conv_out.forward_normed(&x, DEC_NORM_EPS, false)?;
         unpatchify(&x, self.patch_size)
     }
 }
@@ -313,10 +350,8 @@ impl EncResBlock {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let h = silu(&pixel_norm(x, ENC_NORM_EPS)?)?;
-        let h = self.conv1.forward(&h, true)?;
-        let h = silu(&pixel_norm(&h, ENC_NORM_EPS)?)?;
-        let h = self.conv2.forward(&h, true)?;
+        let h = self.conv1.forward_normed(x, ENC_NORM_EPS, true)?;
+        let h = self.conv2.forward_normed(&h, ENC_NORM_EPS, true)?;
         Ok(add(&h, x)?)
     }
 }
@@ -498,12 +533,10 @@ impl VideoEncoder {
                 DownLayer::Down(d) => d.forward(&x)?,
             };
         }
-        let x = pixel_norm(&x, ENC_NORM_EPS)?;
-        let x = silu(&x)?;
         // conv_out width is `LatentLogVar::conv_out_channels` (checked at load). The output is
         // normalize(means) where means = the first `latent_channels`; the log-variance tail —
         // whatever its width and meaning under the declared mode — is discarded.
-        let x = self.conv_out.forward(&x, true)?;
+        let x = self.conv_out.forward_normed(&x, ENC_NORM_EPS, true)?;
         let means = slice_c(&x, 0, self.latent_channels)?;
         let normed = divide(&subtract(&means, &self.mean)?, &self.std)?;
         Ok(normed)
@@ -739,6 +772,7 @@ impl LtxVideoVae {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::array::scalar;
     use mlx_gen::testing::max_abs_diff_host;
 
     fn synthetic_spatial_decode(tile: &Array) -> Result<Array> {
@@ -1218,5 +1252,42 @@ mod tests {
             .stride(),
             (2, 2, 2)
         );
+    }
+
+    /// SW-6142: the shared fused conv input `pad(silu(pixel_norm(x)))` over the LTX conv-input
+    /// geometries (decoder non-causal replicate pads at 128..1024 channels, the encoder's causal
+    /// two-frame replicate, a `kt = 1` conv, bf16 input, the eps floor) against the reference op
+    /// chain at E2's declared tolerance, bit identity reported. **Mutation control**: the causal
+    /// replicate pad on the wrong temporal side must fail parity.
+    #[test]
+    #[ignore = "MLX compute: SW-6142 fused_norm_silu_pad (LTX geometries) vs the reference chain + wrong-side mutation; exhaustive suite, not ordinary CI"]
+    fn fused_norm_silu_pad_matches_the_reference_chain() {
+        use mlx_gen::vae_norm_silu_pad::{parity, NormSiluPadRoute};
+        let reports = parity::run_all(&parity::ltx_cases(), NormSiluPadRoute::Metal).unwrap();
+        let bitwise = reports.iter().filter(|r| r.bitwise()).count();
+        println!(
+            "SW6142_LTX_PARITY cases={} bitwise={bitwise}",
+            reports.len()
+        );
+        for report in &reports {
+            assert!(report.within_tolerance(), "{}", report.line());
+        }
+        let mutations: Vec<_> = parity::mutation_cases()
+            .into_iter()
+            .filter(|case| case.name.starts_with("ltx_"))
+            .collect();
+        assert!(!mutations.is_empty());
+        for case in &mutations {
+            let c = parity::run_mutation(case).unwrap();
+            println!(
+                "SW6142_LTX_MUTATION case={} mismatches={} max_abs={:.3e}",
+                case.name, c.mismatches, c.max_abs
+            );
+            assert!(
+                !c.bitwise() && c.max_abs > 1e-2,
+                "{}: the causal replicate pad on the wrong temporal side must fail parity",
+                case.name
+            );
+        }
     }
 }
