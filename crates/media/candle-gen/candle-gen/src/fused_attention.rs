@@ -83,6 +83,21 @@
 //! helpers check the plan's flag once before launching (returning [`crate::CandleError::Canceled`]);
 //! the budgeted path keeps its between-chunk checks. Long sequences should additionally check
 //! between layers, which is where a fused forward's cancel latency is bounded.
+//!
+//! # The opt-in INT8 QK kernel (SW-6131)
+//!
+//! A second fused kernel, SageAttention-style INT8 `Q·Kᵀ` attention
+//! (`candle_quant_kernels::sage_attention`: Hadamard-rotated per-token INT8 Q/K, softmax-invariant
+//! K centering, bf16/f16 V, f32 softmax), is **lossy**, so it is never a default (epic E2). A caller
+//! opts in for a stretch of work on its own thread with [`with_int8_attention`] /
+//! [`enter_int8_attention`] (Krea's `int8_attention` engine option is the one adopter). Inside that
+//! scope the router tries it **first**, after the shared materialized / autograd gate (training
+//! never sees it) and before FlashAttention: an eligible call (CUDA sm_80+, bf16/f16, no mask,
+//! head dim 64 or 128, every INT8 buffer within `i32` indexing, kernel compiled) takes
+//! [`AttentionKernel::Int8`]; any other call falls through to the flash rule unchanged and the reason
+//! is counted in [`AttentionPathCounts::int8_refusals`]. The flash toggle does not gate it — the
+//! scope is its own explicit switch. It is one-plus-quantizer launches per call, so the planned
+//! helpers' single pre-launch cancel check covers it exactly as it covers flash.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -190,7 +205,7 @@ pub fn training_sdpa_standard_bhsd(
     // An inference forward through this training-shaped entry point (Krea control runs its frozen
     // DiT and branch through it): when the shared router would fuse the call, do so. Under autograd
     // or a training scope the router refuses and the owners below run exactly as before.
-    if route_attention_kernel(q, k, v, mask) == AttentionKernel::Flash {
+    if route_attention_kernel(q, k, v, mask).is_fused() {
         return sdpa_planned_bhsd(
             q,
             k,
@@ -329,6 +344,9 @@ fn fits_kernel_abi(
 pub enum AttentionKernel {
     /// candle-flash-attn's fused FA2 forward — scores never materialize.
     Flash,
+    /// The opt-in, lossy SageAttention-style INT8 `Q·Kᵀ` kernel (SW-6131) — scores never
+    /// materialize. Only routed inside [`with_int8_attention`].
+    Int8,
     /// The materialized, query-chunked [`sdpa_planned_bhsd`], with the reason the fused kernel was
     /// refused.
     Budgeted(FlashRefusal),
@@ -339,8 +357,14 @@ impl AttentionKernel {
     pub fn name(self) -> &'static str {
         match self {
             AttentionKernel::Flash => "flash_attn_v2",
+            AttentionKernel::Int8 => "sage_int8_qk",
             AttentionKernel::Budgeted(_) => "budgeted_sdpa",
         }
+    }
+
+    /// Whether the call takes a fused kernel (no `[.., Sq, Sk]` scores tensor): flash or INT8.
+    pub fn is_fused(self) -> bool {
+        !matches!(self, AttentionKernel::Budgeted(_))
     }
 }
 
@@ -473,6 +497,160 @@ pub fn flash_device(device: &candle_core::Device) -> FlashDevice {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The opt-in INT8 QK kernel (SW-6131).
+// ---------------------------------------------------------------------------------------------
+
+pub use candle_quant_kernels::sage_attention::KCentering;
+
+/// `true` when this build compiled the INT8 QK attention kernel in (`candle-gen/cuda`; it is
+/// nvrtc-compiled at first use, so it needs no `flash-attn`).
+pub const INT8_ATTN_COMPILED: bool = cfg!(feature = "cuda");
+
+/// The INT8 kernel's compute-capability floor (packed: `80` = sm_8.0).
+pub const INT8_MIN_COMPUTE_CAP: u32 = candle_quant_kernels::sage_attention::SAGE_MIN_COMPUTE_CAP;
+
+/// Why a call inside [`with_int8_attention`] did not take the INT8 kernel (it then follows the
+/// flash rule). Counted in [`AttentionPathCounts::int8_refusals`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int8Refusal {
+    /// The build does not enable `candle-gen/cuda`.
+    NotCompiled,
+    /// The tensors are not on a CUDA device.
+    NotCuda,
+    /// The CUDA device's compute capability (`None`: unreadable) is below [`INT8_MIN_COMPUTE_CAP`].
+    UnsupportedArch(Option<u32>),
+    /// The dtype has no INT8 kernel (only bf16 / f16 do).
+    Dtype(DType),
+    /// q / k / v disagree on dtype or device.
+    MixedDtypeOrDevice,
+    /// The call carries an additive mask.
+    Masked,
+    /// The head dim is not 64 or 128 (or differs across q / k / v).
+    HeadDim(usize),
+    /// Rank, batch, K/V shape, empty sequence or head-group mismatch.
+    Shape,
+    /// A padded INT8 buffer exceeds `i32::MAX` elements, or a grid extent its limit.
+    IndexOverflow,
+    /// The kernel source failed to compile or load on this device (cached by the nvrtc seam).
+    Compile,
+}
+
+/// The device side of [`int8_eligibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int8Device {
+    /// CPU / Metal.
+    NotCuda,
+    /// A CUDA device with its packed compute capability (`None` if unreadable).
+    Cuda(Option<u32>),
+}
+
+/// Classify a real device for [`int8_eligibility`] (the capability is cached per ordinal).
+pub fn int8_device(device: &candle_core::Device) -> Int8Device {
+    if device.is_cuda() {
+        Int8Device::Cuda(crate::cuda_arch::device_compute_cap(device))
+    } else {
+        Int8Device::NotCuda
+    }
+}
+
+/// The pure INT8 eligibility rule (the envelope of `candle_quant_kernels::sage_attention`).
+pub fn int8_eligibility(
+    compiled: bool,
+    device: Int8Device,
+    same_device: bool,
+    q: FlashOperand<'_>,
+    k: FlashOperand<'_>,
+    v: FlashOperand<'_>,
+    masked: bool,
+) -> Result<(), Int8Refusal> {
+    use candle_quant_kernels::sage_attention::{check_sage_attention, SageRefusal};
+    if !compiled {
+        return Err(Int8Refusal::NotCompiled);
+    }
+    match device {
+        Int8Device::NotCuda => return Err(Int8Refusal::NotCuda),
+        Int8Device::Cuda(cap) if cap.is_none_or(|c| c < INT8_MIN_COMPUTE_CAP) => {
+            return Err(Int8Refusal::UnsupportedArch(cap))
+        }
+        Int8Device::Cuda(_) => {}
+    }
+    if !same_device {
+        return Err(Int8Refusal::MixedDtypeOrDevice);
+    }
+    if masked {
+        return Err(Int8Refusal::Masked);
+    }
+    check_sage_attention(q.dims, k.dims, v.dims, q.dtype, k.dtype, v.dtype)
+        .map(|_| ())
+        .map_err(|r| match r {
+            SageRefusal::Dtype(d) => Int8Refusal::Dtype(d),
+            SageRefusal::MixedDtype => Int8Refusal::MixedDtypeOrDevice,
+            SageRefusal::HeadDim(d) => Int8Refusal::HeadDim(d),
+            SageRefusal::Shape => Int8Refusal::Shape,
+            SageRefusal::IndexOverflow => Int8Refusal::IndexOverflow,
+        })
+}
+
+thread_local! {
+    static INT8_SCOPE: Cell<u32> = const { Cell::new(0) };
+    static INT8_CENTERING: Cell<KCentering> = const { Cell::new(KCentering::Adaptive) };
+}
+
+/// Run `f` with the opt-in INT8 QK kernel requested for every shared attention helper call on this
+/// thread (adaptive K centering). Nests, and restores on unwind. Lossy: callers opt in explicitly
+/// (an engine option), never by default.
+pub fn with_int8_attention<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = enter_int8_attention(KCentering::Adaptive);
+    f()
+}
+
+/// [`with_int8_attention`] when `on`, else `f()` unchanged.
+pub fn with_int8_attention_if<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    if on {
+        with_int8_attention(f)
+    } else {
+        f()
+    }
+}
+
+/// The guard form of [`with_int8_attention`], with an explicit K-centering mode: the scope lasts
+/// until the returned value drops (restoring the previous depth and mode). Thread-bound.
+pub fn enter_int8_attention(centering: KCentering) -> Int8AttentionScope {
+    let previous = INT8_SCOPE.replace(INT8_SCOPE.get().saturating_add(1));
+    let previous_centering = INT8_CENTERING.replace(centering);
+    Int8AttentionScope {
+        previous,
+        previous_centering,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// An active [`enter_int8_attention`] scope on this thread.
+#[must_use = "the INT8 attention scope ends when this guard drops"]
+pub struct Int8AttentionScope {
+    previous: u32,
+    previous_centering: KCentering,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Int8AttentionScope {
+    fn drop(&mut self) {
+        INT8_SCOPE.set(self.previous);
+        INT8_CENTERING.set(self.previous_centering);
+    }
+}
+
+/// Whether this thread is inside [`with_int8_attention`].
+pub fn in_int8_attention_scope() -> bool {
+    INT8_SCOPE.get() > 0
+}
+
+/// The K-centering mode of the innermost active INT8 scope.
+pub fn int8_k_centering() -> KCentering {
+    INT8_CENTERING.get()
+}
+
+// ---------------------------------------------------------------------------------------------
 // The process-wide toggle (SW-6130 E3).
 // ---------------------------------------------------------------------------------------------
 
@@ -597,23 +775,64 @@ pub fn flash_route(
 /// The kernel a flash-eligible shared helper takes for these `[B, H, S, D]` operands right now:
 /// [`flash_route`] for real tensors, the toggle, the training scope and the autograd state. Pure
 /// with respect to the counters — the helpers count; callers that only need to *know* the route
-/// (MiniMax-H3's execution receipt) may call this freely.
+/// (MiniMax-H3's execution receipt) may call this freely. Inside an INT8 scope the answer already
+/// accounts for an INT8 kernel that failed to compile on the device (the seam caches the outcome).
 pub fn route_attention_kernel(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
 ) -> AttentionKernel {
+    route_ready(q, k, v, mask).0
+}
+
+/// The pure INT8 front of the router: inside an INT8 scope, a call that passed the shared
+/// materialized / autograd gate is offered to the INT8 kernel first. `None` = not requested (or the
+/// gate refused, which the flash rule then reports).
+pub fn int8_route(
+    requested: bool,
+    gate: FlashGate,
+    eligibility: impl FnOnce() -> Result<(), Int8Refusal>,
+) -> Option<Result<(), Int8Refusal>> {
+    (requested && !gate.materialized && !gate.grad_tracked).then(eligibility)
+}
+
+/// [`route_attention_kernel`] plus, for an INT8-scope call that fell through to the flash rule, the
+/// INT8 refusal reason.
+fn route_attention(
+    int8_requested: bool,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> (AttentionKernel, Option<Int8Refusal>) {
     let gate = FlashGate {
         materialized: in_materialized_attention_scope(),
         enabled: flash_attention_enabled(),
         grad_tracked: q.track_op() || k.track_op() || v.track_op(),
     };
-    match flash_gate_refusal(gate, FLASH_ATTN_COMPILED) {
+    let int8 = int8_route(int8_requested, gate, || {
+        int8_eligibility(
+            INT8_ATTN_COMPILED,
+            int8_device(q.device()),
+            q.device().same_device(k.device()) && q.device().same_device(v.device()),
+            FlashOperand::of(q),
+            FlashOperand::of(k),
+            FlashOperand::of(v),
+            mask.is_some(),
+        )
+    });
+    let int8_refusal = match int8 {
+        Some(Ok(())) => return (AttentionKernel::Int8, None),
+        Some(Err(refusal)) => Some(refusal),
+        None => None,
+    };
+    let kernel = match flash_gate_refusal(gate, FLASH_ATTN_COMPILED) {
         Some(refusal) => AttentionKernel::Budgeted(refusal),
         // The device classification only runs once the cheap gate passed.
         None => select_attention_kernel(q, k, v, mask),
-    }
+    };
+    (kernel, int8_refusal)
 }
 
 /// Which flash-eligible helper a call came through: the category the `GradTracked` leak warning is
@@ -652,17 +871,81 @@ fn warn_grad_tracked(site: AttentionSite, caller: &'static std::panic::Location<
     );
 }
 
-/// Route one helper call and count it. `true` = take the fused kernel.
+/// A fused kernel a helper call takes ([`AttentionKernel::is_fused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FusedKernel {
+    Flash,
+    Int8(KCentering),
+}
+
+impl FusedKernel {
+    /// The fused kernel `kernel` names (`None` for the materialized path), with this thread's
+    /// INT8 centering mode.
+    pub(crate) fn of(kernel: AttentionKernel) -> Option<Self> {
+        match kernel {
+            AttentionKernel::Flash => Some(FusedKernel::Flash),
+            AttentionKernel::Int8 => Some(FusedKernel::Int8(int8_k_centering())),
+            AttentionKernel::Budgeted(_) => None,
+        }
+    }
+}
+
+/// Whether the INT8 kernel source compiles and loads on `device` (the nvrtc seam caches the
+/// outcome per device, failure included, so this is a lookup after the first call).
+#[cfg(feature = "cuda")]
+fn int8_kernel_ready(device: &candle_core::Device) -> bool {
+    match device {
+        candle_core::Device::Cuda(dev) => candle_quant_kernels::sage_attention::SOURCE
+            .compiled(dev)
+            .is_ok(),
+        _ => false,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn int8_kernel_ready(_device: &candle_core::Device) -> bool {
+    false
+}
+
+/// Route one call (without counting): the kernel, and the INT8 refusal when an INT8-scope call
+/// fell through to the flash rule. A routed INT8 call whose kernel failed to compile on the device
+/// re-routes by the flash rule, refused as [`Int8Refusal::Compile`].
+pub(crate) fn route_ready(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> (AttentionKernel, Option<Int8Refusal>) {
+    let (kernel, int8_refusal) = route_attention(in_int8_attention_scope(), q, k, v, mask);
+    if kernel == AttentionKernel::Int8 && !int8_kernel_ready(q.device()) {
+        return (
+            route_attention(false, q, k, v, mask).0,
+            Some(Int8Refusal::Compile),
+        );
+    }
+    (kernel, int8_refusal)
+}
+
+/// Count one routed call: its path, and its INT8 refusal if any.
+pub(crate) fn record_route(kernel: AttentionKernel, int8_refusal: Option<Int8Refusal>) {
+    record_attention_path(kernel);
+    if let Some(refusal) = int8_refusal {
+        record_int8_refusal(refusal);
+    }
+}
+
+/// Route one helper call and count it: the fused kernel to take, or `None` for the materialized
+/// path.
 #[track_caller]
-pub(crate) fn take_flash(
+pub(crate) fn take_fused(
     site: AttentionSite,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
-) -> bool {
-    let kernel = route_attention_kernel(q, k, v, mask);
-    record_attention_path(kernel);
+) -> Option<FusedKernel> {
+    let (kernel, int8_refusal) = route_ready(q, k, v, mask);
+    record_route(kernel, int8_refusal);
     // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
     // `Materialized` first.
     if kernel == AttentionKernel::Budgeted(FlashRefusal::GradTracked)
@@ -670,7 +953,104 @@ pub(crate) fn take_flash(
     {
         warn_grad_tracked(site, std::panic::Location::caller());
     }
-    kernel == AttentionKernel::Flash
+    FusedKernel::of(kernel)
+}
+
+/// The fused forward of `kernel` over `[B, H, S, D]` operands: the contiguous `[B, H, Sq, D]`
+/// output.
+pub(crate) fn fused_bhsd(
+    kernel: FusedKernel,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+) -> candle_core::Result<Tensor> {
+    match kernel {
+        FusedKernel::Flash => flash_bhsd(q, k, v, scale),
+        FusedKernel::Int8(centering) => {
+            capture_int8_call(q, k, v, scale);
+            int8_bhsd(q, k, v, scale, centering)
+        }
+    }
+}
+
+/// The operands of one INT8-routed call, kept by [`arm_int8_operand_capture`] for evidence: the
+/// real-weights tests replay a production call's Q/K/V against the f32 reference.
+#[derive(Debug, Clone)]
+pub struct CapturedAttention {
+    /// `[B, H, Sq, D]`.
+    pub q: Tensor,
+    /// `[B, HK, Sk, D]`.
+    pub k: Tensor,
+    /// `[B, HK, Sk, D]`.
+    pub v: Tensor,
+    /// The softmax scale.
+    pub scale: f64,
+}
+
+/// Calls to skip before the capture (`u64::MAX` = disarmed).
+static INT8_CAPTURE_SKIP: AtomicU64 = AtomicU64::new(u64::MAX);
+static INT8_CAPTURED: std::sync::Mutex<Option<CapturedAttention>> = std::sync::Mutex::new(None);
+
+/// Arm a one-shot capture of the operands of the INT8-routed call that follows `skip` more such
+/// calls in this process (evidence tooling; disarmed by default, when it costs one relaxed load
+/// per INT8 call). The tensors are kept by reference (no copy) until [`take_int8_operand_capture`].
+pub fn arm_int8_operand_capture(skip: u64) {
+    if let Ok(mut slot) = INT8_CAPTURED.lock() {
+        *slot = None;
+    }
+    INT8_CAPTURE_SKIP.store(skip, Ordering::Relaxed);
+}
+
+/// The captured operands, if the armed call has run (disarms).
+pub fn take_int8_operand_capture() -> Option<CapturedAttention> {
+    INT8_CAPTURE_SKIP.store(u64::MAX, Ordering::Relaxed);
+    INT8_CAPTURED.lock().ok().and_then(|mut slot| slot.take())
+}
+
+fn capture_int8_call(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) {
+    let skip = INT8_CAPTURE_SKIP.load(Ordering::Relaxed);
+    if skip == u64::MAX {
+        return;
+    }
+    if skip > 0 {
+        // A racing call may decrement past the armed one: evidence tooling, single-threaded use.
+        INT8_CAPTURE_SKIP.store(skip - 1, Ordering::Relaxed);
+        return;
+    }
+    INT8_CAPTURE_SKIP.store(u64::MAX, Ordering::Relaxed);
+    if let Ok(mut slot) = INT8_CAPTURED.lock() {
+        *slot = Some(CapturedAttention {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            scale,
+        });
+    }
+}
+
+/// The INT8 forward (`candle_quant_kernels::sage_attention`).
+#[cfg(feature = "cuda")]
+pub(crate) fn int8_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    centering: KCentering,
+) -> candle_core::Result<Tensor> {
+    candle_quant_kernels::sage_attention::sage_attention(q, k, v, scale, centering)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn int8_bhsd(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _scale: f64,
+    _centering: KCentering,
+) -> candle_core::Result<Tensor> {
+    // Unreachable: `int8_eligibility` refuses with `NotCompiled` first.
+    candle_core::bail!("candle-gen: the INT8 attention kernel is not compiled into this build")
 }
 
 /// Count one explicitly materialized helper call.
@@ -682,13 +1062,19 @@ pub(crate) fn record_materialized_call() {
 // The path counters (SW-6130 E4).
 // ---------------------------------------------------------------------------------------------
 
-/// Process-wide count of shared-helper attention calls by the path they took: the fused kernel,
-/// or the budgeted path with the reason the fused kernel was refused. A cheap `Copy` snapshot —
-/// read it with [`attention_path_counts`], or drain it per job with [`take_attention_path_counts`].
+/// Process-wide count of shared-helper attention calls by the path they took: a fused kernel
+/// (flash or INT8), or the budgeted path with the reason the fused kernel was refused — each call
+/// in exactly one of those fields. A cheap `Copy` snapshot — read it with
+/// [`attention_path_counts`], or drain it per job with [`take_attention_path_counts`].
+///
+/// [`Self::int8_refusals`] is a side tally, not a path: for an INT8-scope call that did not take
+/// the INT8 kernel, why (the call itself is counted under flash or a budgeted reason).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttentionPathCounts {
     /// Calls that ran the FlashAttention-2 kernel.
     pub flash: u64,
+    /// Calls that ran the opt-in INT8 QK kernel (SW-6131).
+    pub int8: u64,
     /// Budgeted: the build does not compile the kernel.
     pub not_compiled: u64,
     /// Budgeted: the operands are not on a CUDA device.
@@ -713,6 +1099,49 @@ pub struct AttentionPathCounts {
     pub grad_tracked: u64,
     /// Budgeted: the caller asked for the materialized path.
     pub materialized: u64,
+    /// INT8-scope calls that did not take the INT8 kernel, by reason.
+    pub int8_refusals: Int8RefusalCounts,
+}
+
+/// Per-reason count of INT8-scope calls that fell through to the flash rule ([`Int8Refusal`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int8RefusalCounts {
+    /// The build does not compile the kernel.
+    pub not_compiled: u64,
+    /// The operands are not on a CUDA device.
+    pub not_cuda: u64,
+    /// The device is below sm_8.0 or its capability is unreadable.
+    pub unsupported_arch: u64,
+    /// Not bf16 / f16.
+    pub dtype: u64,
+    /// q / k / v disagree on dtype or device.
+    pub mixed_dtype_or_device: u64,
+    /// An additive mask.
+    pub masked: u64,
+    /// The head dim is not 64 or 128.
+    pub head_dim: u64,
+    /// Rank, batch, K/V shape or head-group mismatch.
+    pub shape: u64,
+    /// A padded INT8 buffer or grid extent past its limit.
+    pub index_overflow: u64,
+    /// The kernel failed to compile or load on the device.
+    pub compile: u64,
+}
+
+impl Int8RefusalCounts {
+    /// Every refused INT8-scope call.
+    pub fn total(&self) -> u64 {
+        self.not_compiled
+            + self.not_cuda
+            + self.unsupported_arch
+            + self.dtype
+            + self.mixed_dtype_or_device
+            + self.masked
+            + self.head_dim
+            + self.shape
+            + self.index_overflow
+            + self.compile
+    }
 }
 
 impl AttentionPathCounts {
@@ -734,14 +1163,16 @@ impl AttentionPathCounts {
 
     /// Every counted call.
     pub fn total(&self) -> u64 {
-        self.flash + self.budgeted()
+        self.flash + self.int8 + self.budgeted()
     }
 
     /// The field-wise difference `self - earlier` (saturating), for a window between two snapshots.
     pub fn since(&self, earlier: &Self) -> Self {
         let d = |a: u64, b: u64| a.saturating_sub(b);
+        let (r, e) = (&self.int8_refusals, &earlier.int8_refusals);
         Self {
             flash: d(self.flash, earlier.flash),
+            int8: d(self.int8, earlier.int8),
             not_compiled: d(self.not_compiled, earlier.not_compiled),
             not_cuda: d(self.not_cuda, earlier.not_cuda),
             unsupported_arch: d(self.unsupported_arch, earlier.unsupported_arch),
@@ -754,19 +1185,59 @@ impl AttentionPathCounts {
             disabled: d(self.disabled, earlier.disabled),
             grad_tracked: d(self.grad_tracked, earlier.grad_tracked),
             materialized: d(self.materialized, earlier.materialized),
+            int8_refusals: Int8RefusalCounts {
+                not_compiled: d(r.not_compiled, e.not_compiled),
+                not_cuda: d(r.not_cuda, e.not_cuda),
+                unsupported_arch: d(r.unsupported_arch, e.unsupported_arch),
+                dtype: d(r.dtype, e.dtype),
+                mixed_dtype_or_device: d(r.mixed_dtype_or_device, e.mixed_dtype_or_device),
+                masked: d(r.masked, e.masked),
+                head_dim: d(r.head_dim, e.head_dim),
+                shape: d(r.shape, e.shape),
+                index_overflow: d(r.index_overflow, e.index_overflow),
+                compile: d(r.compile, e.compile),
+            },
         }
     }
 }
 
-/// One counter slot per [`AttentionPathCounts`] field, in field order.
-const PATH_SLOTS: usize = 13;
+/// One counter slot per [`AttentionPathCounts`] path field (slots `0..14`, field order but `int8`
+/// last), then one per [`Int8RefusalCounts`] field (slots `14..24`).
+const PATH_SLOTS: usize = 24;
 static PATH_COUNTS: [AtomicU64; PATH_SLOTS] = [const { AtomicU64::new(0) }; PATH_SLOTS];
+
+/// The first [`Int8RefusalCounts`] slot.
+const INT8_REFUSAL_SLOT: usize = 14;
+
+/// The counter slot an INT8 refusal lands in.
+fn int8_refusal_slot(refusal: Int8Refusal) -> usize {
+    use Int8Refusal as R;
+    INT8_REFUSAL_SLOT
+        + match refusal {
+            R::NotCompiled => 0,
+            R::NotCuda => 1,
+            R::UnsupportedArch(_) => 2,
+            R::Dtype(_) => 3,
+            R::MixedDtypeOrDevice => 4,
+            R::Masked => 5,
+            R::HeadDim(_) => 6,
+            R::Shape => 7,
+            R::IndexOverflow => 8,
+            R::Compile => 9,
+        }
+}
+
+/// Count one INT8 refusal (the side tally; the call's path is counted separately).
+pub fn record_int8_refusal(refusal: Int8Refusal) {
+    PATH_COUNTS[int8_refusal_slot(refusal)].fetch_add(1, Ordering::Relaxed);
+}
 
 /// The counter slot a routed call lands in.
 fn path_slot(kernel: AttentionKernel) -> usize {
     use FlashRefusal as R;
     match kernel {
         AttentionKernel::Flash => 0,
+        AttentionKernel::Int8 => 13,
         AttentionKernel::Budgeted(reason) => match reason {
             R::NotCompiled => 1,
             R::NotCuda => 2,
@@ -809,6 +1280,19 @@ fn counts_from_slots(c: &[u64; PATH_SLOTS]) -> AttentionPathCounts {
         disabled: c[10],
         grad_tracked: c[11],
         materialized: c[12],
+        int8: c[13],
+        int8_refusals: Int8RefusalCounts {
+            not_compiled: c[14],
+            not_cuda: c[15],
+            unsupported_arch: c[16],
+            dtype: c[17],
+            mixed_dtype_or_device: c[18],
+            masked: c[19],
+            head_dim: c[20],
+            shape: c[21],
+            index_overflow: c[22],
+            compile: c[23],
+        },
     }
 }
 
@@ -1761,6 +2245,308 @@ mod tests {
         assert!(peak < scores / 16, "peak {peak} vs scores {scores}");
         assert!(peak <= 4 * operand, "peak {peak} vs operand {operand}");
         drop(out);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SW-6131: the opt-in INT8 QK kernel. GPU cases are `#[ignore]`d (CUDA compute):
+    //
+    // CUDA_VISIBLE_DEVICES=<gpu> cargo test -p candle-gen --features flash-attn --lib \
+    //   fused_attention::tests::cuda_int8_ -- --ignored --nocapture --test-threads=1
+    // -----------------------------------------------------------------------------------------
+
+    /// `(cosine, rel-L2, max |Δ|)` of `a` against the reference `b`, in f32.
+    #[cfg(feature = "cuda")]
+    fn int8_errors(a: &Tensor, b: &Tensor) -> crate::Result<(f32, f32, f32)> {
+        let a = a.to_dtype(DType::F32)?.flatten_all()?;
+        let b = b.to_dtype(DType::F32)?.flatten_all()?;
+        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+        let na = a.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        let nb = b.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        let d = (&a - &b)?;
+        let rel = d.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()? / nb.max(f32::MIN_POSITIVE);
+        let max = d.abs()?.max_all()?.to_scalar::<f32>()?;
+        Ok((dot / (na * nb).max(f32::MIN_POSITIVE), rel, max))
+    }
+
+    /// The INT8 route is offered only inside the scope, only past the shared gate, and refusals
+    /// fall through to the flash rule with their reason.
+    #[test]
+    fn int8_routes_only_inside_its_scope_and_after_the_shared_gate() {
+        let ok = || Ok(());
+        assert_eq!(int8_route(false, OPEN, ok), None, "not requested");
+        assert_eq!(int8_route(true, OPEN, ok), Some(Ok(())));
+        let mat = FlashGate {
+            materialized: true,
+            ..OPEN
+        };
+        let taped = FlashGate {
+            grad_tracked: true,
+            ..OPEN
+        };
+        // Training (a materialized scope or a taped operand) never reaches the INT8 kernel (E9),
+        // and the eligibility rule is not even evaluated.
+        let never = || -> Result<(), Int8Refusal> { panic!("evaluated past the gate") };
+        assert_eq!(int8_route(true, mat, never), None);
+        assert_eq!(int8_route(true, taped, never), None);
+        // The flash toggle does not gate it: the scope is its own switch.
+        let off = FlashGate {
+            enabled: false,
+            ..OPEN
+        };
+        assert_eq!(int8_route(true, off, ok), Some(Ok(())));
+        let masked = || Err(Int8Refusal::Masked);
+        assert_eq!(
+            int8_route(true, OPEN, masked),
+            Some(Err(Int8Refusal::Masked))
+        );
+    }
+
+    #[test]
+    fn int8_eligibility_refuses_in_order_with_typed_reasons() {
+        let st = contiguous(&H3);
+        let op = |dtype, dims| FlashOperand {
+            dtype,
+            dims,
+            strides: &st,
+        };
+        let bf = op(DType::BF16, &H3);
+        let sm120 = Int8Device::Cuda(Some(120));
+        let e = |compiled, device, same, q, k, masked| {
+            int8_eligibility(compiled, device, same, q, k, k, masked)
+        };
+        assert_eq!(e(true, sm120, true, bf, bf, false), Ok(()));
+        assert_eq!(
+            e(false, sm120, true, bf, bf, false),
+            Err(Int8Refusal::NotCompiled)
+        );
+        assert_eq!(
+            e(true, Int8Device::NotCuda, true, bf, bf, false),
+            Err(Int8Refusal::NotCuda)
+        );
+        for cap in [Some(75), Some(61), None] {
+            assert_eq!(
+                e(true, Int8Device::Cuda(cap), true, bf, bf, false),
+                Err(Int8Refusal::UnsupportedArch(cap))
+            );
+        }
+        // sm_80 Ampere through sm_120 Blackwell all qualify (nvrtc compiles for the device).
+        for cap in [80, 86, 89, 90, 100, 120] {
+            assert_eq!(
+                e(true, Int8Device::Cuda(Some(cap)), true, bf, bf, false),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            e(true, sm120, false, bf, bf, false),
+            Err(Int8Refusal::MixedDtypeOrDevice)
+        );
+        assert_eq!(e(true, sm120, true, bf, bf, true), Err(Int8Refusal::Masked));
+        let f32op = op(DType::F32, &H3);
+        assert_eq!(
+            e(true, sm120, true, f32op, f32op, false),
+            Err(Int8Refusal::Dtype(DType::F32))
+        );
+        assert_eq!(
+            e(true, sm120, true, bf, op(DType::F16, &H3), false),
+            Err(Int8Refusal::MixedDtypeOrDevice)
+        );
+        // Head dims other than 64 / 128 (flash still serves 72, 256, ...).
+        for d in [72usize, 96, 256] {
+            let dims = [1, 8, 1024, d];
+            let sd = contiguous(&dims);
+            let o = FlashOperand {
+                dtype: DType::BF16,
+                dims: &dims,
+                strides: &sd,
+            };
+            assert_eq!(
+                int8_eligibility(true, sm120, true, o, o, o, false),
+                Err(Int8Refusal::HeadDim(d))
+            );
+        }
+        let gqa_bad = [1, 5, 4096, 128];
+        assert_eq!(
+            e(true, sm120, true, bf, op(DType::BF16, &gqa_bad), false),
+            Err(Int8Refusal::Shape)
+        );
+        // E6: Krea's 2048² joint sequence fits; a sequence whose INT8 Q passes i32::MAX does not.
+        let krea_2048 = [1, 48, 16_640, 128];
+        let k2 = op(DType::BF16, &krea_2048);
+        assert_eq!(e(true, sm120, true, k2, k2, false), Ok(()));
+        let huge = [1, 56, 400_000, 128];
+        let hg = op(DType::BF16, &huge);
+        assert_eq!(
+            e(true, sm120, true, hg, hg, false),
+            Err(Int8Refusal::IndexOverflow)
+        );
+    }
+
+    /// The scope nests and restores, and its centering mode is the innermost one.
+    #[test]
+    fn the_int8_scope_nests_and_restores_its_centering() {
+        assert!(!in_int8_attention_scope());
+        {
+            let _outer = enter_int8_attention(KCentering::Always);
+            assert!(in_int8_attention_scope());
+            assert_eq!(int8_k_centering(), KCentering::Always);
+            with_int8_attention(|| {
+                assert_eq!(int8_k_centering(), KCentering::Adaptive);
+            });
+            assert_eq!(int8_k_centering(), KCentering::Always);
+            assert!(with_int8_attention_if(false, in_int8_attention_scope));
+        }
+        assert!(!in_int8_attention_scope());
+        assert!(!with_int8_attention_if(false, in_int8_attention_scope));
+        assert!(with_int8_attention_if(true, in_int8_attention_scope));
+        assert!(!in_int8_attention_scope());
+    }
+
+    /// On the CPU an INT8-scope call is counted under the flash rule's refusal plus the INT8
+    /// refusal `NotCuda` / `NotCompiled`, and computes the materialized path verbatim.
+    #[test]
+    fn a_cpu_int8_scope_call_counts_its_refusal_and_is_the_materialized_path() -> crate::Result<()>
+    {
+        use crate::attention::sdpa_planned_bhsd_materialized;
+        let dev = Device::Cpu;
+        // f32: the CPU matmul has no bf16 kernel, and the device refusal comes before the dtype one.
+        let q = Tensor::randn(0f32, 1.0, (1, 2, 16, 64), &dev)?;
+        let plan = AttentionPlan::UNBOUNDED;
+        let before = attention_path_counts();
+        let got = with_int8_attention(|| {
+            sdpa_planned_bhsd(&q, &q, &q, 0.125, None, softmax_last_dim, plan)
+        })?;
+        let delta = attention_path_counts().since(&before);
+        assert_eq!(delta.total(), 1, "{delta:?}");
+        assert_eq!(delta.int8, 0);
+        assert_eq!(delta.int8_refusals.total(), 1, "{delta:?}");
+        let refusal = if INT8_ATTN_COMPILED {
+            delta.int8_refusals.not_cuda
+        } else {
+            delta.int8_refusals.not_compiled
+        };
+        assert_eq!(refusal, 1, "{delta:?}");
+        let want = sdpa_planned_bhsd_materialized(&q, &q, &q, 0.125, None, softmax_last_dim, plan)?;
+        let d = (got.to_dtype(DType::F32)? - want.to_dtype(DType::F32)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(d, 0.0);
+        // Outside the scope there is no INT8 tally at all.
+        let before = attention_path_counts();
+        sdpa_planned_bhsd(&q, &q, &q, 0.125, None, softmax_last_dim, plan)?;
+        assert_eq!(
+            attention_path_counts().since(&before).int8_refusals.total(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn int8_paths_and_refusals_land_in_their_own_counters() {
+        use Int8Refusal as R;
+        let before = attention_path_counts();
+        record_attention_path(AttentionKernel::Int8);
+        let delta = attention_path_counts().since(&before);
+        assert_eq!((delta.int8, delta.total(), delta.budgeted()), (1, 1, 0));
+        type Field = fn(&Int8RefusalCounts) -> u64;
+        let cases: [(Int8Refusal, Field); 11] = [
+            (R::NotCompiled, |c| c.not_compiled),
+            (R::NotCuda, |c| c.not_cuda),
+            (R::UnsupportedArch(Some(75)), |c| c.unsupported_arch),
+            (R::UnsupportedArch(None), |c| c.unsupported_arch),
+            (R::Dtype(DType::F32), |c| c.dtype),
+            (R::MixedDtypeOrDevice, |c| c.mixed_dtype_or_device),
+            (R::Masked, |c| c.masked),
+            (R::HeadDim(256), |c| c.head_dim),
+            (R::Shape, |c| c.shape),
+            (R::IndexOverflow, |c| c.index_overflow),
+            (R::Compile, |c| c.compile),
+        ];
+        for (refusal, field) in cases {
+            let before = attention_path_counts();
+            record_int8_refusal(refusal);
+            let delta = attention_path_counts().since(&before);
+            assert_eq!(field(&delta.int8_refusals), 1, "{refusal:?}");
+            assert_eq!(delta.int8_refusals.total(), 1, "{refusal:?}");
+            assert_eq!(delta.total(), 0, "a refusal is a side tally, not a path");
+        }
+        assert_eq!(AttentionKernel::Int8.name(), "sage_int8_qk");
+        assert!(AttentionKernel::Int8.is_fused() && AttentionKernel::Flash.is_fused());
+        assert!(!AttentionKernel::Budgeted(FlashRefusal::Masked).is_fused());
+    }
+
+    /// **SW-6131 AC1.** INT8 attention through the shared helper (inside the INT8 scope) vs the
+    /// f32 materialized reference, at S = 4096 and 16384, d = 128 and 64, bf16 and f16, with the
+    /// K-centering path off, forced on and adaptive; plus a K carrying a large shared per-channel
+    /// offset (the case centering exists for), where the off/on contrast is printed.
+    ///
+    /// Declared criterion (the story's): **cosine ≥ 0.999** against the f32 reference on every
+    /// case. rel-L2 and max|Δ| are printed for scale (INT8 QK is lossy by design).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_int8_matches_the_f32_reference() -> crate::Result<()> {
+        use crate::attention::sdpa_planned_bhsd_materialized;
+        let dev = Device::new_cuda(0)?;
+        let plan = AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(
+            ATTN_SCORES_BUDGET,
+        ));
+        let mut worst = 1f32;
+        // (s, heads, kv heads, d, dtype, k offset scale)
+        for (s, h, hk, d, dtype, offset) in [
+            (4096usize, 24usize, 24usize, 128usize, DType::BF16, 0f32),
+            (4096, 24, 24, 128, DType::BF16, 4.0),
+            (4096, 24, 6, 128, DType::F16, 0.0),
+            (4096, 16, 16, 64, DType::BF16, 2.0),
+            (16384, 8, 8, 128, DType::BF16, 0.0),
+            (16384, 8, 8, 128, DType::BF16, 4.0),
+            (4096 + 77, 8, 8, 128, DType::BF16, 1.0),
+        ] {
+            let q = Tensor::randn(0f32, 1.0, (1, h, s, d), &dev)?;
+            let mut k = Tensor::randn(0f32, 1.0, (1, hk, s, d), &dev)?;
+            if offset != 0.0 {
+                // A per-(head, channel) offset shared by every key: softmax-invariant, but it
+                // dominates every key's quantization range unless K is centered.
+                let bias = (Tensor::randn(0f32, 1.0, (1, hk, 1, d), &dev)? * offset as f64)?;
+                k = k.broadcast_add(&bias)?;
+            }
+            let v = Tensor::randn(0f32, 1.0, (1, hk, s, d), &dev)?;
+            let (q, k, v) = (q.to_dtype(dtype)?, k.to_dtype(dtype)?, v.to_dtype(dtype)?);
+            let scale = 1.0 / (d as f64).sqrt();
+            let group = h / hk;
+            let (ke, ve) = (
+                crate::attention::repeat_kv(&k, group)?,
+                crate::attention::repeat_kv(&v, group)?,
+            );
+            let f32 = |t: &Tensor| t.to_dtype(DType::F32);
+            let want = sdpa_planned_bhsd_materialized(
+                &f32(&q)?,
+                &f32(&ke)?,
+                &f32(&ve)?,
+                scale,
+                None,
+                softmax_last_dim,
+                plan,
+            )?;
+            for centering in [KCentering::Off, KCentering::Always, KCentering::Adaptive] {
+                let before = attention_path_counts();
+                let got = {
+                    let _scope = enter_int8_attention(centering);
+                    sdpa_planned_bhsd(&q, &k, &v, scale, None, softmax_last_dim, plan)?
+                };
+                let delta = attention_path_counts().since(&before);
+                assert_eq!(delta.int8, 1, "{delta:?}");
+                let (cos, rel, max) = int8_errors(&got, &want)?;
+                println!(
+                    "int8 parity s={s} h={h} hk={hk} d={d} {dtype:?} k-offset={offset} \
+                     {centering:?}: cosine {cos:.6} rel-L2 {rel:.3e} max|d| {max:.3e}"
+                );
+                worst = worst.min(cos);
+                assert!(cos >= 0.999, "cosine {cos} < 0.999");
+            }
+        }
+        println!("int8 parity worst cosine: {worst:.6}");
         Ok(())
     }
 

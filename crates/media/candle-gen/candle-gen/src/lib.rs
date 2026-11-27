@@ -110,7 +110,8 @@ mod reference_training_attention;
 pub mod training_attention;
 pub use fused_attention::{
     attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
-    take_attention_path_counts, AttentionKernel, AttentionPathCounts, FlashRefusal,
+    take_attention_path_counts, with_int8_attention, with_int8_attention_if, AttentionKernel,
+    AttentionPathCounts, FlashRefusal, Int8Refusal, Int8RefusalCounts, KCentering,
 };
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count

@@ -198,8 +198,10 @@ pub fn sdpa_budgeted_bhsd(
     budget: usize,
 ) -> Result<Tensor> {
     use crate::fused_attention::AttentionSite;
-    if crate::fused_attention::take_flash(AttentionSite::BudgetedBhsd, q, k, v, mask) {
-        return crate::fused_attention::flash_bhsd(q, k, v, scale);
+    if let Some(kernel) =
+        crate::fused_attention::take_fused(AttentionSite::BudgetedBhsd, q, k, v, mask)
+    {
+        return crate::fused_attention::fused_bhsd(kernel, q, k, v, scale);
     }
     budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
 }
@@ -258,11 +260,13 @@ pub fn sdpa_planned_bhsd(
 ) -> crate::Result<Tensor> {
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
     use crate::fused_attention::AttentionSite;
-    if crate::fused_attention::take_flash(AttentionSite::PlannedBhsd, q, k, v, mask) {
+    if let Some(kernel) =
+        crate::fused_attention::take_fused(AttentionSite::PlannedBhsd, q, k, v, mask)
+    {
         if plan.is_cancelled() {
             return Err(crate::CandleError::Canceled);
         }
-        return Ok(crate::fused_attention::flash_bhsd(q, k, v, scale)?);
+        return Ok(crate::fused_attention::fused_bhsd(kernel, q, k, v, scale)?);
     }
     planned_bhsd(q, k, v, scale, mask, softmax, plan)
 }
@@ -410,9 +414,7 @@ pub fn sdpa_planned_bhsd_key_prefix(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
-    use crate::fused_attention::{
-        flash_bhsd, record_attention_path, route_attention_kernel, AttentionKernel,
-    };
+    use crate::fused_attention::{fused_bhsd, record_route, route_ready, FusedKernel};
     let (batch, _, _, _) = q.dims4()?;
     let sk = k.dim(2)?;
     let prefix = key_prefix_plan(valid_keys, batch, sk);
@@ -423,16 +425,18 @@ pub fn sdpa_planned_bhsd_key_prefix(
         KeyPrefixPlan::Unmasked => return sdpa_planned_bhsd(q, k, v, scale, None, softmax, plan),
         KeyPrefixPlan::SharedPrefix(_) | KeyPrefixPlan::PerRow => {}
     }
-    if route_attention_kernel(q, k, v, None) != AttentionKernel::Flash {
+    let (route, int8_refusal) = route_ready(q, k, v, None);
+    let Some(kernel) = FusedKernel::of(route) else {
         return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan);
-    }
+    };
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
-    record_attention_path(AttentionKernel::Flash);
+    record_route(route, int8_refusal);
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
     }
     if let KeyPrefixPlan::SharedPrefix(n) = prefix {
-        return Ok(flash_bhsd(
+        return Ok(fused_bhsd(
+            kernel,
             q,
             &k.narrow(2, 0, n)?,
             &v.narrow(2, 0, n)?,
@@ -443,7 +447,8 @@ pub fn sdpa_planned_bhsd_key_prefix(
         .iter()
         .enumerate()
         .map(|(row, &n)| {
-            flash_bhsd(
+            fused_bhsd(
+                kernel,
                 &q.narrow(0, row, 1)?,
                 &k.narrow(0, row, 1)?.narrow(2, 0, n)?,
                 &v.narrow(0, row, 1)?.narrow(2, 0, n)?,
@@ -472,10 +477,10 @@ pub fn sdpa_budgeted_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     budget: usize,
 ) -> Result<Tensor> {
-    if let Some((q4, k4, v4)) =
+    if let Some((kernel, q4, k4, v4)) =
         flat_flash_operands(crate::fused_attention::AttentionSite::BudgetedFlat, q, k, v)?
     {
-        return crate::fused_attention::flash_bhsd(&q4, &k4, &v4, scale)?.squeeze(1);
+        return crate::fused_attention::fused_bhsd(kernel, &q4, &k4, &v4, scale)?.squeeze(1);
     }
     budgeted_flat(q, k, v, scale, softmax, budget)
 }
@@ -523,8 +528,8 @@ fn flat_flash_operands(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-) -> Result<Option<(Tensor, Tensor, Tensor)>> {
-    use crate::fused_attention::{flat_as_bhsd, take_flash};
+) -> Result<Option<(crate::fused_attention::FusedKernel, Tensor, Tensor, Tensor)>> {
+    use crate::fused_attention::{flat_as_bhsd, take_fused};
     if q.rank() != 3 || k.rank() != 3 || v.rank() != 3 {
         crate::fused_attention::record_attention_path(
             crate::fused_attention::AttentionKernel::Budgeted(
@@ -534,7 +539,7 @@ fn flat_flash_operands(
         return Ok(None);
     }
     let (q4, k4, v4) = (flat_as_bhsd(q)?, flat_as_bhsd(k)?, flat_as_bhsd(v)?);
-    Ok(take_flash(site, &q4, &k4, &v4, None).then_some((q4, k4, v4)))
+    Ok(take_fused(site, &q4, &k4, &v4, None).map(|kernel| (kernel, q4, k4, v4)))
 }
 
 /// Request-scoped variant of [`sdpa_budgeted_flat`], with the same typed between-chunk cancellation
@@ -548,13 +553,13 @@ pub fn sdpa_planned_flat(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
-    if let Some((q4, k4, v4)) =
+    if let Some((kernel, q4, k4, v4)) =
         flat_flash_operands(crate::fused_attention::AttentionSite::PlannedFlat, q, k, v)?
     {
         if plan.is_cancelled() {
             return Err(crate::CandleError::Canceled);
         }
-        return Ok(crate::fused_attention::flash_bhsd(&q4, &k4, &v4, scale)?.squeeze(1)?);
+        return Ok(crate::fused_attention::fused_bhsd(kernel, &q4, &k4, &v4, scale)?.squeeze(1)?);
     }
     planned_flat(q, k, v, scale, softmax, plan)
 }
