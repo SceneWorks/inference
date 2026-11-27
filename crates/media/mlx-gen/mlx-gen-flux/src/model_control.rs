@@ -32,11 +32,10 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, require_base_dir, require_control,
-    run_flow_sampler_with_latent_hook_spans, AcceptedControlKinds, Capabilities, Conditioning,
-    ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, SamplerRun, TimestepConvention,
+    require_base_dir, require_control, run_flow_sampler_with_latent_hook_spans,
+    AcceptedControlKinds, Conditioning, ConditioningKind, ControlBranch, ControlKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, Residency, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
@@ -55,60 +54,44 @@ use crate::config::{FluxVariant, DEFAULT_GUIDANCE};
 /// Shakker recommends ~0.7 for Union-Pro-2.0; the request's per-control `scale` wins when set.
 const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 
-/// The control variant's identity + capabilities (E2 sc-8239, finalized). Mirrors FLUX.2's
-/// `flux2_dev_control` descriptor (`mlx_gen_flux2::descriptor_dev_control`): the guidance-distilled dev base
-/// (embedded guidance, no negative prompt / true-CFG, no KV cache, mac-only) declaring a required
-/// `Control` conditioning (the structural hint). It diverges from FLUX.2 only where the engines do:
-/// FLUX.2 also declares a `Reference` (an img2img init the FLUX.2 fork seeds from) — the FLUX.1 Shakker
-/// control path has no img2img-init seam, so it declares `Control` alone. Neither declares a `Depth`
-/// `ConditioningKind`: depth is a *control image* (a `ControlKind::Depth` carried by
-/// `Conditioning::Control`), not the separate `Conditioning::Depth` map. The accepted control kinds
-/// (pose/canny/depth) live on the [`ControlBranch`] impl below, not in the descriptor — they gate
-/// `resolve_control`, not capability introspection.
+/// Primary typed route declaration for the FLUX.1-dev Fun-Controlnet-Union variant (`REG-1`, `AP5`).
+pub fn route_dev_control() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Dev.route_record();
+    route.route_id = FLUX1_DEV_CONTROL_ID;
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(accepted_control_kinds());
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["flux_controlnet_union"];
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("flux1_mmdit_control")
+            .with_pag(FluxVariant::Dev.pag_capability()),
+    );
+    route.structure.upsamplers.components.clear();
+    route.structure.adapters.install_policy = gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.defaults.strength = Some(DEFAULT_CONTROL_SCALE);
+    route.bindings = gen_core::RouteBindings::generator(descriptor_dev_control, |spec| {
+        load_dev_control(spec).map_err(Into::into)
+    })
+    .with_footprint(crate::model::component_footprint)
+    .with_render_plan(compile_control)
+    .with_feature_route(Some(crate::FLUX1_DEV_ID), descriptor_dev_control)
+    .with_memory_registration(DEV_CONTROL_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_memory_surface_contract(FLUX1_DEV_CONTROL_ID, surface)
+    })
+    .with_memory_behavior_registration(DEV_CONTROL_MEMORY_BEHAVIOR);
+    route
+}
+
+/// The control variant's identity + capabilities (E2 sc-8239, finalized), computed from
+/// [`route_dev_control`].
 pub fn descriptor_dev_control() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: Some(accepted_control_kinds()),
-        required_components: &[],
-        id: FLUX1_DEV_CONTROL_ID,
-        family: "flux",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
-            supports_guidance: true,
-            // Control (required) — the structural hint (pose/canny/depth, input-agnostic).
-            conditioning: vec![ConditioningKind::Control],
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: {
-                let mut s = curated_sampler_names();
-                s.push(crate::config::DEFAULT_SAMPLER);
-                s.push(HYPER_SAMPLER);
-                s
-            },
-            schedulers: {
-                let mut s = curated_scheduler_names();
-                s.push("linear");
-                s
-            },
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            requires_sigma_shift: FluxVariant::Dev.requires_sigma_shift(),
-            // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
-            // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
-            // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
-            supports_sequential_offload: true,
-            supports_preview: true,
-            pag: Some(FluxVariant::Dev.pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_dev_control().compute_descriptor()
 }
 
 /// The heavy render-phase components for the control variant — the control transformer (the dev DiT
@@ -736,14 +719,6 @@ impl Flux1DevControl {
     }
 }
 
-// Explicit registration lets the platform catalog resolve `flux1_dev_control` by id. The
-// `impl Generator` above stays hand-written because `validate`
-// adds a control-conditioning check beyond the plain capability floor.
-mlx_gen::register_generators! {
-    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control;
-    footprint = crate::model::component_footprint
-}
-
 pub const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: FLUX1_DEV_CONTROL_ID,
@@ -770,7 +745,7 @@ pub const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::WeightsSource;
+    use mlx_gen::{Quant, WeightsSource};
 
     #[test]
     fn control_plan_freezes_native_schedule_and_source_before_load() {

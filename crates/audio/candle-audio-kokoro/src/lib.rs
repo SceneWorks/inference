@@ -79,11 +79,13 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::Pro
     components: &[model::COMPONENT_KEY],
 }];
 
-/// Add the Kokoro generator to an explicit audio registry builder (catalog composition).
+/// Add the Kokoro generator to an explicit audio registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry.register_route(model::route())
 }
 
 /// Build the complete explicit Kokoro provider catalog (this crate's own surface).
@@ -107,5 +109,33 @@ mod tests {
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
+        assert_eq!(registry.route_records().len(), 1);
+
+        let desc = registry.generator_descriptor(MODEL_ID).unwrap();
+        assert_eq!(desc.family, "kokoro");
+        assert_eq!(desc.backend, "candle");
+        assert_eq!(desc.modality, gen_core::Modality::Audio);
+        assert!(desc.encoder_contract.is_none());
+        assert!(desc.denoiser_output_latent_space.is_none());
+        assert!(desc.control_kinds.is_none());
+        assert!(desc.required_components.is_empty());
+        assert_eq!(desc.capabilities.min_size, 0);
+        assert_eq!(desc.capabilities.max_size, 0);
+        assert_eq!(desc.capabilities.max_count, 1);
+        assert_eq!(desc.capabilities.audio_sample_rates, vec![24_000]);
+        assert_eq!(
+            desc.capabilities.max_audio_duration_secs,
+            Some(model::MAX_DURATION_SECS)
+        );
+        assert_eq!(desc.capabilities.audio_voices, VOICES.to_vec());
+        assert_eq!(desc.capabilities.audio_languages, LANGUAGES.to_vec());
+        assert!(!desc.capabilities.mac_only);
+        assert!(!desc.capabilities.supports_preview);
+
+        let route = registry.route_record(MODEL_ID).unwrap();
+        assert_eq!(route.defaults.audio_voice, Some(DEFAULT_VOICE));
+        assert_eq!(route.defaults.audio_sample_rate, Some(24_000));
+        assert_eq!(route.defaults.audio_language, Some("en"));
     }
 }

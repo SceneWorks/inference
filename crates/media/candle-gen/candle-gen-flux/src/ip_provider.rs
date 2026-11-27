@@ -242,29 +242,61 @@ fn validate_ip_spec(
     Ok(())
 }
 
-pub(crate) fn ip_descriptor(variant: Variant) -> ModelDescriptor {
-    let mut descriptor = match variant {
-        Variant::Dev => crate::descriptor_dev(),
-        Variant::Schnell => crate::descriptor_schnell(),
-    };
-    crate::add_conditioned_native_aliases(&mut descriptor);
-    // IP Adapter's existing render contract is the FLUX pack stride, without
-    // the registered txt2img route's 256..=2048 size restriction.
-    descriptor.capabilities.min_size = SIZE_MULTIPLE;
-    descriptor.capabilities.max_size = u32::MAX;
-    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
-        multiple: SIZE_MULTIPLE,
-        max_cells: u32::MAX,
-    };
-    descriptor.id = if variant.is_dev() {
+pub(crate) fn route_ip(variant: Variant) -> candle_gen::gen_core::RouteRecord {
+    let mut route = crate::route_base(variant);
+    route.route_id = if variant.is_dev() {
         "flux1_dev_ip_adapter"
     } else {
         "flux1_schnell_ip_adapter"
     };
-    descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
-    descriptor.capabilities.max_count = 1;
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route.structure.sampling.samplers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut route.structure.sampling.samplers),
+        &["flow_match", "flow_match_euler"],
+    );
+    route.structure.sampling.schedulers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut route.structure.sampling.schedulers),
+        &["native", "flow_match", "flow_match_euler"],
+    );
+    // IP Adapter's existing render contract is the FLUX pack stride, without
+    // the registered txt2img route's 256..=2048 size restriction.
+    route.limits.min_size = SIZE_MULTIPLE;
+    route.limits.max_size = u32::MAX;
+    route.limits.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
+        multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
+    };
+    route.structure.conditioning.kinds = vec![ConditioningKind::Reference];
+    route.structure.conditioning.pass0_requirement =
+        candle_gen::gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.conditioning.modules = vec!["xlabs_ip_adapter"];
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.seed_and_batch.max_count = 1;
+    route.defaults.strength = Some(DEFAULT_IP_SCALE);
+    route.bindings = match variant {
+        Variant::Dev => candle_gen::gen_core::RouteBindings::feature_route(
+            Some(crate::FLUX1_DEV_ID),
+            ip_descriptor_dev,
+        )
+        .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Dev, spec, req)),
+        Variant::Schnell => candle_gen::gen_core::RouteBindings::feature_route(
+            Some(crate::FLUX1_SCHNELL_ID),
+            ip_descriptor_schnell,
+        )
+        .with_render_plan(|spec, req| compile_ip_feature_route(Variant::Schnell, spec, req)),
+    };
+    route
+}
+
+pub(crate) fn ip_descriptor_dev() -> ModelDescriptor {
+    route_ip(Variant::Dev).compute_descriptor()
+}
+
+pub(crate) fn ip_descriptor_schnell() -> ModelDescriptor {
+    route_ip(Variant::Schnell).compute_descriptor()
+}
+
+pub(crate) fn ip_descriptor(variant: Variant) -> ModelDescriptor {
+    route_ip(variant).compute_descriptor()
 }
 
 pub(crate) fn compile_ip_feature_route(

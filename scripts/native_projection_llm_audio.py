@@ -68,6 +68,7 @@ TEXT_ROUTES = {
 # Most crates expose exactly one model::REGISTRATION. These are the catalog's variant factories,
 # including families which register an array via fold and those re-exporting their builder.
 VARIANT_REGISTRATIONS = {
+    "kokoro": {"model::route"},
     "mmaudio": {"generator::REGISTRATION", "generator_44k::REGISTRATION"},
     "stable-audio-3": {"model::" + symbol for symbol in (
         "REGISTRATION", "SFX_REGISTRATION", "MEDIUM_REGISTRATION", "MUSIC_BASE_REGISTRATION",
@@ -80,7 +81,7 @@ VARIANT_REGISTRATIONS = {
 def _audio_registrations(folder):
     code = "\n".join(_production(path) for path in sorted(folder.glob("*.rs")))
     body = next(_bodies(code, "register_providers"), "")
-    entries = set(re.findall(r"\.register_\w+\(\s*([\w:]+)\s*\)", body))
+    entries = set(re.findall(r"\.register_\w+\(\s*([\w:]+)(?:\(\))?\s*\)", body))
     if "REGISTRATIONS" in body:
         array = re.search(r"const REGISTRATIONS\s*:\s*\[[^\]]+\]\s*=\s*\[([^\]]*)\]", code)
         if array:

@@ -54,7 +54,7 @@ MLX_REGISTRATIONS = {
     "boogu": "generator:model::BASE_REGISTRATION generator:model::EDIT_REGISTRATION generator:model::TURBO_REGISTRATION",
     "chroma": "generator:model::BASE_REGISTRATION generator:model::FLASH_REGISTRATION generator:model::HD_REGISTRATION",
     "clip": "image_embedder:IMAGE_REGISTRATION text_embedder:TEXT_REGISTRATION",
-    "flux": "generator:model::DEV_REGISTRATION generator:model::SCHNELL_REGISTRATION generator:model_control::DEV_CONTROL_REGISTRATION",
+    "flux": "route:model::route_dev route:model::route_dev_ip_adapter route:model::route_schnell route:model::route_schnell_ip_adapter route:model_control::route_dev_control",
     "flux2": "generator:model::DEV_EDIT_REGISTRATION generator:model::DEV_REGISTRATION generator:model::KLEIN_EDIT_REGISTRATION generator:model::KLEIN_KV_EDIT_REGISTRATION generator:model::KLEIN_REGISTRATION generator:model_control::DEV_CONTROL_REGISTRATION",
     "flux3": "generator:model::BASE_REGISTRATION generator:model::REGISTRATION trainer:training::trainer::TRAINER_REGISTRATION",
     "ideogram": "generator:model::QUALITY_REGISTRATION generator:model::TURBO_REGISTRATION",
@@ -96,7 +96,7 @@ def _production(path: Path) -> str:
 
 
 REGISTER = re.compile(
-    r"\.register_(generator|trainer|transform|captioner|image_embedder|text_embedder)"
+    r"\.register_(generator|route|trainer|transform|captioner|image_embedder|text_embedder)"
     r"\(\s*([\w:]+)"
 )
 OPEN = re.compile(

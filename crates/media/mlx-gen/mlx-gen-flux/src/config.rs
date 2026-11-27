@@ -1,9 +1,18 @@
 //! FLUX.1 family configuration, lifted from the frozen Python mflux fork's
 //! `ModelConfig.{schnell,dev}` and `FluxWeightDefinition.get_tokenizers`.
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
+    FLUX1_LATENT_SPACE,
+};
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, ConditioningKind, Modality, ModelDescriptor,
+    Quant,
 };
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
@@ -84,64 +93,132 @@ impl FluxVariant {
         }
     }
 
-    pub fn descriptor(self) -> ModelDescriptor {
-        ModelDescriptor {
-            encoder_contract: None,
-            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-            control_kinds: None,
-            required_components: &[],
-            id: self.id(),
+    /// Primary typed route declaration for this FLUX.1 base variant (`REG-1`, `AP5`).
+    pub fn route_record(self) -> RouteRecord {
+        let mut samplers = curated_sampler_names();
+        samplers.push(DEFAULT_SAMPLER);
+        if matches!(self, Self::Dev) {
+            samplers.push(HYPER_SAMPLER);
+        }
+        let mut schedulers = curated_scheduler_names();
+        schedulers.push("linear");
+
+        RouteRecord {
+            route_id: self.id(),
             family: "flux",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities {
-                supports_guidance: self.supports_guidance(),
-                // FLUX.1 reference-image conditioning is the XLabs IP-Adapter (epic 3621): a single
-                // `Reference` rides `Conditioning::Reference { image, strength=ipAdapterScale }`,
-                // exactly as SDXL exposes its IP-Adapter. Only wired when a `LoadSpec::ip_adapter`
-                // is supplied at load time; a `Reference` request without it errors loudly (no
-                // false-capability trap — `validate` rejects MultiReference / multiple references).
-                // The Redux/Depth/Fill/Control variants remain later ports.
-                conditioning: vec![ConditioningKind::Reference],
-                supported_quants: &[Quant::Q4, Quant::Q8],
-                supports_lora: true,
-                supports_lokr: true,
-                // The curated unified-framework integrator menu (epic 7114 P3) + the legacy
-                // `flow_match` alias (== Euler) and, for dev, the Hyper-FLUX few-step profile
-                // (sc-2908). schnell is already a distilled 4-step checkpoint, so it omits the
-                // dev-only Hyper-FLUX LoRA profile. The acceleration profiles (`flow_match`/`hyper`)
-                // route to Euler in `run_flow_sampler`; they change the schedule/steps, not the
-                // integrator.
-                samplers: {
-                    let mut s = curated_sampler_names();
-                    s.push(DEFAULT_SAMPLER);
-                    if matches!(self, Self::Dev) {
-                        s.push(HYPER_SAMPLER);
-                    }
-                    s
+            mac_only: true,
+            structure: RouteStructure {
+                text_encoders: TextEncoderSurface {
+                    encoders: vec![
+                        TextEncoderDeclaration::new("clip_l", Some(77)),
+                        TextEncoderDeclaration::new(
+                            "t5_xxl",
+                            Some(self.max_sequence_length() as u32),
+                        ),
+                    ],
+                    ..Default::default()
                 },
-                // Scheduler axis (epic 7114): the native `linear` schedule (resolution-shifted flow) is
-                // the byte-exact default; a curated name re-shapes σ over FLUX.1's own mu.
-                schedulers: {
-                    let mut s = curated_scheduler_names();
-                    s.push("linear");
-                    s
+                conditioning: ConditioningSurface {
+                    // FLUX.1 reference-image conditioning is the XLabs IP-Adapter (epic 3621): a
+                    // single `Reference` rides `Conditioning::Reference { image, strength=ipAdapterScale }`,
+                    // exactly as SDXL exposes its IP-Adapter. Only wired when a `LoadSpec::ip_adapter`
+                    // is supplied at load time; a `Reference` request without it errors loudly.
+                    kinds: vec![ConditioningKind::Reference],
+                    control_kinds: None,
+                    pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                    supports_negative_prompt: false,
+                    modules: vec!["xlabs_ip_adapter"],
                 },
-                min_size: 256,
-                max_size: 2048,
-                max_count: 8,
-                mac_only: true,
-                requires_sigma_shift: self.requires_sigma_shift(),
-                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
-                // drops the T5-XXL + CLIP-L text encoders after the prompt encode so peak unified
-                // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
-                supports_sequential_offload: true,
-                supports_preview: true,
-                pag: Some(self.pag_capability()),
-                supports_low_res_start: true,
+                sampling: SamplingSurface {
+                    samplers,
+                    schedulers,
+                    guidance_methods: vec![],
+                    supports_guidance: self.supports_guidance(),
+                    supports_true_cfg: false,
+                    supports_cfg_interval: false,
+                    requires_sigma_shift: self.requires_sigma_shift(),
+                    supports_h3_image_sampler: false,
+                },
+                denoiser: ModelBinding::family_model(
+                    FamilyModelSpec::new("flux1_mmdit")
+                        .with_low_res_start()
+                        .with_pag(self.pag_capability()),
+                ),
+                latent_codec: LatentCodecDeclaration {
+                    codec_id: Some("flux1_ae"),
+                    output_latent_space: Some(&FLUX1_LATENT_SPACE),
+                    pixel_stride: Some(crate::SIZE_MULTIPLE),
+                    token_width: Some(crate::PACKED_TOKEN_WIDTH as u32),
+                    supports_diffusion_decoder: false,
+                },
+                upsamplers: UpsamplerSurface {
+                    components: vec!["pid_decoder"],
+                    max_temporal_upsample_rounds: 0,
+                },
+                adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+                residency: ResidencySurface {
+                    lifetime_graph: vec![
+                        ResidencyPhaseNode::new(
+                            ResidencyPhaseKind::PromptEncode,
+                            ["clip_l", "t5_xxl"],
+                            true,
+                        ),
+                        ResidencyPhaseNode::new(
+                            ResidencyPhaseKind::Denoise,
+                            ["flux1_mmdit"],
+                            false,
+                        ),
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux1_ae"], false),
+                    ],
+                    supports_sequential_offload: true,
+                    ..Default::default()
+                },
+                weight_plan: WeightPlanDeclaration {
+                    source_kind: WeightSourceKind::SnapshotDirectory,
+                    supported_quants: &[Quant::Q4, Quant::Q8],
+                    component_precision_floors: &[],
+                    required_components: &[],
+                    requires_control_overlay: false,
+                    requires_ip_adapter_overlay: false,
+                    requires_identity_overlay: false,
+                },
+                output: OutputSurface {
+                    preview: PreviewSupport::LatentProjection,
+                    supports_hdr: false,
+                    supports_alpha_output: false,
+                },
                 ..Default::default()
             },
+            limits: ProductLimits {
+                min_size: 256,
+                max_size: 2048,
+                size_floor: SizeFloor::RangeChecked,
+                supported_steps: StepSupport::Unconstrained,
+                max_audio_duration_secs: None,
+            },
+            seed_and_batch: SeedAndBatchSemantics {
+                seed_scheme: SeedScheme::BackendGlobalSeeded,
+                max_count: 8,
+                supports_prompt_batch: false,
+            },
+            defaults: RouteDefaults {
+                steps: Some(self.default_steps()),
+                guidance: self.supports_guidance().then_some(DEFAULT_GUIDANCE),
+                sampler: Some(DEFAULT_SAMPLER),
+                schedule: Some("linear"),
+                shift: self.requires_sigma_shift().then_some(1.15),
+                strength: None,
+                dimensions: Some((DEFAULT_WIDTH, DEFAULT_HEIGHT)),
+                ..Default::default()
+            },
+            bindings: RouteBindings::default(),
         }
+    }
+
+    pub fn descriptor(self) -> ModelDescriptor {
+        self.route_record().compute_descriptor()
     }
 }
 
