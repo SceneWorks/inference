@@ -635,9 +635,10 @@ impl Ideogram4Transformer {
         }
 
         // Final layer: scale = 1 + adaln(silu(c)); linear(layernorm_no_affine(h) · scale).
-        let scale = (self.final_adaln.forward(&adaln_input.silu()?)? + 1.0)?;
-        let normed = layer_norm_no_affine(&h, FINAL_NORM_EPS)?;
-        let out = self.final_linear.forward(&normed.broadcast_mul(&scale)?)?;
+        let raw_scale = self.final_adaln.forward(&adaln_input.silu()?)?;
+        let out = self
+            .final_linear
+            .forward(&final_norm_scale(&h, &raw_scale)?)?;
         out.to_dtype(DType::F32)
     }
 }
@@ -718,7 +719,9 @@ fn install_window_adapters(
     Ok(())
 }
 
-/// No-affine LayerNorm over the last dim (computed in f32 for stability, cast back to `x`'s dtype).
+/// No-affine LayerNorm over the last dim (computed in f32 for stability, cast back to `x`'s dtype):
+/// the final layer's former norm, kept as the oracle of [`final_norm_scale`] (SW-6129).
+#[cfg(test)]
 fn layer_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let x = x.to_dtype(DType::F32)?;
@@ -789,6 +792,49 @@ fn segment_mask(
         }
     }
     Ok(Some(Tensor::from_vec(data, (b, 1, l, l), dev)?))
+}
+
+/// The final layer's `layer_norm_no_affine(h) · (1 + raw_scale)` (f32 affine-free LayerNorm cast
+/// back, then the scale-only modulation) as the shared fused scale-only AdaLN over that composable
+/// chain (SW-6129, `AdaLnChain::layer`): one launch on CUDA, bit-identical to the chain it ran,
+/// which it runs everywhere else. A `[B, D]` scale is the right-aligned `[1, B, D]` broadcast.
+pub(crate) fn final_norm_scale(h: &Tensor, raw_scale: &Tensor) -> Result<Tensor> {
+    let mut scale = raw_scale.clone();
+    while scale.rank() < 3 {
+        scale = scale.unsqueeze(0)?;
+    }
+    candle_gen::modulate::adaln_chain_scale_only(
+        h,
+        &candle_gen::modulate::AdaLnChain::layer(FINAL_NORM_EPS),
+        &scale,
+    )
+}
+
+#[cfg(test)]
+mod final_norm_adaln_tests {
+    use super::*;
+    use crate::transformer::block::adaln_route_tests::{bits, operands};
+
+    /// `final_norm_scale` equals the former `layer_norm_no_affine(h) · (raw + 1)`, for a
+    /// `[B, 1, D]` and a `[1, D]` scale.
+    #[test]
+    fn fused_final_layer_matches_the_former_chain() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, m, _) = operands(dtype, &Device::Cpu);
+            let raw = m.chunk(4, D::Minus1).unwrap()[1].clone();
+            for scale in [
+                raw.clone(),
+                raw.narrow(0, 0, 1).unwrap().squeeze(1).unwrap(),
+            ] {
+                let got = final_norm_scale(&x, &scale).unwrap();
+                let want = layer_norm_no_affine(&x, FINAL_NORM_EPS)
+                    .unwrap()
+                    .broadcast_mul(&(&scale + 1.0).unwrap())
+                    .unwrap();
+                assert_eq!(bits(&got), bits(&want), "{dtype:?} {:?}", scale.dims());
+            }
+        }
+    }
 }
 
 #[cfg(test)]

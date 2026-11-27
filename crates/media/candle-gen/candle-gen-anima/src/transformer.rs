@@ -19,8 +19,9 @@ use candle_gen::Result;
 
 use crate::adapt::AdaptLinear;
 use crate::config::DitConfig;
-use crate::nn::{apply_rope_half, layer_norm_no_affine, modulate, rms_norm, sdpa, timestep_sincos};
+use crate::nn::{apply_rope_half, rms_norm, sdpa, timestep_sincos};
 use crate::rope::cosmos_image_rope;
+use candle_gen::modulate::{adaln_chain, AdaLnChain};
 use candle_gen::train::projection::FrozenProjectionPack;
 
 /// q/k RMSNorm eps in diffusers `Attention` (`qk_norm="rms_norm"`, default `eps=1e-5`).
@@ -167,6 +168,20 @@ impl TimeEmbed {
     }
 }
 
+/// The Cosmos adaLN `(1 + scale)·LN(x) + shift` over the affine-free LayerNorm computed in `x`'s
+/// own dtype ([`crate::nn::layer_norm_no_affine`]) — the shared fused AdaLN over that composable chain
+/// (SW-6129, [`AdaLnChain::layer`] `.native()`): one launch on CUDA (f32 and bf16), bit-identical
+/// to [`crate::nn::layer_norm_no_affine`] + [`crate::nn::modulate`], that chain everywhere else (and for the trainer's
+/// gradient-tracked operands).
+fn ln_modulate(hidden: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    Ok(adaln_chain(
+        hidden,
+        &AdaLnChain::layer(NORM_EPS).native(),
+        scale,
+        shift,
+    )?)
+}
+
 /// `CosmosAdaLayerNormZero` (norm1/2/3): LayerNorm(no affine) then `(1+scale)·norm + shift`, plus a
 /// `gate`. `linear_2` emits `3·hidden` (shift|scale|gate), added to `temb`.
 struct AdaLayerNormZero {
@@ -197,8 +212,7 @@ impl AdaLayerNormZero {
         let shift = parts[0].unsqueeze(1)?;
         let scale = parts[1].unsqueeze(1)?;
         let gate = parts[2].unsqueeze(1)?;
-        let normed = layer_norm_no_affine(hidden, NORM_EPS)?;
-        Ok((modulate(&normed, &scale, &shift)?, gate))
+        Ok((ln_modulate(hidden, &scale, &shift)?, gate))
     }
 
     /// Visit the modulation's two adaptable projections (`{prefix}.1`, `{prefix}.2`) for the
@@ -239,8 +253,7 @@ impl AdaLayerNorm {
         let parts = e.chunk(2, 1)?; // shift, scale
         let shift = parts[0].unsqueeze(1)?;
         let scale = parts[1].unsqueeze(1)?;
-        let normed = layer_norm_no_affine(hidden, NORM_EPS)?;
-        modulate(&normed, &scale, &shift)
+        ln_modulate(hidden, &scale, &shift)
     }
 
     /// Visit the final modulation's two adaptable projections (`{prefix}.1`, `{prefix}.2`) for the
@@ -873,5 +886,100 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_dit_linear_loads_and_forwards_on_cpu");
+    }
+}
+
+/// SW-6129: the Cosmos adaLN sites are the shared fused AdaLN, bit-identical to
+/// `layer_norm_no_affine` + `modulate`.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use crate::nn::{layer_norm_no_affine, modulate};
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Cosmos-Predict2 2B width (hidden 2048): `x [2, 30, D]`, `[2, 1, D]` scale / shift views of
+    /// a `[2, 3·D]` chunk (the AdaLayerNormZero layout).
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let d = 2048;
+        let x = values(&[2, 30, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let e = values(&[2, 3 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let parts = e.chunk(3, 1).unwrap();
+        (
+            x,
+            parts[1].unsqueeze(1).unwrap(),
+            parts[0].unsqueeze(1).unwrap(),
+        )
+    }
+
+    #[test]
+    fn fused_adaln_site_matches_the_former_chain() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, scale, shift) = operands(dtype, &Device::Cpu);
+            let got = ln_modulate(&x, &scale, &shift).unwrap();
+            let normed = layer_norm_no_affine(&x, NORM_EPS).unwrap();
+            let want = modulate(&normed, &scale, &shift).unwrap();
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// CUDA bf16 (native-precision chain): the site takes the fused AdaLN and is bit-identical to
+    /// the same call with the kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 1;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, scale, shift) = operands(DType::BF16, &dev);
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = ln_modulate(&x, &scale, &shift).unwrap();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = ln_modulate(&x, &scale, &shift).unwrap();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "anima adaln (bf16 native, D=2048): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

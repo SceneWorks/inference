@@ -275,6 +275,23 @@ fn scale_residual(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
     Ok(x.broadcast_mul(&(scale + 1.0)?.to_dtype(x.dtype())?)?)
 }
 
+/// `scale_residual(layer_norm(x, eps), scale)`. With the modulation in `x`'s dtype (the cast after
+/// `1 + scale` is then the identity) this is the shared fused scale-only AdaLN over the composable
+/// f32 LayerNorm chain (SW-6129, `AdaLnChain::layer`): one launch on CUDA, bit-identical to that
+/// chain, which it runs everywhere else (and for the trainer's gradient-tracked operands). A
+/// modulation in another dtype rounds `1 + scale` there first, which the kernel does not replay:
+/// it keeps the chain.
+fn ln_scale_residual(x: &Tensor, eps: f64, scale: &Tensor) -> Result<Tensor> {
+    if scale.dtype() != x.dtype() {
+        return scale_residual(&layer_norm(x, eps)?, scale);
+    }
+    Ok(candle_gen::modulate::adaln_chain_scale_only(
+        x,
+        &candle_gen::modulate::AdaLnChain::layer(eps),
+        scale,
+    )?)
+}
+
 /// Adjacent-pair complex rotation of `x` `[B, H, S, D]` by `cos`/`sin` `[S, D/2]`, in f32. (The MLX
 /// twin rotates `[B, S, H, D]`; the rotation is per token and per head, so the transpose commutes.)
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, ops: Ops) -> Result<Tensor> {
@@ -744,7 +761,7 @@ impl Block {
         perturb_target: bool,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
-        let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
+        let h = ln_scale_residual(x, self.eps, &m.scale1)?;
         let a = match attention {
             BlockAttention::Prefill { capture } => self.attn.forward_with_pag(
                 &h,
@@ -768,7 +785,7 @@ impl Block {
         };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = (x + m.gate1.tanh()?.broadcast_mul(&a)?)?;
-        let h = scale_residual(&layer_norm(&x, self.eps)?, &m.scale2)?;
+        let h = ln_scale_residual(&x, self.eps, &m.scale2)?;
         let f = self.mlp.forward(&h)?;
         trace.push(format!("block_{index}_mlp"), &f)?;
         let out = (&x + m.gate2.tanh()?.broadcast_mul(&f)?)?;
@@ -1583,7 +1600,7 @@ impl QwenImage21Transformer {
         geometry: &JointGeometry,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
-        let x = scale_residual(&layer_norm(x, self.cfg.eps as f64)?, out_scale)?;
+        let x = ln_scale_residual(x, self.cfg.eps as f64, out_scale)?;
         trace.push("norm_out", &x)?;
         let out = self.proj_out.forward(&x)?;
         trace.push("proj_out", &out)?;
@@ -2894,5 +2911,97 @@ mod tests {
             training,
             false,
         )
+    }
+}
+
+/// SW-6129: the block and `norm_out` scale-only sites are the shared fused AdaLN.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Qwen-Image-2.1 width (3072): `x [1, 48, D]` and a per-token `[1, 48, D]` scale.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor) {
+        let d = 3072;
+        let x = values(&[1, 48, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let scale = values(&[1, 48, d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        (x, scale)
+    }
+
+    /// `ln_scale_residual` equals `scale_residual(layer_norm(x))`, with the modulation in `x`'s
+    /// dtype (fused route) and in f32 (kept chain).
+    #[test]
+    fn fused_scale_only_site_matches_the_former_chain() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, scale) = operands(dtype, &Device::Cpu);
+            for scale in [scale.clone(), scale.to_dtype(DType::F32).unwrap()] {
+                let got = ln_scale_residual(&x, 1e-6, &scale).unwrap();
+                let want = scale_residual(&layer_norm(&x, 1e-6).unwrap(), &scale).unwrap();
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "{dtype:?} scale {:?}",
+                    scale.dtype()
+                );
+            }
+        }
+    }
+
+    /// CUDA bf16: the site takes the fused AdaLN and is bit-identical to the same call with the
+    /// kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 1;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, scale) = operands(DType::BF16, &dev);
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = ln_scale_residual(&x, 1e-6, &scale).unwrap();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = ln_scale_residual(&x, 1e-6, &scale).unwrap();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!("qwen-image-2-1 adaln (bf16, D=3072): {mismatches} of {} differ; on {c_on}, off {c_off}", a.len());
+        assert_eq!(mismatches, 0);
     }
 }

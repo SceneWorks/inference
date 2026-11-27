@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::config::TransformerConfig;
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, QwenRope, RopeCache};
+use candle_gen::modulate::{adaln_chain, AdaLnChain};
 
 const EPS: f64 = 1e-6;
 
@@ -73,14 +74,12 @@ fn streamed_linear_detect(
     Ok(QLinear::from_packed(packed, in_dim, out_dim))
 }
 
-/// Affine-free LayerNorm over the last axis (dtype-preserving; computed in f32).
-fn layer_norm(x: &Tensor) -> Result<Tensor> {
-    let dt = x.dtype();
-    let xf = x.to_dtype(DType::F32)?;
-    let mean = xf.mean_keepdim(D::Minus1)?;
-    let xc = xf.broadcast_sub(&mean)?;
-    let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
-    xc.broadcast_div(&(var + EPS)?.sqrt()?)?.to_dtype(dt)
+/// The affine-free LayerNorm over the last axis (computed in f32, cast back) followed by
+/// `(1 + scale)·LN(x) + shift` — the shared fused AdaLN over that composable chain (SW-6129,
+/// [`AdaLnChain::layer`]): one launch on CUDA, bit-identical to the `mean_keepdim` / `sqr` /
+/// `sqrt` / `broadcast_div` chain + modulate the blocks and `NormOut` ran, that chain elsewhere.
+fn layer_norm_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    adaln_chain(x, &AdaLnChain::layer(EPS), scale, shift)
 }
 
 /// Split a `[B, 3·inner]` modulation chunk into `(shift, scale, gate)`, each `[B, 1, inner]`.
@@ -92,11 +91,10 @@ fn chunk3(m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     Ok((shift, scale, gate))
 }
 
-/// AdaLN-zero modulate: returns `(x·(1+scale) + shift, gate)`.
+/// AdaLN-zero over the block LayerNorm: returns `(LN(x)·(1+scale) + shift, gate)`.
 fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     let (shift, scale, gate) = chunk3(m)?;
-    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
-    Ok((out, gate))
+    Ok((layer_norm_modulate(x, &scale, &shift)?, gate))
 }
 
 /// One `[1, seq, inner]` modulation slot of a doubled `[real_t ; zero_t]` chunk `m` (`[2, 3·inner]`):
@@ -115,7 +113,7 @@ fn zero_cond_slot(m: &Tensor, slot: usize, inner: usize, blend: &Tensor) -> Resu
     real.broadcast_add(&zero.broadcast_sub(&real)?.broadcast_mul(blend)?) // [1, seq, inner]
 }
 
-/// `modulate` with optional per-token timestep selection (`zero_cond_t`, Qwen-Image-Edit-2511). With
+/// `modulate` (over the block LayerNorm of `x`) with optional per-token timestep selection (`zero_cond_t`, Qwen-Image-Edit-2511). With
 /// `index = None` this is exactly [`modulate`]. With `index = Some` the `m` chunk carries a doubled
 /// batch `[real_t ; zero_t]` (`[2, 3·inner]`); each image token picks the real-`t` half where
 /// `index == 0` (noise) and the `t 0` half where `index == 1` (conditioning) — the diffusers
@@ -129,8 +127,8 @@ fn modulate_sel(x: &Tensor, m: &Tensor, index: Option<&Tensor>) -> Result<(Tenso
     let shift = zero_cond_slot(m, 0, inner, &blend)?;
     let scale = zero_cond_slot(m, 1, inner, &blend)?;
     let gate = zero_cond_slot(m, 2, inner, &blend)?;
-    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
-    Ok((out, gate))
+    // Per-token `[1, seq, inner]` modulation rows: still the one fused launch.
+    Ok((layer_norm_modulate(x, &scale, &shift)?, gate))
 }
 
 /// `x + gate·y`.
@@ -573,8 +571,8 @@ impl Block {
         );
 
         // attention path
-        let (img_n, img_g1) = modulate_sel(&layer_norm(hidden)?, &im0, modulate_index)?;
-        let (txt_n, txt_g1) = modulate(&layer_norm(encoder)?, &tm0)?;
+        let (img_n, img_g1) = modulate_sel(hidden, &im0, modulate_index)?;
+        let (txt_n, txt_g1) = modulate(encoder, &tm0)?;
         let (img_attn, txt_attn) = self.attn.forward_pag(
             &img_n,
             &txt_n,
@@ -589,9 +587,9 @@ impl Block {
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
         // feed-forward path
-        let (img_n2, img_g2) = modulate_sel(&layer_norm(&hidden)?, &im1, modulate_index)?;
+        let (img_n2, img_g2) = modulate_sel(&hidden, &im1, modulate_index)?;
         let hidden = gated(&hidden, &img_g2, &self.img_ff.forward(&img_n2)?)?;
-        let (txt_n2, txt_g2) = modulate(&layer_norm(&encoder)?, &tm1)?;
+        let (txt_n2, txt_g2) = modulate(&encoder, &tm1)?;
         let encoder = gated(&encoder, &txt_g2, &self.txt_ff.forward(&txt_n2)?)?;
 
         Ok((encoder, hidden))
@@ -638,7 +636,7 @@ impl NormOut {
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
         let shift = p.narrow(D::Minus1, inner, inner)?.unsqueeze(1)?;
-        candle_gen::modulate::modulate(&layer_norm(x)?, &scale, &shift)
+        layer_norm_modulate(x, &scale, &shift)
     }
 
     /// Visit the output-head projection (`{prefix}.linear`) (sc-11091).
@@ -2036,5 +2034,136 @@ mod tests {
             .unwrap();
         // Token 1 should hold head 0 `[4,5,6,7]` followed by head 1 `[16,17,18,19]`.
         assert_eq!(out[0][1], vec![4.0, 5.0, 6.0, 7.0, 16.0, 17.0, 18.0, 19.0]);
+    }
+}
+
+/// SW-6129: the MMDiT's AdaLN sites (block `modulate` / `modulate_sel`, `NormOut`) are the shared
+/// fused AdaLN, bit-identical to the LayerNorm + modulate chain they replaced.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+
+    /// The former affine-free LayerNorm, verbatim (the oracle).
+    fn former_layer_norm(x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let mean = xf.mean_keepdim(D::Minus1)?;
+        let xc = xf.broadcast_sub(&mean)?;
+        let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
+        xc.broadcast_div(&(var + EPS)?.sqrt()?)?.to_dtype(dt)
+    }
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Qwen-Image width (inner 3072): `x [2, 24, D]`, a doubled `[2, 3·D]` modulation chunk (the
+    /// zero-cond layout) and a 0/1 per-token index.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let d = 3072;
+        let x = values(&[2, 24, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let m = values(&[2, 3 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let idx: Vec<u32> = (0..24).map(|i| u32::from(i >= 16)).collect();
+        let index = Tensor::from_vec(idx, (1, 24), dev).unwrap();
+        (x, m, index)
+    }
+
+    /// The former chain: LayerNorm then the composable modulate over the same (selected) rows.
+    fn former(x: &Tensor, m: &Tensor, index: Option<&Tensor>) -> (Tensor, Tensor) {
+        let n = former_layer_norm(x).unwrap();
+        let (shift, scale, gate) = match index {
+            None => chunk3(m).unwrap(),
+            Some(index) => {
+                let inner = m.dim(D::Minus1).unwrap() / 3;
+                let blend = index.unsqueeze(2).unwrap().to_dtype(m.dtype()).unwrap();
+                (
+                    zero_cond_slot(m, 0, inner, &blend).unwrap(),
+                    zero_cond_slot(m, 1, inner, &blend).unwrap(),
+                    zero_cond_slot(m, 2, inner, &blend).unwrap(),
+                )
+            }
+        };
+        (
+            candle_gen::modulate::modulate(&n, &scale, &shift).unwrap(),
+            gate,
+        )
+    }
+
+    #[test]
+    fn fused_adaln_sites_match_the_former_chains() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, m, index) = operands(dtype, &Device::Cpu);
+            let (got, gate) = modulate(&x, &m).unwrap();
+            let (want, want_gate) = former(&x, &m, None);
+            assert_eq!(bits(&got), bits(&want), "modulate {dtype:?}");
+            assert_eq!(bits(&gate), bits(&want_gate));
+            let x1 = x.narrow(0, 0, 1).unwrap();
+            let (got, _) = modulate_sel(&x1, &m, Some(&index)).unwrap();
+            let (want, _) = former(&x1, &m, Some(&index));
+            assert_eq!(bits(&got), bits(&want), "modulate_sel {dtype:?}");
+        }
+    }
+
+    /// CUDA bf16: the per-sample and the per-token (zero-cond) block modulations take the fused
+    /// AdaLN and are bit-identical to the same calls with the kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, m, index) = operands(DType::BF16, &dev);
+        let run = || {
+            let (a, _) = modulate(&x, &m).unwrap();
+            let (b, _) = modulate_sel(&x.narrow(0, 0, 1).unwrap(), &m, Some(&index)).unwrap();
+            Tensor::cat(&[a.flatten_all().unwrap(), b.flatten_all().unwrap()], 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "qwen-image adaln (bf16, D=3072): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }
