@@ -1146,8 +1146,10 @@ fn load_native_dit_at_dtype(
         } else {
             dit_w
         };
+        // Backstop only, as for W4A8 above: `native_file_streamable` never arms implicit streaming
+        // for a Kitchen NVFP4 file, and explicit streaming is refused at request admission.
         if native_nvfp4 && stream_blocks {
-            return Err(CandleError::Msg(
+            return Err(CandleError::Unsupported(
                 "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
             ));
         }

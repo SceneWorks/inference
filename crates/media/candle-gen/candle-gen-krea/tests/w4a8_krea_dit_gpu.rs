@@ -22,7 +22,9 @@
 //!    the W4A8 render clears the declared floor. The W4A8 tier renders twice: resident, and through
 //!    the advertised `StagedResidency` shape (an adapter-free Sequential + DeferredMaterialization
 //!    File load with a staged request), whose DiT must load resident inside the sequential heavy
-//!    phase rather than being routed into native block streaming (PR #1526 review).
+//!    phase rather than being routed into native block streaming (PR #1526 review); when the
+//!    Kitchen NVFP4 fixture is set it renders the same two ways. Each staged render must match its
+//!    resident twin near-exactly.
 //! 2. [`w4a8_krea_dit_gpu_additive_lora_matches_q8_class`] — a real Krea 2 LoRA installs additively
 //!    over the W4A8 trunk onto exactly the targets it resolves on the q8 trunk, and the adapted
 //!    W4A8 render lands in the same result class as the adapted q8 render.
@@ -62,6 +64,11 @@ const STEPS: u32 = 8;
 /// tier, whose image PSNR vs bf16 is ~22.7 dB on Krea 2 Turbo (sc-9601). A W4A8 render below it
 /// would be a tier that is worse than the 4-bit tier it is offered next to.
 const W4A8_PSNR_FLOOR_DB: f64 = 22.0;
+
+/// A staged load runs the same resident DiT as the resident load (only the text encoder's lifetime
+/// differs), so its render must match the resident render of the same tier near-exactly; the
+/// W4A8 pair is bit-identical on sm_120. 40 dB leaves room only for kernel-order noise.
+const STAGED_PARITY_FLOOR_DB: f64 = 40.0;
 
 /// Exactly the projections `W4A8Policy::Mixed` packs on Krea 2 Turbo: the six normalized-input
 /// leaves of single-stream blocks 4..=26.
@@ -327,6 +334,19 @@ fn w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16() {
                 &req,
             ),
         ));
+        // The same staged-residency shape for the Kitchen NVFP4 tier (PR #1526 review): its DiT
+        // must load resident in the sequential heavy phase, never implicitly block-streamed.
+        rows.push((
+            "nvfp4 (Kitchen, staged)".into(),
+            render(
+                Tier::NativeStaged {
+                    base: &bf16,
+                    dit: &nvfp4,
+                },
+                &[],
+                &staged_req,
+            ),
+        ));
     }
 
     println!(
@@ -358,14 +378,28 @@ fn w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16() {
         "the W4A8 render is {w4a8_psnr:.2} dB from bf16, below the {W4A8_PSNR_FLOOR_DB} dB floor"
     );
     let staged_psnr = psnr(&rows[1].1.image, &reference.image);
-    println!(
-        "[sw-6135] staged W4A8 vs resident W4A8: {:.2} dB",
-        psnr(&rows[1].1.image, &rows[0].1.image)
+    let w4a8_parity = psnr(&rows[1].1.image, &rows[0].1.image);
+    println!("[sw-6135] staged W4A8 vs resident W4A8: {w4a8_parity:.2} dB");
+    assert!(
+        w4a8_parity >= STAGED_PARITY_FLOOR_DB,
+        "the staged W4A8 render is {w4a8_parity:.2} dB from the resident W4A8 render"
     );
     assert!(
         staged_psnr >= W4A8_PSNR_FLOOR_DB,
         "the staged W4A8 render is {staged_psnr:.2} dB from bf16, below the {W4A8_PSNR_FLOOR_DB} dB floor"
     );
+    let by_label = |label: &str| rows.iter().find(|(l, _)| l == label).map(|(_, m)| m);
+    if let (Some(resident), Some(staged)) = (
+        by_label("nvfp4 (Kitchen)"),
+        by_label("nvfp4 (Kitchen, staged)"),
+    ) {
+        let parity = psnr(&staged.image, &resident.image);
+        println!("[sw-6135] staged NVFP4 vs resident NVFP4: {parity:.2} dB");
+        assert!(
+            parity >= STAGED_PARITY_FLOOR_DB,
+            "the staged NVFP4 render is {parity:.2} dB from the resident NVFP4 render"
+        );
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16");
