@@ -289,7 +289,7 @@ fn snapshot_identity(root: &Path) -> io::Result<(String, u64)> {
         aggregate.update(bytes.to_le_bytes());
         aggregate.update([0]);
         aggregate.update(digest);
-        aggregate.update([b'\n']);
+        aggregate.update(*b"\n");
     }
     Ok((format!("{:x}", aggregate.finalize()), total))
 }

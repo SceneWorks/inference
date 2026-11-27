@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use candle_audio::gen_core::{
-    self, AudioStem, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    self, AudioStem, AudioTrack, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadPhase, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
     WeightsSource,
 };
@@ -53,43 +53,122 @@ pub fn stage1_hub_revision(variant: Variant) -> &'static str {
     }
 }
 
-/// The weights-free descriptor for `variant`.
-///
-/// - **Mode**: ICL variants advertise [`ConditioningKind::ReferenceAudio`] (the reference clip);
-///   CoT variants advertise no conditioning, so the shared floor refuses a reference sent to them.
-///   Only ICL advertises `supports_reference_region` (the reference window).
-/// - **Song controls**: `supports_segmented_lyrics` (segment count + per-segment token budget),
-///   `supports_repetition_penalty` and `supports_output_limiter` (clamp vs. rescale) on every
-///   variant.
-/// - **Tier**: `supported_quants` = q4 + q8 (bf16 is the unquantized load) for both LMs.
-/// - **Guidance**: `supports_guidance` — CFG on/off (and its scale) is a request knob.
-pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: REQUIRED_COMPONENTS,
-        id: variant.id(),
+/// Primary typed route declaration for one YuE lyrics2song variant (`REG-1`, `AP5`).
+pub fn route_for(variant: Variant) -> gen_core::RouteRecord {
+    let bindings = match (variant.language, variant.mode) {
+        (Language::En, Mode::Cot) => {
+            gen_core::RouteBindings::generator(descriptor_en_cot, load_en_cot)
+        }
+        (Language::En, Mode::Icl) => {
+            gen_core::RouteBindings::generator(descriptor_en_icl, load_en_icl)
+        }
+        (Language::Zh, Mode::Cot) => {
+            gen_core::RouteBindings::generator(descriptor_zh_cot, load_zh_cot)
+        }
+        (Language::Zh, Mode::Icl) => {
+            gen_core::RouteBindings::generator(descriptor_zh_icl, load_zh_icl)
+        }
+        (Language::JpKr, Mode::Cot) => {
+            gen_core::RouteBindings::generator(descriptor_jp_kr_cot, load_jp_kr_cot)
+        }
+        (Language::JpKr, Mode::Icl) => {
+            gen_core::RouteBindings::generator(descriptor_jp_kr_icl, load_jp_kr_icl)
+        }
+    };
+    let mut phases = Vec::new();
+    if variant.mode == Mode::Icl {
+        phases.push(gen_core::ResidencyPhaseNode::new(
+            gen_core::ResidencyPhaseKind::ConditioningEncode,
+            ["icl_encoder", "hubert"],
+            true,
+        ));
+    }
+    phases.push(gen_core::ResidencyPhaseNode::new(
+        gen_core::ResidencyPhaseKind::AudioSynthesize,
+        ["yue_stage1_7b", "yue_stage2_1b"],
+        true,
+    ));
+    phases.push(gen_core::ResidencyPhaseNode::new(
+        gen_core::ResidencyPhaseKind::Decode,
+        ["xcodec", "vocos"],
+        false,
+    ));
+
+    gen_core::RouteRecord {
+        route_id: variant.id(),
         family: FAMILY,
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            max_count: 1,
-            supports_guidance: true,
-            conditioning: match variant.mode {
-                Mode::Cot => Vec::new(),
-                Mode::Icl => vec![ConditioningKind::ReferenceAudio],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("mm_tokenizer", None)],
+                ..Default::default()
             },
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            audio_sample_rates: vec![SAMPLE_RATE],
-            audio_languages: variant.language.codes().to_vec(),
-            supports_segmented_lyrics: true,
-            supports_repetition_penalty: true,
-            supports_reference_region: variant.mode == Mode::Icl,
-            supports_output_limiter: true,
+            conditioning: gen_core::ConditioningSurface {
+                kinds: match variant.mode {
+                    Mode::Cot => Vec::new(),
+                    Mode::Icl => vec![ConditioningKind::ReferenceAudio],
+                },
+                modules: match variant.mode {
+                    Mode::Cot => vec![],
+                    Mode::Icl => vec!["icl_encoder", "hubert"],
+                },
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::non_diffusion("yue_stage1_stage2_ar"),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("xcodec_vocos"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: phases,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                required_components: REQUIRED_COMPONENTS,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                languages: variant.language.codes().to_vec(),
+                supports_segmented_lyrics: true,
+                supports_repetition_penalty: true,
+                supports_reference_region: variant.mode == Mode::Icl,
+                supports_output_limiter: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
+            ..Default::default()
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: variant.language.codes().first().copied(),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// The weights-free descriptor for `variant` — computed from [`route_for`].
+pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 /// Refuse an audio field this model does not read, rather than drop it silently.
@@ -405,7 +484,11 @@ pub fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<d
 }
 
 macro_rules! variant_entry_points {
-    ($($desc:ident, $load:ident, $reg:ident => $lang:ident, $mode:ident;)*) => {$(
+    ($($route:ident, $desc:ident, $load:ident, $reg:ident => $lang:ident, $mode:ident;)*) => {$(
+        #[doc = concat!("Route record of the `", stringify!($lang), "`/`", stringify!($mode), "` variant.")]
+        pub fn $route() -> gen_core::RouteRecord {
+            route_for(Variant::new(Language::$lang, Mode::$mode))
+        }
         #[doc = concat!("Descriptor of the `", stringify!($lang), "`/`", stringify!($mode), "` variant.")]
         pub fn $desc() -> ModelDescriptor {
             descriptor_for(Variant::new(Language::$lang, Mode::$mode))
@@ -421,12 +504,12 @@ macro_rules! variant_entry_points {
 }
 
 variant_entry_points! {
-    descriptor_en_cot, load_en_cot, REGISTRATION_EN_COT => En, Cot;
-    descriptor_en_icl, load_en_icl, REGISTRATION_EN_ICL => En, Icl;
-    descriptor_zh_cot, load_zh_cot, REGISTRATION_ZH_COT => Zh, Cot;
-    descriptor_zh_icl, load_zh_icl, REGISTRATION_ZH_ICL => Zh, Icl;
-    descriptor_jp_kr_cot, load_jp_kr_cot, REGISTRATION_JP_KR_COT => JpKr, Cot;
-    descriptor_jp_kr_icl, load_jp_kr_icl, REGISTRATION_JP_KR_ICL => JpKr, Icl;
+    route_en_cot, descriptor_en_cot, load_en_cot, REGISTRATION_EN_COT => En, Cot;
+    route_en_icl, descriptor_en_icl, load_en_icl, REGISTRATION_EN_ICL => En, Icl;
+    route_zh_cot, descriptor_zh_cot, load_zh_cot, REGISTRATION_ZH_COT => Zh, Cot;
+    route_zh_icl, descriptor_zh_icl, load_zh_icl, REGISTRATION_ZH_ICL => Zh, Icl;
+    route_jp_kr_cot, descriptor_jp_kr_cot, load_jp_kr_cot, REGISTRATION_JP_KR_COT => JpKr, Cot;
+    route_jp_kr_icl, descriptor_jp_kr_icl, load_jp_kr_icl, REGISTRATION_JP_KR_ICL => JpKr, Icl;
 }
 
 /// Every variant's registration, in catalog order ([`Variant::ALL`]).

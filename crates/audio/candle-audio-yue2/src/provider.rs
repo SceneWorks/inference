@@ -84,9 +84,9 @@ use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core::{
-    self, ArtifactRecord, AudioParams, AudioTrack, Capabilities, GenerationMemory,
-    GenerationOutput, GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadShape,
-    LoadSpec, MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    self, ArtifactRecord, AudioParams, AudioTrack, GenerationMemory, GenerationOutput,
+    GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadShape, LoadSpec,
+    MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
     SongCover, SongCoverMode, SongCoverVoice, SongDecoder, SongPlanning, TokenSampling,
     WeightsSource, Yue2ArMode, Yue2ComputePolicy,
 };
@@ -131,14 +131,14 @@ pub const DECODER_COMPONENTS: &[&str] = &[VAE_COMPONENT_ID, VAE_LEGACY_COMPONENT
 pub const KNOWN_COMPONENTS: &[&str] = &[VAE_COMPONENT_ID, VAE_LEGACY_COMPONENT_ID];
 /// Output channels (stereo).
 pub const CHANNELS: u16 = 2;
-/// The per-request memory rungs YuE2 honours ([`Capabilities::request_memory_strategies`]; see
+/// The per-request memory rungs YuE2 honours ([`gen_core::Capabilities::request_memory_strategies`]; see
 /// the [module docs](self#memory-controls-generationrequestmemory-sc-22988)).
 pub const REQUEST_MEMORY_STRATEGIES: &[MemoryStrategy] = &[
     MemoryStrategy::StagedResidency,
     MemoryStrategy::BoundedDecode,
     MemoryStrategy::BoundedAttention,
 ];
-/// The quantized tiers a `LoadSpec` may assert ([`Capabilities::supported_quants`]; the `bf16`
+/// The quantized tiers a `LoadSpec` may assert ([`gen_core::Capabilities::supported_quants`]; the `bf16`
 /// original is the unquantized load, `quantize: None`, as for YuE1). Exactly these are accepted.
 pub const SUPPORTED_QUANTS: &[Quant] = &[Quant::Q4, Quant::Q8];
 /// The record a cover publishes inside its run directory (under the run's digests).
@@ -148,31 +148,83 @@ pub const COVER_SCHEMA: &str = "yue2-cover-v1";
 /// The warning codes of a truncated ABC and semantic phase.
 pub const TRUNCATION_CODES: [&str; 2] = ["abc_truncated", "semantic_truncated"];
 
-/// The weights-free descriptor.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: REQUIRED_COMPONENTS,
-        id: PROVIDER_ID,
+/// Primary typed route declaration for YuE2 (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: PROVIDER_ID,
         family: FAMILY,
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            max_count: 1,
-            supports_guidance: true,
-            audio_sample_rates: vec![SAMPLE_RATE],
-            supports_symbolic_song: true,
-            supports_audio_artifacts: true,
-            supports_song_plan_only: true,
-            supports_song_cover: true,
-            supports_sequential_offload: true,
-            request_memory_strategies: REQUEST_MEMORY_STRATEGIES,
-            supported_quants: SUPPORTED_QUANTS,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen_tiktoken", None)],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::non_diffusion("yue2_3b_mot_ar_nar"),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("yue2_oobleck_vae"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::AudioSynthesize,
+                        ["yue2_3b_ar", "yue2_3b_nar"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["yue2_oobleck_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                request_memory_strategies: REQUEST_MEMORY_STRATEGIES,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: SUPPORTED_QUANTS,
+                required_components: REQUIRED_COMPONENTS,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                supports_symbolic_song: true,
+                supports_audio_artifacts: true,
+                supports_song_plan_only: true,
+                supports_song_cover: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
+            ..Default::default()
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            audio_sample_rate: Some(SAMPLE_RATE),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// The weights-free descriptor — computed from [`route`].
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 fn refuse(field: &str, why: &str) -> gen_core::Error {

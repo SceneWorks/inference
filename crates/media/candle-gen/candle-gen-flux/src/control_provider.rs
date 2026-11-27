@@ -336,27 +336,47 @@ fn validate_control_spec(
     Ok(())
 }
 
-pub(crate) fn control_descriptor() -> ModelDescriptor {
-    let mut descriptor = crate::descriptor_dev();
-    crate::add_conditioned_native_aliases(&mut descriptor);
-    descriptor.id = "flux1_dev_control";
+pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
+    let mut route = crate::route_base(Variant::Dev);
+    route.route_id = "flux1_dev_control";
+    route.structure.sampling.samplers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut route.structure.sampling.samplers),
+        &["flow_match", "flow_match_euler"],
+    );
+    route.structure.sampling.schedulers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut route.structure.sampling.schedulers),
+        &["native", "flow_match", "flow_match_euler"],
+    );
     // The bespoke ControlNet route accepts any positive on-stride geometry; the
     // registered base txt2img route's 256..=2048 range does not apply here.
-    descriptor.capabilities.min_size = SIZE_MULTIPLE;
-    descriptor.capabilities.max_size = u32::MAX;
-    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
+    route.limits.min_size = SIZE_MULTIPLE;
+    route.limits.max_size = u32::MAX;
+    route.limits.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
         multiple: SIZE_MULTIPLE,
         max_cells: u32::MAX,
     };
-    descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
+    route.structure.conditioning.kinds = vec![candle_gen::gen_core::ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
         ControlKind::Pose,
         ControlKind::Canny,
         ControlKind::Depth,
     ]));
-    descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
-    descriptor.capabilities.max_count = 1;
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route.structure.conditioning.pass0_requirement =
+        candle_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["flux_controlnet_union"];
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.seed_and_batch.max_count = 1;
+    route.defaults.strength = Some(DEFAULT_CONTROL_SCALE);
+    route.bindings = candle_gen::gen_core::RouteBindings::feature_route(
+        Some(crate::FLUX1_DEV_ID),
+        control_descriptor,
+    )
+    .with_render_plan(compile_control_feature_route);
+    route
+}
+
+pub(crate) fn control_descriptor() -> ModelDescriptor {
+    route_control().compute_descriptor()
 }
 
 pub(crate) fn compile_control_feature_route(

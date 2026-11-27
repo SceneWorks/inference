@@ -1629,18 +1629,82 @@ pub fn compile_trajectory_for(
     )?)
 }
 
+pub(crate) fn route_schnell() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Schnell.route_record();
+    route.bindings = gen_core::RouteBindings::generator(descriptor_schnell, |spec| {
+        load_schnell(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(FluxVariant::Schnell, spec, req))
+    .with_memory_registration(SCHNELL_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(crate::FLUX1_SCHNELL_ID, spec)
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_memory_surface_contract(
+            crate::FLUX1_SCHNELL_ID,
+            surface,
+        )
+    })
+    .with_memory_behavior_registration(SCHNELL_MEMORY_BEHAVIOR);
+    route
+}
+
+pub(crate) fn route_dev() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Dev.route_record();
+    route.bindings = gen_core::RouteBindings::generator(descriptor_dev, |spec| {
+        load_dev(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(FluxVariant::Dev, spec, req))
+    .with_memory_registration(DEV_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, spec)
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_memory_surface_contract(crate::FLUX1_DEV_ID, surface)
+    })
+    .with_memory_behavior_registration(DEV_MEMORY_BEHAVIOR)
+    .with_activation_memory(crate::DEV_ACTIVATION_MEMORY_REGISTRATION.anchor);
+    route
+}
+
+pub(crate) fn route_schnell_ip_adapter() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Schnell.route_record();
+    route.route_id = "flux1_schnell_ip_adapter";
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.defaults.strength = Some(DEFAULT_IP_SCALE);
+    route.bindings = gen_core::RouteBindings::feature_route(
+        Some(crate::FLUX1_SCHNELL_ID),
+        descriptor_schnell_ip_adapter,
+    )
+    .with_render_plan(|spec, req| compile_ip_adapter(FluxVariant::Schnell, spec, req));
+    route
+}
+
+pub(crate) fn route_dev_ip_adapter() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Dev.route_record();
+    route.route_id = "flux1_dev_ip_adapter";
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.defaults.strength = Some(DEFAULT_IP_SCALE);
+    route.bindings = gen_core::RouteBindings::feature_route(
+        Some(crate::FLUX1_DEV_ID),
+        descriptor_dev_ip_adapter,
+    )
+    .with_render_plan(|spec, req| compile_ip_adapter(FluxVariant::Dev, spec, req));
+    route
+}
+
 pub(crate) fn descriptor_schnell_ip_adapter() -> ModelDescriptor {
-    let mut descriptor = descriptor_schnell();
-    descriptor.id = "flux1_schnell_ip_adapter";
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route_schnell_ip_adapter().compute_descriptor()
 }
 
 pub(crate) fn descriptor_dev_ip_adapter() -> ModelDescriptor {
-    let mut descriptor = descriptor_dev();
-    descriptor.id = "flux1_dev_ip_adapter";
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route_dev_ip_adapter().compute_descriptor()
 }
 
 pub(crate) fn compile_ip_adapter(
@@ -1923,11 +1987,6 @@ pub(crate) fn component_footprint(
     )
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell;
-    footprint = component_footprint
-}
-
 pub const SCHNELL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: crate::FLUX1_SCHNELL_ID,
@@ -1970,10 +2029,6 @@ pub const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
             )
         },
     };
-mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
-    footprint = component_footprint
-}
 
 #[cfg(test)]
 mod tests {

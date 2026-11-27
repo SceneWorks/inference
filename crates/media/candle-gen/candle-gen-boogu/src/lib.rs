@@ -54,9 +54,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
-    WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder;
 
@@ -966,75 +965,189 @@ fn validate_edit_reference(index: usize, image: &Image) -> gen_core::Result<()> 
     Ok(())
 }
 
-/// Boogu Base descriptor — true-CFG text-to-image; no user negative prompt (the CFG-negative is the
-/// model's own fixed empty/drop instruction). A single [`ConditioningKind::Reference`] opts into
-/// img2img latent-init (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start
-/// step. The instruction-edit `MultiReference` (Qwen3-VL semantic edit) is the Edit checkpoint's alone
-/// (`descriptor_edit`); Turbo inherits this img2img surface via `descriptor()`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: BOOGU_IMAGE_ID,
+/// Primary typed route declaration for Candle Boogu Base (`SW-6979`, `REG-1`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: BOOGU_IMAGE_ID,
         family: "boogu",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_guidance: true,
-            supports_negative_prompt: true,
-            // All three registered routes emit one latent preview per outer denoise step. Base and
-            // Edit use the shared flow driver; Turbo additionally covers its default native DMD loop.
-            supports_preview: true,
-            // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img latent-init
-            // (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start step. The
-            // multi-image instruction-edit path is the Edit checkpoint's (`descriptor_edit`).
-            conditioning: vec![ConditioningKind::Reference],
-            // Base is rectified-flow Euler over the static-shift schedule, routed through the unified
-            // curated-sampler framework (epic 7114).
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: 256,
-            max_size: RES_MAX,
-            max_count: 8,
-            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
-            // The resolved `base/`-`-q4/`-`-bf16/` turnkey subdir self-describes its tier
-            // (`loader::linear_detect`, sc-9410, group-size-aware); `build` no-ops the requested quant.
-            // Turbo + edit inherit this via `descriptor()`.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_low_res_start: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl_8b", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img
+                // latent-init (sc-11786): VAE-encode the reference + noise-blend at a
+                // strength-derived start step. The multi-image instruction-edit path is the Edit
+                // checkpoint's (`route_edit`).
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                // Base is rectified-flow Euler over the static-shift schedule, routed through the
+                // unified curated-sampler framework (epic 7114).
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("boogu_mmdit").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_8b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["boogu_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages
+                // off-Mac.
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                // All three registered routes emit one latent preview per outer denoise step. Base
+                // and Edit use the shared flow driver; Turbo additionally covers its default native
+                // DMD loop.
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(pipeline::DEFAULT_STEPS as u32),
+            guidance: Some(pipeline::DEFAULT_GUIDANCE),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: Some(pipeline::base_shift_mu()),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_render_plan(compile_render_plan)
+            .with_memory_registration(BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                memory_strategy::weights_free_base,
+            )
+            .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR),
     }
 }
 
-/// Boogu Turbo descriptor — same base, CFG-free DMD few-step; guidance is inert. The advertised
-/// sampler menu is the DMD-compatible stochastic subset (`TURBO_SAMPLERS`); a selected sampler or
-/// scheduler routes the few-step denoise through the unified curated framework over the DMD σ grid
-/// (sc-9009), while unset keeps the byte-exact native DMD student loop.
-pub fn descriptor_turbo() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = BOOGU_IMAGE_TURBO_ID;
-    d.capabilities.supports_guidance = true;
-    d.capabilities.supports_low_res_start = false;
-    d.capabilities.samplers = TURBO_SAMPLERS.to_vec();
-    d
+/// Primary typed route declaration for Candle Boogu Turbo (`SW-6979`, `REG-1`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = BOOGU_IMAGE_TURBO_ID;
+    route.structure.sampling.samplers = TURBO_SAMPLERS.to_vec();
+    route.structure.denoiser = gen_core::ModelBinding::family_driver(
+        gen_core::FamilyDriverSpec::new(pipeline::turbo_dmd_driver_support()),
+    );
+    route.defaults.steps = Some(pipeline::DEFAULT_TURBO_STEPS as u32);
+    route.defaults.guidance = Some(0.0);
+    route.defaults.sampler = None;
+    route.bindings = gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+        .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            gen_core::candle_memory_contract_surface_specs,
+            memory_strategy::weights_free_turbo,
+        )
+        .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    route
 }
 
-/// Boogu Edit descriptor — same true-CFG surface as the Base path plus one or more img2img/instruction
-/// -edit source images ([`ConditioningKind::Reference`] for a single source, or
-/// [`ConditioningKind::MultiReference`] for up to `MAX_EDIT_REFERENCES`): each source is read by the
-/// Qwen3-VL vision tower (semantic edit) and VAE-encoded into the DiT's spatial reference sequence.
-pub fn descriptor_edit() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = BOOGU_IMAGE_EDIT_ID;
-    d.capabilities.supports_low_res_start = false;
-    d.capabilities.conditioning = vec![
+/// Primary typed route declaration for Candle Boogu Edit (`SW-6979`, `REG-1`).
+pub(crate) fn route_edit() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = BOOGU_IMAGE_EDIT_ID;
+    route.structure.conditioning.kinds = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
-    d
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["qwen3_vl_vision"];
+    route.structure.denoiser =
+        gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("boogu_mmdit"));
+    route.bindings = gen_core::RouteBindings::generator(descriptor_edit, load_edit)
+        .with_render_plan(compile_edit_render_plan)
+        .with_memory_registration(EDIT_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            gen_core::candle_memory_contract_surface_specs,
+            memory_strategy::weights_free_edit,
+        )
+        .with_memory_behavior_registration(EDIT_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Boogu Base descriptor, computed from [`route_base`].
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
+}
+
+/// Boogu Turbo descriptor, computed from [`route_turbo`].
+pub fn descriptor_turbo() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
+}
+
+/// Boogu Edit descriptor, computed from [`route_edit`].
+pub fn descriptor_edit() -> ModelDescriptor {
+    route_edit().compute_descriptor()
 }
 
 fn build(
@@ -1117,16 +1230,6 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor_edit(), Variant::Edit)
 }
 
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-candle_gen::register_generators! {
-    pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit
-}
-
 pub const BASE_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
     gen_core::RenderPlanRegistration {
         provider_id: BOOGU_IMAGE_ID,
@@ -1139,20 +1242,16 @@ pub const EDIT_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
         compile: compile_edit_render_plan,
     };
 
-/// Add all Candle Boogu providers to an explicit media registry builder.
+/// Add all Candle Boogu providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(TURBO_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION)
-        .register_render_plan(BASE_RENDER_PLAN_REGISTRATION)
-        .register_render_plan(EDIT_RENDER_PLAN_REGISTRATION);
-    register_memory_contract_surfaces(registry)
-        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
+    registry
+        .register_route(route_base())
+        .register_route(route_turbo())
+        .register_route(route_edit())
 }
 
 pub fn register_memory_contract_surfaces(
@@ -1217,6 +1316,25 @@ const EDIT_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 /// Build the complete explicit Candle Boogu provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 3);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

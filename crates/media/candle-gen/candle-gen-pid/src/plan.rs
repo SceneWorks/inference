@@ -5,7 +5,7 @@
 //! (`RenderStage::Decode`) plan construction before running pixel-space decode compute.
 
 use candle_gen::gen_core::{
-    Capabilities, Error as CoreError, GenerationRequest, Modality, ModelDescriptor, RenderPlan,
+    self, Error as CoreError, GenerationRequest, Modality, ModelDescriptor, RenderPlan,
     Result as CoreResult,
 };
 use candle_gen::{CandleError, Result};
@@ -21,20 +21,32 @@ pub const STUDENT_SCHEDULE: [f32; 5] = [0.999, 0.866, 0.634, 0.342, 0.0];
 /// Released flow-matching timestep scale factor (`t * fm_timescale`).
 pub const FM_TIMESCALE: f32 = 1000.0;
 
-fn pid_decode_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        id: "pid",
-        backend: "candle",
+fn route_pid_decode() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: "pid",
         family: "pid",
+        backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                crate::sampler::pid_driver_support(),
+            )),
             ..Default::default()
         },
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
+        limits: gen_core::ProductLimits::default(),
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 0,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults::default(),
+        bindings: gen_core::RouteBindings::default(),
     }
+}
+
+fn pid_decode_descriptor() -> ModelDescriptor {
+    route_pid_decode().compute_descriptor()
 }
 
 /// Spatial-tiling resolution plan for one PiD decode invocation.

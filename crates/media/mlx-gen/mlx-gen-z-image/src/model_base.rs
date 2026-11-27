@@ -25,9 +25,8 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind,
-    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, Residency, Result,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor,
+    Progress, Residency, Result,
 };
 use mlx_gen_pid::resolve_pid_decoder_at_sigma;
 
@@ -69,47 +68,36 @@ pub fn base_pag_capability() -> gen_core::PagCapability {
     }
 }
 
+/// Primary typed route declaration for base Z-Image (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    let mut route = crate::model::route_turbo();
+    route.route_id = MODEL_ID;
+    route.structure.sampling.supports_true_cfg = true;
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("z_image_dit")
+            .with_low_res_start()
+            .with_pag(base_pag_capability()),
+    );
+    route.defaults.steps = Some(DEFAULT_STEPS);
+    route.defaults.guidance = Some(DEFAULT_GUIDANCE);
+    route.defaults.shift = Some(SCHEDULE_SHIFT);
+    route.bindings = gen_core::RouteBindings::generator(descriptor, |spec| {
+        load(spec).map_err(Into::into)
+    })
+    .with_footprint(crate::model::component_footprint)
+    .with_render_plan(crate::model::compile_base)
+    .with_memory_registration(MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+    })
+    .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
 /// Base Z-Image's identity + capabilities — constructible without loading weights. Unlike Turbo, the
 /// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported.
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::active_encoder_contract()),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "z-image",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Base is undistilled → full classifier-free guidance + negative prompting (the model card's
-            // headline capabilities), unlike the guidance-distilled Turbo.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // img2img reference; ControlNet is a separate variant (base control = sc-8251).
-            conditioning: vec![ConditioningKind::Reference],
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated unified-framework integrator menu (epic 7114 P3); an unset `req.sampler` is the
-            // curated Euler over the static shift=6.0 schedule.
-            samplers: curated_sampler_names(),
-            // Scheduler axis (epic 7114): the static shift=6.0 schedule is the byte-exact default; a
-            // curated name re-shapes the σ schedule over the same `shift=6.0`.
-            schedulers: curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(base_pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_base().compute_descriptor()
 }
 
 /// A loaded base Z-Image generator — the cached descriptor, the (tiny, always-warm) tokenizer, and the
@@ -476,13 +464,6 @@ impl ZImage {
     }
 }
 
-// The registration constant bridges the rich `Result` into backend-neutral `gen_core::Result`. A
-// distinct id (`z_image`) avoids clashes with the turbo and control registrations in this crate.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
-}
-
 /// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
 /// the worker can select a strategy from the static declaration plus its own measured evidence.
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration = mlx_gen::gen_core::profile_memory_registration!(
@@ -499,6 +480,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Modality;
 
     #[test]
     fn descriptor_is_base_z_image() {

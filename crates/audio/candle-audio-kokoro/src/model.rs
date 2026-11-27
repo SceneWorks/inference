@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, WeightsSource,
+    self, AudioTrack, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 
@@ -117,31 +117,69 @@ pub const LANGUAGES: &[&str] = &["en", "en-us", "en-gb"];
 /// above this; 30 s keeps single-request latency and memory predictable.
 pub const MAX_DURATION_SECS: f32 = 30.0;
 
-/// Kokoro's identity + capabilities — constructible without weights (registry introspection).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Kokoro-82M TTS (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "kokoro",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
-            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
-            // unused 0 rather than a nominal placeholder bound.
-            min_size: 0,
-            // One clip per request (GenerationOutput::Audio carries a single track).
-            max_count: 1,
-            audio_sample_rates: vec![SAMPLE_RATE],
-            max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_voices: VOICES.to_vec(),
-            audio_languages: LANGUAGES.to_vec(),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("albert", Some(512))],
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::non_diffusion("styletts2_istftnet"),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("istftnet_vocoder"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![gen_core::ResidencyPhaseNode::new(
+                    gen_core::ResidencyPhaseKind::AudioSynthesize,
+                    ["albert", "text_encoder", "predictor", "istftnet_vocoder"],
+                    false,
+                )],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                voices: VOICES.to_vec(),
+                languages: LANGUAGES.to_vec(),
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
+            max_audio_duration_secs: Some(MAX_DURATION_SECS),
+            ..Default::default()
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            audio_voice: Some(DEFAULT_VOICE),
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// Kokoro's identity + capabilities — computed from [`route`] without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Capability-driven request validation, factored out for weightless unit tests. Shared floor

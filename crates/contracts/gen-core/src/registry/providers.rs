@@ -1,40 +1,69 @@
 //! The built, immutable `ProviderRegistry` and its resolve-by-id surface.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 /// An immutable, explicit catalog of generative-media providers.
+///
+/// Generator descriptors and route records are precomputed and indexed by id once at
+/// [`ProviderRegistryBuilder::build`] time (`AP18`), avoiding repeated descriptor allocations and
+/// linear scans on lookup.
 pub struct ProviderRegistry {
+    pub(super) route_records: Box<[crate::RouteRecord]>,
+    pub(super) route_record_index: BTreeMap<&'static str, usize>,
     pub(super) generators: Box<[ModelRegistration]>,
+    pub(super) generator_descriptors: Box<[ModelDescriptor]>,
+    pub(super) generator_index: BTreeMap<&'static str, usize>,
     pub(super) render_plans: Box<[crate::RenderPlanRegistration]>,
+    pub(super) render_plan_index: BTreeMap<&'static str, usize>,
     pub(super) video_plans: Box<[crate::VideoPlanRegistration]>,
+    pub(super) video_plan_index: BTreeMap<&'static str, usize>,
     pub(super) feature_routes: Box<[FeatureRouteRegistration]>,
+    pub(super) feature_route_index: BTreeMap<&'static str, usize>,
     pub(super) checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
     pub(super) checkpoint_codecs: CheckpointCodecRegistry,
     pub(super) imported_models: Box<[ImportedModelRegistration]>,
     pub(super) encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
+    pub(super) encoder_contract_route_index: BTreeMap<&'static str, usize>,
     pub(super) memory_strategy: Box<[MemoryRegistration]>,
+    pub(super) memory_strategy_index: BTreeMap<&'static str, usize>,
     pub(super) memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
+    pub(super) memory_contract_fixture_index: BTreeMap<&'static str, usize>,
     pub(super) memory_contract_surface_resolver: Box<[MemoryContractSurfaceResolverRegistration]>,
+    pub(super) memory_contract_surface_resolver_index: BTreeMap<&'static str, usize>,
     pub(super) resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
+    pub(super) resident_only_memory_contract_index: BTreeMap<&'static str, usize>,
     pub(super) memory_behavior: Box<[MemoryBehaviorRegistration]>,
     pub(super) activation_memory: Box<[ActivationMemoryRegistration]>,
+    pub(super) activation_memory_index: BTreeMap<&'static str, usize>,
     pub(super) reference_workspace: Box<[ReferenceWorkspaceRegistration]>,
+    pub(super) reference_workspace_index: BTreeMap<&'static str, usize>,
     pub(super) composed_memory_strategy_ids: Box<[&'static str]>,
     pub(super) transforms: Box<[TransformRegistration]>,
+    pub(super) transform_index: BTreeMap<&'static str, usize>,
     pub(super) audio_transforms: Box<[AudioTransformRegistration]>,
+    pub(super) audio_transform_index: BTreeMap<&'static str, usize>,
     pub(super) trainers: Box<[TrainerRegistration]>,
+    pub(super) trainer_index: BTreeMap<&'static str, usize>,
     pub(super) captioners: Box<[CaptionerRegistration]>,
+    pub(super) captioner_index: BTreeMap<&'static str, usize>,
     pub(super) transcribers: Box<[TranscriberRegistration]>,
+    pub(super) transcriber_index: BTreeMap<&'static str, usize>,
     pub(super) image_embedders: Box<[ImageEmbedderRegistration]>,
+    pub(super) image_embedder_index: BTreeMap<&'static str, usize>,
     pub(super) text_embedders: Box<[TextEmbedderRegistration]>,
+    pub(super) text_embedder_index: BTreeMap<&'static str, usize>,
     pub(super) voice_embedders: Box<[VoiceEmbedderRegistration]>,
+    pub(super) voice_embedder_index: BTreeMap<&'static str, usize>,
     pub(super) audio_embedders: Box<[AudioEmbedderRegistration]>,
+    pub(super) audio_embedder_index: BTreeMap<&'static str, usize>,
     pub(super) rejected_quants: Box<[(Quant, &'static str)]>,
 }
 
 macro_rules! explicit_registry_kind {
     (
-        $iter:ident, $load:ident, $field:ident, $registration:ty,
+        $iter:ident, $load:ident, $field:ident, $index:ident, $registration:ty,
         $kind:literal, $trait:ty $(, $wrap:path)?
     ) => {
         pub fn $iter(&self) -> impl ExactSizeIterator<Item = &$registration> {
@@ -43,8 +72,9 @@ macro_rules! explicit_registry_kind {
 
         pub fn $load(&self, id: &str, spec: &LoadSpec) -> Result<Box<$trait>> {
             let registration = self
-                .$iter()
-                .find(|registration| (registration.descriptor)().id == id)
+                .$index
+                .get(id)
+                .map(|&idx| &self.$field[idx])
                 .ok_or_else(|| {
                     Error::Msg(format!(
                         concat!("no ", $kind, " registered for id '{id}'"),
@@ -74,11 +104,47 @@ fn load_with_receipts(
 }
 
 impl ProviderRegistry {
+    /// Every primary [`crate::RouteRecord`] registered through
+    /// [`ProviderRegistryBuilder::register_route`], in registration order.
+    pub fn route_records(&self) -> &[crate::RouteRecord] {
+        &self.route_records
+    }
+
+    /// Look up one registered [`crate::RouteRecord`] by `route_id` in `O(log N)` without
+    /// allocation (`AP18`).
+    pub fn route_record(&self, id: &str) -> Option<&crate::RouteRecord> {
+        self.route_record_index
+            .get(id)
+            .map(|&idx| &self.route_records[idx])
+    }
+
+    /// Every cached generator [`ModelDescriptor`] in registration order (`AP18`).
+    pub fn generator_descriptors(&self) -> &[ModelDescriptor] {
+        &self.generator_descriptors
+    }
+
+    /// Look up a cached generator [`ModelDescriptor`] by `id` in `O(log N)` without re-allocating
+    /// `descriptor()` (`AP18`).
+    pub fn generator_descriptor(&self, id: &str) -> Option<&ModelDescriptor> {
+        self.generator_index
+            .get(id)
+            .map(|&idx| &self.generator_descriptors[idx])
+    }
+
+    /// Run Tier 0 conformance checks across every registered [`crate::RouteRecord`] (`REG-2`).
+    pub fn route_conformance_errors(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+        for route in &self.route_records {
+            errs.extend(crate::route_record_conformance_errors(route));
+        }
+        errs
+    }
+
     /// Look up the pre-load [`crate::RenderPlanRegistration`] for `id`, when registered.
     pub fn render_plan_registration(&self, id: &str) -> Option<&crate::RenderPlanRegistration> {
-        self.render_plans
-            .iter()
-            .find(|entry| entry.provider_id == id)
+        self.render_plan_index
+            .get(id)
+            .map(|&idx| &self.render_plans[idx])
     }
 
     /// Every registered conditioned or platform-composed feature route in this catalog.
@@ -89,16 +155,23 @@ impl ProviderRegistry {
     }
 
     /// Compute structural Feature applicability for `descriptor` in this registry, including any
-    /// conditioned sub-routes bound to `descriptor.id`.
+    /// conditioned sub-routes bound to `descriptor.id` (`HOOK-4`).
+    ///
+    /// When a route is registered via [`ProviderRegistryBuilder::register_route`], structural
+    /// applicability is derived directly from its primary [`crate::RouteRecord`] declaration.
     pub fn generator_feature_applicability(
         &self,
         descriptor: &ModelDescriptor,
     ) -> std::collections::BTreeMap<String, crate::FeatureApplicability> {
         let registry = crate::FeatureRegistry::standard();
-        let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
-            descriptor,
-            self.render_plan_registration(descriptor.id),
-        );
+        let route = if let Some(record) = self.route_record(descriptor.id) {
+            crate::FeatureRouteStructure::from_route_record(record)
+        } else {
+            crate::FeatureRouteStructure::from_descriptor_and_plan(
+                descriptor,
+                self.render_plan_registration(descriptor.id),
+            )
+        };
         let mut features = registry.evaluate_route(&route);
 
         for child in self
@@ -106,12 +179,16 @@ impl ProviderRegistry {
             .iter()
             .filter(|r| r.parent_provider_id == Some(descriptor.id))
         {
-            let mut child_desc = (child.descriptor)();
-            child_desc.id = child.route_id;
-            let child_route = crate::FeatureRouteStructure::from_descriptor_and_plan(
-                &child_desc,
-                child.render_plan.as_ref(),
-            );
+            let child_route = if let Some(record) = self.route_record(child.route_id) {
+                crate::FeatureRouteStructure::from_route_record(record)
+            } else {
+                let mut child_desc = (child.descriptor)();
+                child_desc.id = child.route_id;
+                crate::FeatureRouteStructure::from_descriptor_and_plan(
+                    &child_desc,
+                    child.render_plan.as_ref(),
+                )
+            };
             let child_features = registry.evaluate_route(&child_route);
             for (feature_id, child_app) in child_features {
                 if let Some(parent_app) = features.get_mut(&feature_id) {
@@ -124,8 +201,8 @@ impl ProviderRegistry {
         features
     }
 
-    /// Compute structural Feature applicability for every registered generator and conditioned
-    /// feature route in this catalog, keyed by `route_id -> feature_id -> FeatureApplicability`.
+    /// Compute structural Feature applicability for every registered generator, route record, and
+    /// conditioned feature route in this catalog, keyed by `route_id -> feature_id -> FeatureApplicability`.
     pub fn all_route_feature_applicability(
         &self,
     ) -> std::collections::BTreeMap<
@@ -134,43 +211,51 @@ impl ProviderRegistry {
     > {
         let registry = crate::FeatureRegistry::standard();
         let mut all = std::collections::BTreeMap::new();
-        for generator in &self.generators {
-            let descriptor = (generator.descriptor)();
+        for descriptor in &self.generator_descriptors {
             all.insert(
                 descriptor.id.to_string(),
-                self.generator_feature_applicability(&descriptor),
+                self.generator_feature_applicability(descriptor),
             );
         }
         for feature_route in &self.feature_routes {
-            let mut descriptor = (feature_route.descriptor)();
-            descriptor.id = feature_route.route_id;
-            let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
-                &descriptor,
-                feature_route.render_plan.as_ref(),
-            );
             all.entry(feature_route.route_id.to_string())
-                .or_insert_with(|| registry.evaluate_route(&route));
+                .or_insert_with(|| {
+                    let route = if let Some(record) = self.route_record(feature_route.route_id) {
+                        crate::FeatureRouteStructure::from_route_record(record)
+                    } else {
+                        let mut descriptor = (feature_route.descriptor)();
+                        descriptor.id = feature_route.route_id;
+                        crate::FeatureRouteStructure::from_descriptor_and_plan(
+                            &descriptor,
+                            feature_route.render_plan.as_ref(),
+                        )
+                    };
+                    registry.evaluate_route(&route)
+                });
+        }
+        for record in &self.route_records {
+            all.entry(record.route_id.to_string())
+                .or_insert_with(|| registry.evaluate_route_record(record));
         }
         all
     }
 
-    /// Compute structural Feature applicability for a specific `route_id` (ordinary generator or
-    /// registered conditioned feature route).
+    /// Compute structural Feature applicability for a specific `route_id` (ordinary generator,
+    /// registered route record, or conditioned feature route).
     pub fn route_feature_applicability(
         &self,
         route_id: &str,
     ) -> Option<std::collections::BTreeMap<String, crate::FeatureApplicability>> {
-        if let Some(generator) = self
-            .generators
-            .iter()
-            .find(|g| (g.descriptor)().id == route_id)
-        {
-            return Some(self.generator_feature_applicability(&(generator.descriptor)()));
+        if let Some(descriptor) = self.generator_descriptor(route_id) {
+            return Some(self.generator_feature_applicability(descriptor));
+        }
+        if let Some(record) = self.route_record(route_id) {
+            return Some(crate::FeatureRegistry::standard().evaluate_route_record(record));
         }
         let feature_route = self
-            .feature_routes
-            .iter()
-            .find(|r| r.route_id == route_id)?;
+            .feature_route_index
+            .get(route_id)
+            .map(|&idx| &self.feature_routes[idx])?;
         let mut descriptor = (feature_route.descriptor)();
         descriptor.id = feature_route.route_id;
         let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
@@ -187,11 +272,7 @@ impl ProviderRegistry {
         spec: &LoadSpec,
         request: &crate::GenerationRequest,
     ) -> Result<Option<crate::RenderPlan>> {
-        let Some(planner) = self
-            .render_plans
-            .iter()
-            .find(|entry| entry.provider_id == id)
-        else {
+        let Some(planner) = self.render_plan_registration(id) else {
             return Ok(None);
         };
         self.ensure_quant_supported(id, spec, "generator")?;
@@ -206,18 +287,15 @@ impl ProviderRegistry {
         request: &crate::GenerationRequest,
     ) -> Result<Option<crate::VideoRenderPlan>> {
         let Some(registration) = self
-            .video_plans
-            .iter()
-            .find(|entry| entry.provider_id == id)
+            .video_plan_index
+            .get(id)
+            .map(|&idx| &self.video_plans[idx])
         else {
             return Ok(None);
         };
         self.ensure_quant_supported(id, spec, "generator")?;
         let backend = self
-            .generators
-            .iter()
-            .map(|entry| (entry.descriptor)())
-            .find(|desc| desc.id == id)
+            .generator_descriptor(id)
             .expect("registered video plan has an owning generator")
             .backend;
         crate::VideoRenderPlan::compile(registration, backend, spec, request)
@@ -472,24 +550,14 @@ impl ProviderRegistry {
     /// `None`; aliases are validated at registry construction and cannot target another alias or a
     /// provider without a contract.
     pub fn provider_encoder_contract(&self, id: &str) -> Option<crate::EncoderContract> {
-        if let Some(descriptor) = self
-            .generators
-            .iter()
-            .map(|registration| (registration.descriptor)())
-            .find(|descriptor| descriptor.id == id)
-        {
+        if let Some(descriptor) = self.generator_descriptor(id) {
             return descriptor.encoder_contract;
         }
         let provider_id = self
-            .encoder_contract_routes
-            .iter()
-            .find(|registration| registration.route_id == id)?
-            .provider_id;
-        self.generators
-            .iter()
-            .map(|registration| (registration.descriptor)())
-            .find(|descriptor| descriptor.id == provider_id)?
-            .encoder_contract
+            .encoder_contract_route_index
+            .get(id)
+            .map(|&idx| self.encoder_contract_routes[idx].provider_id)?;
+        self.generator_descriptor(provider_id)?.encoder_contract
     }
 
     /// Every provider-owned bespoke route participating in encoder-contract lookup.
@@ -529,11 +597,7 @@ impl ProviderRegistry {
         let route = self.imported_models.iter().find(|route| {
             route.family == family && route.source == source && route.operation == operation
         })?;
-        let mut descriptor = self
-            .generators
-            .iter()
-            .find(|registration| (registration.descriptor)().id == route.provider_id)
-            .map(|registration| (registration.descriptor)())?;
+        let mut descriptor = self.generator_descriptor(route.provider_id)?.clone();
         if !route.inherit_adapters {
             descriptor.capabilities.supports_lora = false;
             descriptor.capabilities.supports_lokr = false;
@@ -615,18 +679,15 @@ impl ProviderRegistry {
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
     pub fn activation_memory_bytes_1024(&self, id: &str) -> Result<Option<u64>> {
-        let has_generator = self
-            .generators()
-            .any(|registration| (registration.descriptor)().id == id);
+        let has_generator = self.generator_index.contains_key(id);
         let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
         if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         Ok(self
-            .activation_memory
-            .iter()
-            .find(|registration| registration.provider_id == id)
-            .map(|registration| registration.anchor.bytes_1024))
+            .activation_memory_index
+            .get(id)
+            .map(|&idx| self.activation_memory[idx].anchor.bytes_1024))
     }
 
     /// Provider-owned PRE-FIT bytes of a request's reference work for generator `id` on `spec`.
@@ -639,16 +700,13 @@ impl ProviderRegistry {
         spec: &LoadSpec,
         facts: Option<&crate::MemoryReferenceResourceFacts>,
     ) -> Result<Option<u64>> {
-        if !self
-            .generators()
-            .any(|registration| (registration.descriptor)().id == id)
-        {
+        if !self.generator_index.contains_key(id) {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
         }
         let Some(registration) = self
-            .reference_workspace
-            .iter()
-            .find(|registration| registration.provider_id == id)
+            .reference_workspace_index
+            .get(id)
+            .map(|&idx| &self.reference_workspace[idx])
         else {
             return Ok(None);
         };
@@ -695,17 +753,17 @@ impl ProviderRegistry {
         let mut out = Vec::new();
         for registration in &self.memory_strategy {
             let fixture = self
-                .memory_contract_fixture
-                .iter()
-                .find(|fixture| fixture.provider_id == registration.provider_id);
+                .memory_contract_fixture_index
+                .get(registration.provider_id)
+                .map(|&idx| &self.memory_contract_fixture[idx]);
             let resident_only = self
-                .resident_only_memory_contract
-                .iter()
-                .find(|witness| witness.provider_id == registration.provider_id);
+                .resident_only_memory_contract_index
+                .get(registration.provider_id)
+                .map(|&idx| &self.resident_only_memory_contract[idx]);
             let surface_resolver = self
-                .memory_contract_surface_resolver
-                .iter()
-                .find(|resolver| resolver.provider_id == registration.provider_id);
+                .memory_contract_surface_resolver_index
+                .get(registration.provider_id)
+                .map(|&idx| &self.memory_contract_surface_resolver[idx]);
             let (surface_specs, contract_factory, is_resident_only) = match (fixture, resident_only) {
                 (Some(fixture), None) => (fixture.surface_specs, fixture.contract, false),
                 (None, Some(witness)) => (witness.surface_specs, witness.contract, true),
@@ -849,10 +907,8 @@ impl ProviderRegistry {
                 // parallel builder allow-list or model-id exception exists.
                 if quant == Quant::Fp8Rowwise
                     && (kind != "generator"
-                        || !self.generators().any(|registration| {
-                            let descriptor = (registration.descriptor)();
-                            descriptor.id == id
-                                && descriptor.capabilities.supported_quants.contains(&quant)
+                        || !self.generator_descriptor(id).is_some_and(|descriptor| {
+                            descriptor.capabilities.supported_quants.contains(&quant)
                         }))
                 {
                     return Err(Error::Unsupported(format!("provider '{id}' does not advertise the exact fp8r packed format (it is not Q8); install/convert a compatible artifact and select a supported native tier")));
@@ -866,6 +922,7 @@ impl ProviderRegistry {
         generators,
         load,
         generators,
+        generator_index,
         ModelRegistration,
         "generator",
         dyn Generator,
@@ -875,6 +932,7 @@ impl ProviderRegistry {
         transforms,
         load_transform,
         transforms,
+        transform_index,
         TransformRegistration,
         "transform",
         dyn Transform,
@@ -884,6 +942,7 @@ impl ProviderRegistry {
         audio_transforms,
         load_audio_transform,
         audio_transforms,
+        audio_transform_index,
         AudioTransformRegistration,
         "audio transform",
         dyn AudioTransform,
@@ -893,6 +952,7 @@ impl ProviderRegistry {
         trainers,
         load_trainer,
         trainers,
+        trainer_index,
         TrainerRegistration,
         "trainer",
         dyn Trainer
@@ -901,6 +961,7 @@ impl ProviderRegistry {
         captioners,
         load_captioner,
         captioners,
+        captioner_index,
         CaptionerRegistration,
         "captioner",
         dyn Captioner,
@@ -910,6 +971,7 @@ impl ProviderRegistry {
         transcribers,
         load_transcriber,
         transcribers,
+        transcriber_index,
         TranscriberRegistration,
         "transcriber",
         dyn Transcriber,
@@ -919,6 +981,7 @@ impl ProviderRegistry {
         image_embedders,
         load_image_embedder,
         image_embedders,
+        image_embedder_index,
         ImageEmbedderRegistration,
         "image embedder",
         dyn ImageEmbedder,
@@ -928,6 +991,7 @@ impl ProviderRegistry {
         text_embedders,
         load_text_embedder,
         text_embedders,
+        text_embedder_index,
         TextEmbedderRegistration,
         "text embedder",
         dyn TextEmbedder,
@@ -937,6 +1001,7 @@ impl ProviderRegistry {
         voice_embedders,
         load_voice_embedder,
         voice_embedders,
+        voice_embedder_index,
         VoiceEmbedderRegistration,
         "voice embedder",
         dyn VoiceEmbedder,
@@ -946,6 +1011,7 @@ impl ProviderRegistry {
         audio_embedders,
         load_audio_embedder,
         audio_embedders,
+        audio_embedder_index,
         AudioEmbedderRegistration,
         "audio embedder",
         dyn AudioEmbedder,
@@ -959,8 +1025,9 @@ impl ProviderRegistry {
     /// deliberately choose whether to fail open.
     pub fn footprint(&self, id: &str, spec: &LoadSpec) -> Result<Option<PerComponentBytes>> {
         let registration = self
-            .generators()
-            .find(|registration| (registration.descriptor)().id == id)
+            .generator_index
+            .get(id)
+            .map(|&idx| &self.generators[idx])
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
         if spec.quantize == Some(Quant::Fp8Rowwise) {
             self.ensure_quant_supported(id, spec, "generator")?;
@@ -982,9 +1049,7 @@ impl ProviderRegistry {
         id: &str,
         spec: &LoadSpec,
     ) -> Result<Option<MemoryProviderContract>> {
-        let has_generator = self
-            .generators()
-            .any(|registration| (registration.descriptor)().id == id);
+        let has_generator = self.generator_index.contains_key(id);
         let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
         if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
@@ -993,9 +1058,9 @@ impl ProviderRegistry {
             self.ensure_quant_supported(id, spec, "generator")?;
         }
         let Some(registration) = self
-            .memory_strategy
-            .iter()
-            .find(|registration| registration.provider_id == id)
+            .memory_strategy_index
+            .get(id)
+            .map(|&idx| &self.memory_strategy[idx])
         else {
             return Ok(None);
         };
@@ -1010,9 +1075,9 @@ impl ProviderRegistry {
         Ok(Some(contract))
     }
 
-    /// Run the weights-free descriptor conformance sweep over this explicit catalog.
+    /// Run the weights-free descriptor and route conformance sweep over this explicit catalog.
     pub fn descriptor_conformance_errors(&self) -> Vec<String> {
-        descriptor_conformance_errors_for(
+        let mut errs = descriptor_conformance_errors_for(
             &self.generators,
             &self.transforms,
             &self.audio_transforms,
@@ -1023,7 +1088,15 @@ impl ProviderRegistry {
             &self.text_embedders,
             &self.voice_embedders,
             &self.audio_embedders,
-        )
+        );
+        for route in &self.route_records {
+            for err in crate::route_record_conformance_errors(route) {
+                if !errs.contains(&err) {
+                    errs.push(err);
+                }
+            }
+        }
+        errs
     }
 }
 

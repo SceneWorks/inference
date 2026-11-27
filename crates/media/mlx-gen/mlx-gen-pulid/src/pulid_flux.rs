@@ -25,7 +25,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
+    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
@@ -49,58 +49,147 @@ const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
 const ARCFACE_DIM: i32 = 512;
 pub const MODEL_ID: &str = "pulid_flux";
 
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for PuLID-FLUX (`REG-1`, `AP5`).
+pub(crate) fn route_pulid_flux() -> gen_core::RouteRecord {
+    let mut samplers = curated_sampler_names();
+    samplers.push("flow_match");
+    let mut schedulers = curated_scheduler_names();
+    schedulers.push("linear");
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "pulid",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // PuLID drives its OWN real-CFG (sc-3075): `generate` reads `req.true_cfg` (>1 enables the
-            // pos/neg identity branches) and `req.negative_prompt` (the negative branch text). The
-            // descriptor must advertise what `generate` actually honors, else the shared floor (which
-            // `validate` now delegates to, F-026) would reject the very request that drives the feature.
-            supports_negative_prompt: true, // honored in the real-CFG branch (sc-3075)
-            supports_guidance: true,        // FLUX.1-dev guidance-distilled CFG (default ~4.0)
-            supports_true_cfg: true, // >1 enables real-CFG pos/neg identity branches (sc-3075)
-            conditioning: vec![ConditioningKind::Reference], // the reference face
-            supports_lora: false,
-            // Epic 7114 (sc-7297): PuLID delegates its denoise to the FLUX.1-dev backbone
-            // (`generate_with_injector_cfg` → `run_denoise` → `run_flow_sampler`), which already
-            // honors the full curated integrator menu over the flow-match σ schedule AND the curated
-            // scheduler axis (it threads `req.sampler` / `req.scheduler`). The descriptor previously
-            // advertised only `flow_match`, silently N3-dropping every curated name; mirror the
-            // backbone's menu so the curated samplers are selectable. `hyper` is intentionally NOT
-            // advertised — it needs the dev Hyper-FLUX LoRA loaded at scale, which PuLID does not load.
-            // Pure advertised-name change: the curated names route through the SAME, already-tested
-            // FLUX flow denoise (no new code path, parity by construction). `flow_match` kept as the
-            // legacy default alias (== Euler); `linear` kept as the native default scheduler.
-            samplers: {
-                let mut s = curated_sampler_names();
-                s.push("flow_match");
-                s
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![
+                    gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                    gen_core::TextEncoderDeclaration::new("t5_xxl", Some(512)),
+                ],
+                ..Default::default()
             },
-            schedulers: {
-                let mut s = curated_scheduler_names();
-                s.push("linear");
-                s
+            conditioning: gen_core::ConditioningSurface {
+                // The reference face; PuLID drives its own real-CFG (sc-3075).
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: true,
+                modules: vec!["pulid_idformer", "eva_clip", "arcface"],
             },
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            requires_sigma_shift: true, // dev
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            pag: Some(FluxVariant::Dev.pag_capability()),
+            sampling: gen_core::SamplingSurface {
+                samplers,
+                schedulers,
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("flux1_mmdit_pulid")
+                    .with_pag(FluxVariant::Dev.pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(mlx_gen_flux::SIZE_MULTIPLE),
+                token_width: Some(mlx_gen_flux::PACKED_TOKEN_WIDTH as u32),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["clip_l", "t5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["eva_clip", "pulid_idformer"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["flux1_mmdit_pulid"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: true,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(FluxVariant::Dev.default_steps()),
+            guidance: Some(4.0),
+            sampler: Some("flow_match"),
+            schedule: Some("linear"),
+            shift: Some(1.15),
+            strength: Some(1.0),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load_pulid_flux(spec).map_err(Into::into)
+        })
+        .with_render_plan(compile_plan)
+        .with_memory_registration(MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            gen_core::mlx_memory_contract_surface_specs,
+            crate::memory_strategy::weights_free_contract,
+        )
+        .with_memory_behavior_registration(MEMORY_BEHAVIOR),
     }
+}
+
+/// Conditioned feature sub-route for PuLID over FLUX.1-dev (`REG-1`, `AP5`).
+pub(crate) fn route_flux1_dev_pulid() -> gen_core::RouteRecord {
+    let mut route = route_pulid_flux();
+    route.route_id = "flux1_dev_pulid";
+    route.bindings =
+        gen_core::RouteBindings::feature_route(Some("flux1_dev"), descriptor)
+            .with_render_plan(compile_plan);
+    route
+}
+
+pub fn descriptor() -> ModelDescriptor {
+    route_pulid_flux().compute_descriptor()
 }
 
 /// L2-normalize each row of `[B, D]` over the feature axis (the PuLID `id_cond_vit` normalization).
@@ -794,14 +883,6 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
         identity_inventory,
     )?))
-}
-
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`. The `impl
-// Generator` above stays hand-written because `validate` adds a reference-face check beyond the
-// FLUX backbone's, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load_pulid_flux
 }
 
 pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {

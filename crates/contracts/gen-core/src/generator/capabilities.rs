@@ -18,13 +18,11 @@ use super::*;
 /// # ;
 /// ```
 ///
-/// This is not a style preference. Every descriptor in the workspace constructs `Capabilities`
-/// from another crate, so a new field lands in ~70 files at once unless each construction ends in
-/// `..Default::default()` (or another base). `#[non_exhaustive]` cannot enforce it — that
-/// attribute makes cross-crate construction impossible outright (E0639), and so does a private
-/// field (E0451) — so the invariant is enforced by the
-/// `capabilities_are_constructed_additively` integration test instead, which reads every `.rs`
-/// file in the workspace and fails on any `Capabilities { .. }` literal with no base expression.
+/// This is not a style preference. In production code, every provider's [`Capabilities`] is
+/// computed exhaustively by [`crate::RouteRecord::compute_capabilities`] rather than constructed
+/// directly from provider crates (enforced by the `route_record_registration` integration test),
+/// so adding a new field is a single exhaustive update in `gen-core`. Test fixtures outside
+/// `gen-core` that construct a `Capabilities` literal should still use `..Default::default()`.
 ///
 /// # Measured cost of adding a field (sc-19561 AC1)
 ///
@@ -45,7 +43,7 @@ use super::*;
 ///
 /// Reproduce the parent count with the same parser the guard uses — it is the guard, run over a
 /// different revision.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
     pub supports_guidance: bool,

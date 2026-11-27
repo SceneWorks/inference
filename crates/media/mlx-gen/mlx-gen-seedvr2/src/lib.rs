@@ -42,9 +42,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(registry::BASE_REGISTRATION)
-        .register_generator(registry::THREE_B_REGISTRATION)
-        .register_generator(registry::SEVEN_B_REGISTRATION)
+        .register_route(registry::route_base())
+        .register_route(registry::route_3b())
+        .register_route(registry::route_7b())
 }
 
 /// Build the complete explicit MLX SeedVR2 provider catalog.

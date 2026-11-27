@@ -212,11 +212,7 @@ pub fn register_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: model::compile_sdxl,
-        })
+        .register_route(model::route_sdxl())
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 mlx_gen::gen_core::CheckpointBackendBindingRegistration {
@@ -238,22 +234,6 @@ pub fn register_generator(
             ],
             ..mlx_gen::gen_core::SDXL_CHECKPOINT_ADAPTER
         })
-        .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
-        .register_memory_strategy(model::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: MODEL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX SDXL provider catalog.

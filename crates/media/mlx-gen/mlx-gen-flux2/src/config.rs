@@ -7,9 +7,18 @@
 //! `transformer_overrides` / `text_encoder_overrides` (block/head counts, the Qwen3 hidden /
 //! intermediate sizes); everything else is shared.
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
+    FLUX2_PACKED_LATENT_SPACE,
+};
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, ConditioningKind, Modality, ModelDescriptor,
+    Quant,
 };
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
@@ -402,11 +411,8 @@ impl Flux2Variant {
         }
     }
 
-    pub fn descriptor(self) -> ModelDescriptor {
-        // Conditioning surface by variant: the edit variant consumes one `Reference` (single image,
-        // token concat, sc-2346) or one `MultiReference` (N images, sc-2645); txt2img consumes a
-        // single `Reference` as an **img2img** init image seeding the latents via the noise blend
-        // (sc-2644). Advertise what this port delivers, no more, no less.
+    /// Primary typed route declaration for this FLUX.2 base or edit variant (`REG-1`, `AP5`).
+    pub fn route_record(self) -> RouteRecord {
         let conditioning = if self.is_edit() {
             vec![
                 ConditioningKind::Reference,
@@ -415,65 +421,125 @@ impl Flux2Variant {
         } else {
             vec![ConditioningKind::Reference]
         };
-        ModelDescriptor {
-            encoder_contract: Some(self.encoder_contract()),
-            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-            control_kinds: None,
-            required_components: &[],
-            id: self.id(),
+        let mut schedulers = curated_scheduler_names();
+        schedulers.push("flow_match_euler");
+        let (te_name, dit_name) = if self.is_dev() {
+            ("mistral3_24b", "flux2_dev_mmdit")
+        } else {
+            ("qwen3_8b", "flux2_klein_mmdit")
+        };
+        let mut model_spec = FamilyModelSpec::new(dit_name).with_pag(self.pag_capability());
+        if !self.is_edit() {
+            model_spec = model_spec.with_low_res_start();
+        }
+
+        RouteRecord {
+            route_id: self.id(),
             family: "flux2",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities {
-                // Klein defaults to guidance 1.0 (CFG-free), but every Klein variant runs a
-                // classifier-free negative pass when callers explicitly request guidance > 1.
-                // Dev consumes guidance as an embedded scalar and never takes that negative pass.
-                supports_negative_prompt: !self.uses_embedded_guidance(),
-                supports_guidance: true,
-                conditioning,
-                // Transformer-only LoRA/LoKr (sc-2646): both variants share the `Flux2Transformer`,
-                // which hosts the adapters; the VAE + Qwen3 TE are not adapter targets.
-                supports_lora: true,
-                supports_lokr: true,
-                supported_quants: &[Quant::Q4, Quant::Q8],
-                // Curated unified-framework integrator menu (epic 7114 P3). An unset `req.sampler` is
-                // the curated Euler over the resolution-shifted flow schedule.
-                samplers: curated_sampler_names(),
-                // Curated scheduler menu (epic 7114). An unset `req.scheduler` (or the `flow_match_euler`
-                // alias) is the native empirical-mu schedule; a curated name re-shapes σ over the same mu.
-                schedulers: {
-                    let mut s = curated_scheduler_names();
-                    s.push("flow_match_euler");
-                    s
+            mac_only: true,
+            structure: RouteStructure {
+                text_encoders: TextEncoderSurface {
+                    encoders: vec![TextEncoderDeclaration::new(te_name, Some(512))],
+                    encoder_contract: Some(self.encoder_contract()),
+                    max_prompt_tokens: None,
+                    supports_caption_overflow_policy: false,
+                    supports_prompt_enhancement: self.is_dev(),
                 },
-                min_size: 256,
-                max_size: 2048,
-                max_count: 8,
-                mac_only: true,
-                // Only the 9b-kv edit variant runs the reference-K/V cache (sc-2347).
-                supports_kv_cache: self.is_kv(),
-                // FLUX.2 uses the empirical-mu shifted flow-match schedule.
-                requires_sigma_shift: true,
-                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
-                // text encoder (Qwen3 / dev Mistral-3 + its Pixtral vision tower + projector) drops
-                // after the prompt encode (and any dev caption upsample), then the DiT + VAE load,
-                // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
-                // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
-                supports_sequential_offload: true,
-                supports_preview: true,
-                supports_low_res_start: !self.is_edit(),
-                // Dev (txt2img + edit) loads the Mistral3/Pixtral caption upsampler and consults
-                // `GenerationRequest::enhance_prompt`; Klein returns the raw prompt unchanged.
-                supports_prompt_enhancement: self.is_dev(),
-                // sc-18317: the typed graph-evaluation cadence + FFN chunk this family's MMDiT
-                // forward consumes (`chunk::MemoryConfig`). Declared here, on every base FLUX.2
-                // descriptor, because `model.rs`'s denoise threads the request through
-                // `MemoryConfig::with_request` on every route — gated long-sequence edit or not.
+                conditioning: ConditioningSurface {
+                    kinds: conditioning,
+                    control_kinds: None,
+                    pass0_requirement: if self.is_edit() {
+                        Pass0ConditioningRequirement::RequiresEdit
+                    } else {
+                        Pass0ConditioningRequirement::NoiseStartSupported
+                    },
+                    supports_negative_prompt: !self.uses_embedded_guidance(),
+                    modules: if self.is_edit() {
+                        vec!["flux2_ref_token_concat"]
+                    } else {
+                        vec![]
+                    },
+                },
+                sampling: SamplingSurface {
+                    samplers: curated_sampler_names(),
+                    schedulers,
+                    guidance_methods: vec![],
+                    supports_guidance: true,
+                    supports_true_cfg: false,
+                    supports_cfg_interval: false,
+                    requires_sigma_shift: true,
+                    supports_h3_image_sampler: false,
+                },
+                denoiser: ModelBinding::family_model(model_spec),
+                latent_codec: LatentCodecDeclaration {
+                    codec_id: Some("flux2_ae"),
+                    output_latent_space: Some(&FLUX2_PACKED_LATENT_SPACE),
+                    pixel_stride: Some(SIZE_MULTIPLE),
+                    token_width: Some(128),
+                    supports_diffusion_decoder: false,
+                },
+                upsamplers: UpsamplerSurface {
+                    components: vec!["pid_decoder"],
+                    max_temporal_upsample_rounds: 0,
+                },
+                adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+                residency: ResidencySurface {
+                    lifetime_graph: vec![
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, [te_name], true),
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, [dit_name], false),
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux2_ae"], false),
+                    ],
+                    supports_sequential_offload: true,
+                    supports_kv_cache: self.is_kv(),
+                    ..Default::default()
+                },
+                weight_plan: WeightPlanDeclaration {
+                    source_kind: WeightSourceKind::SnapshotDirectory,
+                    supported_quants: &[Quant::Q4, Quant::Q8],
+                    component_precision_floors: &[],
+                    required_components: &[],
+                    requires_control_overlay: false,
+                    requires_ip_adapter_overlay: false,
+                    requires_identity_overlay: false,
+                },
+                output: OutputSurface {
+                    preview: PreviewSupport::LatentProjection,
+                    supports_hdr: false,
+                    supports_alpha_output: false,
+                },
                 execution: crate::chunk::EXECUTION_SURFACE,
-                pag: Some(self.pag_capability()),
                 ..Default::default()
             },
+            limits: ProductLimits {
+                min_size: 256,
+                max_size: 2048,
+                size_floor: SizeFloor::RangeChecked,
+                supported_steps: StepSupport::Unconstrained,
+                max_audio_duration_secs: None,
+            },
+            seed_and_batch: SeedAndBatchSemantics {
+                seed_scheme: SeedScheme::BackendGlobalSeeded,
+                max_count: 8,
+                supports_prompt_batch: false,
+            },
+            defaults: RouteDefaults {
+                steps: Some(self.default_steps()),
+                guidance: Some(self.default_guidance()),
+                sampler: Some("euler"),
+                schedule: Some("flow_match_euler"),
+                shift: None,
+                strength: None,
+                dimensions: Some((DEFAULT_WIDTH, DEFAULT_HEIGHT)),
+                ..Default::default()
+            },
+            bindings: RouteBindings::default(),
         }
+    }
+
+    pub fn descriptor(self) -> ModelDescriptor {
+        self.route_record().compute_descriptor()
     }
 }
 

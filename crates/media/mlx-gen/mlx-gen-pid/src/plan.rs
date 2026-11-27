@@ -5,8 +5,10 @@
 //! (`RenderStage::Decode`) plan construction before running pixel-space decode compute.
 
 use mlx_gen::gen_core::{
-    Capabilities, Error as CoreError, GenerationRequest, Modality, ModelDescriptor, RenderPlan,
-    Result as CoreResult,
+    Error as CoreError, FamilyModelSpec, GenerationRequest, Modality, ModelBinding,
+    ModelDescriptor, ProductLimits, RenderPlan, Result as CoreResult, RouteBindings,
+    RouteDefaults, RouteRecord, RouteStructure, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    StepSupport, TextEncoderDeclaration, TextEncoderSurface,
 };
 use mlx_gen::{Error, Result};
 
@@ -21,20 +23,45 @@ pub const STUDENT_SCHEDULE: [f32; 5] = [0.999, 0.866, 0.634, 0.342, 0.0];
 /// Released flow-matching timestep scale factor (`t * fm_timescale`).
 pub const FM_TIMESCALE: f32 = 1000.0;
 
-fn pid_decode_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        id: "pid",
-        backend: "mlx",
+/// Primary typed route declaration for standalone PiD decode-stage planning (`REG-1`, `AP5`).
+pub fn route_pid_decode() -> RouteRecord {
+    RouteRecord {
+        route_id: "pid",
         family: "pid",
+        backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
+        mac_only: false,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("gemma2", None)],
+                ..Default::default()
+            },
+            denoiser: ModelBinding::family_model(FamilyModelSpec::new("pid_pixdit")),
             ..Default::default()
         },
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
+        limits: ProductLimits {
+            min_size: 256,
+            max_size: 8192,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Exact(vec![4]),
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(4),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::default(),
     }
+}
+
+fn pid_decode_descriptor() -> ModelDescriptor {
+    route_pid_decode().compute_descriptor()
 }
 
 /// Spatial-tiling resolution plan for one PiD decode invocation.
@@ -367,6 +394,11 @@ impl PidDecodePlan {
 mod tests {
     use super::*;
     use mlx_gen::gen_core::GenerationMemory;
+
+    #[test]
+    fn pid_decode_route_conforms() {
+        mlx_gen::gen_core::verify_route_conformance(&route_pid_decode()).unwrap();
+    }
 
     #[test]
     fn pid_decode_plan_compiles_default_schedule_and_from_ldm_capture() {

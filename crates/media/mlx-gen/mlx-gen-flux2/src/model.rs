@@ -2468,43 +2468,121 @@ pub(crate) fn dev_control_component_footprint(
     )
 }
 
-// Keep footprint callbacks as direct function pointers so the public production catalog mapping
-// can be verified without opening or hashing a model artifact. The load closures retain the same
-// backend-error conversion supplied by `register_generators!`.
-pub(crate) const KLEIN_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
-    mlx_gen::gen_core::ModelRegistration {
-        descriptor: descriptor_klein_9b,
-        load: |spec| load_klein_9b(spec).map_err(Into::into),
-        footprint: Some(component_footprint),
-    };
+pub fn route_klein() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Flux2Variant::Klein9b.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_klein_9b, |spec| {
+        load_klein_9b(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(Flux2Variant::Klein9b, spec, req))
+    .with_activation_memory(crate::KLEIN_ACTIVATION_MEMORY_REGISTRATION.anchor)
+    .with_memory_registration(KLEIN_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| {
+            crate::memory_strategy::weights_free_klein_contract(
+                crate::config::FLUX2_KLEIN_9B_ID,
+                spec,
+            )
+        },
+    )
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_klein_surface_contract(
+            crate::config::FLUX2_KLEIN_9B_ID,
+            surface,
+        )
+    })
+    .with_memory_behavior_registration(KLEIN_MEMORY_BEHAVIOR);
+    route
+}
 
-pub(crate) const KLEIN_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
-    mlx_gen::gen_core::ModelRegistration {
-        descriptor: descriptor_klein_9b_edit,
-        load: |spec| load_klein_9b_edit(spec).map_err(Into::into),
-        footprint: Some(klein_edit_component_footprint),
-    };
+pub fn route_klein_edit() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Flux2Variant::Klein9bEdit.route_record();
+    route.bindings =
+        mlx_gen::gen_core::RouteBindings::generator(descriptor_klein_9b_edit, |spec| {
+            load_klein_9b_edit(spec).map_err(Into::into)
+        })
+        .with_footprint(klein_edit_component_footprint)
+        .with_render_plan(|spec, req| compile_base(Flux2Variant::Klein9bEdit, spec, req))
+        .with_memory_registration(KLEIN_EDIT_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| {
+                crate::memory_strategy::weights_free_klein_contract(
+                    crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+                    spec,
+                )
+            },
+        )
+        .with_memory_surface_resolver(|surface| {
+            crate::memory_strategy::weights_free_klein_surface_contract(
+                crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+                surface,
+            )
+        })
+        .with_memory_behavior_registration(KLEIN_EDIT_MEMORY_BEHAVIOR);
+    route
+}
 
-pub(crate) const KLEIN_KV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
-    mlx_gen::gen_core::ModelRegistration {
-        descriptor: descriptor_klein_9b_kv_edit,
-        load: |spec| load_klein_9b_kv_edit(spec).map_err(Into::into),
-        footprint: Some(klein_kv_edit_component_footprint),
-    };
+pub fn route_klein_kv_edit() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Flux2Variant::Klein9bKvEdit.route_record();
+    route.bindings =
+        mlx_gen::gen_core::RouteBindings::generator(descriptor_klein_9b_kv_edit, |spec| {
+            load_klein_9b_kv_edit(spec).map_err(Into::into)
+        })
+        .with_footprint(klein_kv_edit_component_footprint)
+        .with_render_plan(|spec, req| compile_base(Flux2Variant::Klein9bKvEdit, spec, req))
+        .with_memory_registration(KLEIN_KV_EDIT_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| {
+                crate::memory_strategy::weights_free_klein_contract(
+                    crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                    spec,
+                )
+            },
+        )
+        .with_memory_surface_resolver(|surface| {
+            crate::memory_strategy::weights_free_klein_surface_contract(
+                crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                surface,
+            )
+        })
+        .with_memory_behavior_registration(KLEIN_KV_EDIT_MEMORY_BEHAVIOR);
+    route
+}
 
-pub(crate) const DEV_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
-    mlx_gen::gen_core::ModelRegistration {
-        descriptor: descriptor_dev,
-        load: |spec| load_dev(spec).map_err(Into::into),
-        footprint: Some(dev_component_footprint),
-    };
+pub fn route_dev() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Flux2Variant::Dev.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_dev, |spec| {
+        load_dev(spec).map_err(Into::into)
+    })
+    .with_footprint(dev_component_footprint)
+    .with_render_plan(|spec, req| compile_base(Flux2Variant::Dev, spec, req))
+    .with_memory_registration(DEV_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        crate::memory_strategy::registered_dev_t2i_contract,
+    )
+    .with_memory_behavior_registration(DEV_MEMORY_BEHAVIOR);
+    route
+}
 
-pub(crate) const DEV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
-    mlx_gen::gen_core::ModelRegistration {
-        descriptor: descriptor_dev_edit,
-        load: |spec| load_dev_edit(spec).map_err(Into::into),
-        footprint: Some(dev_edit_component_footprint),
-    };
+pub fn route_dev_edit() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Flux2Variant::DevEdit.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor_dev_edit, |spec| {
+        load_dev_edit(spec).map_err(Into::into)
+    })
+    .with_footprint(dev_edit_component_footprint)
+    .with_render_plan(|spec, req| compile_base(Flux2Variant::DevEdit, spec, req))
+    .with_memory_registration(DEV_EDIT_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        crate::memory_strategy::registered_dev_contract,
+    )
+    .with_memory_behavior_registration(DEV_EDIT_MEMORY_BEHAVIOR);
+    route
+}
 
 pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {

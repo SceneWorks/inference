@@ -322,6 +322,7 @@ class RealWorkspaceTests(unittest.TestCase):
             "candle-gen-krea", "candle-gen-catalog", "runtime-cpu", "runtime-cuda",
             # Conservative literal readers: these run their OWN tests, not their dependents.
             "candle-gen", "candle-gen-flux3", "candle-gen-qwen-image", "candle-llm", "mlx-gen", "mlx-gen-sdxl",
+            "sceneworks-gen-core",
         })
         self.assertIn("crates/media", self.test_reads["mlx-gen-sdxl"])
         self.assertNotIn("crates/media", self.lib_reads["mlx-gen-sdxl"])

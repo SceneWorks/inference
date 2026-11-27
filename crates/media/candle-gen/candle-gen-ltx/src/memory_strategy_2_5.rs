@@ -1633,10 +1633,14 @@ mod tests {
             let contract = (LTX_2_5_DISTILLED_MEMORY_FIXTURE.contract)(&surface.spec).unwrap();
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         }
+        let mut r23 = crate::route_ltx_2_3();
+        r23.bindings.memory = Default::default();
+        let mut r25 = crate::route_ltx_2_5();
+        r25.bindings.memory = Default::default();
         let registry = crate::register_memory_contract_surfaces(
             gen_core::ProviderRegistryBuilder::new()
-                .register_generator(crate::REGISTRATION)
-                .register_generator(crate::REGISTRATION_25),
+                .register_route(r23)
+                .register_route(r25),
         )
         .build()
         .unwrap();

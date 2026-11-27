@@ -81,14 +81,10 @@ pub use text_encoder::{Flux3TextEncoder, TextConditioning};
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(
-        registry
-            .register_generator(model::REGISTRATION)
-            .register_generator(model::BASE_REGISTRATION)
-            .register_reference_workspace(memory_strategy::REFERENCE_WORKSPACE_REGISTRATION)
-            .register_reference_workspace(memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION)
-            .register_trainer(training::trainer::TRAINER_REGISTRATION),
-    )
+    registry
+        .register_route(model::route_distilled())
+        .register_route(model::route_base())
+        .register_trainer(training::trainer::TRAINER_REGISTRATION)
 }
 
 /// The shared-ladder registrations of the route: strategy, weights-free contract fixture and
@@ -109,6 +105,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle FLUX 3 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind,
+    AdapterApplyReport, AdapterSpec, CancelFlag, Conditioning, ConditioningKind,
     Error, GenerationOutput, GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality,
     ModelDescriptor, MoeExpert, OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
@@ -58,7 +58,6 @@ mod denoise_memory;
 mod descriptor;
 mod request;
 mod video_plan;
-pub(crate) use video_plan::register_video_plans;
 use video_plan::{video_dimensions, video_layout, VideoDimensions};
 mod ti2v;
 mod ti2v_generate;
@@ -162,12 +161,6 @@ pub(crate) fn is_wan_curated(name: Option<&str>) -> bool {
 /// Public provider id: `"wan2_2_ti2v_5b"`.
 pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 
-// The registration constants bridge the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! {
-    pub(crate) const TI2V_REGISTRATION = descriptor => load
-}
-
 // ===========================================================================================
 // Wan2.2 T2V-A14B — dual-expert MoE text→video (the S1–S5 core, fully wired)
 // ===========================================================================================
@@ -175,20 +168,12 @@ mlx_gen::register_generators! {
 /// Public provider id for the dual-expert MoE T2V model: `"wan2_2_t2v_14b"`.
 pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
 
-mlx_gen::register_generators! {
-    pub(crate) const T2V_14B_REGISTRATION = descriptor_t2v_14b => load_t2v_14b
-}
-
 // ===========================================================================================
 // Wan2.2 I2V-A14B — dual-expert MoE image→video (channel-concat conditioning, in_dim 36)
 // ===========================================================================================
 
 /// Public provider id for the channel-concat I2V model: `"wan2_2_i2v_14b"`.
 pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
-
-mlx_gen::register_generators! {
-    pub(crate) const I2V_14B_REGISTRATION = descriptor_i2v_14b => load_i2v_14b
-}
 
 #[cfg(test)]
 mod tests;

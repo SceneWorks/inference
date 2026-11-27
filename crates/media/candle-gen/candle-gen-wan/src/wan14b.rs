@@ -30,9 +30,9 @@ use candle_gen::gen_core::runtime::{
     select_expert_adapters, CancelFlag, ExpertAdapterOrder, LoadPhase,
 };
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress,
+    Quant, WeightsSource,
 };
 use candle_gen::{check_cancel as product_check_cancel, CandleError, Result as CResult};
 use gen_core_tokenizer::TextTokenizer;
@@ -1333,45 +1333,124 @@ impl Generator for Wan14bGenerator {
     }
 }
 
-/// Shared descriptor surface for both A14B variants — CFG (per-expert guidance) + negative prompt,
-/// UniPC/Euler samplers; H/W multiple of 16; **LoRA/LoKr supported** (sc-5167 — merged per-expert at
-/// load; quant still deferred). `conditioning` differs per variant.
-fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.id(),
+/// Primary typed route declaration for Candle Wan2.2 A14B (`REG-1`, `AP5`).
+fn route_for(variant: Variant) -> gen_core::RouteRecord {
+    let (dit_id, default_guidance, default_shift, bindings) = match variant {
+        Variant::T2v => (
+            "wan2_2_t2v_14b_moe",
+            T2V_14B_GUIDANCE_HIGH,
+            T2V_14B_FLOW_SHIFT as f32,
+            gen_core::RouteBindings::generator(descriptor_t2v_14b, load_t2v_14b),
+        ),
+        Variant::I2v => (
+            "wan2_2_i2v_14b_moe",
+            I2V_14B_GUIDANCE_HIGH,
+            I2V_14B_FLOW_SHIFT as f32,
+            gen_core::RouteBindings::generator(descriptor_i2v_14b, load_i2v_14b),
+        ),
+    };
+
+    gen_core::RouteRecord {
+        route_id: variant.id(),
         family: "wan",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: match variant {
-                Variant::T2v => vec![],
-                Variant::I2v => vec![ConditioningKind::Reference],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
             },
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
-            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            // Q4/Q8 packed MLX tiers (sc-10025): both dual-expert `WanTransformer` backbones load packed
-            // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).
-            // Tier ingestion (MLX layout + key remap) is sc-10026.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12733): the staged
-            // `render_sequential` offloads UMT5 during denoise and holds only the ACTIVE MoE expert
-            // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
-            // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
-            supports_sequential_offload: true,
+            conditioning: gen_core::ConditioningSurface {
+                kinds: match variant {
+                    Variant::T2v => vec![],
+                    Variant::I2v => vec![ConditioningKind::Reference],
+                },
+                pass0_requirement: match variant {
+                    Variant::T2v => gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                    Variant::I2v => gen_core::Pass0ConditioningRequirement::RequiresReference,
+                },
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new(dit_id).with_expert_switching(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["transformer", "transformer_2"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_video_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS_14B),
+            guidance: Some(default_guidance),
+            sampler: Some("uni_pc"),
+            shift: Some(default_shift),
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+pub(crate) fn route_t2v_14b() -> gen_core::RouteRecord {
+    route_for(Variant::T2v)
+}
+
+pub(crate) fn route_i2v_14b() -> gen_core::RouteRecord {
+    route_for(Variant::I2v)
+}
+
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 /// Wan2.2 T2V-A14B dual-expert MoE text→video descriptor.

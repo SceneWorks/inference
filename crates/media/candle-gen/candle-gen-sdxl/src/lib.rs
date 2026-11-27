@@ -210,8 +210,8 @@ use candle_gen::gen_core::generator::{
     ResolvedExecutionIdentity,
 };
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    self, AdapterSpec, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
 use control_provider::SdxlControlGenerator;
@@ -1160,103 +1160,135 @@ pub(crate) fn enter_attention_memory(
     AttentionMemoryGuard(previous, previous_cfg)
 }
 
-/// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
-/// scale), txt2img, `ddim`, the few-step **`lightning`** sampler (sc-6128 — Euler-trailing, CFG-off,
-/// for distilled Lightning checkpoints), and **LoRA/LoKr** (sc-5165 — load-time merge of a trained
-/// adapter into the UNet weights, see [`load`] + `pipeline`). The registry declares the optional
-/// ControlNet overlay so callers can stage it; a base load without [`LoadSpec::control`] keeps a
-/// narrower descriptor. Other acceleration samplers (lcm/hyper) remain the Python fallback's job
-/// (sc-3678). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
-/// `mac_only = false`.
+/// Primary typed route declaration for Candle SDXL (`REG-1`, `AP5`).
+pub(crate) fn route_sdxl() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
+        family: "sdxl",
+        backend: "candle",
+        modality: Modality::Image,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![
+                    gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                    gen_core::TextEncoderDeclaration::new("clip_bigg", Some(77)),
+                ],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![gen_core::ConditioningKind::Control],
+                control_kinds: Some(gen_core::AcceptedControlKinds::Any),
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &["lightning"],
+                ),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["discrete"],
+                ),
+                guidance_methods: vec!["cfg", "cfg_pp"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("sdxl_unet").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sdxl_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(4),
+                ..Default::default()
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["clip_l", "clip_bigg"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["sdxl_unet"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sdxl_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::DirectoryOrFile,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                required_components: pipeline::REQUIRED_COMPONENTS,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 512,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(30),
+            guidance: Some(7.0),
+            sampler: Some("ddim"),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_render_plan(compile_sdxl)
+            .with_memory_registration(memory_strategy::memory_registration())
+            .with_memory_fixture(
+                memory_strategy::surface_specs,
+                memory_strategy::weights_free_contract,
+            )
+            .with_memory_behavior_registration(memory_strategy::MEMORY_BEHAVIOR),
+    }
+}
+
+/// SDXL's identity + the surface candle wires — computed from [`route_sdxl`].
 pub fn descriptor() -> ModelDescriptor {
-    let mut descriptor = plain_descriptor();
-    descriptor.control_kinds = Some(gen_core::AcceptedControlKinds::Any);
-    descriptor.capabilities.conditioning = vec![gen_core::ConditioningKind::Control];
-    descriptor
+    route_sdxl().compute_descriptor()
 }
 
 /// The narrower descriptor installed on an ordinary base load without a ControlNet checkpoint.
 /// Keeping it separate prevents a request from being admitted and then rendered without its control
 /// residuals.
 fn plain_descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
-        control_kinds: None,
-        // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
-        // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned upstream repos
-        // on the render path. Advertised so SceneWorks stages them, and `load` fails fast if it doesn't.
-        required_components: pipeline::REQUIRED_COMPONENTS,
-        id: MODEL_ID,
-        family: "sdxl",
-        // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".
-        backend: "candle",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
-            //
-            // sc-14195 — the `guidance ≤ 1.0` contract, stated once here because it governs BOTH of
-            // these flags. `guidance > 1.0` engages CFG; anything at or below 1.0 is **accepted and
-            // runs the CFG-off single-branch path** (one conditioned forward per step) rather than
-            // being rejected. That is diffusers' own rule (`do_classifier_free_guidance =
-            // guidance_scale > 1`), and at exactly 1.0 it is provably the same result — the combine
-            // `uncond + 1.0·(cond − uncond)` reduces to `cond` — for half the compute. Sub-1.0 and
-            // non-positive values fold into the same branch rather than interpolating toward the
-            // uncond prediction; they are not rejected, since the request is still satisfiable.
-            //
-            // Consequence, deliberate: with CFG off there is no uncond branch, so a supplied
-            // `negative_prompt` has nothing to act on and is dropped. This matches diffusers and the
-            // `lightning` lane (also CFG-free, also drops it). It is NOT the F-004 "reject a
-            // silently-dropped axis" shape — that rule fires when a request names an axis the engine
-            // cannot honor at all (e.g. `lightning` + a curated scheduler); here the user chose the
-            // guidance value that switches the negative off, so honoring it literally IS the drop.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // The base load is txt2img only. The registry-level descriptor widens this to Control
-            // when the caller stages `LoadSpec::control`; an unloaded base must reject every
-            // conditioning shape rather than silently drop one.
-            conditioning: vec![],
-            // sc-5165: a trained LoRA/LoKr adapter is merged into the UNet weights at load (`load` +
-            // `pipeline::Pipeline::load_components`). Advertised so the worker routes adapter jobs here
-            // rather than to the Python fallback.
-            supports_lora: true,
-            supports_lokr: true,
-            // DDIM (eta=0) is the deterministic, launch-portable DEFAULT (sc-3673); `lightning`
-            // (sc-6128) is the few-step Euler-trailing path for distilled checkpoints. epic 7114 P4
-            // (sc-7124) added the curated ε/DDPM menu (euler / euler_ancestral / heun / dpmpp_2m /
-            // dpmpp_sde / uni_pc / lcm + ddim) over `DiscreteModelSampling`, plus the curated σ-schedule
-            // axis (normal / karras / sgm_uniform / …). sc-10826: every non-`lightning` render — the
-            // omitted-sampler default (→ curated `ddim`) AND every named solver — now routes the curated
-            // EPS path; the native candle-transformers DDIM inference loop (which ghosted on the default)
-            // is gone, so `ddim` and the default take the clean curated `ddim` solver. `lightning` keeps
-            // its native few-step path. The legacy `discrete` scheduler alias falls back to the native schedule.
-            samplers: candle_gen::menu_with_aliases(
-                candle_gen::curated_sampler_names(),
-                &["lightning"],
-            ),
-            schedulers: candle_gen::menu_with_aliases(
-                candle_gen::curated_scheduler_names(),
-                &["discrete"],
-            ),
-            min_size: 512,
-            max_size: 2048,
-            max_count: 8,
-            // Packed q4/q8 MLX-tier inference (sc-9416 UNet + sc-9527 dual-CLIP + sc-9528 adapter fold)
-            // is wired end-to-end, so advertise Q4/Q8 (sc-10767, epic 9083 full-catalog parity). The
-            // tier is packed-detected from disk (`detect_packed_unet` / `detect_packed_clip`); the
-            // LoadSpec `quant` overlay is an advisory no-op on an already-packed tier (as with
-            // boogu/flux2-dev). bf16 tiers stay dense (Quant::None), verbatim.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supported_guidance_methods: vec!["cfg", "cfg_pp"],
-            // Per-step latent previews (epic 16948, sc-16954): every shipped SDXL render lane
-            // emits -- the curated driver lane and the bespoke Lightning loop on this registered
-            // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the
-            // epic-16624 four-channel fit; the trainer's sample render stays deliberately dark.
-            supports_preview: true,
-            supports_low_res_start: true,
-            ..Default::default()
-        },
-    }
+    let mut route = route_sdxl();
+    route.structure.conditioning.kinds.clear();
+    route.structure.conditioning.control_kinds = None;
+    route.compute_descriptor()
 }
 
 /// Construct the (lazy) candle SDXL generator from a [`LoadSpec`]. `spec.weights` must be a
@@ -1359,23 +1391,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-// Link-time self-registration into gen-core's model registry. Linking this crate makes
-// the explicit family and platform catalogs resolve the candle generator.
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-
-/// Add the Candle SDXL generator and trainer to an explicit media registry builder.
+/// Add the Candle SDXL generator and trainer to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: compile_sdxl,
-        });
-    register_memory_contract_surfaces(registry)
+    registry
+        .register_route(route_sdxl())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 gen_core::CheckpointBackendBindingRegistration {

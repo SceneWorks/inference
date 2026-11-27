@@ -292,62 +292,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_render_plan(model::RENDER_PLAN_REGISTRATION)
-        .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model_control::REGISTRATION)
-        .register_render_plan(model_control::RENDER_PLAN_REGISTRATION)
-        .register_generator(model_edit::REGISTRATION)
-        .register_render_plan(model_edit::RENDER_PLAN_REGISTRATION)
-        .register_memory_strategy(model::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: model::MODEL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(model::MODEL_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model_control::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    model_control::MODEL_ID,
-                    spec,
-                )
-            },
-        })
-        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_strategy(model_edit::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model_edit::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model_edit::MODEL_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: model_edit::MODEL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(
-                        model_edit::MODEL_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model_edit::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_route(model::route_qwen_image())
+        .register_route(model_control::route_qwen_image_control())
+        .register_route(model_edit::route_qwen_image_edit())
 }
 
 /// Build the complete explicit MLX Qwen-Image provider catalog.

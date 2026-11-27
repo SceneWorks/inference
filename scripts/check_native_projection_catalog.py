@@ -49,40 +49,40 @@ MLX_MEDIA = {
 # Model variants implemented in a registered crate share its source and constructor trace.
 # Reviewing a new registration requires locating that variant's concrete consumer.
 MLX_REGISTRATIONS = {
-    "anima": "generator:model::AESTHETIC_REGISTRATION generator:model::BASE_REGISTRATION generator:model::TURBO_REGISTRATION trainer:training::AESTHETIC_TRAINER_REGISTRATION trainer:training::BASE_TRAINER_REGISTRATION trainer:training::TURBO_TRAINER_REGISTRATION",
-    "bernini": "generator:bernini::FULL_REGISTRATION generator:pipeline::RENDERER_REGISTRATION",
-    "boogu": "generator:model::BASE_REGISTRATION generator:model::EDIT_REGISTRATION generator:model::TURBO_REGISTRATION",
-    "chroma": "generator:model::BASE_REGISTRATION generator:model::FLASH_REGISTRATION generator:model::HD_REGISTRATION",
+    "anima": "route:model::route_aesthetic route:model::route_base route:model::route_turbo trainer:training::AESTHETIC_TRAINER_REGISTRATION trainer:training::BASE_TRAINER_REGISTRATION trainer:training::TURBO_TRAINER_REGISTRATION",
+    "bernini": "route:bernini::route_full route:pipeline::route_renderer",
+    "boogu": "route:model::route_base route:model::route_edit route:model::route_turbo",
+    "chroma": "route:model::route_base route:model::route_flash route:model::route_hd",
     "clip": "image_embedder:IMAGE_REGISTRATION text_embedder:TEXT_REGISTRATION",
-    "flux": "generator:model::DEV_REGISTRATION generator:model::SCHNELL_REGISTRATION generator:model_control::DEV_CONTROL_REGISTRATION",
-    "flux2": "generator:model::DEV_EDIT_REGISTRATION generator:model::DEV_REGISTRATION generator:model::KLEIN_EDIT_REGISTRATION generator:model::KLEIN_KV_EDIT_REGISTRATION generator:model::KLEIN_REGISTRATION generator:model_control::DEV_CONTROL_REGISTRATION",
-    "flux3": "generator:model::BASE_REGISTRATION generator:model::REGISTRATION trainer:training::trainer::TRAINER_REGISTRATION",
-    "ideogram": "generator:model::QUALITY_REGISTRATION generator:model::TURBO_REGISTRATION",
-    "iris": "generator:model::REGISTRATION trainer:train::REGISTRATION trainer:train::depth::REGISTRATION trainer:train::restore::REGISTRATION transform:restoration::REGISTRATION",
+    "flux": "route:model::route_dev route:model::route_dev_ip_adapter route:model::route_schnell route:model::route_schnell_ip_adapter route:model_control::route_dev_control",
+    "flux2": "route:model::route_dev route:model::route_dev_edit route:model::route_klein route:model::route_klein_edit route:model::route_klein_kv_edit route:model_control::route_dev_control",
+    "flux3": "route:model::route route:model::route_base trainer:training::trainer::TRAINER_REGISTRATION",
+    "ideogram": "route:model::route_quality route:model::route_turbo",
+    "iris": "route:model::route route:model::route_depth route:model::route_restore trainer:train::REGISTRATION trainer:train::depth::REGISTRATION trainer:train::restore::REGISTRATION transform:restoration::REGISTRATION",
     "joycaption": "captioner:model::REGISTRATION",
-    "kolors": "generator:crate::registry::REGISTRATION trainer:training::TRAINER_REGISTRATION",
-    "krea": "generator:model::EDIT_REGISTRATION generator:model::RAW_REGISTRATION generator:model::TURBO_EDIT_REGISTRATION generator:model::TURBO_REGISTRATION generator:model_control::CONTROL_REGISTRATION trainer:training::TRAINER_REGISTRATION",
-    "krea_realtime": "generator:pipeline::REGISTRATION",
-    "lens": "generator:registry::BASE_REGISTRATION generator:registry::TURBO_REGISTRATION trainer:training::TRAINER_REGISTRATION",
-    "ltx": "generator:model::REGISTRATION generator:model::REGISTRATION_25 trainer:training::TRAINER_REGISTRATION trainer:training::TRAINER_REGISTRATION_25",
-    "mage": "generator:model::REGISTRATION generator:model::REGISTRATION_BASE generator:model::REGISTRATION_EDIT generator:model::REGISTRATION_EDIT_BASE generator:model::REGISTRATION_EDIT_TURBO generator:model::REGISTRATION_TURBO trainer:training::REGISTRATION",
-    "minimax_h3": "generator:model::REGISTRATION",
-    "minimax_h3::h3_image": "generator:model::REGISTRATION trainer:crate::training::TRAINER_REGISTRATION",
-    "mochi": "generator:model::REGISTRATION",
-    "moss_image": "generator:model::BASE_REGISTRATION generator:model::SFT_REGISTRATION trainer:training::BASE_REGISTRATION trainer:training::SFT_REGISTRATION",
-    "pulid": "generator:pulid_flux::REGISTRATION",
-    "qwen_image": "generator:model::REGISTRATION generator:model_control::REGISTRATION generator:model_edit::REGISTRATION",
-    "qwen_image_2_1": "generator:model::REGISTRATION generator:model::TURBO_REGISTRATION trainer:training::TRAINER_REGISTRATION",
-    "sana": "generator:model::BASE_REGISTRATION generator:model::SPRINT_REGISTRATION",
-    "scail2": "generator:pipeline::REGISTRATION",
-    "sd3": "generator:model::LARGE_REGISTRATION generator:model::MEDIUM_REGISTRATION generator:model::TURBO_REGISTRATION trainer:training::LARGE_TRAINER_REGISTRATION trainer:training::MEDIUM_TRAINER_REGISTRATION",
-    "sdxl": "generator:model::REGISTRATION trainer:training::TRAINER_REGISTRATION",
-    "seedvr2": "generator:registry::BASE_REGISTRATION generator:registry::SEVEN_B_REGISTRATION generator:registry::THREE_B_REGISTRATION",
-    "sensenova": "generator:model::FAST_REGISTRATION generator:model::QUALITY_REGISTRATION",
-    "supra2": "generator:model::REGISTRATION",
-    "svd": "generator:model::REGISTRATION",
-    "wan": "generator:model::I2V_14B_REGISTRATION generator:model::T2V_14B_REGISTRATION generator:model::TI2V_REGISTRATION generator:model_vace::VACE_FUN_REGISTRATION generator:model_vace::VACE_REGISTRATION trainer:training::I2V_14B_TRAINER_REGISTRATION trainer:training::T2V_14B_TRAINER_REGISTRATION trainer:training::TI2V_5B_TRAINER_REGISTRATION",
-    "z_image": "generator:model::REGISTRATION generator:model_base::REGISTRATION generator:model_base_control::REGISTRATION generator:model_control::REGISTRATION trainer:training::REGISTRATION",
+    "kolors": "route:crate::registry::route trainer:training::TRAINER_REGISTRATION",
+    "krea": "route:model::route_edit route:model::route_raw route:model::route_turbo route:model::route_turbo_edit route:model_control::route_control trainer:training::TRAINER_REGISTRATION",
+    "krea_realtime": "route:pipeline::route",
+    "lens": "route:registry::route_base route:registry::route_turbo trainer:training::TRAINER_REGISTRATION",
+    "ltx": "route:model::route route:model::route_25 trainer:training::TRAINER_REGISTRATION trainer:training::TRAINER_REGISTRATION_25",
+    "mage": "route:model::route route:model::route_base route:model::route_edit route:model::route_edit_base route:model::route_edit_turbo route:model::route_turbo trainer:training::REGISTRATION",
+    "minimax_h3": "route:model::route",
+    "minimax_h3::h3_image": "route:model::route trainer:crate::training::TRAINER_REGISTRATION",
+    "mochi": "route:model::route_mochi",
+    "moss_image": "route:model::route_base route:model::route_sft trainer:training::BASE_REGISTRATION trainer:training::SFT_REGISTRATION",
+    "pulid": "route:pulid_flux::route_flux1_dev_pulid route:pulid_flux::route_pulid_flux",
+    "qwen_image": "route:model::route_qwen_image route:model_control::route_qwen_image_control route:model_edit::route_qwen_image_edit",
+    "qwen_image_2_1": "route:model::route_base route:model::route_turbo trainer:training::TRAINER_REGISTRATION",
+    "sana": "route:model::route_base route:model::route_sprint",
+    "scail2": "route:pipeline::route_scail2",
+    "sd3": "route:model::route_large route:model::route_medium route:model::route_turbo trainer:training::LARGE_TRAINER_REGISTRATION trainer:training::MEDIUM_TRAINER_REGISTRATION",
+    "sdxl": "route:model::route_sdxl trainer:training::TRAINER_REGISTRATION",
+    "seedvr2": "route:registry::route_3b route:registry::route_7b route:registry::route_base",
+    "sensenova": "route:model::route_fast route:model::route_quality",
+    "supra2": "route:model::route_supra2",
+    "svd": "route:model::route_svd",
+    "wan": "route:model::route_i2v_14b route:model::route_t2v_14b route:model::route_ti2v route:model_vace::route_vace route:model_vace::route_vace_fun trainer:training::I2V_14B_TRAINER_REGISTRATION trainer:training::T2V_14B_TRAINER_REGISTRATION trainer:training::TI2V_5B_TRAINER_REGISTRATION",
+    "z_image": "route:model::route_turbo route:model_base::route_base route:model_base_control::route_base_control route:model_control::route_turbo_control trainer:training::REGISTRATION",
 }
 
 
@@ -96,7 +96,7 @@ def _production(path: Path) -> str:
 
 
 REGISTER = re.compile(
-    r"\.register_(generator|trainer|transform|captioner|image_embedder|text_embedder)"
+    r"\.register_(generator|route|trainer|transform|captioner|image_embedder|text_embedder)"
     r"\(\s*([\w:]+)"
 )
 OPEN = re.compile(

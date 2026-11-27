@@ -185,13 +185,13 @@ pub use run::{verify_run, RunError, RunOutcome, RunOutput, SongInput};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
 pub use tokenizer::{TokenizerError, Yue2TextTokenizer};
 
-/// Add the YuE2 generator to an explicit audio registry builder (catalog composition).
+/// Add the YuE2 generator to an explicit audio registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    REGISTRATIONS
-        .into_iter()
-        .fold(registry, |r, reg| r.register_generator(reg))
+    registry.register_route(provider::route())
 }
 
 /// Build this crate's own explicit provider catalog.

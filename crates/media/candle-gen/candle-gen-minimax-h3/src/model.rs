@@ -147,9 +147,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, SizeFloor, StepSupport, WeightsSource,
+    self, reject_unknown_components, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::gen_core::{AdapterSpec, ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
@@ -513,120 +513,136 @@ impl MiniMaxH3Task {
     }
 }
 
-/// The identity, modality and capability surface.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        // Both `None`, and both deliberate (sc-17137 main sync):
-        //   * `encoder_contract`: like every shipped video provider (Wan, LTX, Mochi, SVD,
-        //     SeedVR2), the text encoder is not advertised as substitutable.
-        //   * `denoiser_output_latent_space`: the denoiser's video half is a 24-channel latent on
-        //     the 17-frame clip lattice — `ceil(clip/vae_ratio_t) - token_drop` tokens per clip,
-        //     decoded twice with a seam cross-fade (`crate::chunking`). No `LatentTemporalLaw`
-        //     variant expresses that mapping, and per the field's contract `None` makes every
-        //     external decoder fail closed rather than let a channel-count match imply
-        //     compatibility. The paired ViT decoder + audio VAE are internal to this crate.
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle MiniMax-H3 video+audio (`SW-6979`, `REG-1`).
+pub(crate) fn route_video() -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(crate::memory_strategy::MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "minimax_h3",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // Guidance-distilled: no unconditional branch exists anywhere in the checkpoint.
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            // **One kind covers all three keyframe shapes.** `Keyframe` carries a `frame_idx`, and
-            // first-only / last-only / first+last are one, one and two of them.
-            //
-            // The three `ref2va` kinds (sc-17157) are the omni-reference surface on
-            // `transformer_ref`. They are three kinds rather than one because gen-core has no
-            // heterogeneous-reference variant and `conditioning` is an **ordered** `Vec`, so the
-            // request's own order carries the semantics `ref2va` needs — see
-            // [`crate::reference`] on why order is not incidental, and [`request_references`] for
-            // why the video one is `ReferenceVideo` and not `VideoClip` or `VideoSync`.
-            //
-            // `VideoClip` is deliberately **not** advertised. Nothing here reads it, and leaving it
-            // in the allowlist would let an in-context clip through to a model that has no
-            // in-context clip mechanism; default-deny turns it into the typed
-            // `Error::Unsupported` instead.
-            conditioning: vec![
-                ConditioningKind::Keyframe,
-                ConditioningKind::Reference,
-                ConditioningKind::ReferenceVideo,
-                ConditioningKind::ReferenceAudio,
-            ],
-            // **The turbo-LoRA seam is ported** (sc-18728): `crate::adapters` is the candle twin
-            // of `mlx_gen_minimax_h3::adapters`, installed on the job-local DiT through
-            // `load_task_dit` — which every task, `ref2va` included, goes through. This bit is a
-            // declaration gen-core reads on no path, so it is an advertisement to a weights-free
-            // consumer; the enforcement is `crate::adapters::apply_minimax_h3_adapters`, which is
-            // strict about both unmatched targets and a file that matched nothing.
-            supports_lora: true,
-            // **LoKr is reachable** (sc-20757): the same job-local DiT seam installs structured
-            // Kronecker factors with the allocation-free vec-trick, including fused QKV output
-            // slices and the MiniMax-H3 FC1 half-order transform. The installer remains the real
-            // enforcement; this bit truthfully advertises that reachable path.
-            supports_lokr: true,
-            // **The tier loader is ported** (sc-20267): the pre-quantized tiers are packed offline
-            // by the MLX lane's `convert`, and this lane now *reads* them. `crate::tier` resolves
-            // the per-tier component directories and reconciles the request against the on-disk
-            // `quantization` marker; `crate::quant` builds each packed Linear straight from the MLX
-            // affine triple, so a `q4` DiT loads at its own footprint with no dense bf16 transient.
-            //
-            // **`Nvfp4` is deliberately absent, and that is not an oversight.** It is a distinct
-            // creative-choice tier (epic 11037, sc-11042 Option A) with different numerics — E2M1
-            // elements over FP8 block scales, not an int4 affine pack — and `Quant::Nvfp4.bits()`
-            // reports `4`, so admitting it would let an NVFP4 request reconcile cleanly against a
-            // `q4` marker and render the wrong tier silently. `load` refuses it by name.
-            //
-            // Like `supports_lora`, this is a declaration gen-core reads on no path; the enforcement
-            // is `crate::tier`'s reconcile plus the `Nvfp4` refusal in [`load`].
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // **The discovery signal, and it is true here.** gen-core makes
-            // `OffloadPolicy::Sequential` advisory, so an unwired engine silently stays resident and
-            // the fallback is invisible from outside; this bit is what a consumer reads to know
-            // which it got. `candle-gen-krea` states the rule as a lockstep contract — "never flip
-            // this on ahead of the wiring", because advertising a lane that would really run
-            // resident makes the fit-gate under-predict its peak and admit a job that then OOMs.
-            //
-            // The wiring is here and is *stronger* than honoring: `generate_impl` releases every
-            // heavy component and synchronizes the device before mapping the next, and
-            // `OFFLOAD_POLICY` forces `Sequential` so a caller cannot even opt out. Leaving this
-            // `false` was the divergence worth closing — SceneWorks' manifest already declares
-            // `supportsSequentialOffload: true`, and a `false` bit here would tell the worker to
-            // size this render at the ~143 GB SUM of the components rather than their max.
-            //
-            // Note this is a *separate* question from the memory-ladder rung-1 declaration in
-            // `crate::memory_strategy`, which stays `Missing` pending its behavior seam (sc-18660).
-            // That declaration gates ladder ADMISSION; this bit describes the residency lifecycle.
-            supports_sequential_offload: true,
-            max_count: 1,
-            // The provider's step bound, advertised rather than hidden (sc-19559) — the candle
-            // twin of `mlx-gen-minimax-h3`'s declaration, from this lane's own `MAX_STEPS`.
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl_32b", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Keyframe,
+                    ConditioningKind::Reference,
+                    ConditioningKind::ReferenceVideo,
+                    ConditioningKind::ReferenceAudio,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                crate::drivers::h3_driver_support("candle_minimax_h3_video"),
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("minimax_h3_video_vae"),
+                output_latent_space: None,
+                pixel_stride: Some(SPATIAL_STRIDE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_32b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["minimax_h3_joint_dit"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["minimax_h3_video_vae", "minimax_h3_audio_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: SPATIAL_STRIDE,
+            max_size: MAX_CANVAS_EDGE,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SPATIAL_STRIDE,
+            },
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            component_precision_floors: &[],
-            samplers: Vec::new(),
-            schedulers: Vec::new(),
-            min_size: SPATIAL_STRIDE,
-            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
-            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
-            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
-            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
-            max_size: MAX_CANVAS_EDGE,
-            // The stride is advertised, not hidden in provider code, so a weights-free consumer can
-            // predict that an unaligned canvas is REFUSED rather than quietly refit.
-            size_floor: SizeFloor::RangeCheckedOnGrid {
-                multiple: SPATIAL_STRIDE,
-            },
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: None,
+            sampler: None,
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1280, 704)),
             ..Default::default()
         },
+        bindings,
     }
+}
+
+/// The identity, modality and capability surface, computed from [`route_video`].
+pub fn descriptor() -> ModelDescriptor {
+    route_video().compute_descriptor()
 }
 
 /// One warm component and the device bytes the request that kept it priced it at.

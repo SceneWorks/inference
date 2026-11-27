@@ -53,54 +53,145 @@ pub fn pag_capability() -> gen_core::PagCapability {
     }
 }
 
+/// Primary typed route declaration for Qwen-Image T2I (`REG-1`, `AP5`).
+pub(crate) fn route_qwen_image() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
+        family: "qwen-image",
+        backend: "mlx",
+        modality: Modality::Image,
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen2_5_vl_text",
+                    Some(1058),
+                )],
+                encoder_contract: Some(crate::ENCODER_CONTRACT),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // img2img: a single init `Reference` image (+ `image_strength`) seeds the latents
+                // via the noise blend (sc-2530). Reference conditioning for editing is `qwen_image_edit`.
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // True CFG with a negative prompt + guidance (not distilled).
+                supports_negative_prompt: true,
+                modules: Vec::new(),
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: qwen_samplers(),
+                schedulers: qwen_schedulers(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("qwen_image_mmdit")
+                    .with_low_res_start()
+                    .with_pag(pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen2_5_vl_text"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["qwen_image_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(crate::pipeline::DEFAULT_STEPS),
+            guidance: Some(crate::pipeline::DEFAULT_GUIDANCE),
+            sampler: Some("euler"),
+            schedule: Some("normal"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(compile_render_plan)
+        .with_activation_memory(crate::ACTIVATION_MEMORY_REGISTRATION.anchor)
+        .with_memory_registration(MEMORY_REGISTRATION)
+        .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        })
+        .with_memory_surface_resolver(|surface| {
+            crate::memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+        })
+        .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION),
+    }
+}
+
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
 /// introspection). This is the **T2I** variant (`qwen_image`), which also accepts a single init
 /// `Reference` image for **img2img** (sc-2530); Qwen-Image-Edit ships as a separate `qwen_image_edit`
 /// model (sc-2465). LoRA/LoKr is wired (sc-2528). Few-step **Lightning** acceleration is exposed as
 /// the `lightning` sampler (sc-2909); an unset sampler is the production flow-match path.
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "qwen-image",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // True CFG with a negative prompt + guidance (not distilled).
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // img2img: a single init `Reference` image (+ `image_strength`) seeds the latents via
-            // the noise blend (sc-2530, the fork's `Img2Img` path). Reference *conditioning* for
-            // editing is the separate `qwen_image_edit` variant (sc-2465).
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr wired (sc-2528): the fork's `QwenLoRAMapping` targets routed onto the
-            // transformer's `AdaptableHost`; stacked + mixed via the core seam.
-            supports_lora: true,
-            supports_lokr: true,
-            // The curated unified-framework integrator menu (epic 7114 P3) + the `lightning` few-step
-            // acceleration profile (sc-2909). An unset `req.sampler` is the production flow-match
-            // Euler path; any name outside the menu is rejected in `validate_request`.
-            samplers: qwen_samplers(),
-            schedulers: qwen_schedulers(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Flow-match schedule uses the resolution-dependent sigma shift.
-            requires_sigma_shift: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_qwen_image().compute_descriptor()
 }
 
 /// A loaded Qwen-Image generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
@@ -899,11 +990,6 @@ pub(crate) fn control_component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     component_footprint_for(crate::model_control::MODEL_ID, spec)
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =

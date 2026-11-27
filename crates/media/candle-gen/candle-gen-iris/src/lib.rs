@@ -102,19 +102,105 @@ pub use text_encoder::{
     text_encoder_quant_spec, IrisTextEncoder, TextConditioning, TEXT_ENCODER_QUANT_BLOCK,
 };
 
+fn route_depth_composed() -> candle_gen::gen_core::RouteRecord {
+    candle_gen::gen_core::RouteRecord {
+        route_id: memory_strategy::DEPTH_MEMORY_REGISTRATION.provider_id,
+        family: gen_core_iris::FAMILY,
+        backend: "candle",
+        modality: candle_gen::gen_core::Modality::Image,
+        mac_only: false,
+        structure: candle_gen::gen_core::RouteStructure {
+            denoiser: candle_gen::gen_core::ModelBinding::non_diffusion("iris_depth_estimator"),
+            weight_plan: candle_gen::gen_core::WeightPlanDeclaration {
+                source_kind: candle_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[
+                    candle_gen::gen_core::Quant::Q8,
+                    candle_gen::gen_core::Quant::Q4,
+                ],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            ..Default::default()
+        },
+        limits: candle_gen::gen_core::ProductLimits {
+            min_size: model::MIN_SIZE,
+            max_size: model::MAX_SIZE,
+            size_floor: candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+                multiple: model::SIZE_MULTIPLE,
+            },
+            supported_steps: candle_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: candle_gen::gen_core::SeedAndBatchSemantics::default(),
+        defaults: candle_gen::gen_core::RouteDefaults::default(),
+        bindings: candle_gen::gen_core::RouteBindings::default()
+            .with_composed_memory_registration(memory_strategy::DEPTH_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION),
+    }
+}
+
+fn route_restore_composed() -> candle_gen::gen_core::RouteRecord {
+    candle_gen::gen_core::RouteRecord {
+        route_id: memory_strategy::RESTORE_MEMORY_REGISTRATION.provider_id,
+        family: gen_core_iris::FAMILY,
+        backend: "candle",
+        modality: candle_gen::gen_core::Modality::Image,
+        mac_only: false,
+        structure: candle_gen::gen_core::RouteStructure {
+            denoiser: candle_gen::gen_core::ModelBinding::non_diffusion("iris_restoration"),
+            weight_plan: candle_gen::gen_core::WeightPlanDeclaration {
+                source_kind: candle_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[
+                    candle_gen::gen_core::Quant::Q8,
+                    candle_gen::gen_core::Quant::Q4,
+                ],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+            },
+            ..Default::default()
+        },
+        limits: candle_gen::gen_core::ProductLimits {
+            min_size: model::MIN_SIZE,
+            max_size: model::MAX_SIZE,
+            size_floor: candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+                multiple: model::SIZE_MULTIPLE,
+            },
+            supported_steps: candle_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: candle_gen::gen_core::SeedAndBatchSemantics::default(),
+        defaults: candle_gen::gen_core::RouteDefaults::default(),
+        bindings: candle_gen::gen_core::RouteBindings::default()
+            .with_composed_memory_registration(memory_strategy::RESTORE_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION,
+            ),
+    }
+}
+
 /// Add the Candle Iris-3B generator, its generation (sc-25686) and depth (sc-25687) trainers and the
-/// restoration transform to an explicit media registry builder.
+/// restoration transform to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(
-        registry
-            .register_generator(model::REGISTRATION)
-            .register_trainer(train::REGISTRATION)
-            .register_trainer(train::depth::REGISTRATION)
-            .register_trainer(train::restore::REGISTRATION)
-            .register_transform(restoration::REGISTRATION),
-    )
+    registry
+        .register_route(model::route_generation())
+        .register_route(route_depth_composed())
+        .register_route(route_restore_composed())
+        .register_trainer(train::REGISTRATION)
+        .register_trainer(train::depth::REGISTRATION)
+        .register_trainer(train::restore::REGISTRATION)
+        .register_transform(restoration::REGISTRATION)
 }
 
 /// The shared-ladder registrations of the three inference tasks (sc-25690): strategy, weights-free
@@ -140,6 +226,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Iris provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 3);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

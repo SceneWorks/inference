@@ -67,9 +67,9 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, reject_unknown_components, CancelFlag, Capabilities, Conditioning, ConditioningKind,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Progress, Quant, WeightsSource,
+    self, reject_unknown_components, CancelFlag, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -125,55 +125,120 @@ pub fn descriptor_fast() -> ModelDescriptor {
     descriptor_for(MODEL_ID_FAST)
 }
 
-/// SenseNova-U1's registered Candle surface: classifier-free text guidance plus Reference and
-/// MultiReference it2i with image guidance, over the q4/q8/bf16 turnkey tiers. VQA and interleave are
-/// direct worker APIs because their text-bearing outputs do not fit `GenerationOutput`; user LoRA is
-/// not advertised. Backend-correct deviations from MLX are `backend = "candle"` and `mac_only = false`.
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id,
+/// Primary typed route declaration for a Candle SenseNova-U1 variant (`REG-1`, `AP5`).
+pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
+    let is_fast = id == MODEL_ID_FAST;
+    let bindings = if is_fast {
+        gen_core::RouteBindings::generator(descriptor_fast, load_fast)
+            .with_memory_registration(FAST_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                memory_strategy::weights_free_contract(MODEL_ID_FAST, spec)
+            })
+            .with_memory_behavior_registration(FAST_MEMORY_BEHAVIOR)
+    } else {
+        gen_core::RouteBindings::generator(descriptor, load)
+            .with_memory_registration(QUALITY_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                memory_strategy::weights_free_contract(MODEL_ID, spec)
+            })
+            .with_memory_behavior_registration(QUALITY_MEMORY_BEHAVIOR)
+    };
+    gen_core::RouteRecord {
+        route_id: id,
         family: "sensenova-u1",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_guidance: true,
-            // `guidance` is text CFG; `true_cfg` is the image-guidance scale on it2i.
-            supports_true_cfg: true,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            // Bespoke-by-architecture (epic 7114 P4, sc-7123 — mirrors the mlx-gen SenseNova won't-do):
-            // SenseNova-U1 is an AUTOREGRESSIVE backbone whose `predict_v` mutates a per-step `KvCache`
-            // (`cache.len()` feeds the RoPE/position build) shared across the cond/uncond passes. The
-            // unified curated solvers do multiple model evals per step (heun = 2; dpmpp_2m/uni_pc reuse
-            // prior-step state) and would append to the cache multiple times → desynced AR positions →
-            // corrupt output. The native shifted-Euler (single eval/step, `req.scheduler_shift`) is the
-            // only valid integrator, so no curated sampler/scheduler menu is advertised (N3: empty list).
-            samplers: Vec::new(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            // The SceneWorks turnkey's pre-quantized q4/q8 tiers load natively (sc-14249): every
-            // backbone projection packed-detects its MLX triple, so a Q4/Q8 here is a turnkey tier
-            // SELECT (which subdir the caller resolved), not an on-the-fly quantize. bf16 resolves
-            // to `None` and loads dense. Same contract as flux1/qwen/kolors.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // The backbone uses a KV cache for the AR prefix + denoise.
-            supports_kv_cache: true,
-            // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
-            requires_sigma_shift: true,
-            // Per-step latent previews (epic 16948, sc-16960). Both ids reach the one bespoke
-            // flow-match denoise loop in `t2i.rs`, which emits directly through
-            // `PreviewHook::emit_step`; `preview` owns the fit and the pool to the token grid.
-            supports_preview: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("sensenova_ar", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                requires_sigma_shift: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "sensenova_u1_ar_fm",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sensenova_vae"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["sensenova_u1_backbone"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sensenova_vae"],
+                        false,
+                    ),
+                ],
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(if is_fast {
+                DEFAULT_STEPS_FAST
+            } else {
+                DEFAULT_STEPS
+            }),
+            guidance: Some(if is_fast {
+                DEFAULT_GUIDANCE_FAST
+            } else {
+                DEFAULT_GUIDANCE
+            }),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// SenseNova-U1's registered Candle descriptor — computed from [`route_for`].
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    route_for(id).compute_descriptor()
 }
 
 /// The loaded SenseNova-U1 components, `Arc`-shared so the generator can cache them across calls.
@@ -1229,25 +1294,15 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
     }))
 }
 
-// Link-time self-registration of both ids into gen-core's model registry.
-candle_gen::register_generators! {
-    pub(crate) const QUALITY_REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const FAST_REGISTRATION = descriptor_fast => load_fast
-}
-
-/// Add all Candle SenseNova providers to an explicit media registry builder.
+/// Add all Candle SenseNova providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(QUALITY_REGISTRATION)
-        .register_generator(FAST_REGISTRATION);
-    let registry = register_memory_contract_surfaces(registry);
     registry
-        .register_memory_behavior(QUALITY_MEMORY_BEHAVIOR)
-        .register_memory_behavior(FAST_MEMORY_BEHAVIOR)
+        .register_route(route_for(MODEL_ID))
+        .register_route(route_for(MODEL_ID_FAST))
 }
 
 pub fn register_memory_contract_surfaces(

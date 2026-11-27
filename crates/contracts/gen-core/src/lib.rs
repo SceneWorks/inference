@@ -140,6 +140,7 @@ pub use render::{
     RenderPlanRegistration, RenderRun, RenderStage,
 };
 pub mod residency;
+pub mod route;
 pub mod runtime;
 pub use load_activity::{
     LoadActivity, LoadActivityContext, LoadActivityFile, LoadActivityObserver, LoadActivityPhase,
@@ -344,6 +345,16 @@ pub use registry::{
     WAN_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
+pub use route::{
+    route_record_conformance_errors, verify_route_conformance, AdapterInstallPolicy,
+    AdapterSurface, AudioSurface, ConditioningSurface, FamilyDriverSpec, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, PreviewSupport, ProductLimits,
+    RenderPlanCompiler, RenderPlanScope, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteFeatureBinding, RouteGeneratorBinding, RouteMemoryBindings,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme,
+    TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface, VideoSurface,
+    WeightPlanDeclaration, WeightSourceKind,
+};
 pub use runtime::{
     with_prompt_encoding, AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactDigestAttestation,
     ArtifactSeal, CancelFlag, FileStatFingerprint, HdrFrameSink, HdrOutputFrame, IdentityWeights,
