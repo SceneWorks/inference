@@ -2090,6 +2090,21 @@
       "features": [
         "cuda"
       ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::w4a8_int8::tests::w4a8_linear_gpu_fused_activation_prep_is_byte_identical",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+      "reason": "SW-6134 CUDA W4A8 activation-prep parity: the fused ConvRot FHT + Kitchen int8 row quantizer kernel vs the eager convrot_fht_f32 + quantize_kitchen_int8 reference, codes byte-identical and scales bit-identical for bf16/f16/f32 incl. outlier, zero and tie rows. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
     }
   ]
 }
