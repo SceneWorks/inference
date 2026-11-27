@@ -199,7 +199,7 @@ fn sha256(file: &Path, id: &Identity) -> CoreResult<String> {
             "flux2 calibrated artifact changed while it was hashed".to_owned(),
         ));
     }
-    Ok(seal.content_sha256_hex())
+    seal.require_content_sha256_hex()
 }
 
 /// Pin tensor content independently of safetensors header/payload ordering. The converter

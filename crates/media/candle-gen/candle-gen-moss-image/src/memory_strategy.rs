@@ -120,9 +120,14 @@ fn selected_facts(s: &Sources, mode: MossImageAcceleration) -> gen_core::Result<
         if !a.relative.ends_with(".safetensors") {
             continue;
         }
-        let headers = s.headers.get(a.pin.content_sha256()).ok_or_else(|| {
-            gen_core::Error::Unsupported("MOSS missing authenticated tensor header facts".into())
-        })?;
+        let headers = s
+            .headers
+            .get(a.pin.require_content_sha256()?)
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "MOSS missing authenticated tensor header facts".into(),
+                )
+            })?;
         for h in headers {
             let n = h.element_count()?;
             let cost = match a.role {
@@ -426,7 +431,7 @@ mod tests {
                 std::fs::write(&path, vec![0; bytes]).unwrap();
                 let pin = PinnedWeightsFile::pin(&path).unwrap();
                 sources.headers.insert(
-                    *pin.content_sha256(),
+                    *pin.content_sha256().unwrap(),
                     vec![weightsmeta::SafetensorsTensorHeader {
                         name: name.into(),
                         dtype: weightsmeta::Dtype::F32,
@@ -656,7 +661,7 @@ mod tests {
                 shape: vec![n],
                 data_bytes: (n * 4) as u64,
             };
-            s.headers.insert(*pin.content_sha256(), vec![h]);
+            s.headers.insert(*pin.content_sha256().unwrap(), vec![h]);
             crate::loader::Asset {
                 #[cfg(feature = "test-support")]
                 fixture_digest: None,

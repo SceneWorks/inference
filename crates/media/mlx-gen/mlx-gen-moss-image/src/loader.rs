@@ -84,7 +84,7 @@ impl Asset {
         let expected = moss_image_asset(repo, revision, relative)
             .ok_or_else(|| Error::Unsupported("unknown frozen MOSS asset".into()))?;
         let digest = pin
-            .content_sha256()
+            .require_content_sha256()?
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
@@ -121,7 +121,9 @@ impl Asset {
             };
             #[cfg(feature = "test-support")]
             if let Some(expected) = self.fixture_digest {
-                if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
+                if actual[..] != expected[..]
+                    || actual[..] != self.pin.require_content_sha256()?[..]
+                {
                     return Err(Error::Unsupported(
                         "synthetic fixture consumed bytes changed".into(),
                     ));
@@ -130,7 +132,7 @@ impl Asset {
             }
             if self.repo == IMPORTED_TRANSFORMER_REPOSITORY {
                 if bytes.len() as u64 != self.pin.target_fingerprint().size
-                    || actual[..] != self.pin.content_sha256()[..]
+                    || actual[..] != self.pin.require_content_sha256()?[..]
                 {
                     return Err(Error::Unsupported(
                         "imported transformer bytes changed".into(),
@@ -169,7 +171,7 @@ impl Asset {
         static CACHE: OnceLock<Mutex<HashMap<[u8; 32], Vec<SafetensorsTensorHeader>>>> =
             OnceLock::new();
         check_pin(&self.pin, check)?;
-        let key = *self.pin.content_sha256();
+        let key = *self.pin.require_content_sha256()?;
         let cache = CACHE.get_or_init(Mutex::default);
         let cached = cache
             .lock()
@@ -202,7 +204,7 @@ impl Asset {
             relative_path: self.relative.clone(),
             sha256: self
                 .pin
-                .content_sha256()
+                .require_content_sha256()?
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect(),
@@ -448,7 +450,7 @@ impl Sources {
             let mut hash = Sha256::new();
             for asset in &self.ordinary {
                 hash.update(asset.relative.as_bytes());
-                hash.update(asset.pin.content_sha256());
+                hash.update(asset.pin.content_or_identity_digest());
             }
             format!(
                 "synthetic-moss-full-pipeline-v1:{}:{:x}",
@@ -462,7 +464,7 @@ impl Sources {
         {
             let digest = asset
                 .pin
-                .content_sha256()
+                .content_or_identity_digest()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
