@@ -20,9 +20,22 @@ use candle_gen::train::projection::FrozenProjectionPack;
 use candle_nn::{RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::preprocess::{prepare_inputs, PreparedInputs};
 use candle_transformers::models::z_image::transformer::{
-    apply_rotary_emb, create_coordinate_grid, patchify, unpatchify, Config, LayerNormNoParams,
-    RopeEmbedder, ADALN_EMBED_DIM, FREQUENCY_EMBEDDING_SIZE, MAX_PERIOD,
+    create_coordinate_grid, patchify, unpatchify, Config, LayerNormNoParams, RopeEmbedder,
+    ADALN_EMBED_DIM, FREQUENCY_EMBEDDING_SIZE, MAX_PERIOD,
 };
+
+/// Z-Image's DiT RoPE (candle-transformers' `z_image::apply_rotary_emb`): complex-interleaved pairs on
+/// `[B, S, H, D]`, half tables `[S, D/2]` already in the compute dtype, rotated in that dtype.
+pub(crate) const Z_IMAGE_ROPE: candle_gen::rope::RopeSpec =
+    candle_gen::rope::RopeSpec::interleaved(candle_gen::rope::RopeLayout::Bshd)
+        .with_math(candle_gen::rope::RopeMath::Native);
+
+/// Apply Z-Image's RoPE to a `[B, S, H, D]` q or k: the shared [`candle_gen::rope::apply_rope`] with
+/// [`Z_IMAGE_ROPE`] (SW-6129) — the fused strided kernel on CUDA, elsewhere the shared reference
+/// chain, op for op candle-transformers' `apply_rotary_emb` (`z_image_rope_route_tests`).
+fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    candle_gen::rope::apply_rope(x, cos, sin, &Z_IMAGE_ROPE)
+}
 
 /// Load one projection in a streamed block. Packed triples must resolve through the prepared
 /// device-format cache; dense tensors keep the exact historical `VarBuilder` path.
@@ -3035,5 +3048,75 @@ mod key_padding_tests {
         println!("
 MODEL_INFERENCE_BODY_COMPLETED dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod z_image_rope_route_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_transformers::models::z_image::transformer::apply_rotary_emb as former;
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The real `RopeEmbedder` tables (Z-Image's axes 32/48/48, theta 256) in `dtype` for `s` tokens.
+    fn tables(s: usize, dtype: DType, dev: &Device) -> (Tensor, Tensor) {
+        let rope =
+            RopeEmbedder::new(256.0, vec![32, 48, 48], vec![1536, 512, 512], dev, dtype).unwrap();
+        let ids: Vec<u32> = (0..s as u32)
+            .flat_map(|i| [i % 7, i / 16, i % 16])
+            .collect();
+        let ids = Tensor::from_vec(ids, (s, 3), dev).unwrap();
+        rope.forward(&ids).unwrap()
+    }
+
+    /// SW-6129: the shared route is bit-identical to candle-transformers' `apply_rotary_emb` (the
+    /// former call) on CPU, f32 / bf16 / f16.
+    #[test]
+    fn shared_rope_matches_the_former_candle_transformers_apply() {
+        let dev = Device::Cpu;
+        let (s, h, d) = (40, 3, 128);
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let (cos, sin) = tables(s, dt, &dev);
+            let x = Tensor::randn(0f32, 1.0, (2, s, h, d), &dev).unwrap();
+            let x = x.to_dtype(dt).unwrap();
+            let got = apply_rotary_emb(&x, &cos, &sin).unwrap();
+            assert_eq!(bits(&got), bits(&former(&x, &cos, &sin).unwrap()), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: Z-Image's RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to candle-transformers' `apply_rotary_emb`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // Z-Image 1024^2: 4096 image + 512 caption tokens, 30 heads x 128.
+        let (s, h, d) = (4096 + 512, 30, 128);
+        let (cos, sin) = tables(s, DType::BF16, &dev);
+        let x = Tensor::randn(0f32, 1.0, (1, s, h, d), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = apply_rotary_emb(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = apply_rotary_emb(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
     }
 }

@@ -15,9 +15,10 @@ use super::layers::{FeedForward, Mlp, RMS_EPS};
 use super::rope::apply_rope;
 use crate::nn::{linear, rms};
 
-/// `norm · (scale + 1) + shift` (the DiT AdaLN modulation; mirrors `mlx_gen::nn::modulate`).
+/// `norm · (scale + 1) + shift` (the DiT AdaLN modulation; mirrors `mlx_gen::nn::modulate`): the
+/// shared composable [`candle_gen::modulate::modulate`] (SW-6129), the exact ops this copy ran.
 fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    Ok(norm.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)?)
+    Ok(candle_gen::modulate::modulate(norm, scale, shift)?)
 }
 
 /// `x + gate · y` (mirrors `mlx_gen::nn::gated`). `gate` broadcasts over the token axis.

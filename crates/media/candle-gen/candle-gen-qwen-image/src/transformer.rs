@@ -95,8 +95,24 @@ fn chunk3(m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
 /// AdaLN-zero modulate: returns `(x·(1+scale) + shift, gate)`.
 fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     let (shift, scale, gate) = chunk3(m)?;
-    let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
     Ok((out, gate))
+}
+
+/// One `[1, seq, inner]` modulation slot of a doubled `[real_t ; zero_t]` chunk `m` (`[2, 3·inner]`):
+/// per token the real-`t` row where `blend == 0` and the `t 0` row where `blend == 1`, blended as
+/// `real + (zero − real)·blend` (bit-equivalent for a 0/1 index) — the diffusers `_modulate(index)`
+/// row selection.
+fn zero_cond_slot(m: &Tensor, slot: usize, inner: usize, blend: &Tensor) -> Result<Tensor> {
+    let real = m
+        .narrow(0, 0, 1)?
+        .narrow(D::Minus1, slot * inner, inner)?
+        .unsqueeze(1)?; // [1,1,inner]
+    let zero = m
+        .narrow(0, 1, 1)?
+        .narrow(D::Minus1, slot * inner, inner)?
+        .unsqueeze(1)?; // [1,1,inner]
+    real.broadcast_add(&zero.broadcast_sub(&real)?.broadcast_mul(blend)?) // [1, seq, inner]
 }
 
 /// `modulate` with optional per-token timestep selection (`zero_cond_t`, Qwen-Image-Edit-2511). With
@@ -110,21 +126,10 @@ fn modulate_sel(x: &Tensor, m: &Tensor, index: Option<&Tensor>) -> Result<(Tenso
     };
     let inner = m.dim(D::Minus1)? / 3;
     let blend = index.unsqueeze(2)?.to_dtype(m.dtype())?; // [1, seq, 1]
-    let pick = |slot: usize| -> Result<Tensor> {
-        let real = m
-            .narrow(0, 0, 1)?
-            .narrow(D::Minus1, slot * inner, inner)?
-            .unsqueeze(1)?; // [1,1,inner]
-        let zero = m
-            .narrow(0, 1, 1)?
-            .narrow(D::Minus1, slot * inner, inner)?
-            .unsqueeze(1)?; // [1,1,inner]
-        real.broadcast_add(&zero.broadcast_sub(&real)?.broadcast_mul(&blend)?) // [1, seq, inner]
-    };
-    let shift = pick(0)?;
-    let scale = pick(1)?;
-    let gate = pick(2)?;
-    let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+    let shift = zero_cond_slot(m, 0, inner, &blend)?;
+    let scale = zero_cond_slot(m, 1, inner, &blend)?;
+    let gate = zero_cond_slot(m, 2, inner, &blend)?;
+    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
     Ok((out, gate))
 }
 
@@ -633,9 +638,7 @@ impl NormOut {
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
         let shift = p.narrow(D::Minus1, inner, inner)?.unsqueeze(1)?;
-        layer_norm(x)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)
+        candle_gen::modulate::modulate(&layer_norm(x)?, &scale, &shift)
     }
 
     /// Visit the output-head projection (`{prefix}.linear`) (sc-11091).

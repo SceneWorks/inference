@@ -11,7 +11,12 @@
 //! The freqs are deterministic (no weights); we rebuild them on the host (theta-pow seed, f64) and cast
 //! to f32 — the checkpoint's `rope.freqs_cos/sin` buffers are redundant.
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
+use candle_gen::rope::{RopeLayout, RopeSpec};
+
+/// EVA's vision RoPE: complex-interleaved pairs on `[B, heads, N, head_dim]`, full-width per-lane
+/// `[N, head_dim]` tables (each frequency duplicated adjacently), rotated in f32 and cast back.
+const EVA_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhsd);
 
 /// The fixed RoPE cos/sin tables `[grid²=576, head_dim=64]` for EVA02-CLIP-L-14-336.
 pub struct VisionRope {
@@ -77,37 +82,102 @@ impl VisionRope {
 
     /// Apply RoPE to patch-token q/k: `x·cos + rotate_half_interleaved(x)·sin`, computed in f32.
     /// `x`: `[B, heads, grid², head_dim]` (CLS token already sliced off by the caller).
+    ///
+    /// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`EVA_ROPE`] — the fused strided kernel
+    /// on CUDA, elsewhere the shared reference chain, op for op this method's former body
+    /// (`shared_rope_matches_the_former_private_chain`).
     pub fn apply(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let orig = x.dtype();
-        let xf = x.to_dtype(DType::F32)?;
-        let (n, hd) = (self.cos.dim(0)?, self.cos.dim(1)?);
-        let cos = self.cos.reshape((1, 1, n, hd))?;
-        let sin = self.sin.reshape((1, 1, n, hd))?;
-        let rot = rotate_half_interleaved(&xf)?;
-        let out = (xf.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?;
-        out.to_dtype(orig)
+        candle_gen::rope::apply_rope(x, &self.cos, &self.sin, &EVA_ROPE)
     }
-}
-
-/// Interleaved `rotate_half`: reshape the last dim `(.., d/2, 2)`, then rebuild `(-x_odd, x_even)`.
-/// Result: `out[2i] = -x[2i+1]`, `out[2i+1] = x[2i]`.
-fn rotate_half_interleaved(x: &Tensor) -> candle_core::Result<Tensor> {
-    let dims = x.dims().to_vec();
-    let last = *dims.last().unwrap();
-    let mut pair = dims.clone();
-    *pair.last_mut().unwrap() = last / 2;
-    pair.push(2);
-    let xr = x.reshape(pair)?; // [.., d/2, 2]
-    let ax = xr.rank() - 1;
-    let even = xr.narrow(ax, 0, 1)?; // [.., d/2, 1]
-    let odd = xr.narrow(ax, 1, 1)?;
-    let rotated = Tensor::cat(&[&odd.neg()?, &even], ax)?; // (-odd, even)
-    rotated.reshape(dims)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
+
+    /// Interleaved `rotate_half`: reshape the last dim `(.., d/2, 2)`, then rebuild `(-x_odd, x_even)`.
+    /// Result: `out[2i] = -x[2i+1]`, `out[2i+1] = x[2i]`. (The former private helper of `apply`,
+    /// kept as the oracle's.)
+    fn rotate_half_interleaved(x: &Tensor) -> candle_core::Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let last = *dims.last().unwrap();
+        let mut pair = dims.clone();
+        *pair.last_mut().unwrap() = last / 2;
+        pair.push(2);
+        let xr = x.reshape(pair)?; // [.., d/2, 2]
+        let ax = xr.rank() - 1;
+        let even = xr.narrow(ax, 0, 1)?; // [.., d/2, 1]
+        let odd = xr.narrow(ax, 1, 1)?;
+        let rotated = Tensor::cat(&[&odd.neg()?, &even], ax)?; // (-odd, even)
+        rotated.reshape(dims)
+    }
+
+    /// The pre-SW-6129 `VisionRope::apply`, verbatim (the oracle).
+    fn former(rope: &VisionRope, x: &Tensor) -> candle_core::Result<Tensor> {
+        let orig = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let (n, hd) = (rope.cos.dim(0)?, rope.cos.dim(1)?);
+        let cos = rope.cos.reshape((1, 1, n, hd))?;
+        let sin = rope.sin.reshape((1, 1, n, hd))?;
+        let rot = rotate_half_interleaved(&xf)?;
+        let out = (xf.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?)?;
+        out.to_dtype(orig)
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU over the real
+    /// EVA02-CLIP-L table, f32 / bf16 / f16, including the narrowed patch-token view.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let rope = VisionRope::build(64, 24, 16, 10_000.0, &dev).unwrap();
+        let full = Tensor::randn(0f32, 1.0, (2, 3, 577, 64), &dev).unwrap();
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let x = full.to_dtype(dt).unwrap().narrow(2, 1, 576).unwrap();
+            let got = rope.apply(&x).unwrap();
+            assert_eq!(bits(&got), bits(&former(&rope, &x).unwrap()), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: the EVA RoPE route takes the fused kernel (reading the patch-token view
+    /// through its strides), bit-identical to the shared reference (switch off) and the former chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        let rope = VisionRope::build(64, 24, 16, 10_000.0, &dev).unwrap();
+        // EVA02-CLIP-L-14-336: 16 heads x 64 over 1 CLS + 576 patch tokens.
+        let full = Tensor::randn(0f32, 1.0, (1, 16, 577, 64), &dev).unwrap();
+        let x = full
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .narrow(2, 1, 576)
+            .unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = rope.apply(&x).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = rope.apply(&x).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&rope, &x).unwrap()));
+    }
 
     /// The interleaved rotate swaps adjacent pairs with a sign: `[a,b,c,d] → [-b,a,-d,c]`.
     #[test]

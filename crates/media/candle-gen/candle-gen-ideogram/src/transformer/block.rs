@@ -7,6 +7,12 @@ use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 
 use super::rmsnorm;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// Ideogram's DiT RoPE: HF half-split pairs on `[B, H, L, hd]`, per-batch full-width `[B, L, hd]`
+/// MRoPE tables, rotated in the activation dtype (the tables cast down).
+pub(crate) const IDEOGRAM_ROPE: RopeSpec =
+    RopeSpec::split_half(RopeLayout::Bhsd).with_math(RopeMath::Native);
 use crate::loader::{linear_detect, Weights};
 use crate::quant::QLinear;
 
@@ -101,14 +107,11 @@ impl Ideogram4Attention {
 }
 
 /// HF half-split RoPE in `[B, H, L, hd]` layout: `cos`/`sin` `[B, L, hd]` → broadcast over heads.
+///
+/// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`IDEOGRAM_ROPE`] — fused on CUDA, and
+/// elsewhere the shared reference chain, op for op this function's former body (`rope_route_tests`).
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let cos = cos.unsqueeze(1)?.to_dtype(x.dtype())?; // [B,1,L,hd]
-    let sin = sin.unsqueeze(1)?.to_dtype(x.dtype())?;
-    let chunks = x.chunk(2, D::Minus1)?;
-    let x1 = chunks[0].contiguous()?;
-    let x2 = chunks[1].contiguous()?;
-    let rot = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
-    x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?
+    candle_gen::rope::apply_rope(x, cos, sin, &IDEOGRAM_ROPE)
 }
 
 // ── SwiGLU MLP ───────────────────────────────────────────────────────────────────────────
@@ -300,5 +303,89 @@ mod tests {
                 "layers.0.adaln_modulation",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use crate::transformer::mrope::Ideogram4MRoPE;
+    use candle_gen::candle_core::{DType, Device};
+
+    /// The pre-SW-6129 `apply_rope`, verbatim (the oracle).
+    fn former(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let cos = cos.unsqueeze(1)?.to_dtype(x.dtype())?; // [B,1,L,hd]
+        let sin = sin.unsqueeze(1)?.to_dtype(x.dtype())?;
+        let chunks = x.chunk(2, D::Minus1)?;
+        let x1 = chunks[0].contiguous()?;
+        let x2 = chunks[1].contiguous()?;
+        let rot = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
+        x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Real per-batch MRoPE tables for `b` rows of `l` grid tokens (t, h, w ids differ per batch).
+    fn tables(b: usize, l: usize, hd: usize, dev: &Device) -> (Tensor, Tensor) {
+        let rope = Ideogram4MRoPE::new(hd, 10000.0, [24, 20, 20], dev).unwrap();
+        let ids: Vec<f32> = (0..b * l)
+            .flat_map(|i| {
+                let (bi, li) = (i / l, i % l);
+                [(bi + 1) as f32, (li / 8) as f32, (li % 8 + bi) as f32]
+            })
+            .collect();
+        let pos = Tensor::from_vec(ids, (b, l, 3), dev).unwrap();
+        rope.forward(&pos).unwrap()
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU, f32 / bf16 /
+    /// f16, per-batch tables.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let (b, h, l, hd) = (2, 3, 24, 128);
+        let (cos, sin) = tables(b, l, hd, &dev);
+        let x32 = Tensor::randn(0f32, 1.0, (b, h, l, hd), &dev).unwrap();
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dt).unwrap();
+            let got = apply_rope(&x, &cos, &sin).unwrap();
+            assert_eq!((got.dims(), got.dtype()), (x.dims(), dt));
+            assert_eq!(bits(&got), bits(&former(&x, &cos, &sin).unwrap()), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: the Ideogram RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // CFG batch of 2 over a 1024^2 grid (4096 tokens) + 256 text, 24 heads x 128.
+        let (b, h, l, hd) = (2, 24, 4096 + 256, 128);
+        let (cos, sin) = tables(b, l, hd, &dev);
+        let x = Tensor::randn(0f32, 1.0, (b, h, l, hd), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = apply_rope(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = apply_rope(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
     }
 }

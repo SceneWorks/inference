@@ -108,8 +108,10 @@ impl FlowMatchScheduler {
 // ---------------------------------------------------------------------------
 
 /// `x*(1+scale) + shift` (DiT adaLN modulation).
+/// The shared composable [`candle_gen::modulate::modulate`] (SW-6129); `x`, `shift` and `scale` are
+/// the same shape here, so its broadcast ops are this copy's elementwise ones.
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> CResult<Tensor> {
-    Ok(((x * (scale + 1.0)?)? + shift)?)
+    Ok(candle_gen::modulate::modulate(x, scale, shift)?)
 }
 
 /// GLIDE sinusoidal timestep embedding `[N, dim]` (f32): `half = dim/2`,

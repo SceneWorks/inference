@@ -95,9 +95,9 @@ impl Attention {
     /// this crate exists for, while every CPU unit test passed. Materializing here fixes q and k at
     /// once and is numerically a no-op.
     fn rope_patch_tokens(&self, x: &Tensor, rope: &VisionRope) -> candle_core::Result<Tensor> {
-        let n = x.dim(2)?;
+        let patches = x.dim(2)? - 1;
         let cls = x.narrow(2, 0, 1)?;
-        let pat = rope.apply(&x.narrow(2, 1, n - 1)?)?;
+        let pat = rope.apply(&x.narrow(2, 1, patches)?)?;
         Tensor::cat(&[&cls, &pat], 2)?.contiguous()
     }
 }

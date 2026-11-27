@@ -28,9 +28,9 @@
 //! GPU backend — [`crate::loader::compute_dtype`]); the zero-centred text norm, the affine-free
 //! LayerNorms, the q/k RMSNorm, the RoPE rotation and the timestep sinusoids are computed in f32
 //! and rounded back, as upstream does. The 3-axis RoPE (`axes_dims_rope = [16, 56, 56]`,
-//! `θ = 10000`) rotates **adjacent** channel pairs (`view_as_complex`, `use_real=False`) — candle's
-//! [`rope_i`] — unlike the text tower's half-split RoPE, and its table is built host-side in f32
-//! because the centred image grid's positions are negative.
+//! `θ = 10000`) rotates **adjacent** channel pairs (`view_as_complex`, `use_real=False`) — the
+//! shared [`candle_gen::rope::apply_interleaved_rope`] — unlike the text tower's half-split RoPE,
+//! and its table is built host-side in f32 because the centred image grid's positions are negative.
 //!
 //! Weight keys are the diffusers ones and every Linear is **bias-less** in this checkpoint:
 //! `img_in`, `txt_in.{text_norm.weight, in_layer, out_layer}`,
@@ -43,7 +43,7 @@
 
 use candle_core::{DType, Device, IndexOp, Tensor, TensorId, D};
 use candle_gen::candle_nn::ops::{rms_norm, softmax, softmax_last_dim};
-use candle_gen::candle_nn::rotary_emb::{rope_i, rope_i_slow};
+use candle_gen::candle_nn::rotary_emb::rope_i_slow;
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::{norm::rms_normalize_f32, profile, projection::FrozenProjectionPack};
@@ -103,8 +103,9 @@ pub const GLOBAL_ADAPTER_TARGETS: [&str; 8] = [
 
 /// How the attention core's normalisation, rotation and softmax are realised.
 ///
-/// * [`Ops::Fused`] — candle's fused kernels (`rms_norm`, `rope_i`, `softmax_last_dim`): the render
-///   path, byte-for-byte what it has always been.
+/// * [`Ops::Fused`] — the fused kernels (`rms_norm`, the shared interleaved RoPE,
+///   `softmax_last_dim`): the render path, byte-for-byte what it has always been on CPU (the RoPE is
+///   within one product rounding of the former `rope_i` on CUDA, SW-6129).
 /// * [`Ops::Composable`] — their composable equivalents (shared f32 RMS, `rope_i_slow`, an
 ///   f32-upcast `softmax`): the **training** path (sc-24160). The fused kernels are `CustomOp`s with
 ///   no backward, so a loss built through them cannot reach the adapter factors. The softmax is
@@ -277,13 +278,17 @@ fn scale_residual(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
 /// Adjacent-pair complex rotation of `x` `[B, H, S, D]` by `cos`/`sin` `[S, D/2]`, in f32. (The MLX
 /// twin rotates `[B, S, H, D]`; the rotation is per token and per head, so the transpose commutes.)
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, ops: Ops) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let x32 = x.to_dtype(DType::F32)?.contiguous()?;
-    let rotated = match ops {
-        Ops::Fused => rope_i(&x32, cos, sin)?,
-        Ops::Composable => rope_i_slow(&x32, cos, sin)?,
-    };
-    Ok(rotated.to_dtype(dtype)?)
+    // `Ops::Fused` is the shared `candle_gen::rope::apply_interleaved_rope` (SW-6129): the fused
+    // strided kernel on CUDA (no f32 copy of `x`), elsewhere the shared chain — bit-identical on CPU
+    // to the `rope_i` on an f32 contiguous copy this branch used to run, within one product rounding
+    // of it on CUDA. The composable training twin keeps `rope_i_slow` (epic E9).
+    match ops {
+        Ops::Fused => Ok(candle_gen::rope::apply_interleaved_rope(x, cos, sin)?),
+        Ops::Composable => {
+            let x32 = x.to_dtype(DType::F32)?.contiguous()?;
+            Ok(rope_i_slow(&x32, cos, sin)?.to_dtype(x.dtype())?)
+        }
+    }
 }
 
 /// Per-axis RoPE sinusoid table from the integer position ids `[N, 3]` (mlx-gen's

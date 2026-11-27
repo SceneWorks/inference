@@ -139,7 +139,7 @@ fn chunk3(m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
 /// twin ([`crate::dit_train`]) reuses it verbatim.
 pub fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     let (shift, scale, gate) = chunk3(m)?;
-    let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+    let out = candle_gen::modulate::modulate(x, &scale, &shift)?;
     Ok((out, gate))
 }
 
@@ -644,9 +644,7 @@ impl NormOut {
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
         let shift = p.narrow(D::Minus1, inner, inner)?.unsqueeze(1)?;
-        layer_norm(x)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)
+        candle_gen::modulate::modulate(&layer_norm(x)?, &scale, &shift)
     }
 }
 

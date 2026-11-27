@@ -8,6 +8,7 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
+use candle_gen::modulate::modulate;
 
 use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, rmsnorm, Weights};
@@ -483,9 +484,7 @@ impl DoubleBlock {
                 &self.img_self_attn_norm,
                 self.eps,
             )?)?)?;
-        let img_mlp_in = img_n2
-            .broadcast_mul(&(img_scale_mlp + 1.0)?)?
-            .broadcast_add(&img_shift_mlp)?;
+        let img_mlp_in = modulate(&img_n2, &img_scale_mlp, &img_shift_mlp)?;
         let img_mlp = self
             .img_ff
             .forward(&rmsnorm(&img_mlp_in, &self.img_ffn_norm1, self.eps)?)?;
@@ -503,9 +502,7 @@ impl DoubleBlock {
                 &self.instruct_attn_norm,
                 self.eps,
             )?)?)?;
-        let ins_mlp_in = ins_n2
-            .broadcast_mul(&(ins_scale_mlp + 1.0)?)?
-            .broadcast_add(&ins_shift_mlp)?;
+        let ins_mlp_in = modulate(&ins_n2, &ins_scale_mlp, &ins_shift_mlp)?;
         let ins_mlp =
             self.instruct_ff
                 .forward(&rmsnorm(&ins_mlp_in, &self.instruct_ffn_norm1, self.eps)?)?;
