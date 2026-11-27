@@ -16,7 +16,7 @@
 //! and RoPE is applied in **f32** in the attention path. Pairs are **interleaved**:
 //! `x.reshape(..., d/2, 2)` rotates `(x[2k], x[2k+1])` by `(cos[k], sin[k])`.
 
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use mlx_gen::{Error, Result};
@@ -172,9 +172,7 @@ impl RopeTable {
 /// Rotates the first `seq_len` positions with **interleaved** pairs and leaves any padding tail
 /// (`seq_len..S`) untouched — the "same grid across the batch" vectorized path of `rope_apply`.
 pub fn rope_apply(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let shape = x.shape();
-    let (b, s, n, d) = (shape[0], shape[1], shape[2], shape[3]);
-    let half_d = d / 2;
+    let s = x.shape()[1];
     let seq_len = cos.shape()[0];
 
     // Split off the rotated prefix [b, seq_len, n, d] (and any padding tail) along axis 1.
@@ -186,23 +184,18 @@ pub fn rope_apply(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
         (x.clone(), None)
     };
 
-    // Interleaved pairs: [b, seq_len, n, half_d, 2] → real/imag halves on the last axis.
-    let x5 = head.reshape(&[b, seq_len, n, half_d, 2])?;
-    let parts = split(&x5, 2, 4)?;
-    let x_real = parts[0].reshape(&[b, seq_len, n, half_d])?;
-    let x_imag = parts[1].reshape(&[b, seq_len, n, half_d])?;
-
-    // (a + bi)·(cos + sin·i) = (a·cos − b·sin) + (a·sin + b·cos)i.
-    // The complex rotation `(a+bi)·(cos+sin·i)` is core's fused `rope_rotate` glue (sc-27453): one
-    // kernel when the sc-2957 compile toggle is on, bit-exact to the eager form. This crate's private
-    // copy added `real·sin + imag·cos` in the other order, which is bit-identical.
-    let (out_real, out_imag) = mlx_gen::nn::rope_rotate(&x_real, &x_imag, cos, sin)?;
-
-    // Interleave back: concat on a new trailing axis → [b, seq_len, n, half_d, 2] → [b, seq_len, n, d].
-    let real5 = out_real.reshape(&[b, seq_len, n, half_d, 1])?;
-    let imag5 = out_imag.reshape(&[b, seq_len, n, half_d, 1])?;
-    let stacked = concatenate_axis(&[&real5, &imag5], 4)?;
-    let rotated = stacked.reshape(&[b, seq_len, n, d])?;
+    // Interleaved pairs `(x[2i], x[2i+1])` rotated by `(cos, sin)[i]` — the shared
+    // `mlx_gen::qkv::apply_rope` (SW-6140): the same core `rope_rotate` glue kernel (sc-27453: one
+    // kernel when the sc-2957 compile toggle is on, bit-exact to the eager form) over the same
+    // per-token table broadcast, no casts.
+    let rotated = mlx_gen::qkv::apply_rope(
+        &head,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )?;
 
     match tail {
         Some(t) => Ok(concatenate_axis(&[&rotated, &t], 1)?),

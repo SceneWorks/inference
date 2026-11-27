@@ -983,20 +983,6 @@ fn build_rope_tables(grid: i32) -> (Array, Array) {
     )
 }
 
-/// `rotate_pairwise`: pairs `(a, b)` → `(−b, a)` along the last (head_dim) axis.
-fn rotate_pairwise(x: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let d = sh[sh.len() - 1];
-    let mut paired: Vec<i32> = sh[..sh.len() - 1].to_vec();
-    paired.push(d / 2);
-    paired.push(2);
-    let xr = x.reshape(&paired)?;
-    let x1 = take1(&xr, 0, -1)?; // even lanes
-    let x2 = take1(&xr, 1, -1)?; // odd lanes
-    let stacked = stack_axis(&[&x2.multiply(Array::from_f32(-1.0))?, &x1], -1)?;
-    Ok(stacked.reshape(sh)?)
-}
-
 /// `apply_rotary_pos_emb_2d`: rotate all of `q`; rotate the leading `seq_k − num_k_exclude` keys
 /// (object-pointer tokens pass through). `q`/`k`: `[1, heads, seq, head_dim]`; `cos`/`sin`:
 /// `[seq, head_dim]`. `repeat_freqs_k` tiles the tables when the key length is a multiple of `q`.
@@ -1008,7 +994,21 @@ fn apply_rope_2d(
     num_k_exclude: i32,
     repeat_freqs_k: bool,
 ) -> Result<(Array, Array)> {
-    let q_embed = add(&multiply(q, cos)?, &multiply(&rotate_pairwise(q)?, sin)?)?;
+    // The rotation is the shared eager cos/sin route (SW-6140), `x·cos + rotate_pairwise(x)·sin`
+    // over full-width `repeat_interleave(2)` tables — the same per-element chain as the private
+    // copy this replaced (whose `x2·(−1)` lane is the same bits as `−x2`). 2-D axial, so no fused
+    // route; the key-prefix selection and table tiling below are SAM3 layout, not rotation.
+    let rotate = |x: &Array, cos: &Array, sin: &Array| -> Result<Array> {
+        mlx_gen::qkv::apply_rope_eager(
+            x,
+            mlx_gen::qkv::RopeTables::new(cos, sin),
+            mlx_gen::qkv::RopeStyle::InterleavedFull,
+            mlx_gen::qkv::RotationAxes::HeadMajor,
+            None,
+            mlx_gen::qkv::RopeDtype::Promoted,
+        )
+    };
+    let q_embed = rotate(q, cos, sin)?;
     let seq_k = k.shape()[2];
     let n_rot = seq_k - num_k_exclude;
     let k_rot = slice_range(k, 2, 0, n_rot)?;
@@ -1031,10 +1031,7 @@ fn apply_rope_2d(
     } else {
         (cos.clone(), sin.clone())
     };
-    let k_embed = add(
-        &multiply(&k_rot, &cos_k)?,
-        &multiply(&rotate_pairwise(&k_rot)?, &sin_k)?,
-    )?;
+    let k_embed = rotate(&k_rot, &cos_k, &sin_k)?;
     let k_out = if num_k_exclude > 0 {
         let k_pass = slice_range(k, 2, n_rot, seq_k)?;
         concatenate_axis(&[&k_embed, &k_pass], 2)?

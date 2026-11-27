@@ -2,7 +2,6 @@
 //! HF half-split RoPE, and masked SDPA. Port of the fork's `Attention` (no biases).
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -100,8 +99,11 @@ impl TextAttention {
         let q = rms_norm(&q, &self.q_norm, QK_NORM_EPS)?;
         let k = rms_norm(&k, &self.k_norm, QK_NORM_EPS)?;
 
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
+        // HF half-split RoPE `x*cos + rotate_half(x)*sin` over `[1,s,hd]` tables broadcast across the
+        // heads: the shared `nn::apply_text_rope` (SW-6140) — the identical op sequence this crate's
+        // private copy ran.
+        let q = mlx_gen::nn::apply_text_rope(&q, cos, sin)?;
+        let k = mlx_gen::nn::apply_text_rope(&k, cos, sin)?;
 
         // GQA: repeat each kv head `groups` times to match the query heads.
         let groups = self.num_heads / self.num_kv_heads;
@@ -120,14 +122,4 @@ impl TextAttention {
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
         self.o_proj.forward(&o)
     }
-}
-
-/// HF half-split RoPE: `x*cos + rotate_half(x)*sin`, where `rotate_half(x) = [-x2, x1]`
-/// (x split in halves along the head dim). `cos`/`sin` `[1,s,hd]` → broadcast over heads.
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let cos = cos.expand_dims(2)?; // [1,s,1,hd]
-    let sin = sin.expand_dims(2)?;
-    let parts = split(x, 2, 3)?; // halves along the head dim
-    let rot = concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
-    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
 }

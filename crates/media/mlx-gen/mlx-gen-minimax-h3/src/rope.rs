@@ -36,12 +36,10 @@
 //! *here* the narrow is a no-op on the shipped recipe. Do not "fix" either rotary into an f32
 //! rotation; it would be a different model.
 
-use mlx_rs::ops::{concatenate_axis, cos, multiply, negative, sin};
+use mlx_rs::ops::{concatenate_axis, cos, multiply, sin};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{Error, Result};
-
-use crate::tensor::slice_axis;
 
 /// Precomputed `(cos, sin)` tables for one token grid.
 #[derive(Debug, Clone)]
@@ -224,34 +222,26 @@ impl Rope3d {
             )));
         }
         // Reference-faithful narrow, NOT a missed upcast: `cos.to(query.dtype)` at
-        // `autoencoder_kl_minimax_h3.py:319-320`.
-        let cos_t = tables.cos.as_dtype(t.dtype())?;
-        let sin_t = tables.sin.as_dtype(t.dtype())?;
-
-        let rotate = |x: &Array| -> Result<Array> {
-            let half = self.apply_dim / 2;
-            let x1 = slice_axis(x, 3, 0, half)?;
-            let x2 = slice_axis(x, 3, half, self.apply_dim)?;
-            Ok(concatenate_axis(&[negative(&x2)?, x1], -1)?)
-        };
-
-        if self.apply_dim == d {
-            let rotated = multiply(t, &cos_t)?;
-            return Ok(mlx_rs::ops::add(&rotated, &multiply(&rotate(t)?, &sin_t)?)?);
-        }
-        let head = slice_axis(t, 3, 0, self.apply_dim)?;
-        let tail = slice_axis(t, 3, self.apply_dim, d)?;
-        let rotated = mlx_rs::ops::add(
-            &multiply(&head, &cos_t)?,
-            &multiply(&rotate(&head)?, &sin_t)?,
-        )?;
-        Ok(concatenate_axis(&[rotated, tail], -1)?)
+        // `autoencoder_kl_minimax_h3.py:319-320` — the shared cos/sin route's `RopeDtype::Stream`.
+        // The rotation is `mlx_gen::qkv::apply_rope_eager` (SW-6140) with `RopeStyle::RotateHalf`
+        // over the leading `apply_dim` channels and the pre-broadcast `[B, N, 1, apply_dim]`
+        // tables: the same `t·cos + cat(−x2, x1)·sin` chain and untouched tail as this module's
+        // private copy. 3-axis grid positions, so there is no fused `fast::rope` route.
+        mlx_gen::qkv::apply_rope_eager(
+            t,
+            mlx_gen::qkv::RopeTables::new(&tables.cos, &tables.sin),
+            mlx_gen::qkv::RopeStyle::RotateHalf,
+            mlx_gen::qkv::RotationAxes::TokenMajor,
+            Some(self.apply_dim),
+            mlx_gen::qkv::RopeDtype::Stream,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::slice_axis;
 
     /// Deterministic host-side test data. MLX's RNG evaluates on the GPU stream, which is not
     /// available on every `cargo test` worker thread; building from a host slice keeps these unit

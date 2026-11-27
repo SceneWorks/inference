@@ -2084,6 +2084,45 @@ def _sample_split_note(judged: list[dict[str, Any]]) -> str:
     return "; " + "; ".join(notes) if notes else ""
 
 
+def _token_identity(
+    pairs: list[tuple[list[Process], list[Process], list[tuple[str, str]]]],
+) -> dict[str, Any]:
+    """SW-6139: greedy token-stream identity across an on/off twin pair. For each prompt and
+    each option (``off``, ``auto``, ``mtp``...) separately, every process of both twins must
+    stream the same token ids (the row's ``token_digest``): a kernel that changes accepted tokens
+    is a defect, whatever its speed. Options are not compared with each other: multi-token
+    verification may legitimately flip near-ties against single-token decode
+    (``mlx-llm/src/decode/speculative.rs``), and that difference is not the switch's. Rows or
+    documents without a digest, and non-greedy sampling, are not judged."""
+    checked, mismatches = 0, []
+    for on, off, _ in pairs:
+        temperature = (on[0].document.get("sampling") or {}).get("temperature")
+        # Greedy exactly as the runtime defines it (`Sampling::is_greedy`: temperature <= 0);
+        # a missing or non-numeric temperature is not judged.
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+            continue
+        if temperature > 0.0:
+            continue
+        by_cell: dict[tuple[str, str], dict[str, list[str]]] = {}
+        for side, processes in (("on", on), ("off", off)):
+            for process in processes:
+                for (prompt_id, option), row in rows_by_key(process)[0].items():
+                    digest = row.get("token_digest")
+                    if isinstance(digest, str):
+                        label = f"{process.campaign}/{process.row}:{side}"
+                        by_cell.setdefault((prompt_id, option), {}).setdefault(digest, []).append(
+                            label
+                        )
+        for (prompt_id, option), digests in sorted(by_cell.items()):
+            checked += 1
+            if len(digests) > 1:
+                mismatches.append(
+                    f"{prompt_id} [{option}]: "
+                    + " != ".join(f"{d} ({', '.join(sorted(set(v)))})" for d, v in sorted(digests.items()))
+                )
+    return {"checked_cells": checked, "mismatches": mismatches}
+
+
 def decide_defaults(
     entries: list[dict[str, Any]],
     groups: dict[tuple[str, str], list[Process]],
@@ -2179,10 +2218,21 @@ def decide_defaults(
                 f"; unpaired, no twin row identical but for {what}: "
                 + ", ".join(f"{p[0].campaign}/{p[0].row}" for p in unpaired)
             )
+        identity = (
+            _token_identity(pairs) if entry["kind"] == "switch" else None
+        )
+        if identity and identity["mismatches"]:
+            outcome = {
+                "outcome": "off",
+                "recommended_on": False,
+                "reason": "greedy token streams differ across the on/off twins: "
+                + "; ".join(identity["mismatches"]),
+            }
         recommended = outcome["recommended_on"]
         decisions.append(
             {
                 **entry,
+                "token_identity": identity,
                 "informational": not entry["provisional"],
                 "pairs": len(pairs),
                 "unpaired": [f"{p[0].campaign}/{p[0].row}" for p in unpaired],
