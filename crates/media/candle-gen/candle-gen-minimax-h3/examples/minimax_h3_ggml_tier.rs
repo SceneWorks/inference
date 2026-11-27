@@ -9,7 +9,8 @@
 //!   cargo run --release --example minimax_h3_ggml_tier -p candle-gen-minimax-h3
 //! ```
 //!
-//! Writes `<out>/<tier>/<component>/`. An existing component directory is a hard error, so a
+//! Delegates to the family-generic `candle_gen::ggml_tier` (also the `candle_ggml_tier` example of
+//! candle-gen, which adds the bf16-source Q8_0 mode). Writes `<out>/<tier>/<component>/`. An existing component directory is a hard error, so a
 //! partially converted root resumes by naming only the components still missing.
 use std::path::PathBuf;
 
