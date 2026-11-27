@@ -1006,7 +1006,7 @@ impl ImageDenoiser {
     }
 
     /// One step of `sampler` (SW-7106): the velocity at step `step` through head `step`, then
-    /// gen-core's [`sampler_step`] over the generated rows, in float32. The sigmas are the ones
+    /// gen-core's [`mlx_gen::gen_core::h3_image::sampler_step`] over the generated rows, in float32. The sigmas are the ones
     /// [`velocity_euler_delta`] steps between (`1 - t`, the terminal one 0), so
     /// [`H3ImageSampler::Euler`] is exactly [`Self::step`]. `image_seed` seeds the LCM noise
     /// ([`mlx_gen::gen_core::h3_image::lcm_noise_seed`]); Euler ignores it.
@@ -1027,7 +1027,7 @@ impl ImageDenoiser {
     ///
     /// When `pag` yields `step_scale > 0.0` at `(step, num_steps)`, executes a 2-pass step (`cond`
     /// then `perturbed`) through the identical `pdd_proj_out.{step}` head, combines the generated
-    /// velocity via [`mlx_gen::gen_core::pag_apply`], and advances [`sampler_step`] once (so LCM's
+    /// velocity via [`mlx_gen::gen_core::pag_apply`], and advances [`mlx_gen::gen_core::h3_image::sampler_step`] once (so LCM's
     /// RNG draw count is identical to the 1-pass baseline). When `pag` is `None` or
     /// `step_scale == 0.0`, runs a single conditional pass identically to [`Self::step_with`].
     pub fn step_with_pag(

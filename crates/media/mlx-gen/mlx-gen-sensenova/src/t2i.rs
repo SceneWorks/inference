@@ -378,7 +378,7 @@ pub enum SenseNovaCfgMode {
 /// Weights-free velocity forward seam for [`SenseNovaFmDriver`] (`PIPE-7`, `SW-6974`).
 ///
 /// Generic over step preparation, single/dual-CFG velocity evaluation, and unpatchification so
-/// Tier 0 [`conformance::verify_driver_conformance`] tests verify every [`DriverSupport`] claim
+/// Tier 0 `conformance::verify_driver_conformance` tests verify every [`DriverSupport`] claim
 /// without model weights or real forwards.
 pub trait SenseNovaVelocityForward {
     /// Prepare step latent `z` and conditioned token embedding from model-space `image` at `t`.

@@ -459,7 +459,7 @@ impl<T: ImageVelocity + ?Sized> ImageVelocity for &mut T {
 }
 
 /// **The six-step loop**: one forward per step, then gen-core's shared
-/// [`sampler_step`] in float32 — under
+/// `sampler_step` in float32 — under
 /// [`H3ImageSampler::Euler`] `x ← x + (σᵢ − σᵢ₊₁) · v`, under
 /// [`H3ImageSampler::Lcm`] (the request default) ComfyUI's re-noised LCM step with noise seeded from `image_seed`
 /// ([`crate::image_sampler`]). Both rungs (resident and streamed) run through this one loop.
@@ -502,7 +502,7 @@ pub fn denoise_image(
 /// When `pag` is active at step `i` (`pag.scale_at_step(i, num_steps) > 0.0`), executes two
 /// conditional passes (`cond` then `perturbed`) through the identical step `i` `pdd_proj_out.{i}`
 /// head, combines generated velocities via `pag_apply` (`v_cond + pag_scale * (v_cond - v_pert)`),
-/// and invokes [`sampler_step`] once so stochastic LCM RNG consumption stays one draw per step.
+/// and invokes `sampler_step` once so stochastic LCM RNG consumption stays one draw per step.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_image_with_pag(
     model: &mut dyn ImageVelocity,

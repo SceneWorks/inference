@@ -44,8 +44,8 @@ use crate::h3_memory::{
     NativeTaskAllocation, AUDIO_OUTPUT_CHANNELS, SPATIAL_STRIDE,
 };
 use crate::h3_reference::{
-    normalized_clip_frame_count, reference_audio_max_samples_per_channel, AudioReference,
-    Ref2VaReference, Ref2VaReferences, VideoReference, REFERENCE_IMAGE_MULTIPLE,
+    normalized_clip_frame_count, reference_audio_max_samples_per_channel, Ref2VaReferenceRef,
+    Ref2VaReferences, REFERENCE_IMAGE_MULTIPLE,
 };
 use crate::h3_schedule::{
     JointSchedule, SigmaSchedule, AUDIO_SIGMA_SHIFT, MIN_INFERENCE_STEPS, VIDEO_SIGMA_SHIFT,
@@ -681,24 +681,22 @@ impl H3RenderPlan {
             resolve_keyframe_slots(keyframes.iter().map(|kf| kf.frame_idx), frames as usize)?;
         }
 
-        let mut refs = Vec::new();
+        let mut refs: Vec<Ref2VaReferenceRef<'_>> = Vec::new();
         for c in &req.conditioning {
             match c {
                 Conditioning::Keyframe { .. } => {}
                 Conditioning::Reference { image, .. } => {
-                    refs.push(Ref2VaReference::Image(image.clone()));
+                    refs.push(Ref2VaReferenceRef::Image(image));
                 }
                 Conditioning::ReferenceAudio { audio, .. } => {
-                    refs.push(Ref2VaReference::Audio(AudioReference {
-                        audio: audio.clone(),
-                    }));
+                    refs.push(Ref2VaReferenceRef::Audio(audio));
                 }
                 Conditioning::ReferenceVideo { frames, fps, audio } => {
-                    refs.push(Ref2VaReference::Video(VideoReference {
-                        frames: frames.clone(),
+                    refs.push(Ref2VaReferenceRef::Video {
+                        frames,
                         fps: f64::from(*fps),
-                        audio: audio.clone(),
-                    }));
+                        audio: audio.as_ref(),
+                    });
                 }
                 _ => {
                     return Err(Error::Unsupported(
@@ -713,20 +711,18 @@ impl H3RenderPlan {
                     .into(),
             ));
         }
-        let validated_refs = if refs.is_empty() {
-            None
-        } else {
-            Some(Ref2VaReferences::new(refs)?)
-        };
+        if !refs.is_empty() {
+            Ref2VaReferences::validate_borrowed(&refs)?;
+        }
         validate_reference_image_short_edge("minimax_h3", req)?;
 
         let (route, condition_video_tokens, condition_audio_rows, reference_count) =
-            if let Some(ref_list) = &validated_refs {
+            if !refs.is_empty() {
                 let mut ref_video_tokens = 0usize;
                 let mut ref_audio_rows = 0usize;
-                for item in ref_list.as_slice() {
+                for item in &refs {
                     match item {
-                        Ref2VaReference::Image(img) => {
+                        Ref2VaReferenceRef::Image(img) => {
                             let (rw, rh) = crate::resolve_reference_image_size(
                                 img.width,
                                 img.height,
@@ -740,19 +736,23 @@ impl H3RenderPlan {
                             let gh = ((rh / SPATIAL_STRIDE) as usize).max(1);
                             ref_video_tokens = ref_video_tokens.saturating_add(gw * gh);
                         }
-                        Ref2VaReference::Video(v) => {
+                        Ref2VaReferenceRef::Video {
+                            frames: ref_frames,
+                            fps,
+                            audio,
+                        } => {
                             let kept = normalized_clip_frame_count(
-                                v.frames.len(),
-                                v.fps,
+                                ref_frames.len(),
+                                *fps,
                                 frames as usize,
                                 f64::from(H3_FPS),
                             )?;
                             let latent_f = (kept.saturating_sub(5)) / 17 * 5 + 2;
-                            let first = &v.frames[0];
+                            let first = &ref_frames[0];
                             let rw = (first.width / SPATIAL_STRIDE).max(1) as usize;
                             let rh = (first.height / SPATIAL_STRIDE).max(1) as usize;
                             ref_video_tokens = ref_video_tokens.saturating_add(latent_f * rw * rh);
-                            if let Some(a) = &v.audio {
+                            if let Some(a) = audio {
                                 let per_ch = reference_audio_max_samples_per_channel(
                                     frames as usize,
                                     f64::from(H3_FPS),
@@ -763,15 +763,15 @@ impl H3RenderPlan {
                                     .saturating_add(latents * usize::from(a.channels));
                             }
                         }
-                        Ref2VaReference::Audio(a) => {
+                        Ref2VaReferenceRef::Audio(a) => {
                             let per_ch = reference_audio_max_samples_per_channel(
                                 frames as usize,
                                 f64::from(H3_FPS),
-                                a.audio.sample_rate,
+                                a.sample_rate,
                             );
                             let latents = per_ch.div_ceil(800);
-                            ref_audio_rows = ref_audio_rows
-                                .saturating_add(latents * usize::from(a.audio.channels));
+                            ref_audio_rows =
+                                ref_audio_rows.saturating_add(latents * usize::from(a.channels));
                         }
                     }
                 }
@@ -779,7 +779,7 @@ impl H3RenderPlan {
                     H3RouteKind::Ref2va,
                     ref_video_tokens,
                     ref_audio_rows,
-                    ref_list.len(),
+                    refs.len(),
                 )
             } else if !keyframes.is_empty() {
                 let grid_w = (width / SPATIAL_STRIDE) as usize;
@@ -1967,5 +1967,74 @@ mod tests {
         assert_eq!(image_plan.route, H3RouteKind::ImageEdit);
         assert_eq!(image_plan.condition_video_tokens, expected_image_tokens);
         assert!(image_plan.condition_video_tokens < raw_tokens);
+    }
+
+    #[test]
+    fn ref2va_video_planning_validates_borrowed_media_without_cloning_buffers() {
+        // Large-video metadata Ref2VA clip (120 frames, 1280x720 declared geometry, plus stereo
+        // audio) validated strictly via borrowed `Ref2VaReferenceRef` slices without cloning
+        // pixel or waveform buffers.
+        let frames: Vec<gen_core::Image> = (0..120)
+            .map(|_| gen_core::Image {
+                width: 1280,
+                height: 720,
+                pixels: vec![0u8; 3],
+            })
+            .collect();
+        let audio = gen_core::AudioTrack {
+            sample_rate: 32_000,
+            channels: 2,
+            samples: vec![0.0f32; 64],
+            stems: Vec::new(),
+        };
+        let req = GenerationRequest {
+            prompt: "a sailboat gliding past cliffs".into(),
+            width: H3_CANVAS_DEFAULT_WIDTH,
+            height: H3_CANVAS_DEFAULT_HEIGHT,
+            frames: Some(124),
+            steps: Some(H3_TURBO_8_STEPS),
+            conditioning: vec![Conditioning::ReferenceVideo {
+                frames,
+                fps: 24.0,
+                audio: Some(audio),
+            }],
+            ..Default::default()
+        };
+
+        let plan = H3RenderPlan::from_video_generation_request(
+            &req,
+            H3BudgetDomainKey::UnifiedMemory,
+            H3EnvelopeSpec::m5_24gib(),
+        )
+        .unwrap();
+        assert_eq!(plan.route, H3RouteKind::Ref2va);
+        assert_eq!(plan.reference_count, 1);
+        assert!(plan.condition_video_tokens > 0);
+        assert!(plan.condition_audio_rows > 0);
+
+        // Borrowed validator must still reject invalid Ref2VA payloads (e.g., audio-only).
+        let audio_only = GenerationRequest {
+            prompt: "audio only".into(),
+            width: H3_CANVAS_DEFAULT_WIDTH,
+            height: H3_CANVAS_DEFAULT_HEIGHT,
+            frames: Some(124),
+            steps: Some(H3_TURBO_8_STEPS),
+            conditioning: vec![Conditioning::ReferenceAudio {
+                audio: gen_core::AudioTrack {
+                    sample_rate: 32_000,
+                    channels: 2,
+                    samples: vec![0.0f32; 64],
+                    stems: Vec::new(),
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(H3RenderPlan::from_video_generation_request(
+            &audio_only,
+            H3BudgetDomainKey::UnifiedMemory,
+            H3EnvelopeSpec::m5_24gib(),
+        )
+        .is_err());
     }
 }

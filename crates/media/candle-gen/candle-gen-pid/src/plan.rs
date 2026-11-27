@@ -189,6 +189,21 @@ impl PidDecodePlan {
         let tiling = match selected_tiling {
             Some((edge, overlap)) => {
                 budget::validate_tile(model_id, edge, overlap, th, tw)?;
+                let selected_peak_gib = budget::tiled_peak_gib(
+                    count.max(1) as i32,
+                    th,
+                    tw,
+                    edge,
+                    cfg.patch_size,
+                    cfg.hidden_size,
+                );
+                if selected_peak_gib > safe_gib {
+                    return Err(CandleError::from(CoreError::Unsupported(format!(
+                        "{model_id}: selected PiD tile {edge}px for {output_width}x{output_height} \
+                         needs ~{selected_peak_gib:.2} GiB, exceeding the {safe_gib:.2} GiB safe \
+                         memory budget"
+                    ))));
+                }
                 PidTilingPlan {
                     tile_edge_px: edge,
                     overlap_px: overlap,
@@ -505,5 +520,49 @@ mod tests {
             PidDecodePlan::compile("qwenimage", &cfg, &sampler, None, &good_tile, 0.0, 1, 96.0)
                 .unwrap();
         assert_eq!(default_pid_good.applied_tiling(), Some((2048, 256)));
+    }
+
+    #[test]
+    fn pid_decode_plan_rejects_selected_tile_exceeding_memory_budget() {
+        let cfg = PidConfig::sr4x();
+        let sampler = SamplerConfig::distill_4step();
+        // 1536x1536 with sr4x() -> 6144x6144 output under 3.0 GiB safe budget:
+        // budget::guard (1024px min tile) fits (~2.75 GiB), so automatic planning succeeds with
+        // 1024px, whereas an explicit (2048, 256) selection (~3.42 GiB) must be rejected.
+        let auto_plan = PidDecodePlan::compile_for_fields(
+            "qwenimage",
+            &cfg,
+            &sampler,
+            None,
+            1536,
+            1536,
+            1,
+            0.0,
+            1,
+            3.0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(auto_plan.applied_tiling(), Some((1024, 256)));
+
+        let err = PidDecodePlan::compile_for_fields(
+            "qwenimage",
+            &cfg,
+            &sampler,
+            None,
+            1536,
+            1536,
+            1,
+            0.0,
+            1,
+            3.0,
+            Some((2048, 256)),
+        )
+        .expect_err("explicit 2048px tile exceeding 3.0 GiB budget must be refused");
+        assert!(
+            err.to_string()
+                .contains("exceeding the 3.00 GiB safe memory budget"),
+            "unexpected error: {err}"
+        );
     }
 }
