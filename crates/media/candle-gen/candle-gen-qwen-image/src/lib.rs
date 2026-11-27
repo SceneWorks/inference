@@ -33,6 +33,7 @@ const _: fn() = || {
 
 pub mod adapters;
 pub mod config;
+mod route_wrappers;
 // Shared scaffolding for the control lane (`control_fun`): the component loader, prompt encoder,
 // control-image preprocessor, and VAE-output converter, parameterized by an error `label` (sc-9011,
 // F-074). De-duplicates what used to be verbatim copies; the lane's outputs are preserved exactly.
@@ -1372,13 +1373,13 @@ pub(crate) fn route_edit() -> gen_core::RouteRecord {
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresEdit;
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut bindings = gen_core::RouteBindings::feature_route(Some(MODEL_ID), edit_descriptor)
-        .with_render_plan(compile_edit_render_plan)
-        .with_encoder_contract_parent(MODEL_ID);
+    let mut bindings = gen_core::RouteBindings::generator(edit_descriptor, route_wrappers::load_edit)
+        .with_feature_route(Some(MODEL_ID), edit_descriptor)
+        .with_render_plan(compile_edit_render_plan);
     #[cfg(feature = "cuda")]
     {
         bindings = bindings
-            .with_composed_memory_registration(QWEN_EDIT_MEMORY_REGISTRATION)
+            .with_memory_registration(QWEN_EDIT_MEMORY_REGISTRATION)
             .with_memory_fixture(
                 gen_core::candle_memory_contract_surface_specs,
                 weights_free_qwen_edit_memory_contract,
@@ -1391,6 +1392,18 @@ pub(crate) fn route_edit() -> gen_core::RouteRecord {
 
 pub fn edit_descriptor() -> ModelDescriptor {
     route_edit().compute_descriptor()
+}
+
+pub fn edit_2509_descriptor() -> ModelDescriptor {
+    route_wrappers::route_edit_2509().compute_descriptor()
+}
+
+pub fn edit_2511_descriptor() -> ModelDescriptor {
+    route_wrappers::route_edit_2511().compute_descriptor()
+}
+
+pub fn edit_2511_lightning_descriptor() -> ModelDescriptor {
+    route_wrappers::route_edit_2511_lightning().compute_descriptor()
 }
 
 pub fn compile_edit_render_plan(
@@ -1479,9 +1492,10 @@ pub(crate) fn route_control() -> gen_core::RouteRecord {
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresControl;
     route.structure.weight_plan.requires_control_overlay = true;
-    route.bindings = gen_core::RouteBindings::feature_route(Some(MODEL_ID), control_descriptor)
-        .with_render_plan(compile_control_render_plan)
-        .with_encoder_contract_parent(MODEL_ID);
+    route.bindings =
+        gen_core::RouteBindings::generator(control_descriptor, route_wrappers::load_control)
+            .with_feature_route(Some(MODEL_ID), control_descriptor)
+            .with_render_plan(compile_control_render_plan);
     route
 }
 
@@ -1906,6 +1920,9 @@ pub fn register_providers(
     registry
         .register_route(route_base())
         .register_route(route_edit())
+        .register_route(route_wrappers::route_edit_2509())
+        .register_route(route_wrappers::route_edit_2511())
+        .register_route(route_wrappers::route_edit_2511_lightning())
         .register_route(route_control())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
@@ -1932,7 +1949,7 @@ pub fn register_memory_contract_surfaces(
             contract: weights_free_qwen_image_memory_contract,
         })
         .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: "qwen_image_edit",
@@ -2010,8 +2027,25 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["qwen_image"]);
-        for id in ["qwen_image", "qwen_image_edit", "qwen_image_control"] {
+        assert_eq!(
+            explicit,
+            [
+                "qwen_image",
+                "qwen_image_edit",
+                "qwen_image_edit_2509",
+                "qwen_image_edit_2511",
+                "qwen_image_edit_2511_lightning",
+                "qwen_image_control",
+            ]
+        );
+        for id in [
+            "qwen_image",
+            "qwen_image_edit",
+            "qwen_image_edit_2509",
+            "qwen_image_edit_2511",
+            "qwen_image_edit_2511_lightning",
+            "qwen_image_control",
+        ] {
             assert_eq!(
                 registry.provider_encoder_contract(id),
                 Some(super::ENCODER_CONTRACT),

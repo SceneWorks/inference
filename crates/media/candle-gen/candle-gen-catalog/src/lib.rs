@@ -54,10 +54,9 @@ pub mod providers {
 }
 
 /// Platform-owned crates consumed through provider-specific APIs rather than the registry
-/// `load(id, spec)` path (depth maps, face analysis, segmentation, identity conditioning,
-/// the PiD latent decoder). Listed here so their platform membership is as explicit as a
-/// registered generator. Note `pulid` is bespoke here, whereas MLX ships it as `pulid_flux`.
-pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
+/// `load(id, spec)` path (depth maps, face analysis, segmentation, the PiD latent decoder).
+/// Listed here so their platform membership is as explicit as a registered generator.
+pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "pid", "sam3"];
 
 /// Machine-readable disposition for a provider-owned memory contract that intentionally cannot be
 /// represented by an ordinary [`candle_gen::gen_core::MemoryRegistration`].
@@ -73,18 +72,8 @@ pub struct BespokeMemoryRouteWaiver {
 
 /// Descriptor-less Candle memory routes excluded from ordinary registry reconciliation.
 ///
-/// PuLID is worker-owned and constructs a path-shaped FLUX + identity-stack contract through
-/// `PulidFlux::load_with_memory_context`; inventing a generator registration would make the public
-/// provider topology false. Consumers must reconcile this explicit waiver instead.
-pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
-    &[BespokeMemoryRouteWaiver {
-        provider_id: candle_gen_pulid::memory_strategy::PROVIDER_ID,
-        crate_name: "pulid",
-        owner: "candle-gen-pulid",
-        reason: "worker-owned bespoke route with a path-shaped memory contract and no LoadSpec/Generator registration",
-        contract_path: "crates/media/candle-gen/candle-gen-pulid/src/memory_strategy.rs",
-        verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
-    }];
+/// Empty after `SW-6982` registered `pulid_flux` and `instantid` as full `RouteRecord` generators.
+pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] = &[];
 
 fn register_providers_with_flux3_mode(
     registry: ProviderRegistryBuilder,
@@ -112,6 +101,7 @@ fn register_providers_with_flux3_mode(
         candle_gen_flux3::register_providers(registry)
     };
     let registry = candle_gen_ideogram::register_providers(registry);
+    let registry = candle_gen_instantid::register_providers(registry);
     let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
     let registry = candle_gen_kolors::register_providers(registry);
@@ -125,6 +115,7 @@ fn register_providers_with_flux3_mode(
     let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_moss_image::register_providers(registry);
+    let registry = candle_gen_pulid::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_qwen_image_2_1::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -150,14 +141,12 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
-/// Build the hardware-free descriptor-only Candle media provider catalog representing the
-/// shipping CUDA feature set (`SW-6980`, `REG-3`).
-///
-/// Produces the exact route, descriptor, quantization-tier (including FLUX 3 FP8R / NVFP4),
-/// and memory-contract surface of [`provider_registry`] under `--features cuda` without
-/// requiring the NVIDIA CUDA toolkit.
-pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
-    let registry = register_providers_with_flux3_mode(ProviderRegistryBuilder::new(), true);
+/// Register the hardware-free descriptor-only Candle media providers representing the shipping
+/// CUDA feature set onto `registry` (`SW-6980`, `SW-6982`, `REG-3`).
+pub fn register_cuda_descriptor_providers(
+    registry: ProviderRegistryBuilder,
+) -> ProviderRegistryBuilder {
+    let registry = register_providers_with_flux3_mode(registry, true);
     #[cfg(not(feature = "cuda"))]
     let registry = {
         let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
@@ -167,13 +156,24 @@ pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<Provi
         let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
         let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
         let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_pulid::register_memory_contract_surfaces(registry);
         let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
         let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
         let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
         let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
         candle_gen_wan::register_memory_contract_surfaces(registry)
     };
-    registry.build()
+    registry
+}
+
+/// Build the hardware-free descriptor-only Candle media provider catalog representing the
+/// shipping CUDA feature set (`SW-6980`, `REG-3`).
+///
+/// Produces the exact route, descriptor, quantization-tier (including FLUX 3 FP8R / NVFP4),
+/// and memory-contract surface of [`provider_registry`] under `--features cuda` without
+/// requiring the NVIDIA CUDA toolkit.
+pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    register_cuda_descriptor_providers(ProviderRegistryBuilder::new()).build()
 }
 
 /// Advanced quant tiers surfaced by the shipping CUDA feature set, usable in hardware-free
@@ -201,6 +201,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_pulid::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]

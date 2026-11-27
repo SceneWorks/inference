@@ -17,6 +17,7 @@ pub mod kps;
 pub mod memory_strategy;
 pub mod model;
 pub mod openpose;
+mod registry;
 pub mod restore;
 
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
@@ -28,4 +29,32 @@ pub use openpose::{
     draw_bodypose, face_box_from_keypoints, normalize_keypoints, square_fit, BodyPoint,
     NUM_BODY_KEYPOINTS, STICKWIDTH,
 };
+pub use registry::{descriptor, load_instantid};
 pub use restore::{feather_mask, paste_alpha};
+
+/// Add the MLX InstantID generator to an explicit media registry builder (`SW-6982`, `REG-6`).
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_route(registry::route_instantid())
+}
+
+/// Build the complete explicit MLX InstantID provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(explicit, ["instantid"]);
+        assert!(registry.route_conformance_errors().is_empty());
+        assert!(registry.descriptor_conformance_errors().is_empty());
+    }
+}

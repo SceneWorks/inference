@@ -222,6 +222,7 @@ fn modality_name(modality: Modality) -> &'static str {
         Modality::Video => "video",
         Modality::Both => "both",
         Modality::Audio => "audio",
+        Modality::Vector => "vector",
     }
 }
 

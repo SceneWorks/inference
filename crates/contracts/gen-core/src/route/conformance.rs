@@ -70,20 +70,23 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
                     "{ctx}: FamilyModel declares supports_geometry_change without supports_renoise_from_clean (PIPE-4 requires clean-estimate re-noising across geometry changes)"
                 ));
             }
-            if record.modality == Modality::Audio {
+            if matches!(record.modality, Modality::Audio | Modality::Vector) {
                 if spec.supports_geometry_change {
                     errs.push(format!(
-                        "{ctx}: Modality::Audio route cannot declare supports_geometry_change"
+                        "{ctx}: {:?} route cannot declare supports_geometry_change",
+                        record.modality
                     ));
                 }
                 if spec.supports_multiphase_denoise {
                     errs.push(format!(
-                        "{ctx}: Modality::Audio route cannot declare supports_multiphase_denoise"
+                        "{ctx}: {:?} route cannot declare supports_multiphase_denoise",
+                        record.modality
                     ));
                 }
                 if spec.pag.is_some() {
                     errs.push(format!(
-                        "{ctx}: Modality::Audio route cannot declare PAG capability"
+                        "{ctx}: {:?} route cannot declare PAG capability",
+                        record.modality
                     ));
                 }
             }
@@ -127,15 +130,17 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
                     ));
                 }
             }
-            if record.modality == Modality::Audio {
+            if matches!(record.modality, Modality::Audio | Modality::Vector) {
                 if support.geometry_change {
                     errs.push(format!(
-                        "{ctx}: Modality::Audio route cannot declare DriverSupport::geometry_change"
+                        "{ctx}: {:?} route cannot declare DriverSupport::geometry_change",
+                        record.modality
                     ));
                 }
                 if spec.pag.is_some() {
                     errs.push(format!(
-                        "{ctx}: Modality::Audio route cannot declare PAG capability"
+                        "{ctx}: {:?} route cannot declare PAG capability",
+                        record.modality
                     ));
                 }
             }
@@ -165,10 +170,12 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
     }
 
     // 5. Preview policy consistency.
-    if record.modality == Modality::Audio && s.output.preview != PreviewSupport::Unsupported {
+    if matches!(record.modality, Modality::Audio | Modality::Vector)
+        && s.output.preview != PreviewSupport::Unsupported
+    {
         errs.push(format!(
-            "{ctx}: Modality::Audio route cannot advertise preview {:?}",
-            s.output.preview
+            "{ctx}: {:?} route cannot advertise preview {:?}",
+            record.modality, s.output.preview
         ));
     }
 
@@ -265,9 +272,10 @@ pub fn route_record_conformance_errors(record: &RouteRecord) -> Vec<String> {
         }
     }
     if let Some((w, h)) = defaults.dimensions {
-        if record.modality == Modality::Audio {
+        if matches!(record.modality, Modality::Audio | Modality::Vector) {
             errs.push(format!(
-                "{ctx}: Modality::Audio route should not declare spatial defaults.dimensions ({w}x{h})"
+                "{ctx}: {:?} route should not declare spatial defaults.dimensions ({w}x{h})",
+                record.modality
             ));
         } else {
             if w < record.limits.min_size

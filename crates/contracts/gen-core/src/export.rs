@@ -2606,6 +2606,16 @@ fn derive_route_modes(
                 push("song_cover");
             }
         }
+        Modality::Vector => {
+            if caps.accepts(ConditioningKind::Reference)
+                || caps.accepts(ConditioningKind::ReferenceRgba)
+            {
+                push("image_to_svg");
+            }
+            if supports_noise_start {
+                push("text_to_svg");
+            }
+        }
     }
 
     modes
@@ -2638,6 +2648,7 @@ pub fn modality_name(modality: Modality) -> &'static str {
         Modality::Video => "video",
         Modality::Both => "both",
         Modality::Audio => "audio",
+        Modality::Vector => "vector",
     }
 }
 

@@ -10,6 +10,8 @@ pub use gen_core::memory_strategy;
 pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 pub mod export;
+pub mod reconcile;
+pub mod starvector;
 pub use export::{
     assemble_capabilities_export, run_export_cli, run_export_cli_with_args,
     verify_catalog_against_export, ExportAssemblyOptions, ExportCliTarget,
@@ -802,6 +804,7 @@ fn modality_name(modality: Modality) -> &'static str {
         Modality::Video => "video",
         Modality::Both => "both",
         Modality::Audio => "audio",
+        Modality::Vector => "vector",
     }
 }
 

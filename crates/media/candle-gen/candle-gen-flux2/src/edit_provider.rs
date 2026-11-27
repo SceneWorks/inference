@@ -163,18 +163,199 @@ pub(crate) fn route_edit(variant: Flux2Variant) -> candle_gen::gen_core::RouteRe
             .with_pag(variant.pag_capability()),
     );
     route.bindings = match variant {
-        Flux2Variant::Klein9b => candle_gen::gen_core::RouteBindings::feature_route(
+        Flux2Variant::Klein9b => candle_gen::gen_core::RouteBindings::generator(
+            edit_report_descriptor_klein,
+            load_edit_klein,
+        )
+        .with_feature_route(
             Some(crate::config::FLUX2_KLEIN_9B_ID),
             edit_report_descriptor_klein,
         )
         .with_render_plan(|spec, req| compile_edit_feature_route(Flux2Variant::Klein9b, spec, req)),
-        Flux2Variant::Dev => candle_gen::gen_core::RouteBindings::feature_route(
+        Flux2Variant::Dev => candle_gen::gen_core::RouteBindings::generator(
+            edit_report_descriptor_dev,
+            load_edit_dev,
+        )
+        .with_feature_route(
             Some(crate::config::FLUX2_DEV_ID),
             edit_report_descriptor_dev,
         )
         .with_render_plan(|spec, req| compile_edit_feature_route(Flux2Variant::Dev, spec, req)),
     };
     route
+}
+
+struct Flux2EditGenerator {
+    descriptor: candle_gen::gen_core::ModelDescriptor,
+    variant: Flux2Variant,
+    spec: candle_gen::gen_core::LoadSpec,
+    model: Flux2Edit,
+}
+
+fn extract_edit_references(
+    req: &candle_gen::gen_core::GenerationRequest,
+    route_id: &str,
+) -> candle_gen::gen_core::Result<Vec<Image>> {
+    let mut refs = Vec::new();
+    for cond in &req.conditioning {
+        match cond {
+            candle_gen::gen_core::Conditioning::Reference { image, .. } => refs.push(image.clone()),
+            candle_gen::gen_core::Conditioning::MultiReference { images } => {
+                refs.extend(images.iter().cloned());
+            }
+            _ => {
+                return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                    "{route_id} only accepts Reference or MultiReference conditioning"
+                )));
+            }
+        }
+    }
+    if refs.is_empty() {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{route_id} requires at least one reference image"
+        )));
+    }
+    Ok(refs)
+}
+
+impl candle_gen::gen_core::Generator for Flux2EditGenerator {
+    fn descriptor(&self) -> &candle_gen::gen_core::ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("flux2/edit_route", self.descriptor.id.into());
+        })
+    }
+
+    fn validate(
+        &self,
+        request: &candle_gen::gen_core::GenerationRequest,
+    ) -> candle_gen::gen_core::Result<()> {
+        let _ = compile_edit_feature_route(self.variant, &self.spec, request)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        request: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        self.validate(request)?;
+        let references = extract_edit_references(request, self.descriptor.id)?;
+        let default_steps = match self.variant {
+            Flux2Variant::Klein9b => DEFAULT_STEPS as usize,
+            Flux2Variant::Dev => crate::config::DEFAULT_STEPS_DEV as usize,
+        };
+        let default_guidance = match self.variant {
+            Flux2Variant::Klein9b => DEFAULT_GUIDANCE,
+            Flux2Variant::Dev => crate::config::DEFAULT_GUIDANCE_DEV,
+        };
+        let steps = request.steps.map(|s| s as usize).unwrap_or(default_steps);
+        let guidance = request.guidance.unwrap_or(default_guidance);
+        let base_seed = request.seed.unwrap_or(0);
+        let mut images = Vec::with_capacity(request.count as usize);
+        for idx in 0..request.count {
+            let edit_req = Flux2EditRequest {
+                prompt: request.prompt.clone(),
+                negative: request.negative_prompt.clone().unwrap_or_default(),
+                width: request.width,
+                height: request.height,
+                steps,
+                sampler: request.sampler.as_deref().map(str::to_owned),
+                scheduler: request.scheduler.as_deref().map(str::to_owned),
+                scheduler_shift: request.scheduler_shift,
+                guidance,
+                seed: base_seed.wrapping_add(idx as u64),
+                enhance_prompt: request.enhance_prompt,
+                enhance_max_tokens: request.enhance_max_tokens,
+                enhance_temperature: request.enhance_temperature,
+                prompt_enhancement: request.prompt_enhancement.clone(),
+                use_pid: request.use_pid(),
+                preview: request.preview.clone(),
+                pag: request.features.pag.clone(),
+                cancel: request.cancel.clone(),
+            };
+            images.push(
+                self.model
+                    .generate(&edit_req, &references, on_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?,
+            );
+        }
+        Ok(candle_gen::gen_core::GenerationOutput::Images(images))
+    }
+}
+
+fn load_edit_variant(
+    variant: Flux2Variant,
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    let descriptor = edit_report_descriptor(variant);
+    spec.validate_prepared_file_pins()?;
+    candle_gen::gen_core::reject_unknown_components(spec, &[], descriptor.id)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.identity.is_some()
+        || spec.ip_adapter.is_some()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{} does not accept control, identity, or IP-Adapter overlays",
+            descriptor.id
+        )));
+    }
+    let root = match &spec.weights {
+        candle_gen::gen_core::WeightsSource::Dir(root) => root.clone(),
+        candle_gen::gen_core::WeightsSource::File(_) => {
+            return Err(candle_gen::gen_core::Error::Msg(format!(
+                "{} requires a FLUX.2 snapshot directory",
+                descriptor.id
+            )));
+        }
+    };
+    let paths = Flux2EditPaths {
+        root,
+        adapters: spec.adapters.clone(),
+    };
+    let mut model = match variant {
+        Flux2Variant::Klein9b => {
+            Flux2Edit::load_klein_with_memory_spec(&paths, spec, GenerationMemory::default())
+        }
+        Flux2Variant::Dev => Flux2Edit::load_dev_with_memory_spec(
+            &paths,
+            spec.quantize,
+            spec,
+            GenerationMemory::default(),
+        ),
+    }
+    .map_err(candle_gen::gen_core::Error::from)?;
+    if let Some(pid) = &spec.pid {
+        model = model
+            .with_pid(pid)
+            .map_err(candle_gen::gen_core::Error::from)?;
+    }
+    Ok(Box::new(Flux2EditGenerator {
+        descriptor,
+        variant,
+        spec: spec.clone(),
+        model,
+    }))
+}
+
+pub(crate) fn load_edit_klein(
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    load_edit_variant(Flux2Variant::Klein9b, spec)
+}
+
+pub(crate) fn load_edit_dev(
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    load_edit_variant(Flux2Variant::Dev, spec)
 }
 
 fn edit_report_descriptor_klein() -> candle_gen::gen_core::ModelDescriptor {

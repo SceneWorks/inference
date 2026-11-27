@@ -32,6 +32,16 @@ pub struct VectorTerminalMetadata {
     /// Optional count of SVG elements/primitives retained after sanitization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_count: Option<usize>,
+    /// Optional provider-native terminal finish reason (e.g. `"complete_root"`, `"eos"`,
+    /// `"token_limit"`, `"byte_limit"`, `"wall_time_limit"`, `"cancelled"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_finish_reason: Option<String>,
+    /// Optional raw UTF-8 source byte count emitted by the vector provider before sanitization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_bytes: Option<usize>,
+    /// Optional underlying provider identifier that produced the vector stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 /// Sanitized canonical SVG plus optional rendered preview and terminal metadata (`PIPE-12`).

@@ -2508,7 +2508,16 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+        assert_eq!(
+            explicit,
+            [
+                "flux2_klein_9b",
+                "flux2_dev",
+                "flux2_klein_9b_edit",
+                "flux2_dev_edit",
+                "flux2_dev_control",
+            ]
+        );
         assert_eq!(
             registry.provider_encoder_contract(super::config::FLUX2_DEV_ID),
             Some(super::config::DEV_ENCODER_CONTRACT)

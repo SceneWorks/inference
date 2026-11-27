@@ -63,7 +63,7 @@ pub mod providers {
 /// Platform-owned crates consumed through provider-specific APIs rather than the registry
 /// `load(id, spec)` path (depth maps, face analysis, segmentation, the PiD latent decoder).
 /// Listed here so their platform membership is as explicit as a registered generator.
-pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "sam2", "sam3"];
+pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "pid", "sam2", "sam3"];
 
 /// Provider crates deliberately compiled but not yet composed into this platform registry.
 ///
@@ -101,6 +101,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_flux2::register_providers(registry);
     let registry = mlx_gen_flux3::register_providers(registry);
     let registry = mlx_gen_ideogram::register_providers(registry);
+    let registry = mlx_gen_instantid::register_providers(registry);
     let registry = mlx_gen_iris::register_providers(registry);
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
@@ -878,7 +879,7 @@ mod tests {
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "flux" | "boogu" | "chroma" | "z-image" | "pulid" => Some(&FLUX1_LATENT_SPACE),
                 "sd3" => Some(&SD3_LATENT_SPACE),
-                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "sdxl" | "kolors" | "instantid" => Some(&SDXL_LATENT_SPACE),
                 "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 // FLUX 3's packed 16× latent (its own autoencoder with BatchNorm-stat tokens)
                 // has no shared decoder consumer, so nothing is advertised (sc-26234).
@@ -973,11 +974,13 @@ mod tests {
             !svd.capabilities.supports_preview,
             "SVD temporal previews remain scoped to sc-16636"
         );
+        let instantid = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == "instantid")
+            .expect("InstantID is registered as a callable route in SW-6982");
         assert!(
-            descriptors
-                .iter()
-                .all(|descriptor| descriptor.id != "instantid"),
-            "InstantID is a struct-only composition API and must not gain invented registration"
+            !instantid.capabilities.supports_preview,
+            "InstantID does not advertise live latent previews"
         );
     }
 
@@ -1947,6 +1950,7 @@ mod tests {
                 "flux3_klein_base",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "instantid",
                 "iris_3b",
                 "kolors",
                 "krea_2_turbo",
@@ -2065,8 +2069,9 @@ mod tests {
         // sc-26323 adds both MOSS providers: 79 distinct ids / 69 complete rows.
         // sc-24213 adds `supra2_img` (its own complete row): 80 / 70.
         // SW-7090 adds `minimax_h3_image` (a generator with its own complete row): 81 / 71.
-        assert_eq!(distinct.len(), 81);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 71);
+        // SW-6982 adds `instantid` (a generator with its own component row): 82 / 72.
+        assert_eq!(distinct.len(), 82);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 72);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

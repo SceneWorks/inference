@@ -365,12 +365,136 @@ pub(crate) fn route_control() -> candle_gen::gen_core::RouteRecord {
     route.structure.weight_plan.requires_control_overlay = true;
     route.seed_and_batch.max_count = 1;
     route.defaults.strength = Some(DEFAULT_CONTROL_SCALE);
-    route.bindings = candle_gen::gen_core::RouteBindings::feature_route(
-        Some(crate::FLUX1_DEV_ID),
+    route.bindings = candle_gen::gen_core::RouteBindings::generator(
         control_descriptor,
+        load_control,
     )
+    .with_feature_route(Some(crate::FLUX1_DEV_ID), control_descriptor)
     .with_render_plan(compile_control_feature_route);
     route
+}
+
+struct Flux1DevControlGenerator {
+    descriptor: ModelDescriptor,
+    spec: LoadSpec,
+    model: Flux1DevControl,
+}
+
+impl candle_gen::gen_core::Generator for Flux1DevControlGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        let (control_image, kind, scale) = match req.conditioning.as_slice() {
+            [Conditioning::Control { image, kind, scale }] => (image, kind, *scale),
+            _ => {
+                return Err(candle_gen::gen_core::Error::Unsupported(
+                    "flux1_dev_control requires exactly one Control conditioning image".into(),
+                ));
+            }
+        };
+        let plan = compile_control_feature_route(&self.spec, req)?.ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(
+                "flux1_dev_control: failed to compile control render plan".into(),
+            )
+        })?;
+        let control_kind = match kind {
+            ControlKind::Pose => "pose".to_string(),
+            ControlKind::Canny => "canny".to_string(),
+            ControlKind::Depth => "depth".to_string(),
+            ControlKind::Other(other) => other.clone(),
+        };
+        let control_req = Flux1ControlRequest {
+            prompt: req.prompt.clone(),
+            width: req.width,
+            height: req.height,
+            steps: req.steps.map(|s| s as usize).unwrap_or(25),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
+            scheduler_shift: req.scheduler_shift,
+            guidance: req.guidance.unwrap_or(3.5),
+            control_scale: scale.or(req.control_scale),
+            control_kind,
+            seed: req.seed.unwrap_or(0),
+            memory: req.memory.unwrap_or_default(),
+            preview: req.preview.clone(),
+            pag: req.features.pag.clone(),
+            cancel: req.cancel.clone(),
+        };
+        self.model
+            .generate_with_execution_report(&control_req, control_image, &plan, on_progress)
+    }
+
+    fn validate(&self, request: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
+        let _ = compile_control_feature_route(&self.spec, request)?;
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        self.generate_with_execution_report(request, on_progress)?
+            .generation
+            .output
+            .ok_or_else(|| {
+                candle_gen::gen_core::Error::Msg(
+                    "flux1_dev_control: generation produced no output".into(),
+                )
+            })
+    }
+}
+
+pub(crate) fn load_control(
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Box<dyn candle_gen::gen_core::Generator>> {
+    spec.validate_prepared_file_pins()?;
+    candle_gen::gen_core::reject_unknown_components(spec, &[], control_descriptor().id)?;
+    if !spec.extra_controls.is_empty()
+        || spec.identity.is_some()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "flux1_dev_control does not accept extra control, identity, IP-Adapter, or PiD overlays"
+                .into(),
+        ));
+    }
+    let flux_base = match &spec.weights {
+        WeightsSource::Dir(root) => root.clone(),
+        WeightsSource::File(_) => {
+            return Err(candle_gen::gen_core::Error::Msg(
+                "flux1_dev_control requires a FLUX.1-dev snapshot directory".into(),
+            ));
+        }
+    };
+    let control = match &spec.control {
+        Some(WeightsSource::File(path) | WeightsSource::Dir(path)) => path.clone(),
+        None => {
+            return Err(candle_gen::gen_core::Error::Msg(
+                "flux1_dev_control requires spec.control".into(),
+            ));
+        }
+    };
+    let paths = Flux1ControlPaths {
+        flux_base,
+        control,
+        adapters: spec.adapters.clone(),
+    };
+    let model = Flux1DevControl::load_with_memory_spec(&paths, GenerationMemory::default(), spec)
+        .map_err(candle_gen::gen_core::Error::from)?;
+    Ok(Box::new(Flux1DevControlGenerator {
+        descriptor: control_descriptor(),
+        spec: spec.clone(),
+        model,
+    }))
 }
 
 pub(crate) fn control_descriptor() -> ModelDescriptor {
