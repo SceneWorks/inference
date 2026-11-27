@@ -77,12 +77,6 @@ const SITE_MODULATE: &str = "wan::transformer::modulate";
 const SITE_GATED: &str = "wan::transformer::gated";
 const SITE_GELU_FFN: &str = "wan::transformer::gelu_ffn";
 
-fn modulate_impl(
-    (m, scale, shift): (&Array, &Array, &Array),
-) -> std::result::Result<Array, Exception> {
-    add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)
-}
-
 thread_local! {
     static RETAINED_COMPILE_GLUE: std::cell::RefCell<Option<DitCompileGlue>> =
         const { std::cell::RefCell::new(None) };
@@ -94,9 +88,12 @@ thread_local! {
 /// bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`). The gelu body mirrors
 /// [`mlx_gen::nn::gelu_tanh`] exactly; when compiled it is the single biggest per-step glue cost
 /// fused (~600 MB bf16 tensor × 40 layers, sc-2957).
+///
+/// The modulate body is the shared [`mlx_gen::nn::modulate_f32_one_impl`] (SW-6140): a strong f32
+/// `1`, the same three-op graph this crate's private copy traced.
 static GLUE: DitGlue = DitGlue::new(
     [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN],
-    modulate_impl,
+    mlx_gen::nn::modulate_f32_one_impl,
     &RETAINED_COMPILE_GLUE,
 );
 

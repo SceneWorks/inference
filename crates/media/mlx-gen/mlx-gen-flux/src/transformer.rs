@@ -93,12 +93,6 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
     }
 }
 
-/// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32.
-/// Forwards to the shared [`mlx_gen::nn::rope_rotate`].
-fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    mlx_gen::nn::rope_rotate(real, imag, cos, sin)
-}
-
 pub struct FluxTransformerConfig {
     pub num_layers: usize,
     pub num_single_layers: usize,
@@ -1556,23 +1550,19 @@ fn apply_rope(q: &Array, k: &Array, rope: &RopeTable) -> Result<(Array, Array)> 
     Ok((apply_rope_one(q, rope)?, apply_rope_one(k, rope)?))
 }
 
+/// Interleaved (adjacent-pair) RoPE over a head-major `[B, H, S, D]` stream, rotated in f32 and
+/// left f32: the shared [`mlx_gen::qkv::apply_rope`] (SW-6140) — the same `nn::rope_rotate`
+/// glue kernel over the same `[1, 1, S, D/2]` table broadcast this crate's private copy ran. The
+/// stream is cast to f32 first (FLUX.1's rotation always runs, and stays, in f32), so the
+/// `Promoted` policy is the identity on its output dtype.
 fn apply_rope_one(x: &Array, rope: &RopeTable) -> Result<Array> {
-    let sh = x.shape();
-    let (b, heads, seq, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-    let x5 = x
-        .as_dtype(Dtype::Float32)?
-        .reshape(&[b, heads, seq, half, 2])?;
-    let p = split(&x5, 2, 4)?;
-    let real = p[0].reshape(&[b, heads, seq, half])?;
-    let imag = p[1].reshape(&[b, heads, seq, half])?;
-    let cos = rope.cos.reshape(&[1, 1, seq, half])?;
-    let sin = rope.sin.reshape(&[1, 1, seq, half])?;
-    let (out0, out1) = rope_rotate(&real, &imag, &cos, &sin)?;
-    Ok(
-        concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-            .reshape(&[b, heads, seq, hd])?
-            .as_dtype(Dtype::Float32)?,
+    mlx_gen::qkv::apply_rope(
+        &x.as_dtype(Dtype::Float32)?,
+        mlx_gen::qkv::RopeTables::new(&rope.cos, &rope.sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
     )
 }
 
@@ -2149,9 +2139,9 @@ mod tests {
         let cos = rnd(&[1, 1, s, half], Float32);
         let sin = rnd(&[1, 1, s, half], Float32);
         set_compile_glue(false);
-        let (e0, e1) = rope_rotate(&real, &imag, &cos, &sin).unwrap();
+        let (e0, e1) = mlx_gen::nn::rope_rotate(&real, &imag, &cos, &sin).unwrap();
         set_compile_glue(true);
-        let (c0, c1) = rope_rotate(&real, &imag, &cos, &sin).unwrap();
+        let (c0, c1) = mlx_gen::nn::rope_rotate(&real, &imag, &cos, &sin).unwrap();
         set_compile_glue(false);
         assert_eq!(
             max_abs_diff(&c0, &e0),

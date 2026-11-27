@@ -9,7 +9,6 @@
 
 use gen_core_checkpoint::supra2::{timestep_features, Supra2Config};
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -33,10 +32,11 @@ fn lin(w: &Weights, prefix: &str, shape: [usize; 2]) -> Result<AdaptableLinear> 
     mlx_gen::quant::lin(w, prefix, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
-/// `x * (1 + scale[:, None]) + shift[:, None]`.
+/// `x * (1 + scale[:, None]) + shift[:, None]`, strong-f32 `1`: the shared eager
+/// [`mlx_gen::nn::modulate_eager`] (SW-6140) over the token-broadcast rows, the same three-op chain
+/// as this crate's private copy.
 fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array> {
-    let one = add(&scale.expand_dims(1)?, scalar(1.0))?;
-    Ok(add(&multiply(x, &one)?, &shift.expand_dims(1)?)?)
+    mlx_gen::nn::modulate_eager(x, &scale.expand_dims(1)?, &shift.expand_dims(1)?, false)
 }
 
 fn norm(x: &Array) -> Result<Array> {
