@@ -76,6 +76,7 @@ pub mod encoder_contract;
 pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
+pub mod export;
 pub mod face;
 pub mod feature;
 pub use feature::{

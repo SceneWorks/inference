@@ -1612,7 +1612,7 @@ pub(crate) fn route_ti2v() -> gen_core::RouteRecord {
     }
 }
 
-/// Wan2.2 TI2V-5B descriptor — computed from [`route_ti2v`].
+/// Wan2.2 TI2V-5B descriptor — computed from `route_ti2v`.
 pub fn descriptor() -> ModelDescriptor {
     route_ti2v().compute_descriptor()
 }
@@ -1760,6 +1760,23 @@ pub fn register_providers(
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
         .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
+}
+
+/// Register Wan's CUDA memory contract surfaces without requiring `--features cuda`, used by
+/// hosted hardware-free CUDA capability export (`SW-6980`, `REG-3`).
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
+        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Wan provider catalog.

@@ -11,7 +11,7 @@
 //!   feature sub-route, encoder contract alias, memory contract/fixtures/behavior, activation
 //!   memory, and reference workspace).
 //!
-//! [`ModelDescriptor`], [`Capabilities`], and [`FeatureRouteStructure`] are **computed** from the
+//! [`crate::ModelDescriptor`], [`crate::Capabilities`], and [`crate::FeatureRouteStructure`] are **computed** from the
 //! primary declarations rather than hand-maintained in parallel tables (`AP5`).
 
 mod compute;

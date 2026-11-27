@@ -1031,6 +1031,37 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     )
 }
 
+/// Shipping feature-set identifier compiled into this `runtime-ios` build (`"ios-media"` under
+/// default `media` features; `"ios-llm-only"` under `--no-default-features`).
+#[cfg(feature = "media")]
+pub const EXPORT_FEATURE_SET: &str = gen_core::export::FEATURE_SET_IOS_MEDIA;
+
+/// Shipping feature-set identifier compiled into this `runtime-ios` build (`"ios-media"` under
+/// default `media` features; `"ios-llm-only"` under `--no-default-features`).
+#[cfg(not(feature = "media"))]
+pub const EXPORT_FEATURE_SET: &str = gen_core::export::FEATURE_SET_IOS_LLM_ONLY;
+
+/// Platform export options for this iOS MLX bundle configuration (`SW-6980`, `REG-3`).
+pub fn export_assembly_options() -> runtime_catalog::ExportAssemblyOptions {
+    #[cfg_attr(not(feature = "media"), allow(unused_mut))]
+    let mut options = runtime_catalog::ExportAssemblyOptions::new(EXPORT_FEATURE_SET);
+    #[cfg(feature = "media")]
+    {
+        options.control_required_routes = mlx_gen_ios_catalog::CONTROL_REQUIRED_ROUTES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    options
+}
+
+/// Export the canonical `sga.capabilities/2` build product for this iOS feature set
+/// (`ios-media` or `ios-llm-only`) without loading weights or executing GPU kernels (`SW-6980`).
+pub fn capabilities_export() -> runtime_catalog::Result<gen_core::export::CapabilitiesExportV2> {
+    let catalog = catalog()?;
+    Ok(catalog.capabilities_export(&export_assembly_options()))
+}
+
 #[cfg(test)]
 mod tests {
     /// Off-iOS there is no per-process cap, so binding must be a no-op that says so — and must not
@@ -1129,6 +1160,79 @@ mod tests {
             super::IOS_APP_MEMORY_CAP_MIB,
             mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB
         );
+    }
+
+    /// SW-6980 (`REG-3`, `M8`, `AC1`): the shipping iOS descriptor-only export distinguishes
+    /// `ios-media` (7 image generators + `iris_3b_restore` transform + MLX LLM, 0 trainers, 0 audio)
+    /// from `ios-llm-only` (0 media generators, 0 transforms, MLX LLM only) and is byte-deterministic.
+    #[test]
+    fn descriptor_only_export_distinguishes_ios_media_and_ios_llm_only() {
+        use super::gen_core::export::{
+            canonical_bytes_equal, semantic_equal, CapabilitiesExportV2,
+            CAPABILITIES_EXPORT_SCHEMA_VERSION,
+        };
+
+        let catalog = super::catalog().expect("ios catalog");
+        let export = super::capabilities_export().expect("ios export");
+
+        assert_eq!(export.schema_version, CAPABILITIES_EXPORT_SCHEMA_VERSION);
+        assert_eq!(export.platform, "ios");
+        assert_eq!(export.backend, "mlx");
+        assert_eq!(export.audio_backend, None);
+        assert!(export.audio_routes.is_empty());
+        assert!(export.trainers.is_empty());
+        assert_eq!(
+            export.llm_models.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "mlx-joycaption",
+                "mlx-llama",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
+
+        #[cfg(feature = "media")]
+        {
+            assert_eq!(
+                export.feature_set,
+                super::gen_core::export::FEATURE_SET_IOS_MEDIA
+            );
+            assert_eq!(export.routes.len(), 7);
+            assert!(export.transforms.image.contains_key("iris_3b_restore"));
+            assert!(
+                !export.routes["z_image_turbo_control"]
+                    .modes
+                    .contains(&"text_to_image".to_string()),
+                "control-required iOS route must not advertise plain text_to_image mode"
+            );
+            assert!(export.routes["z_image_turbo_control"]
+                .modes
+                .contains(&"control".to_string()));
+        }
+
+        #[cfg(not(feature = "media"))]
+        {
+            assert_eq!(
+                export.feature_set,
+                super::gen_core::export::FEATURE_SET_IOS_LLM_ONLY
+            );
+            assert!(export.routes.is_empty());
+            assert!(export.transforms.image.is_empty());
+        }
+
+        let bytes_a = export.to_canonical_json_bytes().unwrap();
+        let bytes_b = super::capabilities_export()
+            .unwrap()
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(bytes_a, bytes_b);
+        assert!(canonical_bytes_equal(&bytes_a, &bytes_b).unwrap());
+        let parsed = CapabilitiesExportV2::from_json_bytes(&bytes_a).unwrap();
+        assert!(semantic_equal(&export, &parsed));
+
+        catalog
+            .verify_against_export(&export, &super::export_assembly_options())
+            .expect("ios catalog verifies against its own export");
     }
 
     /// Tiny weights-free (header-only) fixtures for every admitted facade's surface.

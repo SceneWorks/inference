@@ -139,6 +139,77 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
+/// Build the hardware-free descriptor-only Candle media provider catalog representing the
+/// shipping CUDA feature set (`SW-6980`, `REG-3`).
+///
+/// Produces the exact route, descriptor, quantization-tier (including FLUX 3 FP8R / NVFP4),
+/// and memory-contract surface of [`provider_registry`] under `--features cuda` without
+/// requiring the NVIDIA CUDA toolkit.
+pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    #[cfg(feature = "cuda")]
+    {
+        provider_registry()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let registry =
+            candle_gen::logical_weights::register_checkpoint_codecs(ProviderRegistryBuilder::new());
+        let registry =
+            registry.register_checkpoint_codec(candle_gen::gen_core::GGUF_CONTAINER_CODEC);
+        let registry = candle_gen_anima::register_providers(registry);
+        let registry = candle_gen_bernini::register_providers(registry);
+        let registry = candle_gen_boogu::register_providers(registry);
+        let registry = candle_gen_chroma::register_providers(registry);
+        let registry = candle_gen_clip::register_providers(registry);
+        let registry = candle_gen_flux::register_providers(registry);
+        let registry = candle_gen_flux2::register_providers(registry);
+        let registry = candle_gen_flux3::register_cuda_descriptor_providers(registry);
+        let registry = candle_gen_ideogram::register_providers(registry);
+        let registry = candle_gen_iris::register_providers(registry);
+        let registry = candle_gen_joycaption::register_providers(registry);
+        let registry = candle_gen_kolors::register_providers(registry);
+        let registry = candle_gen_krea::register_providers(registry);
+        let registry = candle_gen_lens::register_providers(registry);
+        let registry = candle_gen_ltx::register_providers(registry);
+        let registry = candle_gen_mage::register_providers(registry);
+        let registry = candle_gen_minimax_h3::register_providers(registry);
+        let registry = candle_gen_mochi::register_providers(registry);
+        let registry = candle_gen_moss_image::register_providers(registry);
+        let registry = candle_gen_qwen_image::register_providers(registry);
+        let registry = candle_gen_qwen_image_2_1::register_providers(registry);
+        let registry = candle_gen_sana::register_providers(registry);
+        let registry = candle_gen_scail2::register_providers(registry);
+        let registry = candle_gen_sd3::register_providers(registry);
+        let registry = candle_gen_sdxl::register_providers(registry);
+        let registry = candle_gen_seedvr2::register_providers(registry);
+        let registry = candle_gen_sensenova::register_providers(registry);
+        let registry = candle_gen_supra2::register_providers(registry);
+        let registry = candle_gen_svd::register_providers(registry);
+        let registry = candle_gen_wan::register_providers(registry);
+        let registry = candle_gen_z_image::register_providers(registry);
+
+        let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_wan::register_memory_contract_surfaces(registry);
+        registry.build()
+    }
+}
+
+/// Advanced quant tiers surfaced by the shipping CUDA feature set, usable in hardware-free
+/// descriptor-only exports without `--features cuda` (`SW-6980`, `REG-3`).
+pub fn cuda_descriptor_nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
+    &[media::gen_core::Quant::Nvfp4]
+}
+
 /// Build the complete Candle registry contract surface without loading model weights or requiring
 /// CUDA. On CUDA builds the production catalog already owns these registrations; other platforms
 /// append the same contract-only registrations to the ordinary generator catalog.
