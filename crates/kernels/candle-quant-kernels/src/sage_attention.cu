@@ -93,18 +93,21 @@ __device__ __forceinline__ void sage_load_row(const u16* x, i64 row_off, bool li
 
 // Per-channel partial sums of K over one chunk of rows (the centering mean, before the fixed-order
 // chunk reduction in `sage_k_center`; no atomics, so the mean is deterministic). One thread per
-// channel. grid (B*H, chunks); `partial` is [B*H, chunks, D].
+// channel. grid (chunks, H, B): the chunk count — unbounded with the key length — rides on
+// gridDim.x (limit 2^31 - 1), heads and batch on y / z (the plan bounds both to 65,535).
+// `partial` is [B*H, chunks, D].
 template <int D>
 __device__ void sage_k_sum(const u16* x, i64 sb, i64 sh, i64 ss, int H, int S, int rows_per_cta,
                            bool bf, float* partial) {
-    const int bh = blockIdx.x, b = bh / H, h = bh - b * H, c = threadIdx.x;
-    const int r0 = blockIdx.y * rows_per_cta;
+    const int h = blockIdx.y, b = blockIdx.z, c = threadIdx.x;
+    const i64 bh = (i64)b * H + h;
+    const int r0 = blockIdx.x * rows_per_cta;
     const int r1 = min(S, r0 + rows_per_cta);
     const i64 base = (i64)b * sb + (i64)h * sh + c;
     float acc = 0.0f;
 #pragma unroll 8
     for (int r = r0; r < r1; ++r) acc += ia_load(x + base + (i64)r * ss, bf);
-    partial[((i64)bh * gridDim.y + blockIdx.y) * D + c] = acc;
+    partial[(bh * gridDim.x + blockIdx.x) * D + c] = acc;
 }
 
 // The per-channel mean (the chunk partial sums reduced in a fixed order) and the centering decision

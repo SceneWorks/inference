@@ -187,6 +187,30 @@ pub struct SolPlan {
 }
 
 impl SolPlan {
+    /// Every launch one call makes, by kernel, as its `[x, y, z]` grid, at the largest query
+    /// window (a chunked call's route / exact grids are never wider) — what the envelope
+    /// ([`check_sol_attention`]) holds against CUDA's grid limits. Every grid puts `B·H` on y and
+    /// a block count (at most [`SOL_MAX_KEY_BLOCKS`]) or `ceil(T / 256)` on x.
+    pub fn launch_grids(&self) -> [(&'static str, [usize; 3]); 9] {
+        let (bh, n, np) = (self.bh(), self.blocks, self.blocks_pad);
+        [
+            ("sol_reduce_kv", [np, bh, 1]),
+            ("sol_pooled_stats", [bh, 1, 1]),
+            ("sol_pooled_quant", [np, bh, 1]),
+            ("sol_prep_q", [n, bh, 1]),
+            ("sol_prep_k", [n, bh, 1]),
+            ("sol_vtranspose", [self.len.div_ceil(256), bh, 1]),
+            ("sol_topk_threshold", [n, bh, 1]),
+            ("sol_route", [n.div_ceil(64), bh, 1]),
+            ("sol_exact", [n, bh, 1]),
+        ]
+    }
+
+    /// `sol_topk_threshold`'s dynamic shared memory: one `u32` key per block.
+    pub fn topk_smem_bytes(&self) -> usize {
+        self.blocks * 4
+    }
+
     /// `B·H`.
     pub fn bh(&self) -> usize {
         self.batch * self.heads
@@ -261,22 +285,33 @@ pub fn check_sol_attention(
             .is_some_and(|n| n <= i32::MAX as usize)
     };
     let bh = b.checked_mul(h).ok_or(SolRefusal::IndexOverflow)?;
-    if bh > 65_535
-        || !fits([bh, t_pad, d])
-        || !fits([bh, blocks, blocks])
-        || !fits([bh, blocks_pad, d])
-    {
+    // `B·H` rides on every launch's grid.y; its 65,535 cap is checked with the grids below.
+    if !fits([bh, t_pad, d]) || !fits([bh, blocks, blocks]) || !fits([bh, blocks_pad, d]) {
         return Err(SolRefusal::IndexOverflow);
     }
-    Ok(SolPlan {
+    let plan = SolPlan {
         batch: b,
         heads: h,
         len: sq,
         t_pad,
         blocks,
         blocks_pad,
-    })
+    };
+    // Every launch grid within CUDA's limits, and the top-k pass's dynamic shared memory within
+    // the 48 KiB a launch gets without an opt-in attribute.
+    if !plan
+        .launch_grids()
+        .iter()
+        .all(|(_, grid)| crate::nvrtc::cuda_grid_fits(*grid))
+        || plan.topk_smem_bytes() > SOL_TOPK_SMEM_MAX
+    {
+        return Err(SolRefusal::IndexOverflow);
+    }
+    Ok(plan)
 }
+
+/// The dynamic shared memory a launch may take without the opt-in attribute (48 KiB).
+pub const SOL_TOPK_SMEM_MAX: usize = 48 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // The reference: comfy-kitchen's eager `sol_attn` (full precision), as candle ops on any device.
@@ -603,7 +638,12 @@ mod cuda {
         i32::try_from(x).map_err(|_| refusal(SolRefusal::IndexOverflow))
     }
 
+    /// A launch over the `(x, y)` grid, refused with a typed error past CUDA's grid limits (the
+    /// envelope already refuses every such plan; this keeps a launch from reaching the driver).
     fn cfg(grid: (usize, usize), block: u32, smem: u32) -> Result<LaunchConfig> {
+        if !crate::nvrtc::cuda_grid_fits([grid.0, grid.1, 1]) {
+            return Err(refusal(SolRefusal::IndexOverflow));
+        }
         let dim = |x: usize| u32::try_from(x).map_err(|_| refusal(SolRefusal::IndexOverflow));
         Ok(LaunchConfig {
             grid_dim: (dim(grid.0)?, dim(grid.1)?, 1),
@@ -914,6 +954,45 @@ mod cuda {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    /// PR #1530 review: every Sol-Attn launch's grid is held to CUDA's limits in the envelope.
+    /// `B·H` rides on grid.y (65,535 launches, 65,536 refuses); every x extent is a block count
+    /// (at most [`SOL_MAX_KEY_BLOCKS`]) or `ceil(T / 256)`, and the top-k pass's shared memory stays
+    /// within 48 KiB, at the longest sequence the envelope admits.
+    #[test]
+    fn every_launch_grid_is_inside_cuda_limits_at_the_boundaries() {
+        use crate::nvrtc::{cuda_grid_fits, CUDA_GRID_YZ_MAX};
+        let chk = |dims: &[usize]| {
+            check_sol_attention(dims, dims, dims, DType::BF16, DType::BF16, DType::BF16)
+        };
+        for (b, h, want_ok) in [
+            (1, CUDA_GRID_YZ_MAX, true),
+            (1, CUDA_GRID_YZ_MAX + 1, false),
+            (CUDA_GRID_YZ_MAX, 1, true),
+            (CUDA_GRID_YZ_MAX + 1, 1, false),
+            (257, 255, true),
+            (257, 256, false),
+        ] {
+            let got = chk(&[b, h, 64, SOL_HEAD_DIM]);
+            if want_ok {
+                let plan = got.unwrap();
+                assert!(plan.launch_grids().iter().all(|(_, g)| cuda_grid_fits(*g)));
+            } else {
+                assert_eq!(got, Err(SolRefusal::IndexOverflow), "b={b} h={h}");
+            }
+        }
+        let longest = SOL_MAX_KEY_BLOCKS * SOL_BLOCK;
+        let plan = chk(&[1, 1, longest, SOL_HEAD_DIM]).unwrap();
+        assert_eq!(plan.blocks, SOL_MAX_KEY_BLOCKS);
+        for (name, grid) in plan.launch_grids() {
+            assert!(cuda_grid_fits(grid), "{name}: {grid:?}");
+            assert!(
+                grid[0] <= SOL_MAX_KEY_BLOCKS.max(longest.div_ceil(256)),
+                "{name}"
+            );
+        }
+        assert!(plan.topk_smem_bytes() <= SOL_TOPK_SMEM_MAX);
+    }
 
     #[test]
     fn the_envelope_admits_wan_self_attention_and_refuses_the_rest() {

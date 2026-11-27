@@ -157,7 +157,26 @@ pub struct SagePlan {
     pub k_pad: usize,
 }
 
+/// Key rows one `sage_k_sum` CTA sums (the K-centering mean's chunk).
+pub const SAGE_SUM_ROWS: usize = 256;
+
 impl SagePlan {
+    /// Every launch one call makes, by kernel, as its `[x, y, z]` grid — the one source both the
+    /// envelope ([`check_sage_attention`], which refuses a grid past CUDA's limits) and the launch
+    /// sites read. The K-centering launches run only when centering is on, but are checked always
+    /// (centering is a per-call configuration the router does not see).
+    pub fn launch_grids(&self) -> [(&'static str, [usize; 3]); 6] {
+        let (b, h, hk, d) = (self.batch, self.heads, self.kv_heads, self.head_dim);
+        [
+            ("sage_k_sum", k_sum_grid(b, hk, self.k_len)),
+            ("sage_k_center", k_center_grid(b, hk)),
+            ("sage_quant(q)", quant_grid(b, h, self.q_pad)),
+            ("sage_quant(k)", quant_grid(b, hk, self.k_pad)),
+            ("sage_quant_v", quant_v_grid(b, hk, d)),
+            ("sage_attn", [self.q_pad / SAGE_Q_TILE, h, b]),
+        ]
+    }
+
     /// Bytes of device workspace one call allocates besides its output: the INT8 Q/K codes, their
     /// scales and the centering statistics (allocated even when centering is off, except the
     /// partial sums).
@@ -170,7 +189,7 @@ impl SagePlan {
         );
         let (qp, kp) = (self.q_pad as u64, self.k_pad as u64);
         // The K-centering mean + flag, and its per-256-row partial sums.
-        let chunks = (self.k_len as u64).div_ceil(256);
+        let chunks = (self.k_len as u64).div_ceil(SAGE_SUM_ROWS as u64);
         b * h * qp * (d + 4)
             + b * hk * kp * (d + 4)
             + b * hk * (4 * d + 4)
@@ -178,7 +197,30 @@ impl SagePlan {
     }
 }
 
+/// `sage_k_sum`'s grid: `(chunks, heads, batch)`, the chunk count on x (no 65,535 cap).
+fn k_sum_grid(batch: usize, heads: usize, len: usize) -> [usize; 3] {
+    [len.div_ceil(SAGE_SUM_ROWS), heads, batch]
+}
+
+/// `sage_k_center`'s grid: one CTA per (batch, head) on x.
+fn k_center_grid(batch: usize, heads: usize) -> [usize; 3] {
+    [batch * heads, 1, 1]
+}
+
+/// `sage_quant`'s grid over a `[batch, heads, pad, d]` operand: 8 rows per CTA.
+fn quant_grid(batch: usize, heads: usize, pad: usize) -> [usize; 3] {
+    [pad / 8, heads, batch]
+}
+
+/// `sage_quant_v`'s grid: one CTA per (batch, head, 8-channel tile) on x.
+fn quant_v_grid(batch: usize, heads: usize, d: usize) -> [usize; 3] {
+    [batch * heads * d / 8, 1, 1]
+}
+
 /// The pure envelope check: `q` is `[B, H, Sq, D]`, `k`/`v` are `[B, HK, Sk, D]`, one dtype.
+/// Every buffer stays within `i32` indexing (E6) and every launch grid within CUDA's limits
+/// ([`SagePlan::launch_grids`]), so a shape the kernels cannot launch is refused here, before the
+/// router selects them.
 pub fn check_sage_attention(
     q_dims: &[usize],
     k_dims: &[usize],
@@ -218,11 +260,10 @@ pub fn check_sage_attention(
     };
     // The INT8 buffers, the output, and every strided operand's own extent (its last element's
     // offset is checked by the caller's layout, which candle already bounds).
-    let grid_ok = b <= 65_535 && h <= 65_535 && q_pad / SAGE_Q_TILE <= i32::MAX as usize;
-    if !fits([b, h, q_pad, d]) || !fits([b, hk, k_pad, d]) || !grid_ok {
+    if !fits([b, h, q_pad, d]) || !fits([b, hk, k_pad, d]) {
         return Err(SageRefusal::IndexOverflow);
     }
-    Ok(SagePlan {
+    let plan = SagePlan {
         batch: b,
         heads: h,
         kv_heads: hk,
@@ -231,7 +272,15 @@ pub fn check_sage_attention(
         head_dim: d,
         q_pad,
         k_pad,
-    })
+    };
+    if !plan
+        .launch_grids()
+        .iter()
+        .all(|(_, grid)| crate::nvrtc::cuda_grid_fits(*grid))
+    {
+        return Err(SageRefusal::IndexOverflow);
+    }
+    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -402,17 +451,20 @@ mod cuda {
         i32::try_from(x).map_err(|_| refusal(SageRefusal::IndexOverflow))
     }
 
-    fn launch_cfg(grid: (usize, usize, usize), block: u32) -> Result<LaunchConfig> {
+    /// A launch over `grid` (`[x, y, z]`), refused with a typed error past CUDA's grid limits (the
+    /// envelope already refuses every such plan; this keeps a launch from ever reaching the driver
+    /// with one).
+    fn launch_cfg(grid: [usize; 3], block: u32) -> Result<LaunchConfig> {
+        if !crate::nvrtc::cuda_grid_fits(grid) {
+            return Err(refusal(SageRefusal::IndexOverflow));
+        }
         let dim = |x: usize| u32::try_from(x).map_err(|_| refusal(SageRefusal::IndexOverflow));
         Ok(LaunchConfig {
-            grid_dim: (dim(grid.0)?, dim(grid.1)?, dim(grid.2)?),
+            grid_dim: (dim(grid[0])?, dim(grid[1])?, dim(grid[2])?),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         })
     }
-
-    /// Rows-per-CTA of the centering-sum pass.
-    const SUM_ROWS_PER_CTA: usize = 256;
 
     /// Rotate, optionally center, and INT8-quantize one `[batch, heads, len, d]` operand into
     /// `[batch, heads, pad, d]` codes and `[batch, heads, pad]` scales.
@@ -441,11 +493,12 @@ mod cuda {
             let sum = module
                 .function(&format!("sage_k_sum_d{d}"))
                 .map_err(candle_core::Error::wrap)?;
-            let per = i32_of(SUM_ROWS_PER_CTA)?;
-            let chunks = len.div_ceil(SUM_ROWS_PER_CTA);
+            let per = i32_of(SAGE_SUM_ROWS)?;
+            let grid = k_sum_grid(batch, heads, len);
+            let chunks = grid[0];
             // SAFETY: `sage_k_sum` writes every (row, chunk, channel) partial.
             let mut partial = unsafe { stream.alloc::<f32>(rows * chunks * d) }.map_err(drv)?;
-            let cfg = launch_cfg((rows, chunks, 1), d as u32)?;
+            let cfg = launch_cfg(grid, d as u32)?;
             let mut l = stream.launch_builder(&sum);
             l.arg(&xv)
                 .arg(&sb)
@@ -477,7 +530,7 @@ mod cuda {
                 .arg(&mut mean)
                 .arg(&mut flag);
             // SAFETY: matches `sage_k_center_d*`; `mean` holds rows·d f32 and `flag` rows i32.
-            unsafe { l.launch(launch_cfg((rows, 1, 1), 256)?) }.map_err(drv)?;
+            unsafe { l.launch(launch_cfg(k_center_grid(batch, heads), 256)?) }.map_err(drv)?;
         }
         // SAFETY: the quantizer writes every code and scale of the padded buffers (rows at or past
         // `len` as zero).
@@ -502,7 +555,7 @@ mod cuda {
             .arg(&mut codes)
             .arg(&mut scales);
         // SAFETY: matches `sage_quant_d*`.
-        unsafe { l.launch(launch_cfg((pad / 8, heads, batch), 256)?) }.map_err(drv)?;
+        unsafe { l.launch(launch_cfg(quant_grid(batch, heads, pad), 256)?) }.map_err(drv)?;
         drop(st);
         Ok((
             wrap(codes, dev, (batch, heads, pad, d)),
@@ -544,7 +597,7 @@ mod cuda {
             .arg(&mut codes)
             .arg(&mut scales);
         // SAFETY: matches `sage_quant_v_d*`: one CTA per (b, head, 8-channel tile).
-        unsafe { l.launch(launch_cfg((rows * d / 8, 1, 1), 256)?) }.map_err(drv)?;
+        unsafe { l.launch(launch_cfg(quant_v_grid(batch, heads, d), 256)?) }.map_err(drv)?;
         drop(st);
         Ok((
             wrap(codes, dev, (batch, heads, d, pad)),
@@ -664,7 +717,7 @@ mod cuda {
             i32_of(p.k_pad)?,
         );
         let stream = dev.cuda_stream();
-        let cfg = launch_cfg((p.q_pad / SAGE_Q_TILE, p.heads, p.batch), 256)?;
+        let cfg = launch_cfg([p.q_pad / SAGE_Q_TILE, p.heads, p.batch], 256)?;
         let v_storage = v16.as_ref().map(|v| v.storage_and_layout().0);
         let mut l = stream.launch_builder(&attn);
         l.arg(&qv).arg(&qsv).arg(&kv).arg(&ksv);
@@ -733,6 +786,50 @@ mod cuda {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR #1530 review: every launch's grid is held to CUDA's limits in the envelope, so the
+    /// router never selects a shape the kernels cannot launch. `sage_k_sum`'s chunk count
+    /// (`ceil(Sk / 256)`) rides on grid.x, so the reviewer's 65,536-chunk K launches; heads (y)
+    /// and batch (z) refuse past 65,535. The x extents of `sage_k_center`, `sage_quant_v` and
+    /// `sage_attn` are bounded far below `2^31 - 1` by the `i32` buffer checks.
+    #[test]
+    fn every_launch_grid_is_inside_cuda_limits_at_the_boundaries() {
+        use crate::nvrtc::{cuda_grid_fits, CUDA_GRID_YZ_MAX};
+        let chk = |q: &[usize], k: &[usize]| {
+            check_sage_attention(q, k, k, DType::BF16, DType::BF16, DType::BF16)
+        };
+        for chunks in [65_535usize, 65_536, 65_537] {
+            // The shortest key length with `chunks` chunks (the reviewer's is 16,776,961).
+            let sk = (chunks - 1) * SAGE_SUM_ROWS + 1;
+            let plan = chk(&[1, 1, 128, 64], &[1, 1, sk, 64]).unwrap();
+            let grids = plan.launch_grids();
+            assert_eq!(grids[0], ("sage_k_sum", [chunks, 1, 1]), "sk={sk}");
+            assert!(
+                grids.iter().all(|(_, g)| cuda_grid_fits(*g)),
+                "sk={sk}: {grids:?}"
+            );
+        }
+        // KV heads and query heads on y, batch on z: 65,535 launches, 65,536 refuses.
+        for (heads, batch, want_ok) in [
+            (CUDA_GRID_YZ_MAX, 1, true),
+            (CUDA_GRID_YZ_MAX + 1, 1, false),
+            (1, CUDA_GRID_YZ_MAX, true),
+            (1, CUDA_GRID_YZ_MAX + 1, false),
+        ] {
+            let x = [batch, heads, 64, 64];
+            let got = chk(&x, &x);
+            if want_ok {
+                let plan = got.unwrap();
+                assert!(plan.launch_grids().iter().all(|(_, g)| cuda_grid_fits(*g)));
+            } else {
+                assert_eq!(
+                    got,
+                    Err(SageRefusal::IndexOverflow),
+                    "heads={heads} batch={batch}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_envelope_admits_krea_and_refuses_the_rest() {
@@ -1040,6 +1137,106 @@ mod cuda_tests {
             assert_eq!(mismatches, 0, "d={d} {dtype:?}");
             assert_eq!(v_mismatches, 0, "V d={d} {dtype:?}");
         }
+        Ok(())
+    }
+
+    /// PR #1530 review: `sage_k_sum`'s grid moved to `(chunks, H, B)`; the K-centering mean it
+    /// feeds is still the fixed-order reduction (rows in order within each 256-row chunk, chunks in
+    /// order, times `1 / S`), so the centered K codes are byte-identical to a host oracle of exactly
+    /// that order, over several chunks, ragged lengths, two batches and three heads.
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_sage_centered_k_codes_match_the_fixed_order_oracle() -> candle_core::Result<()> {
+        let dev = device();
+        for (d, dtype, s) in [(64usize, DType::BF16, 600usize), (128, DType::F16, 777)] {
+            let (b, h) = (2usize, 3usize);
+            // A per-channel offset so the centering does real work.
+            let x = (Tensor::randn(0f32, 1.0, (b, h, s, d), &dev)? + 1.5)?.to_dtype(dtype)?;
+            let qk = prequantize(
+                &x,
+                &x,
+                &x,
+                1.0 / (d as f64).sqrt(),
+                KCentering::Always,
+                PvPrecision::ValueDtype,
+            )?;
+            let xs: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let k_codes: Vec<u8> = qk.k_codes.flatten_all()?.to_vec1()?;
+            let kp = qk.plan.k_pad;
+            let inv_s = 1.0f32 / s as f32;
+            let mut mismatches = 0usize;
+            for bh in 0..b * h {
+                let row = |r: usize| &xs[(bh * s + r) * d..(bh * s + r + 1) * d];
+                let mean: Vec<f32> = (0..d)
+                    .map(|c| {
+                        let mut sum = 0f32;
+                        for chunk in (0..s).step_by(SAGE_SUM_ROWS) {
+                            let mut acc = 0f32;
+                            for r in chunk..(chunk + SAGE_SUM_ROWS).min(s) {
+                                acc += row(r)[c];
+                            }
+                            sum += acc;
+                        }
+                        sum * inv_s
+                    })
+                    .collect();
+                for r in 0..s {
+                    let mut centered: Vec<f32> =
+                        row(r).iter().zip(&mean).map(|(x, m)| x - m).collect();
+                    rotate_reference(&mut centered);
+                    let (want, _) = quantize_row_reference(&centered, 1.0);
+                    let at = (bh * kp + r) * d;
+                    mismatches += k_codes[at..at + d]
+                        .iter()
+                        .zip(&want)
+                        .filter(|(g, w)| **g as i8 != **w)
+                        .count();
+                }
+            }
+            println!("centered K codes d={d} {dtype:?} s={s}: {mismatches} mismatches");
+            assert_eq!(mismatches, 0, "d={d} {dtype:?}");
+        }
+        Ok(())
+    }
+
+    /// PR #1530 review: the reviewer's long-key shape, Q `[1,1,128,64]` against K/V
+    /// `[1,1,16776961,64]` — 65,536 K-centering chunks, one past grid.y's limit before the fix —
+    /// launches with the default adaptive centering and agrees with the uncentered call (which
+    /// never runs `sage_k_sum`): finite output, cosine >= 0.999. About 4.3 GiB of bf16 K/V.
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_sage_launches_past_65535_centering_chunks() -> candle_core::Result<()> {
+        let dev = device();
+        let sk = 65_535 * SAGE_SUM_ROWS + 1;
+        assert_eq!(sk, 16_776_961);
+        let q = Tensor::randn(0f32, 1.0, (1, 1, 128, 64), &dev)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1.0, (1, 1, sk, 64), &dev)?.to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1.0, (1, 1, sk, 64), &dev)?.to_dtype(DType::BF16)?;
+        let plan = check_sage_attention(
+            q.dims(),
+            k.dims(),
+            v.dims(),
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+        )
+        .expect("the envelope admits it");
+        assert_eq!(plan.launch_grids()[0].1, [65_536, 1, 1]);
+        let scale = 0.125;
+        let run = |centering| sage_attention(&q, &k, &v, scale, centering, PvPrecision::ValueDtype);
+        let adaptive = run(KCentering::Adaptive)?;
+        let off = run(KCentering::Off)?;
+        dev.synchronize()?;
+        let finite = adaptive
+            .to_dtype(DType::F32)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .is_finite();
+        assert!(finite, "adaptive output is finite");
+        let (cos, rel) = similarity(&adaptive, &off)?;
+        println!("65,536 centering chunks: adaptive vs off cosine {cos:.6} rel-L2 {rel:.3e}");
+        assert!(cos >= 0.999, "cosine {cos}");
         Ok(())
     }
 

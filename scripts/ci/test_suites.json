@@ -2270,6 +2270,36 @@
       ]
     },
     {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_centered_k_codes_match_the_fixed_order_oracle",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review: with sage_k_sum's grid moved to (chunks, H, B), the K-centering mean is still the fixed-order reduction: centered K codes are byte-identical to a host oracle of that order over several 256-row chunks, ragged lengths, d=64 bf16 and d=128 f16. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-quant-kernels",
+      "kind": "lib",
+      "target": "candle_quant_kernels",
+      "test": "sage_attention::cuda_tests::cuda_sage_launches_past_65535_centering_chunks",
+      "source": "crates/kernels/candle-quant-kernels/src/sage_attention.rs",
+      "reason": "PR #1530 review boundary: Q [1,1,128,64] vs K/V [1,1,16776961,64] (65,536 K-centering chunks, one past grid.y before the fix) launches with adaptive centering, finite and cosine >= 0.999 vs the uncentered call. ~4.3 GiB bf16 K/V. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
       "package": "candle-gen",
       "kind": "lib",
       "target": "candle_gen",
