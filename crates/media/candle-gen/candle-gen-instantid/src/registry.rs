@@ -212,8 +212,14 @@ impl Generator for InstantIdGenerator {
     }
 }
 
-pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+fn resolve_instantid_paths(spec: &LoadSpec) -> gen_core::Result<(InstantIdPaths, std::path::PathBuf)> {
     spec.validate_prepared_file_pins()?;
+    if !spec.extra_controls.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "instantid generator route does not support extra_controls (OpenPose pose conditioning is not wired on this route)"
+                .into(),
+        ));
+    }
     let sdxl = SdxlComponents::from_spec(spec)?;
     let sdxl_base = match &spec.weights {
         WeightsSource::Dir(root) => root.clone(),
@@ -240,26 +246,30 @@ pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    let face_dir = spec
-        .identity
-        .as_ref()
-        .and_then(|id| id.face_dir.as_ref())
-        .map(|src| match src {
-            WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
-        });
+    let face_dir = match spec.identity.as_ref().and_then(|id| id.face_dir.as_ref()) {
+        Some(WeightsSource::Dir(p) | WeightsSource::File(p)) => p.clone(),
+        None => {
+            return Err(gen_core::Error::Msg(
+                "instantid requires spec.identity.face_dir (face analysis weights directory)".into(),
+            ));
+        }
+    };
     let paths = InstantIdPaths {
         sdxl_base,
         identitynet,
         ip_adapter,
         adapters: spec.adapters.clone(),
         sdxl,
-        openpose: spec.extra_controls.first().cloned(),
-        face_dir: face_dir.clone(),
+        openpose: None,
+        face_dir: Some(face_dir.clone()),
     };
+    Ok((paths, face_dir))
+}
+
+pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let (paths, face_dir) = resolve_instantid_paths(spec)?;
     let mut model = InstantId::load(&paths).map_err(gen_core::Error::from)?;
-    if let Some(dir) = &face_dir {
-        model = model.with_face(dir).map_err(gen_core::Error::from)?;
-    }
+    model = model.with_face(&face_dir).map_err(gen_core::Error::from)?;
     if let Some(pid) = &spec.pid {
         model = model.with_pid(pid).map_err(gen_core::Error::from)?;
     }
@@ -267,4 +277,64 @@ pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         model: RefCell::new(model),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::IdentityWeights;
+
+    fn base_spec() -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/tmp/sdxl".into()))
+            .with_control(WeightsSource::Dir("/tmp/identitynet".into()))
+            .with_ip_adapter(WeightsSource::File("/tmp/ip-adapter.bin".into()));
+        spec.identity = Some(IdentityWeights {
+            encoder: None,
+            eva: None,
+            face_dir: Some(WeightsSource::Dir("/tmp/face".into())),
+        });
+        for &component in REQUIRED_COMPONENTS {
+            spec.components.insert(
+                component.into(),
+                WeightsSource::Dir(format!("/tmp/{component}").into()),
+            );
+        }
+        spec
+    }
+
+    #[test]
+    fn load_instantid_rejects_missing_face_dir_before_loading_weights() {
+        let mut no_identity = base_spec();
+        no_identity.identity = None;
+        let err = load_instantid(&no_identity).err().expect("must fail closed");
+        assert!(
+            err.to_string().contains("face_dir"),
+            "expected face_dir diagnostic, got: {err}"
+        );
+
+        let mut no_face_dir = base_spec();
+        no_face_dir.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/tmp/ip-adapter.bin".into())),
+            eva: None,
+            face_dir: None,
+        });
+        let err = load_instantid(&no_face_dir).err().expect("must fail closed");
+        assert!(
+            err.to_string().contains("face_dir"),
+            "expected face_dir diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_instantid_rejects_non_empty_extra_controls() {
+        let mut spec = base_spec();
+        spec.extra_controls
+            .push(WeightsSource::Dir("/tmp/openpose".into()));
+        let err = load_instantid(&spec).err().expect("must reject extra_controls");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("extra_controls"),
+            "expected Unsupported extra_controls error, got: {err:?}"
+        );
+    }
 }

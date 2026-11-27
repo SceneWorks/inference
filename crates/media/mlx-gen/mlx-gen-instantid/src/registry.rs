@@ -123,12 +123,35 @@ pub fn descriptor() -> ModelDescriptor {
 
 struct InstantIdGenerator {
     descriptor: ModelDescriptor,
+    adapter_count: usize,
     model: RefCell<InstantId>,
 }
 
 impl Generator for InstantIdGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        let mut progress = |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            mlx_gen::image_execution::choice(
+                "instantid.route",
+                gen_core::generator::ExecutionFact::resolved(self.descriptor.id),
+            );
+            if self.adapter_count != 0 {
+                mlx_gen::image_execution::unavailable(
+                    "instantid_adapter_application_unobserved",
+                    "loaded SDXL adapters have no per-target application report on this route",
+                    "loaded_adapter_application",
+                );
+            }
+            self.generate(req, &mut progress)
+        })
     }
 
     fn validate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
@@ -200,9 +223,15 @@ impl Generator for InstantIdGenerator {
     }
 }
 
-pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+fn resolve_instantid_paths(spec: &LoadSpec) -> gen_core::Result<(InstantIdPaths, std::path::PathBuf)> {
     spec.validate_prepared_file_pins()?;
     gen_core::reject_unknown_components(spec, &[], "instantid")?;
+    if !spec.extra_controls.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "instantid generator route does not support extra_controls (OpenPose pose conditioning is not wired on this route)"
+                .into(),
+        ));
+    }
     let sdxl_base = match &spec.weights {
         WeightsSource::Dir(root) => root.clone(),
         WeightsSource::File(_) => {
@@ -228,33 +257,93 @@ pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
+    let face_dir = match spec.identity.as_ref().and_then(|id| id.face_dir.as_ref()) {
+        Some(WeightsSource::Dir(p) | WeightsSource::File(p)) => p.clone(),
+        None => {
+            return Err(gen_core::Error::Msg(
+                "instantid requires spec.identity.face_dir (face analysis weights directory)".into(),
+            ));
+        }
+    };
     let paths = InstantIdPaths {
         sdxl_base,
         identitynet,
         ip_adapter,
         adapters: spec.adapters.clone(),
     };
+    Ok((paths, face_dir))
+}
+
+pub fn load_instantid(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let (paths, face_dir) = resolve_instantid_paths(spec)?;
+    let adapter_count = paths.adapters.len();
     let mut model = InstantId::load(&paths).map_err(gen_core::Error::from)?;
-    if let Some(face_dir) = spec
-        .identity
-        .as_ref()
-        .and_then(|id| id.face_dir.as_ref())
-        .map(|src| match src {
-            WeightsSource::Dir(p) | WeightsSource::File(p) => p,
-        })
-    {
-        model = model
-            .with_face_paths(
-                &face_dir.join("scrfd_10g.safetensors"),
-                &face_dir.join("arcface_iresnet100.safetensors"),
-            )
-            .map_err(gen_core::Error::from)?;
-    }
+    model = model
+        .with_face_paths(
+            &face_dir.join("scrfd_10g.safetensors"),
+            &face_dir.join("arcface_iresnet100.safetensors"),
+        )
+        .map_err(gen_core::Error::from)?;
     if let Some(pid) = &spec.pid {
         model = model.with_pid(pid).map_err(gen_core::Error::from)?;
     }
     Ok(Box::new(InstantIdGenerator {
         descriptor: descriptor(),
+        adapter_count,
         model: RefCell::new(model),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::gen_core::IdentityWeights;
+
+    fn base_spec() -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/tmp/sdxl".into()))
+            .with_control(WeightsSource::Dir("/tmp/identitynet".into()))
+            .with_ip_adapter(WeightsSource::File("/tmp/ip-adapter.safetensors".into()));
+        spec.identity = Some(IdentityWeights {
+            encoder: None,
+            eva: None,
+            face_dir: Some(WeightsSource::Dir("/tmp/face".into())),
+        });
+        spec
+    }
+
+    #[test]
+    fn load_instantid_rejects_missing_face_dir_before_loading_weights() {
+        let mut no_identity = base_spec();
+        no_identity.identity = None;
+        let err = load_instantid(&no_identity).err().expect("must fail closed");
+        assert!(
+            err.to_string().contains("face_dir"),
+            "expected face_dir diagnostic, got: {err}"
+        );
+
+        let mut no_face_dir = base_spec();
+        no_face_dir.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/tmp/ip-adapter.safetensors".into())),
+            eva: None,
+            face_dir: None,
+        });
+        let err = load_instantid(&no_face_dir).err().expect("must fail closed");
+        assert!(
+            err.to_string().contains("face_dir"),
+            "expected face_dir diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_instantid_rejects_non_empty_extra_controls() {
+        let mut spec = base_spec();
+        spec.extra_controls
+            .push(WeightsSource::Dir("/tmp/openpose".into()));
+        let err = load_instantid(&spec).err().expect("must reject extra_controls");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_))
+                && err.to_string().contains("extra_controls"),
+            "expected Unsupported extra_controls error, got: {err:?}"
+        );
+    }
 }

@@ -48,6 +48,33 @@ fn extract_control_input<'a>(
     }
 }
 
+fn build_edit_request(
+    request: &GenerationRequest,
+    steps: usize,
+    guidance: f32,
+    seed: u64,
+    lightning: bool,
+) -> QwenEditRequest {
+    QwenEditRequest {
+        prompt: request.prompt.clone(),
+        negative: request.negative_prompt.clone().unwrap_or_default(),
+        width: request.width,
+        height: request.height,
+        steps,
+        sampler: request.sampler.as_deref().map(str::to_owned),
+        scheduler: request.scheduler.as_deref().map(str::to_owned),
+        scheduler_shift: request.scheduler_shift,
+        guidance,
+        seed,
+        lightning,
+        stage_residency: request.memory.is_some_and(|m| m.stage_residency),
+        memory: request.memory,
+        cancel: request.cancel.clone(),
+        preview: request.preview.clone(),
+        pag: request.features.pag.clone(),
+    }
+}
+
 struct QwenEditGenerator {
     descriptor: ModelDescriptor,
     model: QwenEdit,
@@ -122,24 +149,13 @@ impl Generator for QwenEditGenerator {
         let base_seed = request.seed.unwrap_or(0);
         let mut images = Vec::with_capacity(request.count as usize);
         for idx in 0..request.count {
-            let edit_req = QwenEditRequest {
-                prompt: request.prompt.clone(),
-                negative: request.negative_prompt.clone().unwrap_or_default(),
-                width: request.width,
-                height: request.height,
+            let edit_req = build_edit_request(
+                request,
                 steps,
-                sampler: request.sampler.as_deref().map(str::to_owned),
-                scheduler: request.scheduler.as_deref().map(str::to_owned),
-                scheduler_shift: request.scheduler_shift,
                 guidance,
-                seed: base_seed.wrapping_add(idx as u64),
-                lightning: self.lightning,
-                stage_residency: request.memory.is_some_and(|m| m.stage_residency),
-                memory: None,
-                cancel: request.cancel.clone(),
-                preview: request.preview.clone(),
-                pag: request.features.pag.clone(),
-            };
+                base_seed.wrapping_add(idx as u64),
+                self.lightning,
+            );
             images.push(
                 self.model
                     .generate(&edit_req, &references, on_progress)
@@ -386,4 +402,29 @@ pub(crate) fn load_control(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generato
         descriptor: crate::control_descriptor(),
         model,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_edit_request_forwards_generation_memory() {
+        let memory = gen_core::GenerationMemory {
+            stage_residency: true,
+            decode_tile_edge: Some(512),
+            attention_chunk_size: Some(65_536),
+            ..Default::default()
+        };
+        let request = GenerationRequest {
+            prompt: "relight in warm sunset".into(),
+            width: 512,
+            height: 512,
+            memory: Some(memory),
+            ..Default::default()
+        };
+        let edit_req = build_edit_request(&request, 4, 1.0, 42, true);
+        assert!(edit_req.stage_residency);
+        assert_eq!(edit_req.memory, Some(memory));
+    }
 }

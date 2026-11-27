@@ -5,6 +5,8 @@
 //! inside `gen-core` and is shared identically by MLX and Candle StarVector routes as well as
 //! SceneWorks consumers.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use sha2::{Digest, Sha256};
 
 use crate::core_llm::StarVectorFinishReason;
@@ -14,16 +16,38 @@ use crate::{Error, Image, Result, VectorFinishReason, VectorOutput, VectorTermin
 pub const VECTOR_SANITIZER_VERSION: &str = "sceneworks-static-svg-v2";
 /// Canonical SVG XML namespace enforced on every sanitized root element.
 pub const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+/// Canonical XLink XML namespace required on root `<svg>` whenever `xlink:href` is used.
+pub const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
 /// Maximum accepted raw/canonical SVG document size in UTF-8 bytes (256 KiB).
 pub const MAX_SVG_BYTES: usize = 256 * 1024;
 /// Maximum allowed XML element nesting depth.
 pub const MAX_SVG_DEPTH: usize = 32;
-/// Maximum allowed retained SVG elements per document.
+/// Maximum allowed retained/expanded SVG elements per document.
 pub const MAX_SVG_ELEMENTS: usize = 2_000;
 /// Maximum allowed attributes across the entire SVG document.
 pub const MAX_SVG_ATTRIBUTES: usize = 4_096;
 /// Maximum byte length of any single attribute value (64 KiB).
 pub const MAX_SVG_ATTRIBUTE_VALUE_BYTES: usize = 64 * 1024;
+/// Maximum total byte length across all attribute values in one document (192 KiB).
+pub const MAX_SVG_ATTRIBUTE_VALUE_BYTES_TOTAL: usize = 192 * 1024;
+/// Maximum total `d` path-data bytes across a document (including `<use>` expansion).
+pub const MAX_SVG_PATH_DATA_BYTES: usize = 160 * 1024;
+/// Maximum total path commands across a document (including `<use>` expansion).
+pub const MAX_SVG_PATH_COMMANDS: usize = 16_384;
+/// Maximum total path numbers across a document (including `<use>` expansion).
+pub const MAX_SVG_PATH_NUMBERS: usize = 65_536;
+/// Maximum total CSS bytes across inline styles and `<style>` elements (64 KiB).
+pub const MAX_STATIC_SVG_CSS_BYTES: usize = 64 * 1024;
+/// Maximum resource definitions (`clipPath`, `linearGradient`, `radialGradient`, `filter`, `symbol`).
+pub const MAX_SVG_RESOURCES: usize = 128;
+/// Maximum local resource references (`href`, `xlink:href`, `url(#id)`).
+pub const MAX_SVG_RESOURCE_REFERENCES: usize = 256;
+/// Maximum gradient `<stop>` elements per document.
+pub const MAX_SVG_GRADIENT_STOPS: usize = 512;
+/// Maximum `<filter>` primitive elements per document.
+pub const MAX_SVG_FILTER_PRIMITIVES: usize = 64;
+/// Maximum `stdDeviation` blur sigma on `<feGaussianBlur>`.
+pub const MAX_SVG_FILTER_BLUR_SIGMA: f64 = 64.0;
 /// Maximum preview width/height edge in pixels.
 pub const MAX_PREVIEW_DIMENSION: u32 = 2_048;
 /// Default derived preview maximum edge in pixels.
@@ -132,6 +156,7 @@ pub fn sanitize_svg_with_options(
     }
     let text = std::str::from_utf8(input)
         .map_err(|err| Error::Msg(format!("vector SVG is not valid UTF-8: {err}")))?;
+    validate_xml_chars(text, "vector SVG source")?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(Error::Msg("vector SVG input is empty".into()));
@@ -272,30 +297,24 @@ enum SvgChild {
     Text(String),
 }
 
-fn is_stripped_active_element(name: &str) -> bool {
+fn is_valid_xml_char(ch: char) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
-        "script"
-            | "foreignobject"
-            | "iframe"
-            | "object"
-            | "embed"
-            | "applet"
-            | "audio"
-            | "video"
-            | "animate"
-            | "animatemotion"
-            | "animatetransform"
-            | "set"
-            | "handler"
-            | "discard"
-            | "a"
-            | "image"
-            | "feimage"
+        ch as u32,
+        0x09 | 0x0A | 0x0D | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
     )
 }
 
-fn is_allowed_static_element(name: &str) -> bool {
+fn validate_xml_chars(text: &str, label: &str) -> Result<()> {
+    if let Some(bad) = text.chars().find(|&c| !is_valid_xml_char(c)) {
+        return Err(Error::Msg(format!(
+            "{label} contains forbidden XML 1.0 character U+{:04X}",
+            bad as u32
+        )));
+    }
+    Ok(())
+}
+
+fn is_allowed_static_element(name: &str, hidden: bool) -> bool {
     matches!(
         name,
         "svg"
@@ -323,118 +342,618 @@ fn is_allowed_static_element(name: &str) -> bool {
             | "feOffset"
             | "feMerge"
             | "feMergeNode"
-            | "text"
-            | "tspan"
-    )
+    ) || (hidden && matches!(name, "text" | "tspan"))
 }
 
 fn is_forbidden_attribute_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.starts_with("on")
-        || matches!(lower.as_str(), "src" | "action" | "formaction" | "srcdoc")
+        || matches!(
+            lower.as_str(),
+            "src" | "cursor" | "action" | "formaction" | "srcdoc"
+        )
 }
 
-fn strip_ascii_control_and_ws(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_ascii_control() && !c.is_ascii_whitespace())
-        .collect()
+fn is_allowed_static_attribute(element: &str, key: &str, hidden: bool) -> bool {
+    let common = matches!(key, "id" | "class" | "style");
+    let presentation = matches!(
+        key,
+        "display"
+            | "visibility"
+            | "color"
+            | "color-interpolation"
+            | "color-interpolation-filters"
+            | "color-rendering"
+            | "fill"
+            | "fill-opacity"
+            | "fill-rule"
+            | "clip-rule"
+            | "clip-path"
+            | "filter"
+            | "opacity"
+            | "paint-order"
+            | "shape-rendering"
+            | "stroke"
+            | "stroke-opacity"
+            | "stroke-width"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-miterlimit"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "transform"
+            | "vector-effect"
+    );
+    common
+        || (presentation
+            && matches!(
+                element,
+                "svg"
+                    | "g"
+                    | "symbol"
+                    | "use"
+                    | "path"
+                    | "rect"
+                    | "circle"
+                    | "ellipse"
+                    | "line"
+                    | "polyline"
+                    | "polygon"
+                    | "text"
+                    | "tspan"
+            ))
+        || match element {
+            "svg" => matches!(
+                key,
+                "xmlns"
+                    | "xmlns:xlink"
+                    | "version"
+                    | "baseProfile"
+                    | "width"
+                    | "height"
+                    | "viewBox"
+                    | "preserveAspectRatio"
+                    | "overflow"
+                    | "x"
+                    | "y"
+                    | "xml:space"
+                    | "enable-background"
+            ),
+            "defs" | "g" | "feMerge" => false,
+            "symbol" => matches!(
+                key,
+                "viewBox" | "preserveAspectRatio" | "overflow" | "x" | "y" | "width" | "height"
+            ),
+            "use" => matches!(key, "href" | "xlink:href" | "x" | "y" | "width" | "height"),
+            "path" => matches!(key, "d" | "pathLength"),
+            "rect" => matches!(key, "x" | "y" | "width" | "height" | "rx" | "ry"),
+            "circle" => matches!(key, "cx" | "cy" | "r" | "pathLength"),
+            "ellipse" => matches!(key, "cx" | "cy" | "rx" | "ry" | "pathLength"),
+            "line" => matches!(key, "x1" | "x2" | "y1" | "y2" | "pathLength"),
+            "polyline" | "polygon" => matches!(key, "points" | "pathLength"),
+            "style" => key == "type",
+            "title" | "desc" | "metadata" => key == "id",
+            "linearGradient" => matches!(
+                key,
+                "x1" | "y1"
+                    | "x2"
+                    | "y2"
+                    | "gradientUnits"
+                    | "gradientTransform"
+                    | "spreadMethod"
+                    | "href"
+                    | "xlink:href"
+            ),
+            "radialGradient" => matches!(
+                key,
+                "cx" | "cy"
+                    | "r"
+                    | "fx"
+                    | "fy"
+                    | "fr"
+                    | "gradientUnits"
+                    | "gradientTransform"
+                    | "spreadMethod"
+                    | "href"
+                    | "xlink:href"
+            ),
+            "stop" => matches!(key, "offset" | "stop-color" | "stop-opacity"),
+            "clipPath" => matches!(key, "clipPathUnits"),
+            "filter" => matches!(
+                key,
+                "x" | "y" | "width" | "height" | "filterUnits" | "primitiveUnits"
+            ),
+            "feGaussianBlur" => matches!(key, "in" | "result" | "stdDeviation"),
+            "feOffset" => matches!(key, "in" | "result" | "dx" | "dy"),
+            "feMergeNode" => key == "in",
+            "text" | "tspan" if hidden => matches!(
+                key,
+                "x" | "y"
+                    | "dx"
+                    | "dy"
+                    | "font"
+                    | "font-family"
+                    | "font-size"
+                    | "font-style"
+                    | "font-weight"
+                    | "text-anchor"
+                    | "xml:space"
+            ),
+            _ => false,
+        }
 }
 
-fn is_safe_local_fragment(value: &str) -> bool {
-    let trimmed = value.trim();
-    let Some(id) = trimmed.strip_prefix('#') else {
-        return false;
-    };
-    !id.is_empty()
-        && id.len() <= 128
-        && id
+fn is_allowed_css_property(name: &str) -> bool {
+    matches!(
+        name,
+        "fill"
+            | "fill-rule"
+            | "clip-rule"
+            | "fill-opacity"
+            | "stroke"
+            | "stroke-opacity"
+            | "stroke-width"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-miterlimit"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "opacity"
+            | "color"
+            | "color-interpolation"
+            | "color-interpolation-filters"
+            | "color-rendering"
+            | "display"
+            | "visibility"
+            | "shape-rendering"
+            | "paint-order"
+            | "vector-effect"
+            | "clip-path"
+            | "filter"
+            | "stop-color"
+            | "stop-opacity"
+            | "flood-color"
+            | "flood-opacity"
+            | "enable-background"
+    )
+}
+
+fn validate_static_svg_id(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '#' || ch == '\\')
+    {
+        return Err(Error::Msg(format!(
+            "vector SVG {label} is not a bounded local identifier"
+        )));
+    }
+    Ok(())
 }
 
-fn contains_unsafe_url_or_script(value: &str) -> bool {
-    let compact = strip_ascii_control_and_ws(value).to_ascii_lowercase();
-    if compact.contains("javascript:")
-        || compact.contains("vbscript:")
-        || compact.contains("expression(")
-        || compact.contains("behavior:")
-        || compact.contains("@import")
+fn local_href_target(value: &str) -> Result<&str> {
+    let trimmed = value.trim();
+    let target = trimmed
+        .strip_prefix('#')
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "vector SVG href must be an exact local fragment, got {value:?}"
+            ))
+        })?;
+    validate_static_svg_id(target, "local href reference")?;
+    Ok(target)
+}
+
+fn local_url_target(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix("url(")?.strip_suffix(')')?.trim();
+    let unquoted = if inner.len() >= 2
+        && ((inner.starts_with('\'') && inner.ends_with('\''))
+            || (inner.starts_with('"') && inner.ends_with('"')))
     {
+        &inner[1..inner.len() - 1]
+    } else {
+        inner
+    };
+    if unquoted.contains('(') || unquoted.contains(')') || unquoted.contains('\\') {
+        return None;
+    }
+    let target = unquoted.strip_prefix('#')?;
+    if validate_static_svg_id(target, "url resource reference").is_ok() {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn contains_external_or_active_tokens(value: &str) -> bool {
+    if value.contains('\\') || value.contains("/*") || value.contains("*/") {
         return true;
     }
-    // Check every `url(...)` occurrence: only local `url(#id)` is permitted.
-    let mut rest = compact.as_str();
-    while let Some(pos) = rest.find("url(") {
-        let after = &rest[pos + 4..];
-        let Some(end) = after.find(')') else {
-            return true;
-        };
-        let target = after[..end].trim_matches(|c| c == '\'' || c == '"');
-        if !is_safe_local_fragment(target) {
-            return true;
-        }
-        rest = &after[end + 1..];
-    }
-    false
+    let compact: String = value
+        .chars()
+        .filter(|c| !c.is_ascii_control() && !c.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.contains("javascript:")
+        || compact.contains("vbscript:")
+        || compact.contains("data:")
+        || compact.contains("file:")
+        || compact.contains("http:")
+        || compact.contains("https:")
+        || compact.contains("ftp:")
+        || compact.contains("ws:")
+        || compact.contains("wss:")
+        || compact.contains("//")
+        || compact.contains("expression(")
+        || compact.contains("behavior:")
+        || compact.contains("binding:")
+        || compact.contains("-moz-binding")
+        || compact.contains("image-set(")
+        || compact.contains("@import")
 }
 
-fn sanitize_style_value(style: &str) -> Option<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaticReferenceKind {
+    Paint,
+    ClipPath,
+    Filter,
+}
+
+#[derive(Debug)]
+struct TypedReference {
+    source_node: usize,
+    target: String,
+    kind: StaticReferenceKind,
+}
+
+#[derive(Default)]
+struct SanitizerCounters {
+    total_attrs: usize,
+    total_attr_value_bytes: usize,
+    css_bytes: usize,
+    resources: usize,
+    gradient_stops: usize,
+    filter_primitives: usize,
+    reference_count: usize,
+    path_data_bytes: usize,
+    path_commands: usize,
+    path_numbers: usize,
+}
+
+fn record_reference_count(counters: &mut SanitizerCounters) -> Result<()> {
+    counters.reference_count = counters
+        .reference_count
+        .checked_add(1)
+        .ok_or_else(|| Error::Msg("vector SVG reference count overflow".into()))?;
+    if counters.reference_count > MAX_SVG_RESOURCE_REFERENCES {
+        return Err(Error::Msg(format!(
+            "vector SVG exceeds the {MAX_SVG_RESOURCE_REFERENCES}-reference budget"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_css_value_functions(property: &str, value: &str) -> Result<Option<String>> {
+    if contains_external_or_active_tokens(value) || value.contains('@') {
+        return Err(Error::Msg(format!(
+            "vector SVG CSS property '{property}' contains forbidden external, escape, or active content"
+        )));
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains('(') || lower.contains(')') {
+        // Strict CSS value function allowlist: only exact local url(#id) on resource properties
+        // or static rgb()/rgba()/hsl()/hsla() color functions.
+        if let Some(target) = local_url_target(value) {
+            if matches!(property, "fill" | "stroke" | "clip-path" | "filter") {
+                return Ok(Some(target.to_owned()));
+            }
+            return Err(Error::Msg(format!(
+                "vector SVG CSS property '{property}' does not permit url(...) references"
+            )));
+        }
+        let mut rest = lower.as_str();
+        while let Some(open) = rest.find('(') {
+            let prefix = rest[..open].trim_end();
+            let fn_name = prefix
+                .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .next()
+                .unwrap_or("");
+            if !matches!(fn_name, "rgb" | "rgba" | "hsl" | "hsla") {
+                return Err(Error::Msg(format!(
+                    "vector SVG CSS function '{fn_name}(' is forbidden in '{property}'"
+                )));
+            }
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find(')') else {
+                return Err(Error::Msg(format!(
+                    "vector SVG CSS property '{property}' has an unterminated function"
+                )));
+            };
+            let args = &after_open[..close];
+            if args.contains('(')
+                || !args.chars().all(|c| {
+                    c.is_ascii_digit()
+                        || c.is_ascii_whitespace()
+                        || matches!(c, ',' | '.' | '%' | '/' | '+' | '-')
+                })
+            {
+                return Err(Error::Msg(format!(
+                    "vector SVG CSS color function in '{property}' has invalid arguments"
+                )));
+            }
+            rest = &after_open[close + 1..];
+        }
+        if rest.contains(')') {
+            return Err(Error::Msg(format!(
+                "vector SVG CSS property '{property}' has an unmatched ')'"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_css_declarations(
+    css: &str,
+    source_node: usize,
+    counters: &mut SanitizerCounters,
+    typed_refs: &mut Vec<TypedReference>,
+) -> Result<String> {
+    if css.contains('\\')
+        || css.contains("/*")
+        || css.contains("*/")
+        || css.contains('@')
+        || css.contains('{')
+        || css.contains('}')
+    {
+        return Err(Error::Msg(
+            "vector SVG CSS contains forbidden escapes, comments, at-rules, or blocks".into(),
+        ));
+    }
     let mut kept = Vec::new();
-    for decl in style.split(';') {
-        let decl = decl.trim();
+    for raw_decl in css.split(';') {
+        let decl = raw_decl.trim();
         if decl.is_empty() {
             continue;
         }
-        if contains_unsafe_url_or_script(decl) {
-            continue;
+        let Some((raw_prop, raw_val)) = decl.split_once(':') else {
+            return Err(Error::Msg(
+                "vector SVG CSS declaration is missing ':'".into(),
+            ));
+        };
+        let prop = raw_prop.trim();
+        let val = raw_val.trim();
+        if prop.is_empty() || val.is_empty() || prop.starts_with("--") || val.contains(':') {
+            return Err(Error::Msg(format!(
+                "vector SVG CSS declaration '{decl}' is malformed or disallowed"
+            )));
         }
-        if let Some((prop, val)) = decl.split_once(':') {
-            let prop = prop.trim();
-            let val = val.trim();
-            if prop.is_empty() || val.is_empty() || prop.starts_with("--") {
-                continue;
-            }
-            kept.push(format!("{prop}:{val}"));
+        let prop_lower = prop.to_ascii_lowercase();
+        if !is_allowed_css_property(&prop_lower) {
+            return Err(Error::Msg(format!(
+                "vector SVG CSS property '{prop}' is not permitted by the static allowlist"
+            )));
         }
+        if prop_lower == "vector-effect" && !matches!(val, "none" | "non-scaling-stroke") {
+            return Err(Error::Msg(
+                "vector SVG CSS vector-effect value is unsupported".into(),
+            ));
+        }
+        if let Some(target) = validate_css_value_functions(&prop_lower, val)? {
+            let kind = match prop_lower.as_str() {
+                "fill" | "stroke" => StaticReferenceKind::Paint,
+                "clip-path" => StaticReferenceKind::ClipPath,
+                "filter" => StaticReferenceKind::Filter,
+                _ => unreachable!("guarded in validate_css_value_functions"),
+            };
+            record_reference_count(counters)?;
+            typed_refs.push(TypedReference {
+                source_node,
+                target,
+                kind,
+            });
+        }
+        kept.push(format!("{prop_lower}:{val}"));
     }
-    (!kept.is_empty()).then(|| kept.join(";"))
+    if kept.is_empty() && !css.trim().is_empty() {
+        return Err(Error::Msg(
+            "vector SVG CSS contains no valid declarations".into(),
+        ));
+    }
+    Ok(kept.join(";"))
 }
 
-fn sanitize_stylesheet(css: &str) -> String {
+fn validate_inline_style(
+    style: &str,
+    source_node: usize,
+    counters: &mut SanitizerCounters,
+    typed_refs: &mut Vec<TypedReference>,
+) -> Result<String> {
+    counters.css_bytes = counters
+        .css_bytes
+        .checked_add(style.len())
+        .ok_or_else(|| Error::Msg("vector SVG CSS byte count overflow".into()))?;
+    if counters.css_bytes > MAX_STATIC_SVG_CSS_BYTES {
+        return Err(Error::Msg(format!(
+            "vector SVG CSS exceeds the {MAX_STATIC_SVG_CSS_BYTES}-byte budget"
+        )));
+    }
+    validate_css_declarations(style, source_node, counters, typed_refs)
+}
+
+fn validate_stylesheet(
+    css: &str,
+    source_node: usize,
+    counters: &mut SanitizerCounters,
+    typed_refs: &mut Vec<TypedReference>,
+) -> Result<String> {
+    counters.css_bytes = counters
+        .css_bytes
+        .checked_add(css.len())
+        .ok_or_else(|| Error::Msg("vector SVG stylesheet byte count overflow".into()))?;
+    if counters.css_bytes > MAX_STATIC_SVG_CSS_BYTES {
+        return Err(Error::Msg(format!(
+            "vector SVG stylesheets exceed the {MAX_STATIC_SVG_CSS_BYTES}-byte budget"
+        )));
+    }
+    if css.contains('\\') || css.contains("/*") || css.contains("*/") || css.contains('@') {
+        return Err(Error::Msg(
+            "vector SVG stylesheet contains forbidden escapes, comments, or @-rules".into(),
+        ));
+    }
     let mut kept = Vec::new();
-    for rule in css.split('}') {
-        let rule = rule.trim();
-        if rule.is_empty() || contains_unsafe_url_or_script(rule) {
-            continue;
+    let mut rest = css.trim();
+    while !rest.is_empty() {
+        let Some(open) = rest.find('{') else {
+            return Err(Error::Msg(
+                "vector SVG stylesheet contains malformed rule without '{'".into(),
+            ));
+        };
+        let selector = rest[..open].trim();
+        if selector.is_empty()
+            || selector.contains('}')
+            || selector.contains(';')
+            || selector.contains('(')
+            || selector.contains(')')
+            || !selector.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c.is_ascii_whitespace()
+                    || matches!(c, '.' | '#' | ',' | '>' | '+' | '~' | '*' | '-' | '_' | ':')
+            })
+        {
+            return Err(Error::Msg(format!(
+                "vector SVG stylesheet selector '{selector}' is not permitted"
+            )));
         }
-        if let Some((selector, body)) = rule.split_once('{') {
-            if let Some(clean_body) = sanitize_style_value(body) {
-                let selector = selector.trim();
-                if !selector.is_empty() && !selector.starts_with('@') {
-                    kept.push(format!("{selector}{{{clean_body}}}"));
-                }
-            }
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            return Err(Error::Msg(
+                "vector SVG stylesheet has an unterminated rule block".into(),
+            ));
+        };
+        let body = &after_open[..close];
+        if body.contains('{') {
+            return Err(Error::Msg(
+                "vector SVG stylesheet does not permit nested blocks".into(),
+            ));
         }
+        let clean_body = validate_css_declarations(body, source_node, counters, typed_refs)?;
+        if !clean_body.is_empty() {
+            kept.push(format!("{selector}{{{clean_body}}}"));
+        }
+        rest = after_open[close + 1..].trim();
     }
-    kept.join("\n")
+    Ok(kept.join("\n"))
 }
 
-fn sanitize_attribute(name: &str, value: &str) -> Option<(String, String)> {
-    if is_forbidden_attribute_name(name) {
-        return None;
+fn parse_number_list(raw: &str, label: &str) -> Result<Vec<f64>> {
+    let mut nums = Vec::new();
+    for token in raw
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+    {
+        let val: f64 = token.parse().map_err(|_| {
+            Error::Msg(format!(
+                "vector SVG {label} contains invalid number {token:?}"
+            ))
+        })?;
+        if !val.is_finite() || val.abs() > MAX_SVG_COORDINATE_MAGNITUDE {
+            return Err(Error::Msg(format!(
+                "vector SVG {label} number {token:?} is out of bounds"
+            )));
+        }
+        nums.push(val);
     }
-    let lower = name.to_ascii_lowercase();
-    if matches!(lower.as_str(), "href" | "xlink:href") {
-        return is_safe_local_fragment(value).then(|| (name.to_owned(), value.trim().to_owned()));
+    if nums.is_empty() {
+        return Err(Error::Msg(format!(
+            "vector SVG {label} must contain at least one number"
+        )));
     }
-    if lower == "style" {
-        return sanitize_style_value(value).map(|v| ("style".to_owned(), v));
+    Ok(nums)
+}
+
+fn scan_path_data_budget(d: &str) -> Result<(usize, usize)> {
+    let mut commands = 0usize;
+    let mut numbers = 0usize;
+    let bytes = d.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || b == b',' {
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_alphabetic() {
+            if !matches!(
+                b,
+                b'M' | b'm'
+                    | b'L'
+                    | b'l'
+                    | b'H'
+                    | b'h'
+                    | b'V'
+                    | b'v'
+                    | b'C'
+                    | b'c'
+                    | b'S'
+                    | b's'
+                    | b'Q'
+                    | b'q'
+                    | b'T'
+                    | b't'
+                    | b'A'
+                    | b'a'
+                    | b'Z'
+                    | b'z'
+            ) {
+                return Err(Error::Msg(format!(
+                    "vector SVG path contains invalid command '{}'",
+                    b as char
+                )));
+            }
+            commands += 1;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if b == b'+' || b == b'-' {
+            i += 1;
+        }
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_digit() {
+                saw_digit = true;
+                i += 1;
+            } else if c == b'.' && !saw_dot {
+                saw_dot = true;
+                i += 1;
+            } else if (c == b'e' || c == b'E') && saw_digit {
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if !saw_digit || i == start {
+            return Err(Error::Msg("vector SVG path data is malformed".into()));
+        }
+        let val: f64 = d[start..i]
+            .parse()
+            .map_err(|_| Error::Msg("vector SVG path data contains invalid number".into()))?;
+        if !val.is_finite() || val.abs() > MAX_SVG_COORDINATE_MAGNITUDE {
+            return Err(Error::Msg(
+                "vector SVG path data number exceeds coordinate bounds".into(),
+            ));
+        }
+        numbers += 1;
     }
-    if contains_unsafe_url_or_script(value) {
-        return None;
-    }
-    Some((name.to_owned(), value.to_owned()))
+    Ok((commands, numbers))
 }
 
 struct XmlCursor<'a> {
@@ -463,45 +982,72 @@ impl<'a> XmlCursor<'a> {
     }
 }
 
-fn decode_xml_entities(input: &str) -> String {
+fn decode_xml_entities(input: &str) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let bytes = input.as_bytes();
     while i < bytes.len() {
         if bytes[i] == b'&' {
-            if let Some(semi) = input[i + 1..].find(';') {
-                let entity = &input[i + 1..i + 1 + semi];
-                let decoded = match entity {
-                    "amp" => Some("&".to_owned()),
-                    "lt" => Some("<".to_owned()),
-                    "gt" => Some(">".to_owned()),
-                    "quot" => Some("\"".to_owned()),
-                    "apos" => Some("'".to_owned()),
-                    num if num.starts_with("#x") || num.starts_with("#X") => {
-                        u32::from_str_radix(&num[2..], 16)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(|c| c.to_string())
+            let Some(semi) = input[i + 1..].find(';') else {
+                return Err(Error::Msg(
+                    "vector SVG contains an unterminated XML entity reference".into(),
+                ));
+            };
+            let entity = &input[i + 1..i + 1 + semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                num if num.starts_with("#x") || num.starts_with("#X") => {
+                    let hex = &num[2..];
+                    if hex.is_empty() {
+                        None
+                    } else {
+                        u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
                     }
-                    num if num.starts_with('#') => num[1..]
-                        .parse::<u32>()
-                        .ok()
-                        .and_then(char::from_u32)
-                        .map(|c| c.to_string()),
-                    _ => None,
-                };
-                if let Some(ch) = decoded {
-                    out.push_str(&ch);
-                    i += semi + 2;
-                    continue;
                 }
+                num if num.starts_with('#') => {
+                    let dec = &num[1..];
+                    if dec.is_empty() {
+                        None
+                    } else {
+                        dec.parse::<u32>().ok().and_then(char::from_u32)
+                    }
+                }
+                _ => {
+                    return Err(Error::Msg(format!(
+                        "vector SVG contains unsupported XML entity '&{entity};'"
+                    )));
+                }
+            };
+            let ch = decoded.ok_or_else(|| {
+                Error::Msg(format!(
+                    "vector SVG contains invalid XML character reference '&{entity};'"
+                ))
+            })?;
+            if !is_valid_xml_char(ch) {
+                return Err(Error::Msg(format!(
+                    "vector SVG entity '&{entity};' decodes to forbidden XML 1.0 character U+{:04X}",
+                    ch as u32
+                )));
             }
+            out.push(ch);
+            i += semi + 2;
+            continue;
         }
         let ch = input[i..].chars().next().expect("non-empty slice");
+        if !is_valid_xml_char(ch) {
+            return Err(Error::Msg(format!(
+                "vector SVG contains forbidden XML 1.0 character U+{:04X}",
+                ch as u32
+            )));
+        }
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
+    Ok(out)
 }
 
 fn escape_xml_text(input: &str, out: &mut String) {
@@ -544,12 +1090,111 @@ fn parse_tag_name(cursor: &mut XmlCursor<'_>) -> Result<String> {
     Ok(cursor.src[start..cursor.pos].to_owned())
 }
 
+fn parse_xml_declaration(cursor: &mut XmlCursor<'_>) -> Result<()> {
+    let rem = cursor.remaining();
+    if !rem.starts_with("<?") {
+        return Ok(());
+    }
+    // Only allow a single standard `<?xml ...?>` declaration where `xml` is immediately followed
+    // by ASCII whitespace. Reject `<?xml-stylesheet ...?>`, `<?xml-model ...?>`, and all other PIs.
+    let bytes = rem.as_bytes();
+    if !(rem.starts_with("<?xml")
+        && bytes.get(5).is_some_and(u8::is_ascii_whitespace))
+    {
+        return Err(Error::Msg(
+            "vector SVG processing instructions are forbidden (only standard <?xml ...?> declaration is permitted)"
+                .into(),
+        ));
+    }
+    let Some(end) = rem.find("?>") else {
+        return Err(Error::Msg(
+            "vector SVG has an unterminated XML declaration".into(),
+        ));
+    };
+    let inner = rem[5..end].trim();
+    let mut inner_cursor = XmlCursor::new(inner);
+    let mut seen = BTreeSet::new();
+    let mut saw_version = false;
+    while !inner_cursor.is_eof() {
+        inner_cursor.skip_ws();
+        if inner_cursor.is_eof() {
+            break;
+        }
+        let name = parse_tag_name(&mut inner_cursor)?;
+        inner_cursor.skip_ws();
+        if !inner_cursor.remaining().starts_with('=') {
+            return Err(Error::Msg(
+                "vector SVG XML declaration pseudo-attribute is missing '='".into(),
+            ));
+        }
+        inner_cursor.pos += 1;
+        inner_cursor.skip_ws();
+        let quote = inner_cursor
+            .remaining()
+            .as_bytes()
+            .first()
+            .copied()
+            .filter(|&b| b == b'"' || b == b'\'')
+            .ok_or_else(|| {
+                Error::Msg("vector SVG XML declaration pseudo-attribute must be quoted".into())
+            })?;
+        inner_cursor.pos += 1;
+        let val_start = inner_cursor.pos;
+        let ibytes = inner_cursor.src.as_bytes();
+        while inner_cursor.pos < ibytes.len() && ibytes[inner_cursor.pos] != quote {
+            inner_cursor.pos += 1;
+        }
+        if inner_cursor.pos >= ibytes.len() {
+            return Err(Error::Msg(
+                "vector SVG XML declaration has an unterminated quote".into(),
+            ));
+        }
+        let value = &inner_cursor.src[val_start..inner_cursor.pos];
+        inner_cursor.pos += 1;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(Error::Msg(
+                "vector SVG XML declaration has duplicate pseudo-attributes".into(),
+            ));
+        }
+        match name.as_str() {
+            "version" if value == "1.0" => saw_version = true,
+            "encoding" if value.eq_ignore_ascii_case("utf-8") => {}
+            "standalone" if matches!(value, "yes" | "no") => {}
+            _ => {
+                return Err(Error::Msg(format!(
+                    "vector SVG XML declaration attribute '{name}={value:?}' is not permitted"
+                )));
+            }
+        }
+        // Require whitespace before next pseudo-attribute if not at end.
+        if !inner_cursor.is_eof()
+            && !inner_cursor
+                .remaining()
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            return Err(Error::Msg(
+                "vector SVG XML declaration attributes must be whitespace-separated".into(),
+            ));
+        }
+    }
+    if !saw_version {
+        return Err(Error::Msg(
+            "vector SVG XML declaration must specify version=\"1.0\"".into(),
+        ));
+    }
+    cursor.pos += end + 2;
+    cursor.skip_ws();
+    Ok(())
+}
+
 fn parse_attributes(
     cursor: &mut XmlCursor<'_>,
-    total_attrs: &mut usize,
+    counters: &mut SanitizerCounters,
 ) -> Result<(Vec<(String, String)>, bool)> {
     let mut attrs = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     loop {
         cursor.skip_ws();
         let rem = cursor.remaining();
@@ -604,50 +1249,628 @@ fn parse_attributes(
                 "vector SVG attribute '{name}' exceeds {MAX_SVG_ATTRIBUTE_VALUE_BYTES}-byte cap"
             )));
         }
-        *total_attrs = total_attrs
+        counters.total_attrs = counters
+            .total_attrs
             .checked_add(1)
             .ok_or_else(|| Error::Msg("vector SVG attribute count overflow".into()))?;
-        if *total_attrs > MAX_SVG_ATTRIBUTES {
+        if counters.total_attrs > MAX_SVG_ATTRIBUTES {
             return Err(Error::Msg(format!(
                 "vector SVG exceeds the {MAX_SVG_ATTRIBUTES}-attribute budget"
             )));
         }
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_ascii_lowercase()) {
             return Err(Error::Msg(format!(
                 "vector SVG contains duplicate attribute '{name}'"
             )));
         }
-        let decoded = decode_xml_entities(raw_value);
+        let decoded = decode_xml_entities(raw_value)?;
+        if decoded.len() > MAX_SVG_ATTRIBUTE_VALUE_BYTES {
+            return Err(Error::Msg(format!(
+                "vector SVG attribute '{name}' decoded value exceeds {MAX_SVG_ATTRIBUTE_VALUE_BYTES}-byte cap"
+            )));
+        }
+        counters.total_attr_value_bytes = counters
+            .total_attr_value_bytes
+            .checked_add(decoded.len())
+            .ok_or_else(|| Error::Msg("vector SVG attribute byte count overflow".into()))?;
+        if counters.total_attr_value_bytes > MAX_SVG_ATTRIBUTE_VALUE_BYTES_TOTAL {
+            return Err(Error::Msg(format!(
+                "vector SVG exceeds the {MAX_SVG_ATTRIBUTE_VALUE_BYTES_TOTAL}-byte total attribute budget"
+            )));
+        }
         attrs.push((name, decoded));
     }
+}
+
+#[derive(Debug)]
+struct GraphNode {
+    name: String,
+    children: Vec<usize>,
+    href_target: Option<String>,
+    path_data_bytes: usize,
+    path_commands: usize,
+    path_numbers: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExpansionCost {
+    elements: usize,
+    max_depth: usize,
+    path_data_bytes: usize,
+    path_commands: usize,
+    path_numbers: usize,
+}
+
+impl ExpansionCost {
+    fn nested(mut self) -> Result<Self> {
+        self.max_depth = self
+            .max_depth
+            .checked_add(1)
+            .ok_or_else(|| Error::Msg("vector SVG expanded depth overflow".into()))?;
+        if self.max_depth > MAX_SVG_DEPTH {
+            return Err(Error::Msg(format!(
+                "vector SVG <use> expansion exceeds the {MAX_SVG_DEPTH}-level nesting depth budget"
+            )));
+        }
+        Ok(self)
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self> {
+        let elements = self
+            .elements
+            .checked_add(other.elements)
+            .ok_or_else(|| Error::Msg("vector SVG expansion count overflow".into()))?;
+        let path_data_bytes = self
+            .path_data_bytes
+            .checked_add(other.path_data_bytes)
+            .ok_or_else(|| Error::Msg("vector SVG expanded path bytes overflow".into()))?;
+        let path_commands = self
+            .path_commands
+            .checked_add(other.path_commands)
+            .ok_or_else(|| Error::Msg("vector SVG expanded path command count overflow".into()))?;
+        let path_numbers = self
+            .path_numbers
+            .checked_add(other.path_numbers)
+            .ok_or_else(|| Error::Msg("vector SVG expanded path number count overflow".into()))?;
+        if elements > MAX_SVG_ELEMENTS {
+            return Err(Error::Msg(format!(
+                "vector SVG <use> expansion exceeds the {MAX_SVG_ELEMENTS}-element budget"
+            )));
+        }
+        if path_data_bytes > MAX_SVG_PATH_DATA_BYTES
+            || path_commands > MAX_SVG_PATH_COMMANDS
+            || path_numbers > MAX_SVG_PATH_NUMBERS
+        {
+            return Err(Error::Msg(
+                "vector SVG <use> expansion exceeds the path-work budget".into(),
+            ));
+        }
+        Ok(Self {
+            elements,
+            max_depth: self.max_depth.max(other.max_depth),
+            path_data_bytes,
+            path_commands,
+            path_numbers,
+        })
+    }
+}
+
+fn compute_expansion_cost(
+    node: usize,
+    nodes: &[GraphNode],
+    ids: &BTreeMap<String, usize>,
+    visiting: &mut BTreeSet<usize>,
+    memo: &mut BTreeMap<usize, ExpansionCost>,
+) -> Result<ExpansionCost> {
+    if let Some(cost) = memo.get(&node) {
+        return Ok(*cost);
+    }
+    if !visiting.insert(node) {
+        return Err(Error::Msg(
+            "vector SVG local <use>/resource graph contains a cycle".into(),
+        ));
+    }
+    let mut cost = ExpansionCost {
+        elements: 1,
+        max_depth: 1,
+        path_data_bytes: nodes[node].path_data_bytes,
+        path_commands: nodes[node].path_commands,
+        path_numbers: nodes[node].path_numbers,
+    };
+    for &child in &nodes[node].children {
+        cost = cost.checked_add(compute_expansion_cost(child, nodes, ids, visiting, memo)?.nested()?)?;
+    }
+    if let Some(target) = &nodes[node].href_target {
+        let target_node = *ids.get(target).ok_or_else(|| {
+            Error::Msg(format!(
+                "vector SVG local reference '#{target}' is unresolved"
+            ))
+        })?;
+        if nodes[node].name == "use" {
+            if !matches!(
+                nodes[target_node].name.as_str(),
+                "svg"
+                    | "g"
+                    | "symbol"
+                    | "path"
+                    | "rect"
+                    | "circle"
+                    | "ellipse"
+                    | "line"
+                    | "polyline"
+                    | "polygon"
+            ) {
+                return Err(Error::Msg(format!(
+                    "vector SVG <use> target '#{target}' (<{}>) is not permitted",
+                    nodes[target_node].name
+                )));
+            }
+        } else if !matches!(
+            nodes[node].name.as_str(),
+            "linearGradient" | "radialGradient"
+        ) || !matches!(
+            nodes[target_node].name.as_str(),
+            "linearGradient" | "radialGradient"
+        ) {
+            return Err(Error::Msg(format!(
+                "vector SVG href target '#{target}' has an unsupported resource type"
+            )));
+        }
+        cost = cost
+            .checked_add(compute_expansion_cost(target_node, nodes, ids, visiting, memo)?.nested()?)?;
+    }
+    visiting.remove(&node);
+    memo.insert(node, cost);
+    Ok(cost)
+}
+
+fn visit_reference_graph(
+    node: usize,
+    edges: &[Vec<usize>],
+    visiting: &mut BTreeSet<usize>,
+    complete: &mut BTreeSet<usize>,
+) -> Result<()> {
+    if complete.contains(&node) {
+        return Ok(());
+    }
+    if !visiting.insert(node) {
+        return Err(Error::Msg(
+            "vector SVG resource reference graph contains a cycle".into(),
+        ));
+    }
+    for &target in &edges[node] {
+        visit_reference_graph(target, edges, visiting, complete)?;
+    }
+    visiting.remove(&node);
+    complete.insert(node);
+    Ok(())
+}
+
+fn validate_filter_primitive(
+    name: &str,
+    attrs: &[(String, String)],
+    filter_id: Option<&str>,
+    parent_name: Option<&str>,
+    filter_results: &mut BTreeMap<String, BTreeSet<String>>,
+    counters: &mut SanitizerCounters,
+) -> Result<()> {
+    if !matches!(
+        name,
+        "feGaussianBlur" | "feOffset" | "feMerge" | "feMergeNode"
+    ) {
+        return Ok(());
+    }
+    let filter_key = filter_id.ok_or_else(|| {
+        Error::Msg(format!(
+            "vector SVG filter primitive <{name}> must appear inside a <filter>"
+        ))
+    })?;
+    if name == "feMergeNode" && parent_name != Some("feMerge") {
+        return Err(Error::Msg(
+            "vector SVG <feMergeNode> must appear directly inside <feMerge>".into(),
+        ));
+    }
+    counters.filter_primitives = counters
+        .filter_primitives
+        .checked_add(1)
+        .ok_or_else(|| Error::Msg("vector SVG filter primitive count overflow".into()))?;
+    if counters.filter_primitives > MAX_SVG_FILTER_PRIMITIVES {
+        return Err(Error::Msg(format!(
+            "vector SVG exceeds the {MAX_SVG_FILTER_PRIMITIVES}-filter-primitive budget"
+        )));
+    }
+    let results = filter_results.entry(filter_key.to_owned()).or_default();
+    if let Some((_, input)) = attrs.iter().find(|(k, _)| k == "in") {
+        if !matches!(input.as_str(), "SourceGraphic" | "SourceAlpha") && !results.contains(input) {
+            return Err(Error::Msg(format!(
+                "vector SVG <{name}> input '{input}' must reference SourceGraphic, SourceAlpha, or an earlier filter result"
+            )));
+        }
+    }
+    if let Some((_, result)) = attrs.iter().find(|(k, _)| k == "result") {
+        if !matches!(name, "feGaussianBlur" | "feOffset") {
+            return Err(Error::Msg(format!(
+                "vector SVG <{name}> cannot name a filter result"
+            )));
+        }
+        validate_static_svg_id(result, "filter result")?;
+        if !results.insert(result.clone()) {
+            return Err(Error::Msg(format!(
+                "vector SVG filter result '{result}' is duplicated"
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct ParseFrame {
+    node_idx: usize,
+    node: SvgNode,
+    hidden: bool,
+    filter_key: Option<String>,
+    style_text: String,
+}
+
+struct ValidatedAttributes {
+    attrs: Vec<(String, String)>,
+    element_id: Option<String>,
+    href_target: Option<String>,
+    path_bytes: usize,
+    path_cmds: usize,
+    path_nums: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_element_attributes(
+    element: &str,
+    raw_attrs: Vec<(String, String)>,
+    is_root: bool,
+    node_idx: usize,
+    hidden: &mut bool,
+    root_xlink_bound: &mut bool,
+    xlink_href_seen: &mut bool,
+    counters: &mut SanitizerCounters,
+    typed_refs: &mut Vec<TypedReference>,
+) -> Result<ValidatedAttributes> {
+    let mut clean_attrs = Vec::with_capacity(raw_attrs.len());
+    let mut element_id = None;
+    let mut href_target = None;
+    let mut node_path_bytes = 0usize;
+    let mut node_path_cmds = 0usize;
+    let mut node_path_nums = 0usize;
+
+    // First check root namespace bindings and hidden flag before validating remaining attributes.
+    if is_root {
+        for (key, value) in &raw_attrs {
+            if key == "xmlns:xlink" {
+                if value != XLINK_NAMESPACE {
+                    return Err(Error::Msg(format!(
+                        "vector SVG root xmlns:xlink must equal {XLINK_NAMESPACE:?}"
+                    )));
+                }
+                *root_xlink_bound = true;
+            }
+        }
+    }
+    for (key, value) in &raw_attrs {
+        if key == "display" && value.trim() == "none" {
+            *hidden = true;
+        }
+    }
+
+    for (key, value) in raw_attrs {
+        if is_forbidden_attribute_name(&key) {
+            return Err(Error::Msg(format!(
+                "vector SVG active attribute '{key}' is forbidden"
+            )));
+        }
+        if key == "xmlns" {
+            if !is_root || element != "svg" || value != SVG_NAMESPACE {
+                return Err(Error::Msg(format!(
+                    "vector SVG xmlns attribute is only permitted on root <svg> with {SVG_NAMESPACE:?}"
+                )));
+            }
+            clean_attrs.push((key, value));
+            continue;
+        }
+        if key == "xmlns:xlink" {
+            if !is_root || element != "svg" || value != XLINK_NAMESPACE {
+                return Err(Error::Msg(format!(
+                    "vector SVG xmlns:xlink is only permitted on root <svg> with {XLINK_NAMESPACE:?}"
+                )));
+            }
+            clean_attrs.push((key, value));
+            continue;
+        }
+        if key.starts_with("xmlns:") || (key.contains(':') && !matches!(key.as_str(), "xml:space" | "xlink:href")) {
+            return Err(Error::Msg(format!(
+                "vector SVG namespaced attribute '{key}' is forbidden"
+            )));
+        }
+        if !is_allowed_static_attribute(element, &key, *hidden) {
+            return Err(Error::Msg(format!(
+                "vector SVG attribute '{key}' is not permitted on <{element}>"
+            )));
+        }
+        if contains_external_or_active_tokens(&value) {
+            return Err(Error::Msg(format!(
+                "vector SVG attribute '{key}' contains forbidden external, escape, or active content"
+            )));
+        }
+
+        match key.as_str() {
+            "id" => {
+                validate_static_svg_id(&value, "element id")?;
+                element_id = Some(value.clone());
+                clean_attrs.push((key, value));
+            }
+            "display" => {
+                let v = value.trim();
+                if !matches!(v, "inline" | "block" | "none" | "inherit" | "initial" | "unset") {
+                    return Err(Error::Msg(format!(
+                        "vector SVG display value {value:?} is unsupported"
+                    )));
+                }
+                if v == "none" {
+                    *hidden = true;
+                }
+                clean_attrs.push((key, v.to_owned()));
+            }
+            "visibility" => {
+                let v = value.trim();
+                if !matches!(v, "visible" | "hidden" | "collapse" | "inherit" | "initial" | "unset")
+                {
+                    return Err(Error::Msg(format!(
+                        "vector SVG visibility value {value:?} is unsupported"
+                    )));
+                }
+                clean_attrs.push((key, v.to_owned()));
+            }
+            "vector-effect" => {
+                let v = value.trim();
+                if !matches!(v, "none" | "non-scaling-stroke") {
+                    return Err(Error::Msg(
+                        "vector SVG vector-effect value is unsupported".into(),
+                    ));
+                }
+                clean_attrs.push((key, v.to_owned()));
+            }
+            "xml:space" => {
+                if !matches!(value.as_str(), "default" | "preserve") {
+                    return Err(Error::Msg(
+                        "vector SVG xml:space value must be 'default' or 'preserve'".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            "version" => {
+                if !is_root || !matches!(value.as_str(), "1.0" | "1.1" | "2.0") {
+                    return Err(Error::Msg(
+                        "vector SVG version attribute is unsupported".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            "baseProfile" => {
+                if !is_root || value != "full" {
+                    return Err(Error::Msg(
+                        "vector SVG baseProfile must be exact root 'full'".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            "type" if element == "style" => {
+                if value != "text/css" {
+                    return Err(Error::Msg(
+                        "vector SVG <style> type attribute must be 'text/css'".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            "style" => {
+                let cleaned = validate_inline_style(&value, node_idx, counters, typed_refs)?;
+                if cleaned
+                    .split(';')
+                    .filter_map(|d| d.split_once(':'))
+                    .any(|(p, v)| p == "display" && v.eq_ignore_ascii_case("none"))
+                {
+                    *hidden = true;
+                }
+                if !cleaned.is_empty() {
+                    clean_attrs.push(("style".to_owned(), cleaned));
+                }
+            }
+            "href" | "xlink:href" => {
+                if !matches!(element, "use" | "linearGradient" | "radialGradient") {
+                    return Err(Error::Msg(format!(
+                        "vector SVG attribute '{key}' is not allowed on <{element}>"
+                    )));
+                }
+                if key == "xlink:href" {
+                    *xlink_href_seen = true;
+                    if !*root_xlink_bound {
+                        return Err(Error::Msg(
+                            "vector SVG xlink:href requires root xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+                                .into(),
+                        ));
+                    }
+                }
+                if href_target.is_some() {
+                    return Err(Error::Msg(format!(
+                        "vector SVG <{element}> has ambiguous href and xlink:href attributes"
+                    )));
+                }
+                let target = local_href_target(&value)?;
+                record_reference_count(counters)?;
+                href_target = Some(target.to_owned());
+                clean_attrs.push((key, format!("#{target}")));
+            }
+            "fill" | "stroke" | "clip-path" | "filter" => {
+                if let Some(target) = validate_css_value_functions(&key, &value)? {
+                    let kind = match key.as_str() {
+                        "fill" | "stroke" => StaticReferenceKind::Paint,
+                        "clip-path" => StaticReferenceKind::ClipPath,
+                        "filter" => StaticReferenceKind::Filter,
+                        _ => unreachable!(),
+                    };
+                    record_reference_count(counters)?;
+                    typed_refs.push(TypedReference {
+                        source_node: node_idx,
+                        target,
+                        kind,
+                    });
+                }
+                clean_attrs.push((key, value));
+            }
+            "d" if element == "path" => {
+                counters.path_data_bytes = counters
+                    .path_data_bytes
+                    .checked_add(value.len())
+                    .ok_or_else(|| Error::Msg("vector SVG path bytes overflow".into()))?;
+                if counters.path_data_bytes > MAX_SVG_PATH_DATA_BYTES {
+                    return Err(Error::Msg(
+                        "vector SVG exceeds the path-data byte budget".into(),
+                    ));
+                }
+                let (cmds, nums) = scan_path_data_budget(&value)?;
+                counters.path_commands = counters
+                    .path_commands
+                    .checked_add(cmds)
+                    .ok_or_else(|| Error::Msg("vector SVG path command count overflow".into()))?;
+                counters.path_numbers = counters
+                    .path_numbers
+                    .checked_add(nums)
+                    .ok_or_else(|| Error::Msg("vector SVG path number count overflow".into()))?;
+                if counters.path_commands > MAX_SVG_PATH_COMMANDS {
+                    return Err(Error::Msg(
+                        "vector SVG exceeds the path-command budget".into(),
+                    ));
+                }
+                if counters.path_numbers > MAX_SVG_PATH_NUMBERS {
+                    return Err(Error::Msg(
+                        "vector SVG exceeds the path-number budget".into(),
+                    ));
+                }
+                node_path_bytes = value.len();
+                node_path_cmds = cmds;
+                node_path_nums = nums;
+                clean_attrs.push((key, value));
+            }
+            "stdDeviation" if element == "feGaussianBlur" => {
+                let vals = parse_number_list(&value, "filter stdDeviation")?;
+                if vals.len() > 2
+                    || vals
+                        .iter()
+                        .any(|v| !(0.0..=MAX_SVG_FILTER_BLUR_SIGMA).contains(v))
+                {
+                    return Err(Error::Msg(format!(
+                        "vector SVG <feGaussianBlur> stdDeviation must be 1..=2 values in 0..={MAX_SVG_FILTER_BLUR_SIGMA}"
+                    )));
+                }
+                clean_attrs.push((key, value));
+            }
+            "dx" | "dy" if element == "feOffset" => {
+                let vals = parse_number_list(&value, &key)?;
+                if vals.len() != 1 {
+                    return Err(Error::Msg(format!(
+                        "vector SVG <feOffset> {key} must be a single finite number"
+                    )));
+                }
+                clean_attrs.push((key, value));
+            }
+            "width" | "height" if element == "filter" => {
+                let trimmed = value.trim();
+                if let Some(pct) = trimmed.strip_suffix('%') {
+                    let vals = parse_number_list(pct, &key)?;
+                    if vals.len() != 1 || !(0.0..=200.0).contains(&vals[0]) {
+                        return Err(Error::Msg(format!(
+                            "vector SVG <filter> {key} percentage must be in 0%..=200%"
+                        )));
+                    }
+                } else {
+                    let vals = parse_number_list(trimmed, &key)?;
+                    if vals.len() != 1
+                        || vals[0] <= 0.0
+                        || vals[0] > f64::from(MAX_PREVIEW_DIMENSION)
+                    {
+                        return Err(Error::Msg(format!(
+                            "vector SVG <filter> {key} exceeds bounded dimension budget"
+                        )));
+                    }
+                }
+                clean_attrs.push((key, value));
+            }
+            "offset" if element == "stop" => {
+                let trimmed = value.trim();
+                let (num_str, max_v) = if let Some(pct) = trimmed.strip_suffix('%') {
+                    (pct, 100.0)
+                } else {
+                    (trimmed, 1.0)
+                };
+                let vals = parse_number_list(num_str, "gradient stop offset")?;
+                if vals.len() != 1 || !(0.0..=max_v).contains(&vals[0]) {
+                    return Err(Error::Msg(
+                        "vector SVG gradient stop offset is outside its range".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            "stop-opacity" if element == "stop" => {
+                let vals = parse_number_list(&value, "stop-opacity")?;
+                if vals.len() != 1 || !(0.0..=1.0).contains(&vals[0]) {
+                    return Err(Error::Msg(
+                        "vector SVG stop-opacity must be between 0 and 1".into(),
+                    ));
+                }
+                clean_attrs.push((key, value));
+            }
+            _ => {
+                let compact_lower: String = value
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if compact_lower.contains("url(") {
+                    return Err(Error::Msg(format!(
+                        "vector SVG attribute '{key}' does not permit url(...) values"
+                    )));
+                }
+                clean_attrs.push((key, value));
+            }
+        }
+    }
+
+    if element == "use" && href_target.is_none() {
+        return Err(Error::Msg(
+            "vector SVG <use> requires a local href or xlink:href fragment".into(),
+        ));
+    }
+
+    Ok(ValidatedAttributes {
+        attrs: clean_attrs,
+        element_id,
+        href_target,
+        path_bytes: node_path_bytes,
+        path_cmds: node_path_cmds,
+        path_nums: node_path_nums,
+    })
 }
 
 fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
     let mut cursor = XmlCursor::new(input);
     cursor.skip_ws();
-
-    // Permit a single standard leading XML declaration, refusing xml-stylesheet / DOCTYPE.
-    if cursor.remaining().starts_with("<?xml") {
-        let Some(end) = cursor.remaining().find("?>") else {
-            return Err(Error::Msg(
-                "vector SVG has an unterminated XML declaration".into(),
-            ));
-        };
-        let decl = &cursor.remaining()[..end + 2];
-        if decl.to_ascii_lowercase().starts_with("<?xml-stylesheet") {
-            return Err(Error::Msg(
-                "vector SVG processing instruction <?xml-stylesheet?> is forbidden".into(),
-            ));
-        }
-        cursor.pos += end + 2;
-        cursor.skip_ws();
-    }
+    parse_xml_declaration(&mut cursor)?;
 
     let mut roots: Vec<SvgNode> = Vec::new();
-    let mut stack: Vec<(Option<SvgNode>, String)> = Vec::new();
-    let mut total_elements = 0usize;
-    let mut total_attrs = 0usize;
-    let mut stripped_depth = 0usize;
+    let mut stack: Vec<ParseFrame> = Vec::new();
+    let mut graph_nodes: Vec<GraphNode> = Vec::new();
+    let mut ids: BTreeMap<String, usize> = BTreeMap::new();
+    let mut typed_refs: Vec<TypedReference> = Vec::new();
+    let mut filter_results: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut counters = SanitizerCounters::default();
+    let mut root_idx: Option<usize> = None;
+    let mut root_xlink_bound = false;
+    let mut xlink_href_seen = false;
 
     while !cursor.is_eof() {
         let rem = cursor.remaining();
@@ -655,32 +1878,32 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             let next_lt = rem.find('<').unwrap_or(rem.len());
             let text_raw = &rem[..next_lt];
             cursor.pos += next_lt;
-            if stripped_depth > 0 {
-                continue;
-            }
-            if stack.is_empty() {
-                if !text_raw.trim().is_empty() {
+            let decoded = decode_xml_entities(text_raw)?;
+            let Some(parent) = stack.last_mut() else {
+                if !decoded.trim().is_empty() {
                     return Err(Error::Msg(
                         "vector SVG contains content outside the <svg> root".into(),
                     ));
                 }
                 continue;
-            }
-            let decoded = decode_xml_entities(text_raw);
-            if !decoded.trim().is_empty() {
-                if let Some((Some(parent), _)) = stack.last_mut() {
-                    if parent.name == "style" {
-                        let clean = sanitize_stylesheet(&decoded);
-                        if !clean.is_empty() {
-                            parent.children.push(SvgChild::Text(clean));
-                        }
-                    } else if matches!(
-                        parent.name.as_str(),
-                        "title" | "desc" | "text" | "tspan"
-                    ) {
-                        parent.children.push(SvgChild::Text(decoded));
-                    }
+            };
+            if parent.node.name == "style" {
+                parent.style_text.push_str(&decoded);
+            } else if matches!(
+                parent.node.name.as_str(),
+                "title" | "desc" | "metadata"
+            ) || parent.hidden
+            {
+                if !decoded.trim().is_empty()
+                    && matches!(parent.node.name.as_str(), "title" | "desc")
+                {
+                    parent.node.children.push(SvgChild::Text(decoded));
                 }
+            } else if !decoded.trim().is_empty() {
+                return Err(Error::Msg(
+                    "vector SVG visible text content is not permitted by the static sanitizer"
+                        .into(),
+                ));
             }
             continue;
         }
@@ -696,7 +1919,7 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             continue;
         }
 
-        // CDATA
+        // CDATA — permitted only inside <style> (matching sceneworks-static-svg-v2)
         if let Some(after_cdata) = rem.strip_prefix("<![CDATA[") {
             let Some(end) = after_cdata.find("]]>") else {
                 return Err(Error::Msg(
@@ -704,21 +1927,23 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
                 ));
             };
             let cdata = &after_cdata[..end];
+            validate_xml_chars(cdata, "vector SVG CDATA")?;
             cursor.pos += 9 + end + 3;
-            if stripped_depth == 0 {
-                if let Some((Some(parent), _)) = stack.last_mut() {
-                    if parent.name == "style" {
-                        let clean = sanitize_stylesheet(cdata);
-                        if !clean.is_empty() {
-                            parent.children.push(SvgChild::Text(clean));
-                        }
-                    }
-                }
+            let Some(parent) = stack.last_mut() else {
+                return Err(Error::Msg(
+                    "vector SVG contains CDATA outside a <style> element".into(),
+                ));
+            };
+            if parent.node.name != "style" {
+                return Err(Error::Msg(
+                    "vector SVG contains CDATA outside a <style> element".into(),
+                ));
             }
+            parent.style_text.push_str(cdata);
             continue;
         }
 
-        // Declarations (DOCTYPE / ENTITY / etc.) and processing instructions are forbidden.
+        // Declarations (DOCTYPE / ENTITY / etc.) and any subsequent processing instructions are forbidden.
         if rem.starts_with("<!") || rem.starts_with("<?") {
             return Err(Error::Msg(
                 "vector SVG declarations and processing instructions are forbidden".into(),
@@ -736,25 +1961,32 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
                 )));
             }
             cursor.pos += 1;
-            let Some((node_opt, opened_name)) = stack.pop() else {
+            let Some(mut frame) = stack.pop() else {
                 return Err(Error::Msg(format!(
                     "vector SVG has unexpected closing tag </{name}>"
                 )));
             };
-            if opened_name != name {
+            if frame.node.name != name {
                 return Err(Error::Msg(format!(
-                    "vector SVG closes </{name}> while <{opened_name}> is open"
+                    "vector SVG closes </{name}> while <{}> is open",
+                    frame.node.name
                 )));
             }
-            if node_opt.is_none() {
-                stripped_depth = stripped_depth.saturating_sub(1);
-                continue;
+            if frame.node.name == "style" {
+                let clean_css = validate_stylesheet(
+                    &frame.style_text,
+                    frame.node_idx,
+                    &mut counters,
+                    &mut typed_refs,
+                )?;
+                if !clean_css.is_empty() {
+                    frame.node.children.push(SvgChild::Text(clean_css));
+                }
             }
-            let node = node_opt.expect("checked Some above");
-            if let Some((Some(parent), _)) = stack.last_mut() {
-                parent.children.push(SvgChild::Element(node));
-            } else if stack.is_empty() {
-                roots.push(node);
+            if let Some(parent) = stack.last_mut() {
+                parent.node.children.push(SvgChild::Element(frame.node));
+            } else {
+                roots.push(frame.node);
             }
             continue;
         }
@@ -762,7 +1994,7 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
         // Start or self-closing tag
         cursor.pos += 1;
         let name = parse_tag_name(&mut cursor)?;
-        let (raw_attrs, self_closing) = parse_attributes(&mut cursor, &mut total_attrs)?;
+        let (raw_attrs, self_closing) = parse_attributes(&mut cursor, &mut counters)?;
 
         if stack.len() >= MAX_SVG_DEPTH {
             return Err(Error::Msg(format!(
@@ -770,33 +2002,127 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
             )));
         }
 
-        if stripped_depth > 0 || is_stripped_active_element(&name) {
-            if !self_closing {
-                stripped_depth += 1;
-                stack.push((None, name));
-            }
-            continue;
+        let is_root = stack.is_empty();
+        if is_root && (root_idx.is_some() || name != "svg") {
+            return Err(Error::Msg(
+                "vector SVG must contain exactly one <svg> root element".into(),
+            ));
         }
 
-        if !is_allowed_static_element(&name) {
+        let parent_hidden = stack.last().is_some_and(|f| f.hidden);
+        let parent_name = stack.last().map(|f| f.node.name.as_str());
+        let mut hidden = parent_hidden;
+        if !is_allowed_static_element(&name, hidden) {
             return Err(Error::Msg(format!(
-                "vector SVG element <{name}> is not permitted by the static SVG allowlist"
+                "vector SVG element <{name}> is active or unsupported by the static SVG allowlist"
             )));
         }
 
-        total_elements = total_elements
-            .checked_add(1)
-            .ok_or_else(|| Error::Msg("vector SVG element count overflow".into()))?;
-        if total_elements > MAX_SVG_ELEMENTS {
+        if graph_nodes.len() >= MAX_SVG_ELEMENTS {
             return Err(Error::Msg(format!(
                 "vector SVG exceeds the {MAX_SVG_ELEMENTS}-element budget"
             )));
         }
 
-        let clean_attrs: Vec<(String, String)> = raw_attrs
-            .into_iter()
-            .filter_map(|(k, v)| sanitize_attribute(&k, &v))
-            .collect();
+        let node_idx = graph_nodes.len();
+        let ValidatedAttributes {
+            attrs: clean_attrs,
+            element_id,
+            href_target,
+            path_bytes,
+            path_cmds,
+            path_nums,
+        } = validate_element_attributes(
+                &name,
+                raw_attrs,
+                is_root,
+                node_idx,
+                &mut hidden,
+                &mut root_xlink_bound,
+                &mut xlink_href_seen,
+                &mut counters,
+                &mut typed_refs,
+            )?;
+
+        if is_root && hidden {
+            return Err(Error::Msg(
+                "vector SVG root display:none is unsupported".into(),
+            ));
+        }
+
+        if name == "style" && !matches!(parent_name, Some("svg" | "defs")) {
+            return Err(Error::Msg(
+                "vector SVG <style> element must be directly under <svg> or <defs>".into(),
+            ));
+        }
+
+        if matches!(
+            name.as_str(),
+            "clipPath" | "linearGradient" | "radialGradient" | "filter" | "symbol"
+        ) {
+            counters.resources = counters
+                .resources
+                .checked_add(1)
+                .ok_or_else(|| Error::Msg("vector SVG resource count overflow".into()))?;
+            if counters.resources > MAX_SVG_RESOURCES {
+                return Err(Error::Msg(format!(
+                    "vector SVG exceeds the {MAX_SVG_RESOURCES}-resource budget"
+                )));
+            }
+        }
+
+        if name == "stop" {
+            counters.gradient_stops = counters
+                .gradient_stops
+                .checked_add(1)
+                .ok_or_else(|| Error::Msg("vector SVG gradient stop count overflow".into()))?;
+            if counters.gradient_stops > MAX_SVG_GRADIENT_STOPS {
+                return Err(Error::Msg(format!(
+                    "vector SVG exceeds the {MAX_SVG_GRADIENT_STOPS}-gradient-stop budget"
+                )));
+            }
+        }
+
+        let filter_key = if name == "filter" {
+            Some(
+                element_id
+                    .clone()
+                    .unwrap_or_else(|| format!("__anon_filter_{node_idx}")),
+            )
+        } else {
+            stack.last().and_then(|f| f.filter_key.clone())
+        };
+        validate_filter_primitive(
+            &name,
+            &clean_attrs,
+            filter_key.as_deref(),
+            parent_name,
+            &mut filter_results,
+            &mut counters,
+        )?;
+
+        if let Some(id) = element_id {
+            if ids.insert(id.clone(), node_idx).is_some() {
+                return Err(Error::Msg(format!(
+                    "vector SVG element id '{id}' is duplicated"
+                )));
+            }
+        }
+
+        if let Some(parent) = stack.last() {
+            graph_nodes[parent.node_idx].children.push(node_idx);
+        } else {
+            root_idx = Some(node_idx);
+        }
+        graph_nodes.push(GraphNode {
+            name: name.clone(),
+            children: Vec::new(),
+            href_target,
+            path_data_bytes: path_bytes,
+            path_commands: path_cmds,
+            path_numbers: path_nums,
+        });
+
         let node = SvgNode {
             name: name.clone(),
             attrs: clean_attrs,
@@ -804,21 +2130,92 @@ fn parse_and_sanitize_document(input: &str) -> Result<Vec<SvgNode>> {
         };
 
         if self_closing {
-            if let Some((Some(parent), _)) = stack.last_mut() {
-                parent.children.push(SvgChild::Element(node));
-            } else if stack.is_empty() {
+            if let Some(parent) = stack.last_mut() {
+                parent.node.children.push(SvgChild::Element(node));
+            } else {
                 roots.push(node);
             }
         } else {
-            stack.push((Some(node), name));
+            stack.push(ParseFrame {
+                node_idx,
+                node,
+                hidden,
+                filter_key,
+                style_text: String::new(),
+            });
         }
     }
 
-    if let Some((_, unclosed)) = stack.last() {
+    if let Some(unclosed) = stack.last() {
         return Err(Error::Msg(format!(
-            "vector SVG is truncated: unclosed <{unclosed}> element"
+            "vector SVG is truncated: unclosed <{}> element",
+            unclosed.node.name
         )));
     }
+    let root = root_idx
+        .ok_or_else(|| Error::Msg("vector SVG has no root <svg> element".into()))?;
+    if xlink_href_seen && !root_xlink_bound {
+        return Err(Error::Msg(
+            "vector SVG xlink:href requires root xmlns:xlink=\"http://www.w3.org/1999/xlink\""
+                .into(),
+        ));
+    }
+    if graph_nodes
+        .iter()
+        .any(|node| node.name == "use" && !node.children.is_empty())
+    {
+        return Err(Error::Msg(
+            "vector SVG <use> element must be empty".into(),
+        ));
+    }
+
+    // Build combined reference graph (containment + href + typed CSS/attribute url(#id)),
+    // verify every target resolves to the right resource type, reject cycles, and enforce
+    // bounded <use> expansion cost.
+    let mut ref_edges: Vec<Vec<usize>> = graph_nodes.iter().map(|n| n.children.clone()).collect();
+    for (src, gnode) in graph_nodes.iter().enumerate() {
+        if let Some(target) = &gnode.href_target {
+            let target_idx = *ids.get(target).ok_or_else(|| {
+                Error::Msg(format!(
+                    "vector SVG local reference '#{target}' is unresolved"
+                ))
+            })?;
+            ref_edges[src].push(target_idx);
+        }
+    }
+    for tref in &typed_refs {
+        let target_idx = *ids.get(&tref.target).ok_or_else(|| {
+            Error::Msg(format!(
+                "vector SVG resource reference '#{}' is unresolved",
+                tref.target
+            ))
+        })?;
+        let target_name = graph_nodes[target_idx].name.as_str();
+        let valid_type = match tref.kind {
+            StaticReferenceKind::Paint => {
+                matches!(target_name, "linearGradient" | "radialGradient")
+            }
+            StaticReferenceKind::ClipPath => target_name == "clipPath",
+            StaticReferenceKind::Filter => target_name == "filter",
+        };
+        if !valid_type {
+            return Err(Error::Msg(format!(
+                "vector SVG resource reference '#{}' points to wrong element type <{target_name}>",
+                tref.target
+            )));
+        }
+        ref_edges[tref.source_node].push(target_idx);
+    }
+
+    visit_reference_graph(root, &ref_edges, &mut BTreeSet::new(), &mut BTreeSet::new())?;
+    compute_expansion_cost(
+        root,
+        &graph_nodes,
+        &ids,
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+    )?;
+
     Ok(roots)
 }
 
@@ -1510,40 +2907,161 @@ mod tests {
     }
 
     #[test]
-    fn strips_script_foreign_object_event_handlers_and_javascript_hrefs() {
-        let hostile = r##"
-<svg width="64" height="64" onload="alert(1)">
-  <script>alert('xss')</script>
-  <foreignObject width="64" height="64"><div>owned</div></foreignObject>
-  <defs><path id="ok" d="M0 0 L10 10 Z"/></defs>
-  <use href="javascript:alert(2)" onclick="evil()"/>
-  <use xlink:href="https://evil.example/x.svg#a" onmouseover="evil()"/>
-  <use href="#ok" style="fill:red;background:url(https://evil.example/bg.png);behavior:url(x)"/>
-  <circle cx="32" cy="32" r="16" fill="blue" onerror="boom()"/>
-</svg>"##;
-        let canonical = sanitize_svg(hostile).expect("hostile active markup should be stripped");
-        let lower = canonical.svg.to_ascii_lowercase();
-        for forbidden in [
-            "<script",
-            "alert(",
-            "foreignobject",
-            "onload",
-            "onclick",
-            "onmouseover",
-            "onerror",
-            "javascript:",
-            "https://evil.example",
-            "behavior:",
+    fn rejects_active_elements_event_handlers_and_external_hrefs_fail_closed() {
+        for hostile in [
+            r##"<svg width="64" height="64" onload="alert(1)"><rect x="0" y="0" width="64" height="64"/></svg>"##,
+            r##"<svg width="64" height="64"><script>alert('xss')</script></svg>"##,
+            r##"<svg width="64" height="64"><foreignObject width="64" height="64"><g/></foreignObject></svg>"##,
+            r##"<svg width="64" height="64"><defs><path id="ok" d="M0 0 L10 10 Z"/></defs><use href="javascript:alert(2)"/></svg>"##,
+            r##"<svg width="64" height="64" xmlns:xlink="http://www.w3.org/1999/xlink"><use xlink:href="https://evil.example/x.svg#a"/></svg>"##,
+            r##"<svg width="64" height="64"><circle cx="32" cy="32" r="16" fill="blue" onerror="boom()"/></svg>"##,
+            r##"<svg width="64" height="64"><iframe/></svg>"##,
+            r##"<svg width="64" height="64"><animate attributeName="x" from="0" to="10"/></svg>"##,
+            r##"<svg width="64" height="64"><image href="https://evil.example/a.png"/></svg>"##,
+            r##"<svg width="64" height="64"><a href="#ok"><rect width="10" height="10"/></a></svg>"##,
         ] {
             assert!(
-                !lower.contains(forbidden),
-                "sanitized SVG leaked forbidden token {forbidden:?}: {}",
-                canonical.svg
+                sanitize_svg(hostile).is_err(),
+                "sceneworks-static-svg-v2 must fail closed on active markup: {hostile}"
             );
         }
-        assert!(canonical.svg.contains("href=\"#ok\""));
-        assert!(canonical.svg.contains("fill:red"));
-        assert!(canonical.svg.contains("<circle"));
+    }
+
+    #[test]
+    fn rejects_css_escape_at_rule_and_image_set_exfiltration_bypasses() {
+        for bypass in [
+            // CSS hex escape for `url(...)`
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="fill:\75 rl(https://evil.example/a)"/></svg>"##,
+            r##"<svg width="64" height="64"><style>rect { fill: \75 rl(https://evil.example/a); }</style><rect width="10" height="10"/></svg>"##,
+            // Escaped and raw @import rules
+            r##"<svg width="64" height="64"><style>@import url(https://evil.example/a.css);</style><rect width="10" height="10"/></svg>"##,
+            r##"<svg width="64" height="64"><style>@\69 mport "https://evil.example/a.css";</style><rect width="10" height="10"/></svg>"##,
+            // image-set / -webkit-image-set
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="fill:image-set(url(https://evil.example/x.png) 1x)"/></svg>"##,
+            r##"<svg width="64" height="64"><style>rect { fill: -webkit-image-set("https://evil.example/x.png" 1x); }</style><rect width="10" height="10"/></svg>"##,
+            // CSS comment splitting & disallowed properties
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="fill:u/*x*/rl(#g)"/></svg>"##,
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="background:url(https://evil.example/bg.png)"/></svg>"##,
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="fill:red;behavior:url(x)"/></svg>"##,
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="--x:red;fill:var(--x)"/></svg>"##,
+            r##"<svg width="64" height="64"><rect width="10" height="10" fill="url(https://evil.example/p#a)"/></svg>"##,
+        ] {
+            assert!(
+                sanitize_svg(bypass).is_err(),
+                "CSS bypass must be rejected: {bypass}"
+            );
+        }
+
+        // Valid static CSS with safe local gradient reference succeeds.
+        let valid = r##"<svg width="64" height="64"><defs><linearGradient id="g1"><stop offset="0%" stop-color="#ff0000"/><stop offset="100%" stop-color="#0000ff"/></linearGradient></defs><style>rect { fill: url(#g1); stroke: rgb(10, 20, 30); }</style><rect x="0" y="0" width="64" height="64" style="opacity:0.9"/></svg>"##;
+        let canonical = sanitize_svg(valid).expect("valid static CSS and local gradient must pass");
+        assert!(canonical.svg.contains("url(#g1)"));
+        assert!(canonical.svg.contains("opacity:0.9"));
+    }
+
+    #[test]
+    fn rejects_xml_base_child_xmlns_and_unbound_xlink_href() {
+        for bad in [
+            // xml:base smuggling
+            r##"<svg width="64" height="64" xml:base="https://evil.example/"><rect width="10" height="10"/></svg>"##,
+            r##"<svg width="64" height="64"><g xml:base="https://evil.example/"><rect width="10" height="10"/></g></svg>"##,
+            // child xmlns namespace switch
+            r##"<svg width="64" height="64"><g xmlns="http://www.w3.org/1999/xhtml"><rect width="10" height="10"/></g></svg>"##,
+            r##"<svg width="64" height="64" xmlns="http://www.w3.org/1999/xhtml"><rect width="10" height="10"/></svg>"##,
+            // xlink:href without root xmlns:xlink
+            r##"<svg width="64" height="64"><defs><path id="p1" d="M0 0 L10 10 Z"/></defs><use xlink:href="#p1"/></svg>"##,
+            // wrong xmlns:xlink URI
+            r##"<svg width="64" height="64" xmlns:xlink="https://evil.example/xlink"><defs><path id="p1" d="M0 0 L10 10 Z"/></defs><use xlink:href="#p1"/></svg>"##,
+        ] {
+            assert!(
+                sanitize_svg(bad).is_err(),
+                "namespace/attribute bypass must be rejected: {bad}"
+            );
+        }
+
+        // Valid xlink:href WITH exact root xmlns:xlink passes and preserves valid XML binding.
+        let ok_xlink = r##"<svg width="64" height="64" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><path id="p1" d="M0 0 L10 10 Z"/></defs><use xlink:href="#p1"/></svg>"##;
+        let canonical = sanitize_svg(ok_xlink).expect("bound xlink:href must pass");
+        assert!(canonical.svg.contains(XLINK_NAMESPACE));
+        assert!(canonical.svg.contains("xlink:href=\"#p1\""));
+    }
+
+    #[test]
+    fn rejects_entity_nul_control_chars_duplicate_attrs_and_arbitrary_pis() {
+        for bad in [
+            // NUL and illegal XML 1.0 control chars after entity decoding
+            r##"<svg width="64" height="64"><rect id="a&#0;b" width="10" height="10"/></svg>"##,
+            r##"<svg width="64" height="64"><rect id="a&#x0;b" width="10" height="10"/></svg>"##,
+            r##"<svg width="64" height="64"><title>hello&#0;world</title></svg>"##,
+            r##"<svg width="64" height="64"><title>ctrl&#x1f;char</title></svg>"##,
+            // Case-insensitive duplicate attributes
+            r##"<svg width="64" height="64"><rect width="10" height="10" style="fill:red" STYLE="fill:blue"/></svg>"##,
+            // Arbitrary processing instructions
+            r##"<?xml-model href="https://evil.example/schema.rng"?><svg width="64" height="64"/>"##,
+            r##"<?xml-stylesheet href="https://evil.example/a.css"?><svg width="64" height="64"/>"##,
+            r##"<?xml version="1.0" evil="1"?><svg width="64" height="64"/>"##,
+            r##"<?xml version="1.0" encoding="UTF-8"?><?xml version="1.0"?><svg width="64" height="64"/>"##,
+        ] {
+            assert!(
+                sanitize_svg(bad).is_err(),
+                "entity/duplicate/PI bypass must be rejected: {bad}"
+            );
+        }
+
+        // Standard leading XML declaration succeeds.
+        let ok_decl = r##"<?xml version="1.0" encoding="UTF-8"?><svg width="16" height="16"><rect width="8" height="8"/></svg>"##;
+        assert!(sanitize_svg(ok_decl).is_ok());
+    }
+
+    #[test]
+    fn rejects_use_cycles_unresolved_refs_billion_laughs_and_filter_budget_abuse() {
+        // Direct <use> cycle
+        let direct_cycle = r##"<svg width="64" height="64"><g id="a"><use href="#a"/></g></svg>"##;
+        assert!(sanitize_svg(direct_cycle).is_err());
+
+        // Mutual <use> cycle
+        let mutual_cycle = r##"<svg width="64" height="64"><defs><g id="a"><use href="#b"/></g><g id="b"><use href="#a"/></g></defs><use href="#a"/></svg>"##;
+        assert!(sanitize_svg(mutual_cycle).is_err());
+
+        // Unresolved #id ref
+        let unresolved = r##"<svg width="64" height="64"><use href="#does_not_exist"/></svg>"##;
+        assert!(sanitize_svg(unresolved).is_err());
+
+        // Billion-laughs <use> exponential amplification (2^12 = 4096 > MAX_SVG_ELEMENTS = 2000)
+        let mut laughs = String::from(r##"<svg width="64" height="64"><defs><rect id="u0" width="1" height="1"/>"##);
+        for level in 1..=12 {
+            let prev = level - 1;
+            laughs.push_str(&format!(
+                r##"<g id="u{level}"><use href="#u{prev}"/><use href="#u{prev}"/></g>"##
+            ));
+        }
+        laughs.push_str(r##"</defs><use href="#u12"/></svg>"##);
+        assert!(
+            sanitize_svg(&laughs).is_err(),
+            "billion-laughs <use> amplification must be rejected"
+        );
+
+        // Filter stdDeviation > MAX_SVG_FILTER_BLUR_SIGMA (64.0)
+        let huge_blur = r##"<svg width="64" height="64"><defs><filter id="f1"><feGaussianBlur in="SourceGraphic" stdDeviation="65" result="b"/></filter></defs><rect width="10" height="10" filter="url(#f1)"/></svg>"##;
+        assert!(sanitize_svg(huge_blur).is_err());
+
+        // Filter primitive count > MAX_SVG_FILTER_PRIMITIVES (64)
+        let mut many_prims = String::from(r##"<svg width="64" height="64"><defs><filter id="f1">"##);
+        for i in 0..=MAX_SVG_FILTER_PRIMITIVES {
+            many_prims.push_str(&format!(
+                r##"<feGaussianBlur in="SourceGraphic" stdDeviation="1" result="r{i}"/>"##
+            ));
+        }
+        many_prims.push_str(r##"</filter></defs><rect width="10" height="10" filter="url(#f1)"/></svg>"##);
+        assert!(sanitize_svg(&many_prims).is_err());
+
+        // Filter primitive outside <filter>
+        let stray_prim = r##"<svg width="64" height="64"><feGaussianBlur in="SourceGraphic" stdDeviation="2"/></svg>"##;
+        assert!(sanitize_svg(stray_prim).is_err());
+
+        // Bounded valid filter passes
+        let ok_filter = r##"<svg width="64" height="64"><defs><filter id="f1" width="120%" height="120%"><feGaussianBlur in="SourceGraphic" stdDeviation="4" result="b1"/><feOffset in="b1" dx="2" dy="2" result="o1"/></filter></defs><rect width="10" height="10" filter="url(#f1)"/></svg>"##;
+        assert!(sanitize_svg(ok_filter).is_ok());
     }
 
     #[test]

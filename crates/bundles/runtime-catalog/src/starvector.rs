@@ -14,8 +14,10 @@ use core_llm::{
     Role, Sampling, StarVectorFinishReason, StarVectorProvider, StarVectorRequest,
     StarVectorStreamEvent, TextLlm, TextLlmRegistry, TextLlmRequest,
 };
+use gen_core::generator::{CompletedGeneration, ExecutionFact, ExecutionIdentity, GenerationReport};
 use gen_core::vector::{
-    build_vector_output, VectorSanitizeOptions, DEFAULT_PREVIEW_DIMENSION, MAX_SVG_BYTES,
+    build_vector_output, VectorSanitizeOptions, DEFAULT_PREVIEW_DIMENSION, MAX_PREVIEW_DIMENSION,
+    MAX_SVG_BYTES,
 };
 use gen_core::{
     Conditioning, ConditioningKind, FamilyExtensionKind, GenerationOutput, GenerationRequest,
@@ -242,7 +244,6 @@ pub fn load_from_text_registry(
         None => None,
         Some(Quant::Q4) => Some(Quantize::Q4),
         Some(Quant::Q8) => Some(Quantize::Q8),
-        Some(Quant::Nvfp4) => Some(Quantize::Nvfp4),
         Some(other) => {
             return Err(gen_core::Error::Unsupported(format!(
                 "{} does not support quantization tier {other:?}",
@@ -371,14 +372,30 @@ impl StarVectorGenerator {
         text_request.seed = request.seed;
         text_request.cancel = LlmCancelFlag::from_arc(request.cancel.as_arc().clone());
 
+        if let Some(dim) = ext.and_then(|v| v.preview_max_dimension) {
+            if dim == 0 || dim > MAX_PREVIEW_DIMENSION {
+                return Err(gen_core::Error::Msg(format!(
+                    "{}: vector.preview_max_dimension must be in 1..={MAX_PREVIEW_DIMENSION}, got {dim}",
+                    self.descriptor.id
+                )));
+            }
+        }
+
         let default_max_svg_bytes = if sv_desc.max_svg_bytes > 0 {
-            sv_desc.max_svg_bytes
+            sv_desc.max_svg_bytes.min(MAX_SVG_BYTES)
         } else {
             MAX_SVG_BYTES
         };
-        let max_svg_bytes = ext
-            .and_then(|v| v.max_svg_bytes)
-            .unwrap_or(default_max_svg_bytes);
+        let max_svg_bytes = match ext.and_then(|v| v.max_svg_bytes) {
+            Some(bytes) if bytes == 0 || bytes > MAX_SVG_BYTES => {
+                return Err(gen_core::Error::Msg(format!(
+                    "{}: vector.max_svg_bytes must be in 1..={MAX_SVG_BYTES}, got {bytes}",
+                    self.descriptor.id
+                )));
+            }
+            Some(bytes) => bytes,
+            None => default_max_svg_bytes,
+        };
         let max_wall_time = ext
             .and_then(|v| v.max_wall_time_ms)
             .map(Duration::from_millis)
@@ -390,6 +407,25 @@ impl StarVectorGenerator {
             max_svg_bytes,
             max_wall_time,
         ))
+    }
+
+    fn adapt_execution_identity(&self, execution: ExecutionIdentity) -> ExecutionIdentity {
+        match execution {
+            ExecutionIdentity::Resolved { mut identity } => {
+                if identity.provider_id != self.descriptor.id {
+                    let backing_id = identity.provider_id.clone();
+                    identity
+                        .provider_choices
+                        .entry("starvector.backing_provider_id".to_owned())
+                        .or_insert_with(|| ExecutionFact::resolved(backing_id));
+                    identity.provider_id = self.descriptor.id.to_owned();
+                }
+                identity.backend = self.descriptor.backend.to_owned();
+                identity.output_units = 1;
+                ExecutionIdentity::Resolved { identity }
+            }
+            unavailable @ ExecutionIdentity::Unavailable { .. } => unavailable,
+        }
     }
 }
 
@@ -408,11 +444,11 @@ impl Generator for StarVectorGenerator {
             .map_err(map_llm_error)
     }
 
-    fn generate(
+    fn generate_with_execution_report(
         &self,
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
+    ) -> gen_core::Result<CompletedGeneration> {
         if request.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
@@ -466,7 +502,28 @@ impl Generator for StarVectorGenerator {
             sanitize_options,
             allow_non_publishable,
         )?;
-        Ok(GenerationOutput::Vector(vector_output))
+        let execution = self.adapt_execution_identity(completed.execution);
+        CompletedGeneration::new(
+            GenerationReport::from_output(GenerationOutput::Vector(vector_output)),
+            execution,
+            &self.descriptor,
+        )
+    }
+
+    fn generate(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_execution_report(request, on_progress)?
+            .generation
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{}: generation produced no output",
+                    self.descriptor.id
+                ))
+            })
     }
 }
 
@@ -492,6 +549,7 @@ mod tests {
         text_desc: TextLlmDescriptor,
         sv_desc: core_llm::StarVectorDescriptor,
         output: StarVectorOutput,
+        execution: Option<ExecutionIdentity>,
     }
 
     impl TextLlm for MockStarVectorProvider {
@@ -538,6 +596,50 @@ mod tests {
             });
             Ok(self.output.clone())
         }
+
+        fn generate_svg_with_execution_report(
+            &self,
+            request: &StarVectorRequest,
+            on_event: &mut dyn FnMut(StarVectorStreamEvent),
+        ) -> core_llm::Result<core_llm::CompletedStarVector> {
+            let output = self.generate_svg(request, on_event)?;
+            let execution = self
+                .execution
+                .clone()
+                .unwrap_or_else(ExecutionIdentity::provider_default);
+            core_llm::CompletedStarVector::new(output, execution, &self.text_desc)
+        }
+    }
+
+    fn mock_resolved_execution(provider_id: &str, backend: &str) -> ExecutionIdentity {
+        use core_llm::{
+            ExecutionRandomness, ExecutionReplaySupport, ResolvedExecutionIdentity,
+            EXECUTION_IDENTITY_VERSION,
+        };
+        use std::collections::BTreeMap;
+
+        ExecutionIdentity::Resolved {
+            identity: Box::new(ResolvedExecutionIdentity {
+                version: EXECUTION_IDENTITY_VERSION,
+                provider_id: provider_id.to_owned(),
+                backend: backend.to_owned(),
+                runtime_id: "mock-starvector@1".to_owned(),
+                sampling: ExecutionFact::resolved("greedy"),
+                schedule: ExecutionFact::not_applicable("autoregressive_tokens"),
+                estimator: ExecutionFact::not_applicable("autoregressive_decoder"),
+                randomness: ExecutionRandomness::NoDraws {
+                    reason: "greedy_decode".into(),
+                },
+                deterministic_replay: ExecutionReplaySupport::Deterministic {
+                    scope: "greedy_decode".into(),
+                },
+                geometry: ExecutionFact::resolved("40x40"),
+                quality_policy: ExecutionFact::resolved("bf16"),
+                output_policy: ExecutionFact::resolved("sceneworks-static-svg-v2"),
+                provider_choices: BTreeMap::new(),
+                output_units: 1,
+            }),
+        }
     }
 
     fn mock_request() -> GenerationRequest {
@@ -582,8 +684,9 @@ mod tests {
     }
 
     #[test]
-    fn starvector_generator_sanitizes_svg_renders_preview_and_populates_terminal_metadata() {
-        let raw_svg = r##"<svg width="40" height="40" onload="alert(1)"><script>boom()</script><rect x="4" y="4" width="32" height="32" fill="#0080ff"/></svg>"##;
+    fn starvector_generator_sanitizes_svg_renders_preview_and_forwards_execution_identity() {
+        let raw_svg =
+            r##"<svg width="40" height="40"><rect x="4" y="4" width="32" height="32" fill="#0080ff"/></svg>"##;
         let provider = MockStarVectorProvider {
             text_desc: starvector_8b::text_descriptor(MLX_STARVECTOR_8B_LLM_ID, "mlx"),
             sv_desc: starvector_8b::starvector_descriptor(),
@@ -594,14 +697,15 @@ mod tests {
                 finish_reason: StarVectorFinishReason::CompleteRoot,
                 kv_cache: None,
             },
+            execution: Some(mock_resolved_execution(MLX_STARVECTOR_8B_LLM_ID, "mlx")),
         };
         let gen = StarVectorGenerator::new(descriptor_mlx_8b(), Box::new(provider))
             .expect("wrap mock StarVector provider");
 
         let mut saw_step = false;
         let mut saw_decoding = false;
-        let output = gen
-            .generate(&mock_request(), &mut |progress| match progress {
+        let completed = gen
+            .generate_with_execution_report(&mock_request(), &mut |progress| match progress {
                 Progress::Step { current, total } => {
                     saw_step = current == 37 && total == 128;
                 }
@@ -613,11 +717,22 @@ mod tests {
         assert!(saw_step, "expected token progress step");
         assert!(saw_decoding, "expected Decoding progress before sanitize/preview");
 
-        let GenerationOutput::Vector(vec_out) = output else {
+        let resolved = completed
+            .execution
+            .resolved()
+            .expect("StarVectorGenerator must preserve resolved ExecutionIdentity");
+        assert_eq!(resolved.provider_id, STARVECTOR_8B_ID);
+        assert_eq!(resolved.backend, "mlx");
+        assert_eq!(
+            resolved
+                .provider_choices
+                .get("starvector.backing_provider_id"),
+            Some(&ExecutionFact::resolved(MLX_STARVECTOR_8B_LLM_ID))
+        );
+
+        let Some(GenerationOutput::Vector(vec_out)) = completed.generation.output else {
             panic!("expected GenerationOutput::Vector");
         };
-        assert!(!vec_out.svg.contains("<script"));
-        assert!(!vec_out.svg.contains("onload"));
         assert!(vec_out.svg.contains("<rect"));
         assert_eq!(vec_out.finish_reason, VectorFinishReason::Stop);
         assert!(!vec_out.truncated);
@@ -636,6 +751,24 @@ mod tests {
         assert_eq!(vec_out.terminal.generated_bytes, Some(raw_svg.len()));
         assert_eq!(vec_out.terminal.viewport, Some([40, 40]));
         assert!(vec_out.terminal.svg_sha256.is_some());
+
+        // Hostile active markup fails closed under sceneworks-static-svg-v2.
+        let hostile_svg = r##"<svg width="40" height="40" onload="alert(1)"><script>boom()</script><rect x="4" y="4" width="32" height="32" fill="#0080ff"/></svg>"##;
+        let hostile_provider = MockStarVectorProvider {
+            text_desc: starvector_8b::text_descriptor(MLX_STARVECTOR_8B_LLM_ID, "mlx"),
+            sv_desc: starvector_8b::starvector_descriptor(),
+            output: StarVectorOutput {
+                svg: Some(hostile_svg.to_string()),
+                generated_tokens: 37,
+                generated_bytes: hostile_svg.len(),
+                finish_reason: StarVectorFinishReason::CompleteRoot,
+                kv_cache: None,
+            },
+            execution: None,
+        };
+        let hostile_gen = StarVectorGenerator::new(descriptor_mlx_8b(), Box::new(hostile_provider))
+            .expect("wrap hostile mock StarVector provider");
+        assert!(hostile_gen.generate(&mock_request(), &mut |_| {}).is_err());
     }
 
     #[test]
@@ -650,6 +783,7 @@ mod tests {
                 finish_reason: StarVectorFinishReason::TokenLimit,
                 kv_cache: None,
             },
+            execution: None,
         };
         let gen = StarVectorGenerator::new(descriptor_candle_8b(), Box::new(provider))
             .expect("wrap mock StarVector provider");
@@ -673,6 +807,60 @@ mod tests {
         assert_eq!(
             vec_out.terminal.provider_finish_reason.as_deref(),
             Some("token_limit")
+        );
+    }
+
+    #[test]
+    fn starvector_validate_rejects_out_of_bounds_vector_extension_and_loader_rejects_nvfp4() {
+        let provider = MockStarVectorProvider {
+            text_desc: starvector_8b::text_descriptor(CANDLE_STARVECTOR_8B_LLM_ID, "candle"),
+            sv_desc: starvector_8b::starvector_descriptor(),
+            output: StarVectorOutput {
+                svg: None,
+                generated_tokens: 0,
+                generated_bytes: 0,
+                finish_reason: StarVectorFinishReason::Eos,
+                kv_cache: None,
+            },
+            execution: None,
+        };
+        let gen = StarVectorGenerator::new(descriptor_candle_8b(), Box::new(provider))
+            .expect("wrap mock StarVector provider");
+
+        for bad_dim in [0, MAX_PREVIEW_DIMENSION + 1] {
+            let mut req = mock_request();
+            req.extensions.vector.as_mut().unwrap().preview_max_dimension = Some(bad_dim);
+            let err = gen.validate(&req).unwrap_err();
+            assert!(
+                err.to_string().contains("preview_max_dimension"),
+                "expected preview_max_dimension error for {bad_dim}, got: {err}"
+            );
+        }
+
+        for bad_bytes in [0, MAX_SVG_BYTES + 1] {
+            let mut req = mock_request();
+            req.extensions.vector.as_mut().unwrap().max_svg_bytes = Some(bad_bytes);
+            let err = gen.validate(&req).unwrap_err();
+            assert!(
+                err.to_string().contains("max_svg_bytes"),
+                "expected max_svg_bytes error for {bad_bytes}, got: {err}"
+            );
+        }
+
+        let empty_registry = core_llm::TextLlmRegistryBuilder::new().build().unwrap();
+        let mut nvfp4_spec = LoadSpec::new(WeightsSource::Dir("/tmp/starvector-8b".into()));
+        nvfp4_spec.quantize = Some(Quant::Nvfp4);
+        let err = load_from_text_registry(
+            descriptor_candle_8b(),
+            &empty_registry,
+            CANDLE_STARVECTOR_8B_LLM_ID,
+            &nvfp4_spec,
+        )
+        .err()
+        .expect("Quant::Nvfp4 must be rejected");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)) && err.to_string().contains("Nvfp4"),
+            "expected Unsupported Nvfp4 error, got: {err:?}"
         );
     }
 }

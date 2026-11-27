@@ -872,8 +872,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
 pub(crate) fn route_turbo_control() -> gen_core::RouteRecord {
     let mut route = route_turbo();
     route.route_id = "z_image_turbo_control";
-    route.structure.conditioning.kinds =
-        vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
     route.structure.conditioning.control_kinds =
         Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
     route.structure.conditioning.pass0_requirement =
@@ -905,8 +904,7 @@ pub(crate) fn route_turbo_control() -> gen_core::RouteRecord {
 pub(crate) fn route_base_control() -> gen_core::RouteRecord {
     let mut route = base::route_base();
     route.route_id = "z_image_control";
-    route.structure.conditioning.kinds =
-        vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
     route.structure.conditioning.control_kinds =
         Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
     route.structure.conditioning.pass0_requirement =
@@ -1675,18 +1673,16 @@ mod tests {
 
     #[test]
     fn catalog_surfaces_publish_exact_prepacked_z_image_routes() {
-        let registry = register_memory_contract_surfaces(
-            gen_core::ProviderRegistryBuilder::new()
-                .register_generator(REGISTRATION)
-                .register_generator(base::REGISTRATION),
-        )
+        let registry = register_memory_contract_surfaces(register_providers(
+            gen_core::ProviderRegistryBuilder::new(),
+        ))
         .build()
         .expect("Z-Image surface registry");
         let surfaces = registry
             .memory_contract_surfaces()
             .expect("weights-free Z-Image surfaces");
 
-        for (provider_id, composed, fingerprint) in [
+        for (provider_id, expects_control, fingerprint) in [
             (MODEL_ID, false, memory_strategy::CALIBRATION_FINGERPRINT),
             (
                 base::MODEL_ID,
@@ -1729,7 +1725,7 @@ mod tests {
                     surface.selector.id()
                 );
                 rung_four += usize::from(expected);
-                assert_eq!(surface.composed, composed, "{provider_id}");
+                assert!(!surface.composed, "{provider_id}");
                 assert_eq!(
                     surface.contract.calibration.as_ref().unwrap().fingerprint,
                     fingerprint,
@@ -1740,7 +1736,7 @@ mod tests {
                     gen_core::MemoryAssetFacts::default(),
                     "weights-free Z surfaces claim no asset bytes"
                 );
-                if composed {
+                if expects_control {
                     assert!(
                         surface.spec.control.is_some(),
                         "{provider_id}:{} must carry a control source",

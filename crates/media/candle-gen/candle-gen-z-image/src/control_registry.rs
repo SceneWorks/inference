@@ -17,21 +17,15 @@ fn extract_control<'a>(
     request: &'a GenerationRequest,
     route_id: &str,
 ) -> gen_core::Result<(&'a Image, Option<f32>)> {
-    let mut control = None;
-    for cond in &request.conditioning {
-        if let Conditioning::Control { image, scale, .. } = cond {
-            if control.replace((image, *scale)).is_some() {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{route_id} accepts at most one Control conditioning image"
-                )));
-            }
-        }
-    }
-    control.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
+    match request.conditioning.as_slice() {
+        [Conditioning::Control { image, scale, .. }] => Ok((image, *scale)),
+        [] => Err(gen_core::Error::Unsupported(format!(
             "{route_id} requires a Control conditioning image"
-        ))
-    })
+        ))),
+        _ => Err(gen_core::Error::Unsupported(format!(
+            "{route_id} accepts exactly one Control conditioning image (unsupported extra or non-Control conditioning)"
+        ))),
+    }
 }
 
 struct ZImageControlGenerator {
@@ -175,4 +169,63 @@ pub(crate) fn load_turbo_control(spec: &LoadSpec) -> gen_core::Result<Box<dyn Ge
 
 pub(crate) fn load_base_control(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_control_variant(crate::base_control_descriptor(), true, spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::gen_core::ControlKind;
+
+    fn sample_image() -> Image {
+        Image {
+            width: 8,
+            height: 8,
+            pixels: vec![128; 8 * 8 * 3],
+        }
+    }
+
+    #[test]
+    fn extract_control_accepts_single_control_and_rejects_reference_conditioning() {
+        let single = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                kind: ControlKind::Pose,
+                image: sample_image(),
+                scale: Some(0.7),
+            }],
+            ..Default::default()
+        };
+        let (_, scale) = extract_control(&single, "z_image_turbo_control").expect("single control");
+        assert_eq!(scale, Some(0.7));
+
+        let ref_only = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: sample_image(),
+                strength: Some(0.8),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            extract_control(&ref_only, "z_image_turbo_control"),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        let control_plus_ref = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Control {
+                    kind: ControlKind::Canny,
+                    image: sample_image(),
+                    scale: Some(0.75),
+                },
+                Conditioning::Reference {
+                    image: sample_image(),
+                    strength: Some(0.8),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(matches!(
+            extract_control(&control_plus_ref, "z_image_control"),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+    }
 }

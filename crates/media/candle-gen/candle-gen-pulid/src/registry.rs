@@ -3,7 +3,7 @@
 
 use candle_gen::gen_core::{
     self, Conditioning, ConditioningKind, GenerationMemory, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, RenderPlan, RouteRecord,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, RenderPlan, RouteRecord,
     WeightsSource,
 };
 use candle_gen_flux::Variant;
@@ -94,7 +94,7 @@ pub(crate) fn route_pulid_flux() -> RouteRecord {
             },
             weight_plan: gen_core::WeightPlanDeclaration {
                 source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
-                supported_quants: &[Quant::Q4, Quant::Q8],
+                supported_quants: &[],
                 requires_identity_overlay: true,
                 ..Default::default()
             },
@@ -120,8 +120,24 @@ pub(crate) fn route_pulid_flux() -> RouteRecord {
             strength: Some(DEFAULT_ID_WEIGHT),
             ..Default::default()
         },
-        bindings: gen_core::RouteBindings::generator(descriptor, load_pulid_flux)
-            .with_render_plan(compile_pulid_render_plan),
+        bindings: {
+            #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+            let mut bindings = gen_core::RouteBindings::generator(descriptor, load_pulid_flux)
+                .with_render_plan(compile_pulid_render_plan);
+            #[cfg(feature = "cuda")]
+            {
+                bindings = bindings
+                    .with_memory_registration(crate::memory_strategy::PULID_MEMORY_REGISTRATION)
+                    .with_memory_fixture(
+                        crate::memory_strategy::memory_contract_surface_specs,
+                        crate::memory_strategy::registered_provider_contract,
+                    )
+                    .with_memory_behavior_registration(
+                        crate::memory_strategy::PULID_MEMORY_BEHAVIOR,
+                    );
+            }
+            bindings
+        },
     }
 }
 
@@ -129,7 +145,7 @@ pub fn descriptor() -> ModelDescriptor {
     route_pulid_flux().compute_descriptor()
 }
 
-fn paths_from_spec(spec: &LoadSpec) -> gen_core::Result<PulidFluxPaths> {
+pub(crate) fn paths_from_spec(spec: &LoadSpec) -> gen_core::Result<PulidFluxPaths> {
     spec.validate_prepared_file_pins()?;
     gen_core::reject_unknown_components(spec, &[], "pulid_flux")?;
     if spec.control.is_some()
