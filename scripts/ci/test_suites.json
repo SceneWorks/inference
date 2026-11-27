@@ -2960,66 +2960,6 @@
       ]
     },
     {
-      "package": "candle-gen-mage",
-      "kind": "lib",
-      "target": "candle_gen_mage",
-      "test": "vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs",
-      "reason": "SW-6129 CUDA smoke: Mage-VAE channel AdaLN (bf16 [1,384,64,64]) and pixel-MLP token AdaLN (bf16 [1,4096,384], f32 weight/bias) are fused (2 calls), bit-identical to the switch-off chain. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
-      "package": "candle-gen-iris",
-      "kind": "lib",
-      "target": "candle_gen_iris",
-      "test": "nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
-      "reason": "SW-6129 CUDA smoke: Iris RmsNorm::rms_modulate (bf16 [1,4352,3072], f32 and bf16 rows) takes the fused S2 RMS AdaLN (2 calls), bit-identical to the switch-off chain. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
-      "package": "candle-gen-moss-image",
-      "kind": "lib",
-      "target": "candle_gen_moss_image",
-      "test": "transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs",
-      "reason": "SW-6129 CUDA smoke: MOSS-Image Norm::norm_modulate (bf16 [1,4352,3072], bf16 and f32 FP32-island norm weights; rms_recip, cast_through, post-weight, bf16 rows) takes the fused composable-chain AdaLN (2 calls), bit-identical to the switch-off chain. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
-      "package": "candle-gen-lens",
-      "kind": "lib",
-      "target": "candle_gen_lens",
-      "test": "transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs",
-      "reason": "SW-6129 CUDA bf16 smoke of the crate's AdaLN route through the shared fused AdaLN: switch on counts 3 fused calls only, bit-identical to the switch-off reference. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
       "package": "candle-gen-qwen-image",
       "kind": "lib",
       "target": "candle_gen_qwen_image",
@@ -3110,21 +3050,6 @@
       ]
     },
     {
-      "package": "candle-gen-z-image",
-      "kind": "lib",
-      "target": "candle_gen_z_image",
-      "test": "dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
-      "reason": "SW-6129 CUDA bf16 smoke of the crate's AdaLN route through the shared fused AdaLN: switch on counts 2 fused calls only, bit-identical to the switch-off reference. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
       "package": "candle-gen-qwen-image-2-1",
       "kind": "lib",
       "target": "candle_gen_qwen_image_2_1",
@@ -3176,21 +3101,6 @@
       "test": "transformer::ltx_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
       "source": "crates/media/candle-gen/candle-gen-ltx/src/transformer.rs",
       "reason": "SW-6129 CUDA smoke: LTX DiT AdaLN (f32 recip RMS and f32 LayerNorm head, cast back to bf16, per-token ada_values modulation, inner 4096) takes the fused adaln_chain (2 calls) and is bit-identical to the switch-off reference. cfg(cuda), Device::new_cuda(0).",
-      "platforms": [
-        "linux",
-        "win32"
-      ],
-      "features": [
-        "cuda"
-      ]
-    },
-    {
-      "package": "candle-gen-minimax-h3",
-      "kind": "lib",
-      "target": "candle_gen_minimax_h3",
-      "test": "dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
-      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
-      "reason": "SW-6129 CUDA smoke: MiniMax-H3 block AdaLN (weighted f32 RMSNorm cast back, per-row gathered modulation, bf16, hidden 5376) takes the fused adaln_chain (2 calls) and is bit-identical to the switch-off reference. cfg(cuda), Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"

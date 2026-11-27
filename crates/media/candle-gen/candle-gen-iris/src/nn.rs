@@ -1953,7 +1953,7 @@ mod sw6129_adaln_route_tests {
                 let shift = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(md).unwrap();
                 let scale = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(md).unwrap();
                 let want = modulate(&n.forward(&x).unwrap(), &shift, &scale).unwrap();
-                let got = n.rms_modulate(&x, &shift, &scale).unwrap();
+                let got = __model_proof_output!(n.rms_modulate(&x, &shift, &scale)).unwrap();
                 assert_eq!(got.dtype(), want.dtype());
                 assert_eq!(bits(&got), bits(&want), "x {xd:?} mod {md:?}");
             }
@@ -1967,7 +1967,7 @@ mod sw6129_adaln_route_tests {
     /// modulation rows) is fused (2 calls) and bit-identical to the switch-off chain.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         let dev = Device::new_cuda(0).unwrap();
         let d = 3072;
@@ -1987,10 +1987,13 @@ mod sw6129_adaln_route_tests {
             "iris rms_modulate (bf16 [1,4352,3072], f32 + bf16 rows)",
             2,
             &|| {
-                let a = n.rms_modulate(&x, &m32.0, &m32.1).unwrap();
+                let a = __model_proof_output!(n.rms_modulate(&x, &m32.0, &m32.1)).unwrap();
                 let b = n.rms_modulate(&x, &mbf.0, &mbf.1).unwrap();
                 Tensor::cat(&[&a, &b], 1).unwrap()
             },
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

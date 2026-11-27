@@ -1137,7 +1137,8 @@ mod adaln_route_tests {
             for dt in [DType::F32, DType::BF16, DType::F16] {
                 let (norm, x, scale, shift, idx) = operands(hidden, dt, &Device::Cpu);
                 let former = modulate(&norm.forward(&x).unwrap(), &scale, &shift, &idx).unwrap();
-                let got = norm_modulate(&norm, &x, &scale, &shift, &idx).unwrap();
+                let got =
+                    __model_proof_output!(norm_modulate(&norm, &x, &scale, &shift, &idx)).unwrap();
                 assert_eq!(got.dtype(), dt);
                 assert_eq!(bits(&got), bits(&former), "hidden={hidden} {dt:?}");
             }
@@ -1151,7 +1152,7 @@ mod adaln_route_tests {
     /// reference.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         use candle_gen::fused_path::media_fused_policy_guard;
         use candle_gen::modulate::ADALN_PATH;
@@ -1163,7 +1164,7 @@ mod adaln_route_tests {
         let run = || {
             Tensor::cat(
                 &[
-                    norm_modulate(&norm, &x, &scale, &shift, &idx).unwrap(),
+                    __model_proof_output!(norm_modulate(&norm, &x, &scale, &shift, &idx)).unwrap(),
                     norm_modulate(&norm, &x, &shift, &scale, &idx).unwrap(),
                 ],
                 0,
@@ -1187,5 +1188,8 @@ mod adaln_route_tests {
             f.len()
         );
         assert_eq!(mismatches, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

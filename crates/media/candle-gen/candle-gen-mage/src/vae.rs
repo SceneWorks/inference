@@ -912,7 +912,7 @@ mod sw6129_adaln_route_tests {
                 .squeeze(2)
                 .unwrap();
             let want = candle_gen::modulate::modulate(&former, &scale, &shift).unwrap();
-            let got = n.ln_modulate_tokens(&t, &scale, &shift).unwrap();
+            let got = __model_proof_output!(n.ln_modulate_tokens(&t, &scale, &shift)).unwrap();
             assert_eq!(bits(&got), bits(&want), "tokens {dtype:?}");
         }
 
@@ -925,7 +925,7 @@ mod sw6129_adaln_route_tests {
     /// bit-identical to the switch-off chain.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         let dev = Device::new_cuda(0).unwrap();
         let c = 384;
@@ -952,13 +952,15 @@ mod sw6129_adaln_route_tests {
                     .unwrap()
                     .flatten_all()
                     .unwrap();
-                let b = norm
-                    .ln_modulate_tokens(&t, &m.0, &m.1)
+                let b = __model_proof_output!(norm.ln_modulate_tokens(&t, &m.0, &m.1))
                     .unwrap()
                     .flatten_all()
                     .unwrap();
                 Tensor::cat(&[&a, &b], 0).unwrap()
             },
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

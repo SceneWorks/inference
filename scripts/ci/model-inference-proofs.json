@@ -295002,6 +295002,62 @@
     }
   },
   {
+    "package": "candle-gen-lens",
+    "target": "candle_gen_lens",
+    "target_kind": "lib",
+    "fqn": "transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_lens",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Lens block RmsNorm gain with a deterministic bf16 stream and modulation table; crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of two Lens block rms_modulate calls (learned RmsNorm) and the NormOut layer_norm_modulate with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run two Lens block rms_modulate calls (learned RmsNorm) and the NormOut layer_norm_modulate on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-ltx",
     "target": "integration",
     "target_kind": "test",
@@ -313199,6 +313255,62 @@
     }
   },
   {
+    "package": "candle-gen-mage",
+    "target": "candle_gen_mage",
+    "target_kind": "lib",
+    "fqn": "vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_mage",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Mage-VAE AffineNorm weight/bias (384 channels, bf16) with deterministic [1, 384, 64, 64] channel and [1, 4096, 384] token activations/modulation; crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Mage-VAE channel_ln_modulate and AffineNorm::ln_modulate_tokens with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Mage-VAE channel_ln_modulate and AffineNorm::ln_modulate_tokens on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-moss-image",
     "target": "integration",
     "target_kind": "test",
@@ -314426,6 +314538,62 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic MOSS Norm weight (hidden 3072, bf16 and f32) with a deterministic bf16 [1, 4352, 3072] stream and modulation; crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of MOSS Norm::norm_modulate with the bf16 and the f32 (FP32 island) weight with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run MOSS Norm::norm_modulate with the bf16 and the f32 (FP32 island) weight on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
       "requirements": []
     }
   },
@@ -317265,6 +317433,62 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "candle_gen_iris",
+    "target_kind": "lib",
+    "fqn": "nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Iris RmsNorm gain (hidden 3072) with a deterministic bf16 [1, 4352, 3072] stream and f32 + bf16 modulation rows; crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Iris RmsNorm::rms_modulate with f32 and bf16 rows with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Iris RmsNorm::rms_modulate with f32 and bf16 rows on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
       "requirements": []
     }
   },
@@ -321648,6 +321872,62 @@
     }
   },
   {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic H3 DiT block RmsNorm gain at hidden 5376 with deterministic bf16 activations, modulation and per-token index; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of two H3 block norm_modulate calls (learned RmsNorm, per-row modulation) with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run two H3 block norm_modulate calls (learned RmsNorm, per-row modulation) on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "mlx-gen-minimax-h3",
     "target": "mlx_gen_minimax_h3",
     "target_kind": "lib",
@@ -321941,6 +322221,62 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-z-image",
+    "target": "candle_gen_z_image",
+    "target_kind": "lib",
+    "fqn": "dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_z_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Z-Image block RmsNorm gain (D 3840) with deterministic bf16 activations and modulation chunks; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Z-Image Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Z-Image Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
       "requirements": []
     }
   },

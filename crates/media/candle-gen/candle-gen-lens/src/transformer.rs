@@ -1348,7 +1348,7 @@ mod adaln_route_tests {
             let (x, m, norm) = operands(dtype, &Device::Cpu);
             let d = x.dim(2).unwrap();
             let first = m.narrow(1, 0, 3 * d).unwrap();
-            let (got, gate) = rms_modulate(&norm, &x, &first).unwrap();
+            let (got, gate) = __model_proof_output!(rms_modulate(&norm, &x, &first), pair).unwrap();
             let (want, want_gate) = modulate(&norm.forward(&x).unwrap(), &first).unwrap();
             assert_eq!(bits(&got), bits(&want), "rms {dtype:?}");
             assert_eq!(bits(&gate), bits(&want_gate));
@@ -1369,7 +1369,7 @@ mod adaln_route_tests {
     /// bit-identical to the same calls with the kernel switch off.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         use candle_gen::fused_path::media_fused_policy_guard;
         use candle_gen::modulate::ADALN_PATH;
@@ -1380,7 +1380,11 @@ mod adaln_route_tests {
         let (x, m, norm) = operands(DType::BF16, &dev);
         let d = x.dim(2).unwrap();
         let run = || {
-            let (a, _) = rms_modulate(&norm, &x, &m.narrow(1, 0, 3 * d).unwrap()).unwrap();
+            let (a, _) = __model_proof_output!(
+                rms_modulate(&norm, &x, &m.narrow(1, 0, 3 * d).unwrap()),
+                pair
+            )
+            .unwrap();
             let (b, _) = rms_modulate(&norm, &x, &m.narrow(1, 3 * d, 3 * d).unwrap()).unwrap();
             let scale = m.narrow(1, 0, d).unwrap().unsqueeze(1).unwrap();
             let shift = m.narrow(1, d, d).unwrap().unsqueeze(1).unwrap();
@@ -1405,5 +1409,8 @@ mod adaln_route_tests {
             a.len()
         );
         assert_eq!(mismatches, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

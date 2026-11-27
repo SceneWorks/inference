@@ -1867,7 +1867,9 @@ mod sw6129_adaln_route_tests {
                     let scale = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
                     let shift = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
                     for out in [md, xd] {
-                        let got = n.norm_modulate(&x, &scale, &shift, md, out).unwrap();
+                        let got =
+                            __model_proof_output!(n.norm_modulate(&x, &scale, &shift, md, out))
+                                .unwrap();
                         let want = former(&n, &x, &scale, &shift, md, out);
                         assert_eq!(got.dtype(), want.dtype());
                         assert_eq!(
@@ -1889,7 +1891,7 @@ mod sw6129_adaln_route_tests {
     /// bit-identical to the switch-off chain.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         let dev = Device::new_cuda(0).unwrap();
         let d = 3072;
@@ -1903,10 +1905,19 @@ mod sw6129_adaln_route_tests {
             "moss norm_modulate (bf16 [1,4352,3072], bf16 + f32 weight)",
             2,
             &|| {
-                let a = n_bf.norm_modulate(&x, &scale, &shift, DType::BF16, DType::BF16);
+                let a = __model_proof_output!(n_bf.norm_modulate(
+                    &x,
+                    &scale,
+                    &shift,
+                    DType::BF16,
+                    DType::BF16
+                ));
                 let b = n_f32.norm_modulate(&x, &scale, &shift, DType::F32, DType::BF16);
                 Tensor::cat(&[&a.unwrap(), &b.unwrap()], 1).unwrap()
             },
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

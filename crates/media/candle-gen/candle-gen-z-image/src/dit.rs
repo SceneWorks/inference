@@ -3191,8 +3191,7 @@ mod adaln_route_tests {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let (x, m, norm) = operands(dtype, &Device::Cpu);
             let chunks = m.chunk(4, D::Minus1).unwrap();
-            let got = Execution::Inference
-                .rms_scale(&norm, &x, &chunks[0])
+            let got = __model_proof_output!(Execution::Inference.rms_scale(&norm, &x, &chunks[0]))
                 .unwrap();
             let want = norm
                 .forward(&x)
@@ -3217,7 +3216,7 @@ mod adaln_route_tests {
     /// kernel switch off.
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
         use candle_gen::fused_path::media_fused_policy_guard;
         use candle_gen::modulate::ADALN_PATH;
@@ -3228,8 +3227,7 @@ mod adaln_route_tests {
         let (x, m, norm) = operands(DType::BF16, &dev);
         let chunks = m.chunk(4, D::Minus1).unwrap();
         let run = || {
-            let a = Execution::Inference
-                .rms_scale(&norm, &x, &chunks[0])
+            let a = __model_proof_output!(Execution::Inference.rms_scale(&norm, &x, &chunks[0]))
                 .unwrap();
             let b = final_norm_scale(&x, &chunks[1]).unwrap();
             Tensor::cat(&[a, b], 0).unwrap()
@@ -3252,5 +3250,8 @@ mod adaln_route_tests {
             a.len()
         );
         assert_eq!(mismatches, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }
