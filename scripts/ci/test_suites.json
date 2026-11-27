@@ -2225,6 +2225,111 @@
       "features": [
         "cuda"
       ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::fused_rope_is_bit_identical_to_the_reference",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA fused strided RoPE vs the shared reference chain, bit-identical over F32/BF16/F16, interleaved and split-half, f32 and native math, contiguous BSHD, permuted BHSD view, q/k views of a fused QKV buffer, partial rotary (incl. an odd tail), full-width / per-batch / offset tables, FLUX freqs_cis matrix views and Krea 1024^2 q/k shapes. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::in_place_rope_writes_only_its_view",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA in-place RoPE and QK-RMSNorm+RoPE on q/k views of a fused QKV buffer: the buffer holds the bit-identical reference result in the view and the original values elsewhere, every dtype/pairing/math. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::fused_rms_norm_rope_is_bit_identical_to_rope_of_rmsnorm",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA fused QK-RMSNorm+RoPE equals rope(rms_norm(x)) bit for bit (out of place and in place) over the fused_rope geometry matrix and two eps values. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::in_place_forms_allocate_no_q_sized_buffer",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA stream-ordered pool high-water: the in-place RoPE and QK-RMSNorm+RoPE at Krea's 4608x48x128 bf16 q allocate less than one q (out of place exactly one q); path counters report fused. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::parity_catches_convention_mutations",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA mutation checks: a flipped sine, swapped cos/sin, the other pairing, rotary dim - 2, a dropped norm weight each break fused-vs-reference parity. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::the_public_entry_points_report_their_path",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA path telemetry: apply_rope / rms_norm_rope record fused on CUDA, disabled with the switch off (identical output), autograd / dtype / layout (in-place broadcast view, never written) / shape (head dim 1024) reasons for unserved inputs. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "fused_rope_gpu::media_rope_kernels_compile_once_and_use_no_local_memory",
+      "source": "crates/media/candle-gen/candle-gen/tests/fused_rope_gpu.rs",
+      "reason": "SW-6128 CUDA nvrtc seam: the media RoPE source compiles once per device (cached module, one nvrtc attempt), exposes its six entry points, and none spills to per-thread local memory. cfg(cuda), Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
     }
   ]
 }

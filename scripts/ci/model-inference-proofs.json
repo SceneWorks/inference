@@ -321735,6 +321735,62 @@
     }
   },
   {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
+    "fqn": "transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for one Krea 2 gated attention at production geometry (hidden 6144, GQA 48Q/12KV x 128, norm_q/norm_k scales near 1 before the folded +1), the real t2i RoPE table for 512 caption + 64x64 image tokens (the 1024^2 joint sequence).",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+    "required_environment": [],
+    "device_witness": "The test observes the bf16 attention output on the selected CUDA device and counts two fused QK-RMSNorm+RoPE calls (q and k) with the kernel switch on and two disabled-reference calls with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count and max-abs difference of the attention output with the fused in-place QK-RMSNorm+RoPE against the reference rms_scale -> RoPE chain, bf16 and f32; both must be bit-identical (0 mismatches).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run the gated attention at bf16 and f32 twice each (fused QK-RMSNorm+RoPE switch on, then off) and compare outputs bit for bit; run the no-RoPE form once."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-wan",
     "target": "candle_gen_wan",
     "target_kind": "lib",
