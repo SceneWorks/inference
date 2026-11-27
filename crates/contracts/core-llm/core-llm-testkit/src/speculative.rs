@@ -1268,9 +1268,23 @@ impl BenchOption {
     }
 }
 
+/// FNV-1a (64-bit) over the little-endian bytes of each streamed token id, as 16 hex digits plus
+/// the count (`<hex>:<n>`): a compact token-stream identity for comparing bench rows across
+/// campaign rows (a kernel switch on/off, MTP off/on). Not a cryptographic digest.
+pub fn token_stream_digest(tokens: &[(u32, String)]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (id, _) in tokens {
+        for byte in id.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}:{}", tokens.len())
+}
+
 /// The row keys the harness writes beyond the pre-epic schema (SW-7200/SW-F356/SW-F357 per-path
 /// telemetry): the baseline driver predates them, so a schema comparison leaves them out.
-pub const BENCH_PATH_ROW_KEYS: [&str; 10] = [
+pub const BENCH_PATH_ROW_KEYS: [&str; 11] = [
     "speculative",
     "verify",
     "wall_ms",
@@ -1281,6 +1295,7 @@ pub const BENCH_PATH_ROW_KEYS: [&str; 10] = [
     "peak_memory_bytes",
     "prefix_checkpoints",
     "adaptive_speculative",
+    "token_digest",
 ];
 
 /// The document keys the harness writes beyond the pre-epic schema (SW-7200).
@@ -1417,6 +1432,7 @@ impl BenchStats {
 /// | `thinking` | the reasoning setting the request carried ([`BenchThinking::label`]) |
 /// | `proposer`, `path`, `draft_tokens` | [`DecodeReport`]'s proposer label, decode path and depth |
 /// | `prompt_tokens`, `generated_tokens` | token counts |
+/// | `token_digest` | [`token_stream_digest`] of the first repeat's streamed token ids (`<fnv1a64 hex>:<count>`); greedy rows of one prompt that differ only in a kernel switch or `off` vs `mtp` carry the same digest |
 /// | `repeats` | measured repeats (the length of `samples`) |
 /// | `ttft_ms`, `decode_tok_s`, `prefill_ms`, `decode_ms` | [`BenchStats`] over the repeats: `{"n", "mean", "min", "max", "stddev"}` (`stddev` `null` for one repeat; the whole object `null` when no repeat produced the value) |
 /// | `timing_source` | `backend` or `wall` |
@@ -1470,6 +1486,10 @@ pub struct BenchRow {
     pub generated_tokens: u32,
     /// `backend` or `wall` (the first repeat's).
     pub timing_source: &'static str,
+    /// [`token_stream_digest`] of the first repeat's streamed token ids (SW-6139): two rows of one
+    /// prompt under greedy sampling that differ only in a kernel switch (or in `off` vs `mtp`)
+    /// must carry the same digest.
+    pub token_digest: String,
     /// The first repeat's decode report (`None` when the provider reports none).
     pub report: Option<DecodeReport>,
     /// Every measured repeat, in run order.
@@ -1500,6 +1520,7 @@ impl BenchRow {
             "draft_tokens": report.and_then(|r| r.draft_tokens),
             "prompt_tokens": self.prompt_tokens,
             "generated_tokens": self.generated_tokens,
+            "token_digest": self.token_digest,
             "repeats": self.samples.len(),
             "ttft_ms": series(|s| s.ttft_ms),
             "decode_tok_s": series(|s| s.decode_tok_s),
@@ -1820,6 +1841,7 @@ pub fn run_speculative_bench_with(
                     prompt_tokens: run.prompt_tokens,
                     generated_tokens: run.generated,
                     timing_source,
+                    token_digest: token_stream_digest(&run.tokens),
                     report: run.report,
                     samples: std::mem::take(&mut cell.samples),
                 });
@@ -1858,6 +1880,7 @@ pub fn run_speculative_bench_with(
                     prompt_tokens: run.prompt_tokens,
                     generated_tokens: run.generated,
                     timing_source,
+                    token_digest: token_stream_digest(&run.tokens),
                     report: run.report,
                     samples,
                 });
@@ -3569,6 +3592,7 @@ mod tests {
             prompt_tokens: 64,
             generated_tokens: 26,
             timing_source: "backend",
+            token_digest: token_stream_digest(&[(1, "a".into()), (2, "b".into())]),
             samples: vec![BenchSample {
                 ttft_ms: Some(12.0),
                 wall_ms: Some(42.0),

@@ -1844,6 +1844,28 @@
       "package": "mlx-llm",
       "kind": "lib",
       "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::dropping_the_decay_multiply_fails_the_kernel_fixture",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Mutation check: runs the Metal GDN kernel and a no-decay mutant against the ops reference at T=1/4/512 (GPU recurrence compute).",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::restoring_the_wrong_prefix_state_is_caught",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Mutation check: per-token checkpoint kernel plus a decode step seeded from the wrong ring row (GPU recurrence compute).",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::chunked_prefill_matches_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
       "reason": "Helper expands 512/2048/ragged300-token shapes x three dtypes x zero/carried states on CPU stream; 18 full prefill/reference comparisons.",
@@ -2098,6 +2120,36 @@
       "test": "quant::w4a8_int8::tests::w4a8_linear_gpu_fused_activation_prep_is_byte_identical",
       "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
       "reason": "SW-6134 CUDA W4A8 activation-prep parity: the fused ConvRot FHT + Kitchen int8 row quantizer kernel vs the eager convrot_fht_f32 + quantize_kitchen_int8 reference, codes byte-identical and scales bit-identical for bf16/f16/f32 incl. outlier, zero and tie rows. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::fused_recurrence_matches_the_op_chain_bit_for_bit",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6136 CUDA numerical parity: the fused gated-delta recurrence kernel vs the op-chain reference, bit for bit, through prefill, decode, a verify step, a ring rollback and decode-on at Dk 32/64/128/256 with GQA x3. cfg(cuda), CUDA device 0.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::the_fused_parity_check_discriminates_mutations",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6136 CUDA mutation check: the fused-vs-reference parity comparison must FAIL when the fused arm drops the decay multiply or a rollback restores the wrong ring slot (Dk 64/128), proving the parity test discriminates. cfg(cuda), CUDA device 0.",
       "platforms": [
         "linux",
         "win32"
