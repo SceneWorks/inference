@@ -20,7 +20,6 @@ use candle_gen::gen_core::{
     MemoryWindowMaterialization, OffloadPolicy, Precision, Quant, ResidentRequestMemory,
     WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryMode};
 use candle_gen::{CandleError, Result as CandleResult};
 
@@ -49,15 +48,12 @@ pub const CALIBRATED_TIER: Option<Quant> = None;
 ///
 /// No production string may start with this prefix — that is what keeps a fixture contract from
 /// being mistaken for measured evidence of the cell it describes, and it is asserted directly.
-#[cfg(any(feature = "cuda", test))]
 const WEIGHTS_FREE_FINGERPRINT_PREFIX: &str = "sc-19223-wan2-2-ti2v-5b-candle-registry-";
 /// The weights-free `bf16` / `Resident` cell, retained byte-for-byte for the same reason as the
 /// production pair.
-#[cfg(any(feature = "cuda", test))]
 const STATIC_CALIBRATION_FINGERPRINT_RESIDENT: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-registry-resident-v1";
 /// The weights-free `bf16` / `Sequential` cell, retained byte-for-byte.
-#[cfg(any(feature = "cuda", test))]
 const STATIC_CALIBRATION_FINGERPRINT_SEQUENTIAL: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-registry-sequential-v1";
 
@@ -681,7 +677,6 @@ const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemory
 /// [`CALIBRATED_TIER`] cell byte-identical, and the packed tiers get distinct siblings so the
 /// weights-free surface is per-tier too — otherwise a fixture handshake minted for one tier would
 /// satisfy a contract built for another.
-#[cfg(any(feature = "cuda", test))]
 fn weights_free_calibration_fingerprint(tier: Option<Quant>, policy: OffloadPolicy) -> String {
     if tier == CALIBRATED_TIER {
         return match policy {
@@ -891,7 +886,6 @@ pub(crate) fn contract_for_loaded(
     Ok(production_contract_and_tier(spec, dit_source).ok())
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn weights_free_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
@@ -905,7 +899,6 @@ pub(crate) fn weights_free_memory_strategy_contract(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 /// Whether `contract` came from the weights-free registry surface.
 ///
 /// Detected on the isolated namespace rather than on an enumerated pair of strings (sc-22736): the
@@ -920,12 +913,10 @@ fn fixture_contract(contract: &MemoryProviderContract) -> bool {
     })
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn resolved_numeric_tier(spec: &LoadSpec) -> gen_core::Result<MemoryNumericTier> {
     production_assets(spec, &crate::DitSource::from_environment()).map(|assets| assets.tier)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_tier(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1005,7 +996,6 @@ pub(crate) fn safety_check(
     gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1016,14 +1006,12 @@ pub(crate) fn registered_safety_check(
 
 /// The registry's profile: [`MEMORY_PROFILE`] with the weights-free tier [`registered_tier`]
 /// reads off the contract (the registry fixture vs a real snapshot).
-#[cfg(any(feature = "cuda", test))]
 const REGISTERED_MEMORY_PROFILE: gen_core::ProviderMemoryProfile =
     gen_core::ProviderMemoryProfile {
         tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
         ..MEMORY_PROFILE
     };
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixtures(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1139,7 +1127,6 @@ pub(crate) fn begin_request(
     begin_with_device(contract, loaded_tier, device, context)
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1155,7 +1142,6 @@ pub(crate) fn registered_begin_request(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_scope(
     _provider_id: &'static str,
     _spec: &LoadSpec,
@@ -1186,7 +1172,6 @@ pub(crate) fn selected_decode_cap(request: &GenerationRequest) -> CandleResult<O
     Ok(memory.decode_tile_edge)
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
     contract: memory_strategy_contract,
@@ -1200,7 +1185,6 @@ pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
 /// so publishing the deferred selectors would advertise a load surface no contract can be built
 /// for. The witness set is deliberately the provider's own finite inventory, not the shared
 /// default.
-#[cfg(any(feature = "cuda", test))]
 fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
     gen_core::candle_memory_contract_surface_specs()
         .into_iter()
@@ -1208,7 +1192,6 @@ fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
         .collect()
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
@@ -1216,7 +1199,6 @@ pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
         surface_specs: memory_contract_surface_specs,
     };
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,

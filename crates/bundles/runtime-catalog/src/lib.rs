@@ -9,6 +9,12 @@ pub use gen_core;
 pub use gen_core::memory_strategy;
 pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
+pub mod export;
+pub use export::{
+    assemble_capabilities_export, run_export_cli, run_export_cli_with_args,
+    verify_catalog_against_export, ExportAssemblyOptions, ExportCliTarget,
+};
+
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
 use gen_core::{
     ConditioningKind, Modality, ModelDescriptor, ProviderRegistry, Quant, TrainerDescriptor,
@@ -229,9 +235,30 @@ impl RuntimeCatalog {
 
     /// Look up a registered [`gen_core::RouteRecord`] across media and audio lanes in `O(log N)`.
     pub fn route_record(&self, id: &str) -> Option<&gen_core::RouteRecord> {
-        self.media
-            .route_record(id)
-            .or_else(|| self.audio.as_ref().and_then(|a| a.registry.route_record(id)))
+        self.media.route_record(id).or_else(|| {
+            self.audio
+                .as_ref()
+                .and_then(|a| a.registry.route_record(id))
+        })
+    }
+
+    /// Assemble a versioned, hardware-free `sga.capabilities/2` capability export from this
+    /// validated catalog (`SW-6980`, `REG-3`).
+    pub fn capabilities_export(
+        &self,
+        options: &ExportAssemblyOptions,
+    ) -> gen_core::export::CapabilitiesExportV2 {
+        assemble_capabilities_export(self, options)
+    }
+
+    /// Verify that this authoritative linked catalog agrees with a `sga.capabilities/2` export,
+    /// returning a typed [`gen_core::export::ExportDisagreementError`] on any mismatch (`REG-3`).
+    pub fn verify_against_export(
+        &self,
+        expected: &gen_core::export::CapabilitiesExportV2,
+        options: &ExportAssemblyOptions,
+    ) -> std::result::Result<(), gen_core::export::ExportDisagreementError> {
+        verify_catalog_against_export(self, expected, options)
     }
 
     /// Return a stable, serializable inventory without loading model weights.
@@ -2279,14 +2306,8 @@ mod tests {
             json["routes"]["route_pilot_dev"]["limits"]["max_size"],
             2048
         );
-        assert_eq!(
-            json["generator_capabilities"][0]["defaults"]["steps"],
-            25
-        );
-        assert_eq!(
-            json["generator_capabilities"][0]["limits"]["min_size"],
-            256
-        );
+        assert_eq!(json["generator_capabilities"][0]["defaults"]["steps"], 25);
+        assert_eq!(json["generator_capabilities"][0]["limits"]["min_size"], 256);
         assert_eq!(
             json["features"]["route_pilot_dev"]["low_res_start"]["applicable"],
             true
@@ -2308,10 +2329,58 @@ mod tests {
             json_no_latent["features"]["route_pilot_dev"]["low_res_start"]["applicable"],
             false
         );
-        assert!(json_no_latent["features"]["route_pilot_dev"]["low_res_start"]
-            ["inapplicability_reasons"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("missing_spatial_unpack_repack")));
+        assert!(
+            json_no_latent["features"]["route_pilot_dev"]["low_res_start"]
+                ["inapplicability_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("missing_spatial_unpack_repack"))
+        );
+
+        // Verify CapabilitiesExportV2 (`sga.capabilities/2`, SW-6980) reflects the exact HOOK-4
+        // flip, byte-for-byte determinism, and typed runtime-vs-export disagreement refusal.
+        let opts = ExportAssemblyOptions::new("macos-mlx");
+        let export_with = catalog.capabilities_export(&opts);
+        let export_without = catalog_no_latent.capabilities_export(&opts);
+        assert_eq!(
+            export_with.schema_version,
+            gen_core::export::CAPABILITIES_EXPORT_SCHEMA_VERSION
+        );
+        let lrs_with = export_with.routes["route_pilot_dev"]
+            .features
+            .iter()
+            .find(|f| f.feature_id == "low_res_start")
+            .unwrap();
+        assert!(lrs_with.applicable);
+        assert!(lrs_with.reasons.is_empty());
+
+        let lrs_without = export_without.routes["route_pilot_dev"]
+            .features
+            .iter()
+            .find(|f| f.feature_id == "low_res_start")
+            .unwrap();
+        assert!(!lrs_without.applicable);
+        assert!(lrs_without
+            .reasons
+            .iter()
+            .any(|r| r.code == "missing_spatial_unpack_repack"));
+
+        let bytes_a = export_with.to_canonical_json_bytes().unwrap();
+        let bytes_b = catalog
+            .capabilities_export(&opts)
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(bytes_a, bytes_b);
+        assert!(gen_core::export::canonical_bytes_equal(&bytes_a, &bytes_b).unwrap());
+
+        catalog
+            .verify_against_export(&export_with, &opts)
+            .expect("matching catalog must verify against its own export");
+        let disagreement = catalog_no_latent
+            .verify_against_export(&export_with, &opts)
+            .expect_err("catalog with removed structural precondition must refuse disagreement");
+        assert!(disagreement.disagreements.iter().any(|d| {
+            d.kind == gen_core::export::ExportDisagreementKind::RouteFeatureApplicabilityMismatch
+        }));
     }
 }

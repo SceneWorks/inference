@@ -27,3 +27,8 @@ media = ["dep:candle-gen-catalog"]
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.
 audio = ["dep:candle-audio-catalog"]
+
+[[bin]]
+name = "sga-capabilities-export-candle"
+path = "src/bin/sga_capabilities_export.rs"
+required-features = ["media", "audio"]

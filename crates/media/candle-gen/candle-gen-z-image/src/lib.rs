@@ -147,6 +147,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_turbo_surface_contract,
             },
         )
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -159,6 +160,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_base_surface_contract,
             },
         )
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: control_memory_contract_surface_specs,
@@ -171,6 +173,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_turbo_control_surface_contract,
             },
         )
+        .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: control_memory_contract_surface_specs,
@@ -183,6 +186,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_base_control_surface_contract,
             },
         )
+        .register_memory_behavior(BASE_CONTROL_MEMORY_BEHAVIOR)
 }
 
 fn control_memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
@@ -1485,7 +1489,6 @@ const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     contract: registered_turbo_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(any(feature = "cuda", test))]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,
@@ -1500,7 +1503,6 @@ const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryR
     contract: registered_base_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: base::MODEL_ID,
@@ -1517,7 +1519,6 @@ const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
         safety_check: memory_strategy::registered_safety_check,
     };
 
-#[cfg(any(feature = "cuda", test))]
 const TURBO_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "z_image_turbo_control",
@@ -1539,7 +1540,6 @@ const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
         safety_check: memory_strategy::registered_safety_check,
     };
 
-#[cfg(any(feature = "cuda", test))]
 const BASE_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "z_image_control",

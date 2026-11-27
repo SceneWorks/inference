@@ -665,6 +665,10 @@ jobs:
       # the audio lane must keep composing — one lane covers it, on the cheapest platform.
       - name: Test media-only CPU bundle
         run: python3 scripts/ci/test_suites.py audited-safe -- cargo test --locked --no-default-features --features media --lib -p runtime-cpu
+      # SW-6980 (REG-3): hosted hardware-free descriptor-only capability exports for both shipping
+      # Candle feature sets (`candle-cpu` and `candle-cuda`), zero GPU and zero CUDA toolkit.
+      - name: Verify hosted Candle descriptor-only capability exports
+        run: cargo run --locked -p runtime-cpu --bin sga-capabilities-export-candle -- --self-check
 
   macos-metal:
     # Main runs 40691949793 and 40732695026 passed every product step, then the
@@ -1042,6 +1046,32 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/test_suites.py audited-safe -- cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
+      # SW-6980 (REG-3): hosted hardware-free descriptor-only capability exports for the shipping
+      # Apple-platform feature sets (`macos-mlx`, `ios-media`, `ios-llm-only`), zero GPU execution.
+      - name: Verify hosted macOS MLX descriptor-only capability export
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo run --locked -p runtime-macos --bin sga-capabilities-export-macos -- --self-check
+      - name: Verify hosted iOS media descriptor-only capability export
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo run --locked -p runtime-ios --bin sga-capabilities-export-ios -- --self-check
+      - name: Verify hosted iOS LLM-only descriptor-only capability export
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo run --locked --no-default-features -p runtime-ios --bin sga-capabilities-export-ios -- --self-check
       # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
       # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
       # only; never fails the job.

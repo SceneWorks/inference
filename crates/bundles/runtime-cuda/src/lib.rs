@@ -176,6 +176,45 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     }
 }
 
+/// Platform export options for the CUDA Candle bundle (`SW-6980`, `REG-3`).
+pub fn export_assembly_options() -> runtime_catalog::ExportAssemblyOptions {
+    #[cfg_attr(not(any(feature = "media", feature = "audio")), allow(unused_mut))]
+    let mut options =
+        runtime_catalog::ExportAssemblyOptions::new(gen_core::export::FEATURE_SET_CANDLE_CUDA);
+    #[cfg(feature = "media")]
+    {
+        options.advanced_quant_tiers = nvfp4_quant_tiers().to_vec();
+        options.bespoke_utility_crates = candle_gen_catalog::BESPOKE_UTILITY_CRATES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        options.memory_route_waivers = BESPOKE_MEMORY_ROUTE_WAIVERS
+            .iter()
+            .map(|w| gen_core::export::ExportedBespokeMemoryWaiverV2 {
+                provider_id: w.provider_id.to_string(),
+                crate_name: w.crate_name.to_string(),
+                owner: w.owner.to_string(),
+                reason: w.reason.to_string(),
+            })
+            .collect();
+    }
+    #[cfg(feature = "audio")]
+    {
+        options.crate_api_providers = candle_audio_catalog::CRATE_API_PROVIDERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    options
+}
+
+/// Export the canonical `sga.capabilities/2` build product from this linked CUDA runtime catalog
+/// (`SW-6980`, `REG-3`).
+pub fn capabilities_export() -> runtime_catalog::Result<gen_core::export::CapabilitiesExportV2> {
+    let catalog = catalog()?;
+    Ok(catalog.capabilities_export(&export_assembly_options()))
+}
+
 #[cfg(test)]
 mod tests {
     /// SceneWorks reaches SheetSage2 transcription only through this bundle (sc-23002): the crate is
@@ -580,6 +619,68 @@ mod tests {
         assert_eq!(
             std::any::TypeId::of::<super::layers::Linear>(),
             std::any::TypeId::of::<super::media::Linear>()
+        );
+    }
+
+    /// SW-6980 (`REG-3`, `AC1`): the live CUDA runtime's `sga.capabilities/2` export matches the
+    /// hardware-free hosted CUDA descriptor-only registry byte-for-byte, and reports
+    /// `has_memory_behavior == true` on every CUDA-gated behavior-bearing route (non-CUDA branch
+    /// parity is additionally pinned by `candle-gen-catalog`'s source+runtime test and
+    /// `runtime-cpu`'s hosted `candle-cuda` export test).
+    #[cfg(all(feature = "media", feature = "audio"))]
+    #[test]
+    fn live_cuda_export_matches_hosted_descriptor_only_cuda_export() {
+        let live = super::capabilities_export().expect("live runtime-cuda export");
+        for route_id in [
+            "flux1_schnell",
+            "flux1_dev",
+            "flux2_dev",
+            "flux2_klein_9b",
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+            "krea_2_turbo_control",
+            "lens",
+            "lens_turbo",
+            "mage_flow",
+            "mage_flow_base",
+            "mage_flow_turbo",
+            "mage_flow_edit",
+            "mage_flow_edit_base",
+            "mage_flow_edit_turbo",
+            "qwen_image",
+            "z_image",
+            "z_image_turbo",
+            "bernini",
+            "bernini_renderer",
+            "ltx_2_3_distilled",
+            "ltx_2_5_distilled",
+            "minimax_h3",
+            "minimax_h3_image",
+            "wan2_2_ti2v_5b",
+            "wan2_2_t2v_14b",
+            "wan2_2_i2v_14b",
+        ] {
+            assert!(
+                live.routes[route_id].memory.has_memory_behavior,
+                "live runtime-cuda export must report has_memory_behavior=true for `{route_id}`"
+            );
+        }
+        let descriptor_catalog = super::RuntimeCatalog::try_new_with_audio(
+            super::PLATFORM,
+            super::BACKEND,
+            candle_gen_catalog::cuda_descriptor_provider_registry(),
+            super::llm::cuda_descriptor_text_registry(),
+            super::llm::snapshot_preparer_registry(),
+            super::audio_lane(),
+        )
+        .expect("hosted cuda descriptor catalog");
+        let hosted = descriptor_catalog.capabilities_export(&super::export_assembly_options());
+        assert_eq!(
+            live.to_canonical_json_bytes().unwrap(),
+            hosted.to_canonical_json_bytes().unwrap(),
+            "live CUDA runtime export must match hosted descriptor-only CUDA export byte-for-byte"
         );
     }
 }
