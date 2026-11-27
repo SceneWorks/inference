@@ -113,6 +113,20 @@
 //! cross-attention, for one) falls through to the INT8 / flash rule unchanged and the reason is
 //! counted in [`AttentionPathCounts::sol_refusals`]. It is a fixed sequence of launches per call,
 //! so the planned helpers' single pre-launch cancel check covers it as it covers flash (E7).
+//!
+//! # One job-level opt-in for every model (SW-6132)
+//!
+//! Both lossy kernels are also one shared, job-level decision, the opt-in twin of the flash toggle:
+//! [`set_lossy_attention`] with a [`LossyAttentionOptIns`] (`int8` / `sol`, each `None` = off by
+//! default) applies to **every** shared-helper call in the process, so any model whose attention
+//! routes through these helpers can opt in — no per-engine option needed. The product worker runs
+//! one job per GPU process and sets it at job start, resetting it at job end. The routing rule is
+//! unchanged: each call is still offered to Sol-Attn, then INT8, after the materialized / autograd
+//! gate, and a call either cannot serve falls through to flash / budgeted with its refusal counted.
+//! A thread scope (an engine option: Krea's `int8_attention`, Wan's `sol_attention`) wins over the
+//! job switch for the calls inside it ([`requested_opt_ins`]). Which providers route attention
+//! through the shared helpers at all is the catalog's `shared_attention_routing` (a provider that
+//! does not is refused upfront by `admit_lossy_attention`, never silently rendered exact).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -360,10 +374,12 @@ pub enum AttentionKernel {
     /// candle-flash-attn's fused FA2 forward — scores never materialize.
     Flash,
     /// The opt-in, lossy SageAttention-style INT8 `Q·Kᵀ` kernel (SW-6131) — scores never
-    /// materialize. Only routed inside [`with_int8_attention`].
+    /// materialize. Only routed inside [`with_int8_attention`] or under the job switch
+    /// ([`set_lossy_attention`], SW-6132).
     Int8,
     /// The opt-in, lossy Sol-Attn sparse block-routed kernel (SW-6137) — scores never
-    /// materialize. Only routed inside [`with_sol_attention`].
+    /// materialize. Only routed inside [`with_sol_attention`] or under the job switch
+    /// ([`set_lossy_attention`], SW-6132).
     Sol,
     /// The materialized, query-chunked [`sdpa_planned_bhsd`], with the reason the fused kernel was
     /// refused.
@@ -829,6 +845,123 @@ pub fn in_sol_attention_scope() -> bool {
 pub fn sol_attention_config() -> SolConfig {
     SOL_CONFIG.get()
 }
+
+// ---------------------------------------------------------------------------------------------
+// The shared, job-scoped lossy-attention opt-ins (SW-6132).
+// ---------------------------------------------------------------------------------------------
+
+/// The job-level lossy-attention opt-ins every Candle media provider that routes attention through
+/// the shared helpers honours (SW-6132): the INT8 QK kernel and the Sol-Attn sparse kernel, each
+/// `None` (off) by default. Set for a whole job with [`set_lossy_attention`], the opt-in twin of
+/// [`set_flash_attention_enabled`]: process-wide and read per attention call, so the product worker
+/// (one job at a time per GPU process) sets it at job start and resets it at job end, for any model.
+///
+/// Lossy (epic E2): neither is ever a default. Inside the opt-in, a call either kernel cannot serve
+/// (a mask, a head dim, a dtype, the device's compute capability, an autograd/training call, a
+/// cross-attention for Sol-Attn) keeps FlashAttention / the budgeted path and the reason is counted
+/// in [`AttentionPathCounts::int8_refusals`] / [`AttentionPathCounts::sol_refusals`] — never silent.
+/// A thread-scoped engine option ([`enter_int8_attention`] — Krea's `int8_attention`;
+/// [`enter_sol_attention`] — Wan's `sol_attention`) takes precedence over the job switch for the
+/// calls inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LossyAttentionOptIns {
+    /// The INT8 QK kernel with this configuration (`P·V` mode, K centering).
+    pub int8: Option<Int8AttentionConfig>,
+    /// The Sol-Attn sparse kernel with this configuration (validated by [`set_lossy_attention`]).
+    pub sol: Option<SolConfig>,
+}
+
+impl LossyAttentionOptIns {
+    /// Neither opt-in: the default, exact routing.
+    pub const OFF: Self = Self {
+        int8: None,
+        sol: None,
+    };
+
+    /// Whether any lossy kernel is requested.
+    pub fn any(&self) -> bool {
+        self.int8.is_some() || self.sol.is_some()
+    }
+
+    /// Why this selection cannot be set: an invalid [`SolConfig`].
+    pub fn validate(&self) -> Result<(), LossyAttentionRefusal> {
+        match self.sol.map(|c| c.validate()) {
+            Some(Err(reason)) => Err(LossyAttentionRefusal::InvalidSolConfig(reason)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Why a lossy-attention opt-in was refused before any attention call ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LossyAttentionRefusal {
+    /// The Sol-Attn configuration is invalid (the reason from `SolConfig::validate`).
+    InvalidSolConfig(&'static str),
+}
+
+impl std::fmt::Display for LossyAttentionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LossyAttentionRefusal::InvalidSolConfig(reason) => {
+                write!(f, "invalid sol_attention configuration: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LossyAttentionRefusal {}
+
+/// Fast path: whether the job switch carries any opt-in (one relaxed load per call when off).
+static LOSSY_ATTENTION_SET: AtomicBool = AtomicBool::new(false);
+static LOSSY_ATTENTION: std::sync::RwLock<LossyAttentionOptIns> =
+    std::sync::RwLock::new(LossyAttentionOptIns::OFF);
+
+/// Set the job-level lossy-attention opt-ins for every subsequent shared-helper attention call in
+/// this process ([`LossyAttentionOptIns`]; default [`LossyAttentionOptIns::OFF`]). An invalid
+/// selection is refused and leaves the switch unchanged. Read per call: flipping it between jobs
+/// takes effect at the next attention call, with no pipeline reload.
+pub fn set_lossy_attention(opt_ins: LossyAttentionOptIns) -> Result<(), LossyAttentionRefusal> {
+    opt_ins.validate()?;
+    let mut slot = LOSSY_ATTENTION
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = opt_ins;
+    LOSSY_ATTENTION_SET.store(opt_ins.any(), Ordering::Release);
+    Ok(())
+}
+
+/// The job-level lossy-attention opt-ins currently set ([`set_lossy_attention`]).
+pub fn lossy_attention() -> LossyAttentionOptIns {
+    if !LOSSY_ATTENTION_SET.load(Ordering::Acquire) {
+        return LossyAttentionOptIns::OFF;
+    }
+    *LOSSY_ATTENTION
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The precedence rule of the opt-ins in force for one call: each kernel's active thread scope
+/// (`int8_scope` / `sol_scope`, an engine option such as Krea's `int8_attention`) wins over the job
+/// switch (`job`, [`set_lossy_attention`]); with neither, that kernel is off. Pure.
+pub fn requested_opt_ins(
+    int8_scope: Option<Int8AttentionConfig>,
+    sol_scope: Option<SolConfig>,
+    job: LossyAttentionOptIns,
+) -> LossyAttentionOptIns {
+    LossyAttentionOptIns {
+        int8: int8_scope.or(job.int8),
+        sol: sol_scope.or(job.sol),
+    }
+}
+
+/// [`requested_opt_ins`] for this thread right now.
+pub fn requested_lossy_attention() -> LossyAttentionOptIns {
+    requested_opt_ins(
+        in_int8_attention_scope().then(int8_attention_config),
+        in_sol_attention_scope().then(sol_attention_config),
+        lossy_attention(),
+    )
+}
 // ---------------------------------------------------------------------------------------------
 // The process-wide toggle (SW-6130 E3).
 // ---------------------------------------------------------------------------------------------
@@ -1010,8 +1143,7 @@ pub(crate) struct OptInRefusals {
 /// [`route_attention_kernel`] plus, for an opt-in-scope call that fell through to the next rule,
 /// the opt-in refusal reasons. Sol-Attn is offered first, then INT8, then the flash rule.
 fn route_attention(
-    int8_requested: bool,
-    sol_requested: bool,
+    requested: LossyAttentionOptIns,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -1024,7 +1156,7 @@ fn route_attention(
     };
     let same_device = || q.device().same_device(k.device()) && q.device().same_device(v.device());
     let mut refusals = OptInRefusals::default();
-    let sol = sol_route(sol_requested, gate, || {
+    let sol = sol_route(requested.sol.is_some(), gate, || {
         sol_eligibility(
             SOL_ATTN_COMPILED,
             int8_device(q.device()),
@@ -1033,7 +1165,7 @@ fn route_attention(
             FlashOperand::of(k),
             FlashOperand::of(v),
             mask.is_some(),
-            &sol_attention_config(),
+            requested.sol.as_ref().expect("sol requested"),
         )
     });
     match sol {
@@ -1041,7 +1173,7 @@ fn route_attention(
         Some(Err(refusal)) => refusals.sol = Some(refusal),
         None => {}
     }
-    let int8 = int8_route(int8_requested, gate, || {
+    let int8 = int8_route(requested.int8.is_some(), gate, || {
         int8_eligibility(
             INT8_ATTN_COMPILED,
             int8_device(q.device()),
@@ -1110,13 +1242,13 @@ pub(crate) enum FusedKernel {
 }
 
 impl FusedKernel {
-    /// The fused kernel `kernel` names (`None` for the materialized path), with this thread's
-    /// INT8 centering mode / Sol-Attn configuration.
-    pub(crate) fn of(kernel: AttentionKernel) -> Option<Self> {
+    /// The fused kernel `kernel` names (`None` for the materialized path), with the INT8 / Sol-Attn
+    /// configuration the call was routed under (`requested`, from [`route_ready`]).
+    pub(crate) fn of(kernel: AttentionKernel, requested: &LossyAttentionOptIns) -> Option<Self> {
         match kernel {
             AttentionKernel::Flash => Some(FusedKernel::Flash),
-            AttentionKernel::Int8 => Some(FusedKernel::Int8(int8_attention_config())),
-            AttentionKernel::Sol => Some(FusedKernel::Sol(sol_attention_config())),
+            AttentionKernel::Int8 => Some(FusedKernel::Int8(requested.int8.unwrap_or_default())),
+            AttentionKernel::Sol => requested.sol.map(FusedKernel::Sol),
             AttentionKernel::Budgeted(_) => None,
         }
     }
@@ -1156,31 +1288,34 @@ fn int8_kernel_ready(_device: &candle_core::Device) -> bool {
     false
 }
 
-/// Route one call (without counting): the kernel, and the opt-in refusals when an opt-in-scope
-/// call fell through. A routed Sol-Attn / INT8 call whose kernel failed to compile on the device
-/// re-routes by the next rule, refused as [`SolRouteRefusal::Compile`] / [`Int8Refusal::Compile`].
+/// Route one call (without counting): the kernel, the opt-in refusals when an opt-in call fell
+/// through, and the opt-ins it was routed under ([`requested_lossy_attention`]: the thread scope's,
+/// else the job switch's — read once, so the launch uses the configuration the route checked). A
+/// routed Sol-Attn / INT8 call whose kernel failed to compile on the device re-routes by the next
+/// rule, refused as [`SolRouteRefusal::Compile`] / [`Int8Refusal::Compile`].
 pub(crate) fn route_ready(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
-) -> (AttentionKernel, OptInRefusals) {
-    let (mut sol, mut int8) = (in_sol_attention_scope(), in_int8_attention_scope());
+) -> (AttentionKernel, OptInRefusals, LossyAttentionOptIns) {
+    let requested = requested_lossy_attention();
+    let mut tried = requested;
     let mut compile = OptInRefusals::default();
     loop {
-        let (kernel, mut refusals) = route_attention(int8, sol, q, k, v, mask);
+        let (kernel, mut refusals) = route_attention(tried, q, k, v, mask);
         refusals.sol = refusals.sol.or(compile.sol);
         refusals.int8 = refusals.int8.or(compile.int8);
         match kernel {
             AttentionKernel::Sol if !sol_kernel_ready(q.device()) => {
-                sol = false;
+                tried.sol = None;
                 compile.sol = Some(SolRouteRefusal::Compile);
             }
             AttentionKernel::Int8 if !int8_kernel_ready(q.device()) => {
-                int8 = false;
+                tried.int8 = None;
                 compile.int8 = Some(Int8Refusal::Compile);
             }
-            _ => return (kernel, refusals),
+            _ => return (kernel, refusals, requested),
         }
     }
 }
@@ -1206,7 +1341,7 @@ pub(crate) fn take_fused(
     v: &Tensor,
     mask: Option<&Tensor>,
 ) -> Option<FusedKernel> {
-    let (kernel, refusals) = route_ready(q, k, v, mask);
+    let (kernel, refusals, requested) = route_ready(q, k, v, mask);
     record_route(kernel, refusals);
     // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
     // `Materialized` first.
@@ -1215,7 +1350,7 @@ pub(crate) fn take_fused(
     {
         warn_grad_tracked(site, std::panic::Location::caller());
     }
-    FusedKernel::of(kernel)
+    FusedKernel::of(kernel, &requested)
 }
 
 /// The fused forward of `kernel` over `[B, H, S, D]` operands: the contiguous `[B, H, Sq, D]`
@@ -3345,5 +3480,202 @@ mod tests {
             tb / tf
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SW-6132: the shared, job-level lossy-attention opt-ins. Pure routing / scope / validation;
+    // the only tensors are zero-filled CPU operands read for their layout (no attention computed).
+    // Serial test threads (`.cargo/config.toml`), so flipping the process-wide switch is safe.
+    // -----------------------------------------------------------------------------------------
+
+    /// Restores the job switch to off even when an assertion unwinds.
+    struct JobSwitchReset;
+    impl Drop for JobSwitchReset {
+        fn drop(&mut self) {
+            set_lossy_attention(LossyAttentionOptIns::OFF).unwrap();
+        }
+    }
+
+    fn int8_pv8() -> Int8AttentionConfig {
+        Int8AttentionConfig {
+            pv: PvPrecision::Int8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_thread_scope_wins_over_the_job_switch_per_kernel() {
+        let job = LossyAttentionOptIns {
+            int8: Some(Int8AttentionConfig::default()),
+            sol: Some(SolConfig::top_k(0.5)),
+        };
+        let off = LossyAttentionOptIns::OFF;
+        assert_eq!(
+            requested_opt_ins(None, None, off),
+            off,
+            "default: exact routing"
+        );
+        assert_eq!(
+            requested_opt_ins(None, None, job),
+            job,
+            "the job switch alone"
+        );
+        let scoped = requested_opt_ins(Some(int8_pv8()), None, job);
+        assert_eq!(
+            scoped.int8,
+            Some(int8_pv8()),
+            "Krea's engine option wins for INT8"
+        );
+        assert_eq!(scoped.sol, job.sol, "and leaves the job's Sol-Attn choice");
+        let wan = requested_opt_ins(None, Some(SolConfig::top_k(0.1)), off);
+        assert_eq!(
+            wan.sol,
+            Some(SolConfig::top_k(0.1)),
+            "Wan's option, no job switch"
+        );
+        assert_eq!(wan.int8, None);
+        assert!(!off.any() && job.any() && wan.any());
+    }
+
+    #[test]
+    fn the_job_switch_defaults_off_round_trips_and_refuses_an_invalid_sol_config() {
+        let _reset = JobSwitchReset;
+        assert_eq!(
+            lossy_attention(),
+            LossyAttentionOptIns::OFF,
+            "off by default"
+        );
+        assert_eq!(requested_lossy_attention(), LossyAttentionOptIns::OFF);
+        let on = LossyAttentionOptIns {
+            int8: Some(int8_pv8()),
+            sol: Some(SolConfig::top_k(0.25)),
+        };
+        set_lossy_attention(on).unwrap();
+        assert_eq!(lossy_attention(), on);
+        assert_eq!(requested_lossy_attention(), on);
+        let seen = std::thread::spawn(requested_lossy_attention)
+            .join()
+            .unwrap();
+        assert_eq!(seen, on, "process-wide, like the flash toggle");
+        // A scope on this thread overrides it for its own calls only.
+        with_int8_attention(|| {
+            assert_eq!(
+                requested_lossy_attention().int8,
+                Some(Int8AttentionConfig::default())
+            );
+        });
+        assert_eq!(requested_lossy_attention(), on);
+        for bad in [SolConfig::top_k(0.0), SolConfig::top_k(1.5)] {
+            let refused = set_lossy_attention(LossyAttentionOptIns {
+                int8: None,
+                sol: Some(bad),
+            });
+            assert!(
+                matches!(&refused, Err(LossyAttentionRefusal::InvalidSolConfig(r)) if r.contains("topk_ratio")),
+                "{refused:?}"
+            );
+            assert_eq!(lossy_attention(), on, "a refused selection changes nothing");
+        }
+        set_lossy_attention(LossyAttentionOptIns::OFF).unwrap();
+        assert_eq!(lossy_attention(), LossyAttentionOptIns::OFF);
+    }
+
+    #[test]
+    fn the_job_switch_offers_every_call_and_counts_each_refusal() -> candle_core::Result<()> {
+        let (q, k, v) = zero_operands(DType::BF16)?;
+        let _reset = JobSwitchReset;
+        let cpu_int8 = if INT8_ATTN_COMPILED {
+            Int8Refusal::NotCuda
+        } else {
+            Int8Refusal::NotCompiled
+        };
+        let cpu_sol = if SOL_ATTN_COMPILED {
+            SolRouteRefusal::NotCuda
+        } else {
+            SolRouteRefusal::NotCompiled
+        };
+        // Off: no opt-in is consulted, no refusal recorded.
+        let (kernel, refusals, requested) = route_ready(&q, &k, &v, None);
+        assert_eq!(kernel, AttentionKernel::Budgeted(cpu_refusal()));
+        assert_eq!(refusals, OptInRefusals::default());
+        assert_eq!(requested, LossyAttentionOptIns::OFF);
+        // On for the job: a CPU call is refused by both kernels, typed, and takes the flash rule.
+        let on = LossyAttentionOptIns {
+            int8: Some(int8_pv8()),
+            sol: Some(SolConfig::top_k(0.25)),
+        };
+        set_lossy_attention(on).unwrap();
+        let (kernel, refusals, requested) = route_ready(&q, &k, &v, None);
+        assert_eq!(kernel, AttentionKernel::Budgeted(cpu_refusal()));
+        assert_eq!(refusals.int8, Some(cpu_int8));
+        assert_eq!(refusals.sol, Some(cpu_sol));
+        assert_eq!(
+            requested, on,
+            "the launch uses the configuration the route checked"
+        );
+        // A training scope never reaches the opt-ins (E9).
+        let (kernel, refusals, _) = with_materialized_attention(|| route_ready(&q, &k, &v, None));
+        assert_eq!(
+            kernel,
+            AttentionKernel::Budgeted(FlashRefusal::Materialized)
+        );
+        assert_eq!(refusals, OptInRefusals::default());
+        // A routed kernel carries the job's configuration.
+        assert_eq!(
+            FusedKernel::of(AttentionKernel::Int8, &requested),
+            Some(FusedKernel::Int8(int8_pv8()))
+        );
+        assert_eq!(
+            FusedKernel::of(AttentionKernel::Sol, &requested),
+            Some(FusedKernel::Sol(SolConfig::top_k(0.25)))
+        );
+        // Counted like a scoped call: one path, one refusal per kernel.
+        let before = attention_path_counts();
+        let (kernel, refusals, _) = route_ready(&q, &k, &v, None);
+        record_route(kernel, refusals);
+        let delta = attention_path_counts().since(&before);
+        assert_eq!(delta.total(), 1, "{delta:?}");
+        assert_eq!(delta.int8_refusals.total(), 1, "{delta:?}");
+        assert_eq!(delta.sol_refusals.total(), 1, "{delta:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn under_the_job_switch_eligible_calls_take_the_kernel_and_the_rest_are_typed_refusals() {
+        // The pure router for a sm_120 device: what a CUDA job with the switch on decides.
+        let sm120 = Int8Device::Cuda(Some(120));
+        let op = |dims: &'static [usize; 4], st: &'static [usize]| FlashOperand {
+            dtype: DType::BF16,
+            dims,
+            strides: st,
+        };
+        static WAN: [usize; 4] = [1, 40, 32_760, 128];
+        static WAN_ST: [usize; 4] = [40 * 32_760 * 128, 32_760 * 128, 128, 1];
+        static VAE: [usize; 4] = [1, 1, 4096, 512];
+        static VAE_ST: [usize; 4] = [4096 * 512, 4096 * 512, 512, 1];
+        let (dit, vae) = (op(&WAN, &WAN_ST), op(&VAE, &VAE_ST));
+        let int8 = |o: FlashOperand<'_>, masked| {
+            int8_route(true, OPEN, || {
+                int8_eligibility(true, sm120, true, o, o, o, masked)
+            })
+        };
+        let sol = |o: FlashOperand<'_>, masked| {
+            sol_route(true, OPEN, || {
+                sol_eligibility(true, sm120, true, o, o, o, masked, &SolConfig::top_k(0.25))
+            })
+        };
+        assert_eq!(int8(dit, false), Some(Ok(())));
+        assert_eq!(sol(dit, false), Some(Ok(())));
+        // A masked call (text encoders) and a head-dim-512 call (VAE mid-block attention).
+        assert_eq!(int8(dit, true), Some(Err(Int8Refusal::Masked)));
+        assert_eq!(sol(dit, true), Some(Err(SolRouteRefusal::Masked)));
+        assert_eq!(int8(vae, false), Some(Err(Int8Refusal::HeadDim(512))));
+        assert_eq!(sol(vae, false), Some(Err(SolRouteRefusal::HeadDim(512))));
+        // Below the sm_80 floor both are refused by arch.
+        let sm75 = Int8Device::Cuda(Some(75));
+        assert_eq!(
+            int8_eligibility(true, sm75, true, dit, dit, dit, false),
+            Err(Int8Refusal::UnsupportedArch(Some(75)))
+        );
     }
 }

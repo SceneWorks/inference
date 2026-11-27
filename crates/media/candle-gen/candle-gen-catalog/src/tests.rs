@@ -1490,3 +1490,110 @@ fn wan_sampler_menus_match_mlx_except_the_pinned_14b_fold_in_gap() {
         );
     }
 }
+
+/// SW-6132: every provider a product can run has a stated attention routing, so a job-level
+/// lossy-attention opt-in is either honoured (the shared helpers) or refused upfront (bespoke).
+#[test]
+fn catalog_attention_routing_covers_every_provider() {
+    let registry = super::provider_registry().unwrap();
+    let mut registered: Vec<String> = registry
+        .generators()
+        .map(|r| (r.descriptor)().id.to_string())
+        .chain(
+            registry
+                .transforms()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .captioners()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .image_embedders()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .chain(
+            registry
+                .text_embedders()
+                .map(|r| (r.descriptor)().id.to_string()),
+        )
+        .collect();
+    registered.push(candle_gen_pulid::memory_strategy::PROVIDER_ID.to_string());
+    registered.push(candle_gen_instantid::memory_strategy::PROVIDER_ID.to_string());
+    registered.sort();
+    registered.dedup();
+    let mut table: Vec<String> = super::SHARED_ATTENTION_ROUTING
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let rows = table.len();
+    table.sort();
+    table.dedup();
+    assert_eq!(rows, table.len(), "a provider is listed twice");
+    assert_eq!(
+        table, registered,
+        "every registered provider (and only those) states its attention routing"
+    );
+    use super::SharedAttentionRouting::{Bespoke, SharedHelpers};
+    for (id, want) in [
+        ("krea_2_turbo", SharedHelpers),
+        ("wan2_2_ti2v_5b", SharedHelpers),
+        ("ltx_2_3_distilled", SharedHelpers),
+        ("sdxl", SharedHelpers),
+        ("moss_image_base", Bespoke),
+        ("sana_1600m", Bespoke),
+        ("supra2_img", Bespoke),
+    ] {
+        assert_eq!(super::shared_attention_routing(id), Some(want), "{id}");
+    }
+    assert_eq!(super::shared_attention_routing("no_such_model"), None);
+}
+
+/// SW-6132: the upfront admission of a job's lossy-attention opt-ins is typed for every refusal.
+#[test]
+fn lossy_attention_admission_is_typed() {
+    use super::media::fused_attention::{
+        Int8AttentionConfig, LossyAttentionOptIns, SolConfig, INT8_ATTN_COMPILED, SOL_ATTN_COMPILED,
+    };
+    use super::media::gen_core::Error;
+    let admit = super::admit_lossy_attention;
+    let int8 = LossyAttentionOptIns {
+        int8: Some(Int8AttentionConfig::default()),
+        sol: None,
+    };
+    let sol = LossyAttentionOptIns {
+        int8: None,
+        sol: Some(SolConfig::top_k(0.25)),
+    };
+    let unsupported = |r: super::media::gen_core::Result<()>, needle: &str| match r {
+        Err(Error::Unsupported(m)) => assert!(m.contains(needle), "{m}"),
+        other => panic!("expected Unsupported({needle}), got {other:?}"),
+    };
+    // Nothing requested: always admitted, even for a bespoke or unknown id.
+    for id in ["moss_image_base", "no_such_model", "krea_2_turbo"] {
+        admit(id, &LossyAttentionOptIns::OFF).unwrap();
+    }
+    unsupported(admit("moss_image_base", &int8), "runs its own attention");
+    unsupported(admit("sana_1600m", &sol), "runs its own attention");
+    unsupported(admit("no_such_model", &int8), "not a Candle provider");
+    let bad = LossyAttentionOptIns {
+        int8: None,
+        sol: Some(SolConfig::top_k(0.0)),
+    };
+    unsupported(admit("wan2_2_t2v_14b", &bad), "topk_ratio");
+    for (opt_ins, compiled, needle) in [
+        (int8, INT8_ATTN_COMPILED, "INT8 attention kernel"),
+        (sol, SOL_ATTN_COMPILED, "Sol-Attn kernel"),
+    ] {
+        for id in ["krea_2_turbo", "wan2_2_ti2v_5b", "flux2_dev", "pulid_flux"] {
+            let got = admit(id, &opt_ins);
+            if compiled {
+                got.unwrap();
+            } else {
+                unsupported(got, needle);
+            }
+        }
+    }
+}

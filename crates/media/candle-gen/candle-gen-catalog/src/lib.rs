@@ -86,6 +86,170 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
         verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
     }];
 
+/// Whether a registered provider's model attention runs through `candle-gen`'s shared SDPA helpers
+/// (`sdpa_budgeted_*` / `sdpa_planned_*` / the `training_sdpa_*` inference entry points) — the one
+/// dispatch the job-level attention switches act on (SW-6130 flash toggle, SW-6132 lossy opt-ins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedAttentionRouting {
+    /// The provider's transformer / UNet attention goes through the shared helpers: the flash
+    /// toggle and the INT8 / Sol-Attn opt-ins reach it. Each call is still eligibility-checked; a
+    /// call a lossy kernel cannot serve keeps FlashAttention / the budgeted path, counted in
+    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`.
+    SharedHelpers,
+    /// The provider's model attention is its own code (outside the shared helpers): no job-level
+    /// attention switch reaches it, so a product must refuse a lossy-attention opt-in for it with a
+    /// typed error rather than silently render the exact path ([`admit_lossy_attention`]).
+    Bespoke,
+}
+
+/// Every provider this catalog registers (generators, transforms, captioners, embedders) plus the
+/// worker-owned bespoke routes ([`BESPOKE_MEMORY_ROUTE_WAIVERS`], InstantID), and how its model
+/// attention routes. Trainers are not listed: training attention always runs the
+/// materialized path (epic E9), whatever the job switches say. `catalog_attention_routing_covers_every_provider`
+/// (tests) pins this table to the registry, so a new provider must state its routing here.
+pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
+    use SharedAttentionRouting::{Bespoke, SharedHelpers as Shared};
+    &[
+        ("anima_base", Shared),
+        ("anima_aesthetic", Shared),
+        ("anima_turbo", Shared),
+        // Bernini renders with Wan's `WanTransformer`.
+        ("bernini_renderer", Shared),
+        ("bernini", Shared),
+        ("boogu_image", Shared),
+        ("boogu_image_turbo", Shared),
+        ("boogu_image_edit", Shared),
+        ("chroma1_hd", Shared),
+        ("chroma1_base", Shared),
+        ("chroma1_flash", Shared),
+        ("flux1_schnell", Shared),
+        ("flux1_dev", Shared),
+        ("flux2_klein_9b", Shared),
+        ("flux2_dev", Shared),
+        ("flux3_klein", Shared),
+        ("flux3_klein_base", Shared),
+        ("ideogram_4", Shared),
+        ("ideogram_4_turbo", Shared),
+        ("iris_3b", Shared),
+        // Kolors denoises with the SDXL UNet (`candle-gen-sdxl`).
+        ("kolors", Shared),
+        ("krea_2_turbo", Shared),
+        ("krea_2_raw", Shared),
+        ("krea_2_edit", Shared),
+        ("krea_2_turbo_edit", Shared),
+        ("krea_2_turbo_control", Shared),
+        ("lens_turbo", Shared),
+        ("lens", Shared),
+        ("ltx_2_3_distilled", Shared),
+        ("ltx_2_5_distilled", Shared),
+        // Mage's DiT attention goes through `training_sdpa_bhsd` (the shared planned helper).
+        ("mage_flow", Shared),
+        ("mage_flow_base", Shared),
+        ("mage_flow_turbo", Shared),
+        ("mage_flow_edit", Shared),
+        ("mage_flow_edit_base", Shared),
+        ("mage_flow_edit_turbo", Shared),
+        ("minimax_h3", Shared),
+        ("minimax_h3_image", Shared),
+        ("mochi_1", Shared),
+        // MOSS-Image's DiT attention is its own explicit-f32 materialized path.
+        ("moss_image_base", Bespoke),
+        ("moss_image_sft", Bespoke),
+        ("qwen_image", Shared),
+        ("qwen_image_2_1", Shared),
+        ("qwen_image_2_1_turbo", Shared),
+        // Sana: ReLU linear self-attention plus its own masked cross-attention.
+        ("sana_1600m", Bespoke),
+        ("sana_sprint_1600m", Bespoke),
+        ("scail2_14b", Shared),
+        ("sd3_5_large", Shared),
+        ("sd3_5_large_turbo", Shared),
+        ("sd3_5_medium", Shared),
+        ("sdxl", Shared),
+        ("seedvr2", Shared),
+        ("seedvr2_3b", Shared),
+        ("seedvr2_7b", Shared),
+        ("sensenova_u1_8b", Shared),
+        ("sensenova_u1_8b_fast", Shared),
+        // Supra-2's DiT has its own materialized `sdpa`.
+        ("supra2_img", Bespoke),
+        ("svd_xt", Shared),
+        ("wan2_2_ti2v_5b", Shared),
+        ("wan2_2_t2v_14b", Shared),
+        ("wan2_2_i2v_14b", Shared),
+        ("wan_vace", Shared),
+        ("wan2_2_vace_fun_14b", Shared),
+        ("z_image_turbo", Shared),
+        ("z_image", Shared),
+        ("iris_3b_restore", Shared),
+        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet.
+        (candle_gen_pulid::memory_strategy::PROVIDER_ID, Shared),
+        (candle_gen_instantid::memory_strategy::PROVIDER_ID, Shared),
+        // The captioner and the CLIP embedders run their own attention.
+        ("fancyfeast/llama-joycaption-beta-one-hf-llava", Bespoke),
+        ("clip_vit_l14", Bespoke),
+        ("clip_vit_l14_text", Bespoke),
+    ]
+};
+
+/// How `provider_id`'s model attention routes ([`SharedAttentionRouting`]); `None` for an id this
+/// catalog does not register.
+pub fn shared_attention_routing(provider_id: &str) -> Option<SharedAttentionRouting> {
+    SHARED_ATTENTION_ROUTING
+        .iter()
+        .find_map(|(id, routing)| (*id == provider_id).then_some(*routing))
+}
+
+/// The one upfront check a product runs before setting a job's lossy-attention opt-ins
+/// (`candle_gen::fused_attention::set_lossy_attention`) for `provider_id` (SW-6132): `Ok` when
+/// nothing is requested, or when the provider's attention routes through the shared helpers and
+/// this build compiles every requested kernel; otherwise a typed [`media::gen_core::Error::Unsupported`]
+/// naming the provider and the reason — never a silently exact render. Per-call constraints (mask,
+/// head dim, dtype, the device's compute capability, cross-attention for Sol-Attn) are checked at
+/// each attention call and counted in `AttentionPathCounts::{int8_refusals, sol_refusals}`.
+pub fn admit_lossy_attention(
+    provider_id: &str,
+    opt_ins: &media::fused_attention::LossyAttentionOptIns,
+) -> media::gen_core::Result<()> {
+    use media::fused_attention::{INT8_ATTN_COMPILED, SOL_ATTN_COMPILED};
+    use media::gen_core::Error;
+    if !opt_ins.any() {
+        return Ok(());
+    }
+    let requested = match (opt_ins.int8.is_some(), opt_ins.sol.is_some()) {
+        (true, true) => "int8_attention + sol_attention",
+        (true, false) => "int8_attention",
+        _ => "sol_attention",
+    };
+    opt_ins
+        .validate()
+        .map_err(|refusal| Error::Unsupported(format!("{provider_id}: {refusal}")))?;
+    match shared_attention_routing(provider_id) {
+        None => {
+            return Err(Error::Unsupported(format!(
+                "{requested}: `{provider_id}` is not a Candle provider this runtime registers"
+            )))
+        }
+        Some(SharedAttentionRouting::Bespoke) => {
+            return Err(Error::Unsupported(format!(
+                "{requested}: `{provider_id}` runs its own attention, outside the shared Candle                  attention helpers the option acts on"
+            )))
+        }
+        Some(SharedAttentionRouting::SharedHelpers) => {}
+    }
+    if opt_ins.int8.is_some() && !INT8_ATTN_COMPILED {
+        return Err(Error::Unsupported(format!(
+            "int8_attention: this build does not compile the INT8 attention kernel (`{provider_id}`)"
+        )));
+    }
+    if opt_ins.sol.is_some() && !SOL_ATTN_COMPILED {
+        return Err(Error::Unsupported(format!(
+            "sol_attention: this build does not compile the Sol-Attn kernel (`{provider_id}`)"
+        )));
+    }
+    Ok(())
+}
+
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     // The engine's checkpoint codec table is registered here, exactly once, before any family

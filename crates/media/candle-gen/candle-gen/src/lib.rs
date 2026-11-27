@@ -118,6 +118,10 @@ pub use fused_attention::{
 pub use fused_attention::{
     with_sol_attention, SolConfig, SolRefusalCounts, SolRouteRefusal, SolSelection,
 };
+// SW-6132: the shared, job-level lossy-attention opt-ins (INT8 / Sol-Attn) for every model.
+pub use fused_attention::{
+    lossy_attention, set_lossy_attention, LossyAttentionOptIns, LossyAttentionRefusal,
+};
 
 // The media fused-kernel path seam (SW-6126, SW-F287): every fused media kernel's switch
 // (`CANDLE_MEDIA_FUSED_KERNELS` over a per-kernel variable) and its fused-vs-reference counters

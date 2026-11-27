@@ -1162,6 +1162,10 @@ pub struct Wan14bEngineOptions {
     /// `topk_ratio` of the key blocks exact per query block, the rest pooled) instead of
     /// FlashAttention. Calls the kernel cannot serve keep FlashAttention / the budgeted path, counted
     /// in `candle_gen::AttentionPathCounts::sol_refusals`. `None`, the default, is off (epic E2).
+    ///
+    /// SW-6132: the same kernel is also one shared, job-level opt-in for every model
+    /// (`candle_gen::set_lossy_attention`, which a product worker sets per job); this engine option
+    /// scopes it to the denoise self-attention and wins over the job switch for those calls.
     pub sol_attention: Option<candle_gen::SolConfig>,
 }
 

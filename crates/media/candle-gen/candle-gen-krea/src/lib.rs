@@ -413,6 +413,10 @@ pub struct KreaEngineOptions {
     /// (comfy-kitchen's INT8 `P·V`) — instead of FlashAttention. Calls the kernel cannot serve keep
     /// FlashAttention / the budgeted path, counted in
     /// `candle_gen::AttentionPathCounts::int8_refusals`. `None`, the default, is off (epic E2).
+    ///
+    /// SW-6132: the same kernel is also one shared, job-level opt-in for every model
+    /// (`candle_gen::set_lossy_attention`, which a product worker sets per job); this engine option
+    /// scopes it to the DiT's single-stream blocks and wins over the job switch for those calls.
     pub int8_attention: Option<candle_gen::fused_attention::PvPrecision>,
 }
 
