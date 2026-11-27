@@ -393,19 +393,18 @@ impl EncoderContract {
                 "directory-backed packed encoder",
                 "single File source",
             )),
-            (Some(actual), Some(expected)) if actual.group_size == expected.group_size => Ok(()),
-            (Some(actual), Some(expected)) => Err(self.mismatch(
-                path,
-                "quantization.group_size",
-                expected.group_size,
-                actual.group_size,
-            )),
-            (Some(actual), None) => Err(self.mismatch(
-                path,
-                "quantization",
-                "dense-only encoder",
-                format!("Q{} group_size {}", actual.bits, actual.group_size),
-            )),
+            // A stored GGML block's group is fixed by its type (SW-7285): the provider's affine
+            // group size constrains only the MLX triple form.
+            (Some(actual), Some(_)) if actual.is_ggml() => Ok(()),
+            (Some(actual), Some(expected)) if actual.group_size() == Some(expected.group_size) => {
+                Ok(())
+            }
+            (Some(actual), Some(expected)) => {
+                Err(self.mismatch(path, "quantization.group_size", expected.group_size, actual))
+            }
+            (Some(actual), None) => {
+                Err(self.mismatch(path, "quantization", "dense-only encoder", actual))
+            }
         }
     }
 
@@ -533,14 +532,24 @@ impl EncoderContract {
                     ),
                 ));
             }
+            // A `{bits, storage: "ggml"}` tier stores every packed matrix as GGML blocks: an
+            // affine triple under that marker is a mixed surface.
+            let Some(group_size) = quant.group_size() else {
+                return Err(self.mismatch(
+                    path,
+                    "packed_storage",
+                    format!("stored GGML block tensor for {base} ({quant})"),
+                    "MLX affine triple",
+                ));
+            };
             let logical_input = weight.shape[1]
                 .checked_mul(32)
                 .and_then(|value| value.checked_div(quant.bits))
                 .ok_or_else(|| {
                     self.mismatch(path, "packed_geometry", "non-overflowing matrix", base)
                 })?;
-            if !logical_input.is_multiple_of(quant.group_size)
-                || scales.shape[1] != logical_input / quant.group_size
+            if !logical_input.is_multiple_of(group_size)
+                || scales.shape[1] != logical_input / group_size
             {
                 return Err(self.mismatch(
                     path,
@@ -548,9 +557,9 @@ impl EncoderContract {
                     format!(
                         "[{}, {}] from bits={} group_size={}",
                         weight.shape[0],
-                        logical_input / quant.group_size,
+                        logical_input / group_size,
                         quant.bits,
-                        quant.group_size
+                        group_size
                     ),
                     format!("scales={:?}, biases={:?}", scales.shape, biases.shape),
                 ));
@@ -746,6 +755,16 @@ impl EncoderContract {
                         format!("stored GGML blocks {base} without authoritative metadata"),
                     )
                 })?;
+                // C3: the marker must declare this storage (`{bits, storage: "ggml"}`); an MLX
+                // affine marker over stored blocks is a mislabelled tier.
+                if !quant.is_ggml() {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_storage",
+                        format!("MLX affine triple for {base} ({quant})"),
+                        "stored GGML blocks",
+                    ));
+                }
                 let bits = weight.stored_ggml_block_bits();
                 if bits != Some(quant.bits) {
                     return Err(self.mismatch(
@@ -755,11 +774,12 @@ impl EncoderContract {
                         format!("{:?} with {bits:?}-bit blocks", weight.shape),
                     ));
                 }
-                let block_elements = if weight.shape[2] == 144 { 256 } else { 32 };
+                let cols = crate::stored_ggml::stored_ggml_header_geometry(weight)
+                    .map(|geometry| geometry.cols);
                 if weight.shape[0] != expected_output {
                     return Err(self.mismatch(path, field, expected_output, weight.shape[0]));
                 }
-                if weight.shape[1].checked_mul(block_elements) != Some(expected_input) {
+                if cols != Some(expected_input) {
                     return Err(self.mismatch(
                         path,
                         "hidden_size",
@@ -770,12 +790,12 @@ impl EncoderContract {
             }
             (None, None) => {
                 if must_be_packed {
-                    return Err(self.mismatch(
-                        path,
-                        "packed_surface",
-                        format!("packed triple for {base}"),
-                        "dense weight",
-                    ));
+                    let expected = if packed_quant.is_some_and(PackedQuantization::is_ggml) {
+                        format!("stored GGML block tensor for {base}")
+                    } else {
+                        format!("packed triple for {base}")
+                    };
+                    return Err(self.mismatch(path, "packed_surface", expected, "dense weight"));
                 }
                 if !dtype_policy.accepts_dense(weight.dtype) {
                     return Err(self.mismatch(
@@ -822,6 +842,24 @@ impl EncoderContract {
                         format!("packed tensor {base} without authoritative metadata"),
                     )
                 })?;
+                if weight.is_stored_ggml_block() {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_components",
+                        format!(
+                            "{base}.weight as a stored GGML block tensor or an MLX affine triple"
+                        ),
+                        "both a stored block and .scales/.biases",
+                    ));
+                }
+                let Some(group_size) = quant.group_size() else {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_storage",
+                        format!("stored GGML block tensor for {base} ({quant})"),
+                        "MLX affine triple",
+                    ));
+                };
                 if weight.dtype != Dtype::U32 {
                     return Err(self.mismatch(
                         path,
@@ -849,7 +887,7 @@ impl EncoderContract {
                             format!("input={expected_input}, bits={}", quant.bits),
                         )
                     })?;
-                if !expected_input.is_multiple_of(quant.group_size)
+                if !expected_input.is_multiple_of(group_size)
                     || !packed_input_bits.is_multiple_of(32)
                 {
                     return Err(self.mismatch(
@@ -857,13 +895,13 @@ impl EncoderContract {
                         "packed_geometry",
                         "group-aligned Q4/Q8 matrix",
                         format!(
-                            "input={expected_input}, bits={}, group_size={}",
-                            quant.bits, quant.group_size
+                            "input={expected_input}, bits={}, group_size={group_size}",
+                            quant.bits
                         ),
                     ));
                 }
                 let expected_weight = vec![expected_output, packed_input_bits / 32];
-                let expected_affine = vec![expected_output, expected_input / quant.group_size];
+                let expected_affine = vec![expected_output, expected_input / group_size];
                 if weight.shape != expected_weight {
                     return Err(self.mismatch(
                         path,

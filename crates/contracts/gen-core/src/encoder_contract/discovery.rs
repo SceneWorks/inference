@@ -31,6 +31,31 @@ pub(super) fn parse_packed_quantization(
             path.display()
         )));
     }
+    match marker.get("storage") {
+        None => {}
+        Some(Value::String(storage)) if storage == crate::stored_ggml::GGML_STORAGE => {
+            // A GGML block's group is fixed by its type: a declared affine group size is a layout
+            // this storage does not have, so refuse it rather than silently ignore it.
+            if marker.contains_key("group_size") {
+                return Err(Error::Unsupported(format!(
+                    "text encoder quantization: {} declares `quantization.storage` \"{}\" together with `quantization.group_size`; stored GGML blocks have no affine group size",
+                    path.display(),
+                    crate::stored_ggml::GGML_STORAGE
+                )));
+            }
+            return Ok(Some(PackedQuantization {
+                bits,
+                storage: PackedStorage::Ggml,
+            }));
+        }
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "text encoder quantization: {} declares unsupported `quantization.storage` {other}; expected \"{}\" or no storage (MLX affine)",
+                path.display(),
+                crate::stored_ggml::GGML_STORAGE
+            )));
+        }
+    }
     let group_size = marker
         .get("group_size")
         .map(|value| {
@@ -52,7 +77,10 @@ pub(super) fn parse_packed_quantization(
             path.display()
         )));
     }
-    Ok(Some(PackedQuantization { bits, group_size }))
+    Ok(Some(PackedQuantization {
+        bits,
+        storage: PackedStorage::MlxAffine { group_size },
+    }))
 }
 
 pub(super) fn source_path(source: &WeightsSource) -> &Path {
@@ -516,25 +544,69 @@ pub(super) fn validate_quantization_evidence(
         .iter()
         .map(|header| header.name.as_str())
         .collect::<BTreeSet<_>>();
-    let has_packed_evidence = headers.iter().any(|header| {
+    let has_affine_evidence = headers.iter().any(|header| {
         if !header.name.ends_with(".weight") {
             return false;
         }
         let base = header.name.strip_suffix(".weight").unwrap_or(&header.name);
-        // A Candle-native GGML tier's stored blocks (SW-7285) are packed evidence too.
         header.dtype == Dtype::U32
-            || header.is_stored_ggml_block()
             || names.contains(format!("{base}.scales").as_str())
             || names.contains(format!("{base}.biases").as_str())
     });
+    // Stored GGML blocks (SW-7285) are classified by the one shared header rule. The first one
+    // whose block type contradicts the declared bits is kept for the refusal.
+    let stored = headers
+        .iter()
+        .filter(|header| header.name.ends_with(".weight"))
+        .filter_map(|header| {
+            crate::stored_ggml::stored_ggml_header_geometry(header).map(|g| (header, g))
+        })
+        .collect::<Vec<_>>();
+    let has_stored_evidence = !stored.is_empty();
+    if has_affine_evidence && has_stored_evidence {
+        return Err(Error::Unsupported(format!(
+            "text encoder quantization mismatch at {}: the exact direct-shard surface mixes MLX affine triples with stored GGML block tensors (e.g. {}); a tier stores its packed matrices in one form",
+            path.display(),
+            stored[0].0.name
+        )));
+    }
+    let has_packed_evidence = has_affine_evidence || has_stored_evidence;
     match (declared, has_packed_evidence) {
-        (Some(quant), true) => Ok(Some(quant)),
+        (Some(quant), true) => {
+            match quant.storage {
+                PackedStorage::MlxAffine { .. } if has_stored_evidence => {
+                    return Err(Error::Unsupported(format!(
+                        "text encoder quantization mismatch at {}: config declares {quant} (MLX affine) but the exact direct-shard surface stores GGML block tensors (e.g. {}); declare `quantization.storage` \"{}\"",
+                        path.display(),
+                        stored[0].0.name,
+                        crate::stored_ggml::GGML_STORAGE
+                    )));
+                }
+                PackedStorage::Ggml if has_affine_evidence => {
+                    return Err(Error::Unsupported(format!(
+                        "text encoder quantization mismatch at {}: config declares {quant} but the exact direct-shard surface stores MLX affine triples",
+                        path.display()
+                    )));
+                }
+                PackedStorage::MlxAffine { .. } | PackedStorage::Ggml => {}
+            }
+            if let Some((header, g)) = stored.iter().find(|(_, g)| g.block.bits() != quant.bits) {
+                return Err(Error::Unsupported(format!(
+                    "text encoder quantization mismatch at {}: config declares {quant} but {} stores {:?} blocks (Q{})",
+                    path.display(),
+                    header.name,
+                    g.block,
+                    g.block.bits()
+                )));
+            }
+            Ok(Some(quant))
+        }
         (Some(quant), false) => Err(Error::Unsupported(format!(
-            "text encoder quantization mismatch at {}: config declares Q{} group_size {} but the exact direct-shard surface is dense",
-            path.display(), quant.bits, quant.group_size
+            "text encoder quantization mismatch at {}: config declares {quant} but the exact direct-shard surface is dense",
+            path.display()
         ))),
         (None, true) => Err(Error::Unsupported(format!(
-            "text encoder quantization mismatch at {}: packed tensor evidence requires authoritative config.json bits/group_size",
+            "text encoder quantization mismatch at {}: packed tensor evidence requires authoritative config.json bits/group_size or bits/storage",
             path.display()
         ))),
         (None, false) => Ok(None),

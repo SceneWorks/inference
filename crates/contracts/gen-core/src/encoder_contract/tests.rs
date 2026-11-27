@@ -1527,7 +1527,7 @@ fn ignored_vision_packing_does_not_determine_the_language_tier() {
         Path::new("fixture"),
         Some(PackedQuantization {
             bits: 4,
-            group_size: 64,
+            storage: PackedStorage::MlxAffine { group_size: 64 },
         }),
     )
     .unwrap_err()
@@ -1551,7 +1551,7 @@ fn stored_ggml_blocks_are_packed_quantization_evidence() {
     assert_eq!(stored(21).stored_ggml_block_bits(), None);
     let declared = PackedQuantization {
         bits: 8,
-        group_size: 64,
+        storage: PackedStorage::Ggml,
     };
     assert_eq!(
         validate_quantization_evidence(&[stored(34)], Path::new("fixture"), Some(declared))
@@ -2148,4 +2148,354 @@ fn selected_encoder_bytes_equal_the_direct_loader_shards_only() {
         text_encoder_source_bytes(&WeightsSource::Dir(temp.path().to_path_buf())).unwrap(),
         direct_bytes
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SW-7285: Candle-native stored GGML encoder tiers.
+// ---------------------------------------------------------------------------------------------
+
+/// The header of one tensor: `(name, dtype, shape)`.
+type FixtureTensor = (String, &'static str, Vec<usize>);
+
+/// [`PACKED_CONTRACT`]'s geometry as a Candle-native GGML tier: every layer projection is ONE U8
+/// `[out, in / 32, block_bytes]` block tensor, norms and the embedding dense F16, and `config.json`
+/// carries `quant` verbatim. `edit` may rewrite the tensor list before it is written.
+fn write_ggml_fixture(
+    root: &Path,
+    quant: Value,
+    block_bytes: usize,
+    edit: impl FnOnce(&mut Vec<FixtureTensor>),
+) {
+    std::fs::create_dir_all(root).unwrap();
+    let mut config = json!({"model_type":"qwen3","hidden_size":64,"intermediate_size":96,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":16,"hidden_act":"silu","attention_dropout":0.0,"rms_norm_eps":0.000001,"rope_theta":1000000,"max_position_embeddings":4096,"attention_bias":false,"tie_word_embeddings":true});
+    if !quant.is_null() {
+        config["quantization"] = quant;
+    }
+    std::fs::write(
+        root.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let mut entries: Vec<FixtureTensor> =
+        vec![("model.embed_tokens.weight".to_owned(), "F16", vec![16, 64])];
+    for layer in 0..2 {
+        let base = format!("model.layers.{layer}");
+        for (name, output, input) in [
+            ("self_attn.q_proj", 64, 64),
+            ("self_attn.k_proj", 32, 64),
+            ("self_attn.v_proj", 32, 64),
+            ("self_attn.o_proj", 64, 64),
+            ("mlp.gate_proj", 96, 64),
+            ("mlp.up_proj", 96, 64),
+            ("mlp.down_proj", 64, 96),
+        ] {
+            entries.push((
+                format!("{base}.{name}.weight"),
+                "U8",
+                vec![output, input / 32, block_bytes],
+            ));
+        }
+        entries.extend([
+            (format!("{base}.self_attn.q_norm.weight"), "F16", vec![32]),
+            (format!("{base}.self_attn.k_norm.weight"), "F16", vec![32]),
+            (format!("{base}.input_layernorm.weight"), "F16", vec![64]),
+            (
+                format!("{base}.post_attention_layernorm.weight"),
+                "F16",
+                vec![64],
+            ),
+        ]);
+    }
+    entries.push(("model.norm.weight".to_owned(), "F16", vec![64]));
+    edit(&mut entries);
+    let mut offset = 0usize;
+    let mut header = serde_json::Map::new();
+    for (name, dtype, shape) in entries {
+        let element_bytes = match dtype {
+            "U8" => 1,
+            "F16" | "BF16" => 2,
+            _ => 4,
+        };
+        let bytes = shape.iter().product::<usize>() * element_bytes;
+        header.insert(
+            name,
+            json!({"dtype":dtype, "shape":shape, "data_offsets":[offset, offset + bytes]}),
+        );
+        offset += bytes;
+    }
+    let encoded = serde_json::to_vec(&header).unwrap();
+    let mut file = Vec::with_capacity(8 + encoded.len() + offset);
+    file.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    file.extend_from_slice(&encoded);
+    file.resize(8 + encoded.len() + offset, 0);
+    std::fs::write(root.join("model.safetensors"), file).unwrap();
+}
+
+fn ggml_marker(bits: usize) -> Value {
+    json!({"bits": bits, "storage": "ggml"})
+}
+
+fn validate_ggml(root: &Path) -> Result<ValidatedEncoderSource> {
+    PACKED_CONTRACT.validate_source(&WeightsSource::Dir(root.to_path_buf()))
+}
+
+fn ggml_error(root: &Path) -> String {
+    validate_ggml(root)
+        .expect_err("malformed stored-GGML encoder must be refused")
+        .to_string()
+}
+
+fn find_tensor<'a>(entries: &'a mut [FixtureTensor], name: &str) -> &'a mut FixtureTensor {
+    entries
+        .iter_mut()
+        .find(|(tensor, _, _)| tensor == name)
+        .unwrap()
+}
+
+/// The SW-7285 defect: a stored-GGML encoder was refused as "dense" at both tiers. Q4_1 / Q4_0
+/// match a declared Q4 and Q8_0 a declared Q8; executable validation, discovery, and the
+/// header-only bits query all admit it, and the discovery surface carries the U8 block bytes as
+/// stored.
+#[test]
+fn stored_ggml_encoder_is_admitted_at_q4_and_q8() {
+    for (bits, block_bytes) in [(4, 20), (4, 18), (8, 34)] {
+        let temp = tempfile::tempdir().unwrap();
+        write_ggml_fixture(temp.path(), ggml_marker(bits), block_bytes, |_| {});
+        let validated = validate_ggml(temp.path()).unwrap();
+        assert_eq!(validated.packed_quant_bits(), Some(bits as i32));
+        assert_eq!(validated.packed_quant_group_size(), None);
+        assert!(validated.packed_quant_is_stored_ggml());
+        assert_eq!(
+            validated
+                .load_time_quant_bits(Some(bits as i32), "fixture")
+                .unwrap(),
+            None,
+            "a matching pre-packed tier needs no load-time conversion"
+        );
+        let source = WeightsSource::Dir(temp.path().to_path_buf());
+        assert_eq!(
+            text_encoder_packed_quant_bits(&source).unwrap(),
+            Some(bits as i32)
+        );
+        let facts = PACKED_CONTRACT
+            .validate_source_for_discovery(&source, &authorized_test_roots(temp.path()))
+            .unwrap();
+        let q = facts
+            .materialized_language_tensor_headers()
+            .iter()
+            .find(|h| h.name == "model.layers.0.self_attn.q_proj.weight")
+            .expect("the stored projection is part of the materialized surface");
+        assert_eq!(q.dtype, Dtype::U8);
+        assert_eq!(q.data_bytes, (64 * 2 * block_bytes) as u64);
+        assert_eq!(
+            facts.source_bytes(),
+            std::fs::metadata(temp.path().join("model.safetensors"))
+                .unwrap()
+                .len()
+        );
+    }
+}
+
+/// A stored embedding is admitted exactly where the provider packs the embedding (FLUX.2 dev).
+#[test]
+fn stored_ggml_embedding_follows_the_provider_packing_contract() {
+    let embed = |entries: &mut Vec<FixtureTensor>| {
+        entries[0] = ("model.embed_tokens.weight".into(), "U8", vec![16, 2, 20]);
+    };
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, embed);
+    let packs_embedding = EncoderContract {
+        packing: Some(EncoderPackingContract {
+            pack_embedding: true,
+            ..PACKED_CONTRACT.packing.unwrap()
+        }),
+        ..PACKED_CONTRACT
+    };
+    packs_embedding
+        .validate_source(&WeightsSource::Dir(temp.path().to_path_buf()))
+        .unwrap();
+    let error = ggml_error(temp.path());
+    assert!(error.contains("field packed_surface"), "{error}");
+    assert!(
+        error.contains("dense weight for model.embed_tokens"),
+        "{error}"
+    );
+
+    // A pack-embedding provider refuses a dense embedding under the GGML marker, naming the form.
+    let dense = tempfile::tempdir().unwrap();
+    write_ggml_fixture(dense.path(), ggml_marker(4), 20, |_| {});
+    let error = packs_embedding
+        .validate_source(&WeightsSource::Dir(dense.path().to_path_buf()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("stored GGML block tensor for model.embed_tokens"),
+        "{error}"
+    );
+}
+
+#[test]
+fn declared_ggml_over_a_dense_surface_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    write_fixture(temp.path(), 8);
+    let path = temp.path().join("config.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["quantization"] = ggml_marker(4);
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let error = CONTRACT
+        .validate_source(&WeightsSource::Dir(temp.path().to_path_buf()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("config declares Q4 stored GGML blocks"),
+        "{error}"
+    );
+    assert!(error.contains("direct-shard surface is dense"), "{error}");
+}
+
+#[test]
+fn stored_block_type_contradicting_the_declared_bits_is_refused() {
+    // Q4_1 blocks under a declared Q8 (caught by the layer-0 evidence anchor) ...
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(8), 20, |_| {});
+    let error = ggml_error(temp.path());
+    assert!(
+        error.contains("config declares Q8 stored GGML blocks"),
+        "{error}"
+    );
+    assert!(error.contains("stores Q4_1 blocks (Q4)"), "{error}");
+
+    // ... and a single Q8_0 block deeper in the loaded window under a declared Q4 (caught by the
+    // full header walk).
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, |entries| {
+        find_tensor(entries, "model.layers.1.mlp.down_proj.weight").2 = vec![64, 3, 34];
+    });
+    let error = ggml_error(temp.path());
+    assert!(error.contains("field packed_dtype"), "{error}");
+    assert!(error.contains("Some(8)-bit blocks"), "{error}");
+}
+
+#[test]
+fn stored_blocks_mixed_with_affine_triples_are_refused() {
+    let triple = |entries: &mut Vec<FixtureTensor>, base: &str| {
+        *find_tensor(entries, &format!("{base}.weight")) =
+            (format!("{base}.weight"), "U32", vec![64, 8]);
+        entries.push((format!("{base}.scales"), "F16", vec![64, 1]));
+        entries.push((format!("{base}.biases"), "F16", vec![64, 1]));
+    };
+    // A triple in the evidence anchor (layer 0) is refused as a mixed surface.
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, |entries| {
+        triple(entries, "model.layers.0.self_attn.q_proj")
+    });
+    let error = ggml_error(temp.path());
+    assert!(
+        error.contains("mixes MLX affine triples with stored GGML"),
+        "{error}"
+    );
+
+    // A triple outside the anchor is refused by the full header walk.
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, |entries| {
+        triple(entries, "model.layers.1.self_attn.q_proj")
+    });
+    let error = ggml_error(temp.path());
+    assert!(error.contains("field packed_storage"), "{error}");
+    assert!(error.contains("got MLX affine triple"), "{error}");
+
+    // One projection carrying both a stored block and affine siblings.
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, |entries| {
+        for leaf in ["scales", "biases"] {
+            entries.push((
+                format!("model.layers.1.self_attn.q_proj.{leaf}"),
+                "F16",
+                vec![64, 1],
+            ));
+        }
+    });
+    let error = ggml_error(temp.path());
+    assert!(
+        error.contains("both a stored block and .scales/.biases"),
+        "{error}"
+    );
+}
+
+#[test]
+fn affine_marker_over_stored_blocks_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(
+        temp.path(),
+        json!({"bits": 4, "group_size": 64}),
+        20,
+        |_| {},
+    );
+    let error = ggml_error(temp.path());
+    assert!(
+        error.contains("config declares Q4 group_size 64 (MLX affine)"),
+        "{error}"
+    );
+    assert!(error.contains("stores GGML block tensors"), "{error}");
+
+    // No marker at all: stored blocks are packed evidence that requires one.
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), Value::Null, 20, |_| {});
+    let error = ggml_error(temp.path());
+    assert!(
+        error.contains("requires authoritative config.json"),
+        "{error}"
+    );
+}
+
+#[test]
+fn malformed_ggml_markers_are_refused() {
+    for (marker, expected) in [
+        (
+            json!({"bits": 4, "storage": "ggml", "group_size": 64}),
+            "stored GGML blocks have no affine group size",
+        ),
+        (
+            json!({"bits": 4, "storage": "gguf"}),
+            "unsupported `quantization.storage`",
+        ),
+        (
+            json!({"bits": 4, "storage": 1}),
+            "unsupported `quantization.storage`",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        write_ggml_fixture(temp.path(), marker, 20, |_| {});
+        let error = ggml_error(temp.path());
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn stored_block_geometry_must_match_the_contract_matrix() {
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), ggml_marker(4), 20, |entries| {
+        find_tensor(entries, "model.layers.1.self_attn.k_proj.weight").2 = vec![32, 3, 20];
+    });
+    let error = ggml_error(temp.path());
+    assert!(error.contains("field hidden_size"), "{error}");
+    assert!(error.contains("got [32, 3, 20] stored blocks"), "{error}");
+}
+
+/// Unloaded decoder-tail layers keep their exemption: a stored tail is never validated.
+#[test]
+fn stored_blocks_in_an_unloaded_decoder_tail_are_not_validated() {
+    let contract = EncoderContract {
+        loaded_hidden_layers: 1,
+        ..PACKED_CONTRACT
+    };
+    let headers = vec![SafetensorsTensorHeader {
+        name: "model.layers.1.self_attn.q_proj.weight".into(),
+        dtype: Dtype::U8,
+        shape: vec![64, 2, 34],
+        data_bytes: 64 * 2 * 34,
+    }];
+    contract
+        .validate_all_packed_triples(&headers, Path::new("fixture"), None, &BTreeSet::new())
+        .unwrap();
 }

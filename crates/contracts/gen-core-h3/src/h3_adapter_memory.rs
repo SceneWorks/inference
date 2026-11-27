@@ -207,9 +207,24 @@ pub fn targets_from_headers(
             let h = by_name
                 .get(format!("{path}.weight").as_str())
                 .ok_or_else(|| invalid(format!("missing selected target {path}")))?;
-            let (output, stored_input) = matrix(h)?;
             let scales = by_name.get(format!("{path}.scales").as_str());
-            let (input, packed) = if let Some(scales) = scales {
+            // A Candle-native GGML tier (SW-7285) stores the target as ONE U8 block tensor
+            // `[out, in / 32, block_bytes]`: a packed base whose logical geometry is decoded by
+            // gen-core's shared header rule.
+            let stored = gen_core::stored_ggml::stored_ggml_header_geometry(h)
+                .filter(|_| h.shape.len() == 3);
+            let (output, stored_input) = match stored {
+                Some(g) => (g.rows as u64, g.cols as u64),
+                None => matrix(h)?,
+            };
+            let (input, packed) = if stored.is_some() {
+                if scales.is_some() || by_name.contains_key(format!("{path}.biases").as_str()) {
+                    return Err(invalid(format!(
+                        "{path}: stored GGML block target also carries affine operands"
+                    )));
+                }
+                (stored_input, true)
+            } else if let Some(scales) = scales {
                 let (n, groups) = matrix(scales)?;
                 let input = mul(groups, 64)?;
                 let bits = mul(stored_input, 32)?;
@@ -1169,6 +1184,40 @@ mod tests {
             assert_eq!(columns as u64 * 32 / targets[0].input, expected);
             assert!(targets[0].packed);
         }
+    }
+
+    /// SW-7285: a Candle-native GGML tier's target is one U8 `[out, in / 32, block_bytes]` block
+    /// tensor: a packed base whose logical shape is decoded from the header, not a refused
+    /// non-matrix. A stored block carrying affine operands too is refused.
+    #[test]
+    fn stored_ggml_target_is_a_packed_base_of_its_decoded_shape() {
+        let paths = ["transformer_blocks.0.attn.to_q".to_string()];
+        for block_bytes in [20, 34] {
+            let headers = [h(
+                "transformer_blocks.0.attn.to_q.weight",
+                Dtype::U8,
+                &[12, 4, block_bytes],
+            )];
+            let targets = targets_from_headers(&headers, &[], &paths, 2).unwrap();
+            assert_eq!((targets[0].output, targets[0].input), (12, 128));
+            assert!(targets[0].packed);
+        }
+        let headers = [
+            h(
+                "transformer_blocks.0.attn.to_q.weight",
+                Dtype::U8,
+                &[12, 4, 20],
+            ),
+            h(
+                "transformer_blocks.0.attn.to_q.scales",
+                Dtype::BF16,
+                &[12, 2],
+            ),
+        ];
+        let error = targets_from_headers(&headers, &[], &paths, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("also carries affine operands"), "{error}");
     }
 
     #[test]

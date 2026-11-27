@@ -393,10 +393,10 @@ pub fn mlx_affine_in_dim(
 /// (its per-block `min` is the MLX `bias`), so a Candle-native media tier persists exactly the
 /// blocks that load-time repack would build (`candle-gen-minimax-h3`'s GGML tier).
 pub const STORED_GGML: [GgmlDType; 4] = [
-    GgmlDType::Q4_0,
-    GgmlDType::Q4_1,
-    GgmlDType::Q8_0,
-    GgmlDType::Q4K,
+    stored_block_dtype(gen_core::stored_ggml::STORED_GGML_BLOCKS[0]),
+    stored_block_dtype(gen_core::stored_ggml::STORED_GGML_BLOCKS[1]),
+    stored_block_dtype(gen_core::stored_ggml::STORED_GGML_BLOCKS[2]),
+    stored_block_dtype(gen_core::stored_ggml::STORED_GGML_BLOCKS[3]),
 ];
 
 /// The GGML block type and logical `(rows, cols)` of a **stored GGML block tensor** — a prepared
@@ -408,18 +408,24 @@ pub const STORED_GGML: [GgmlDType; 4] = [
 /// [`STORED_GGML`] whose block size is `block_bytes`. `None` for any other tensor. The loader,
 /// load admission, the weight reader and the NVFP4 gate classify a tensor by this one rule, from
 /// its dtype and shape alone.
+///
+/// The rule itself lives tensor-free in [`gen_core::stored_ggml::stored_ggml_geometry`] (SW-7285),
+/// so the header-only contracts (text-encoder admission, memory evidence) classify exactly the
+/// tensors this loader builds; this is its `GgmlDType` projection.
 pub fn ggml_block_storage(is_u8: bool, shape: &[usize]) -> Option<(GgmlDType, usize, usize)> {
-    let [lead @ .., rows, blocks, block_bytes] = shape else {
-        return None;
-    };
-    if !is_u8 {
-        return None;
+    let g = gen_core::stored_ggml::stored_ggml_geometry(is_u8, shape)?;
+    Some((stored_block_dtype(g.block), g.rows, g.cols))
+}
+
+/// The `GgmlDType` of a [`gen_core::stored_ggml::StoredGgmlBlock`].
+pub const fn stored_block_dtype(block: gen_core::stored_ggml::StoredGgmlBlock) -> GgmlDType {
+    use gen_core::stored_ggml::StoredGgmlBlock as B;
+    match block {
+        B::Q4_0 => GgmlDType::Q4_0,
+        B::Q4_1 => GgmlDType::Q4_1,
+        B::Q8_0 => GgmlDType::Q8_0,
+        B::Q4K => GgmlDType::Q4K,
     }
-    let dtype = STORED_GGML
-        .into_iter()
-        .find(|d| d.type_size() == *block_bytes)?;
-    let rows = lead.iter().try_fold(*rows, |n, &d| n.checked_mul(d))?;
-    Some((dtype, rows, blocks.checked_mul(dtype.block_size())?))
 }
 
 /// Whether `t` is a stored GGML block tensor ([`ggml_block_storage`]).
@@ -1760,6 +1766,12 @@ mod tests {
             Some((GgmlDType::Q4_1, 6, 128))
         );
         assert_eq!(ggml_block_storage(false, &[8, 2, 34]), None);
+        // The tensor-free gen-core rule's block tables are candle's own (SW-7285).
+        for block in gen_core::stored_ggml::STORED_GGML_BLOCKS {
+            let dtype = stored_block_dtype(block);
+            assert_eq!(dtype.type_size(), block.block_bytes(), "{dtype:?}");
+            assert_eq!(dtype.block_size(), block.block_size(), "{dtype:?}");
+        }
 
         assert_eq!(
             mlx_affine_q8_in_dim(true, (16, 32), (16, 2), (16, 2), 64),

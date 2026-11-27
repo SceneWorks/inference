@@ -1969,6 +1969,33 @@ mod tests {
         );
     }
 
+    /// SW-7285: a Candle-native GGML tier's stored block tensor (embedding or projection) is
+    /// priced at its stored bytes on every tier, not cast to F32 like an ordinary integer tensor.
+    #[test]
+    fn stored_ggml_blocks_are_priced_at_their_stored_bytes() {
+        use gen_core::weightsmeta::Dtype;
+        let header = |name: &str, dtype, shape: Vec<usize>, data_bytes| {
+            gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.into(),
+                dtype,
+                shape,
+                data_bytes,
+            }
+        };
+        let tensors = [
+            header("model.embed_tokens.weight", Dtype::U8, vec![16, 2, 20], 640),
+            header("model.layers.0.q.weight", Dtype::U8, vec![8, 4, 34], 1_088),
+            header("model.layers.0.norm.weight", Dtype::BF16, vec![64], 128),
+        ];
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            assert_eq!(
+                f32_or_packed_tensor_headers(&tensors, quant, "test", true, false, "test").unwrap(),
+                640 + 1_088 + 64 * 4,
+                "{quant:?}"
+            );
+        }
+    }
+
     #[test]
     fn imported_file_contract_and_loader_share_the_full_typed_field_matrix() {
         let tmp = tempfile::tempdir().unwrap();
