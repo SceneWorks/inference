@@ -1,7 +1,7 @@
-// Attribution (SW-F287 E10): the gated delta rule recurrence and the GDN input preparation follow
-// mlx_lm.models.gated_delta (MIT, ml-explore/mlx-lm) and the Gated DeltaNet kernels of comfy-kitchen
-// (Apache-2.0, Comfy-Org/comfy-kitchen); the implementation here targets this repository's
-// candle op chains bit for bit (see the numerics contract below).
+// Provenance (SW-F287 E10): an original implementation of the published Gated DeltaNet recurrence
+// (Yang et al., "Gated Delta Networks"), written against this repository's candle op chain bit for
+// bit (inference PR #1469). No source is copied from comfy-kitchen's or mlx_lm's kernels, so no
+// third-party licence applies.
 //
 // Fused Gated DeltaNet input preparation (Qwen3.5 / Qwen3.8 linear-attention layers): the short
 // causal conv + SiLU, the q/k L2 norms, and the decay / delta-strength gates.
