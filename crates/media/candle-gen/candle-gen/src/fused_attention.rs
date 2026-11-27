@@ -613,7 +613,9 @@ pub fn int8_device(device: &candle_core::Device) -> Int8Device {
 ///   it explicitly).
 ///
 /// Head dims above 128 are never adapted: the kernels have no wider template, and padding cannot
-/// shrink a head.
+/// shrink a head. Q, K and V must share the head dim to be padded (each kernel has one width for
+/// all three); a call whose value width differs keeps the materialized path. One call's plan is
+/// [`lossy_call_adapt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LossyOperandAdapt {
     /// The f32 operands run at bf16 (the output is cast back to f32).
@@ -665,19 +667,63 @@ fn adapted_operand(op: FlashOperand<'_>, adapt: LossyOperandAdapt) -> (DType, Ve
     (dtype, dims)
 }
 
-/// The adaptation `kernel` (INT8 or Sol-Attn) applies to a call whose query is `q` (the identity
-/// for every other kernel).
-fn lossy_adapt_for(kernel: AttentionKernel, q: &Tensor) -> LossyOperandAdapt {
-    let head_dim = q.dims().last().copied().unwrap_or(0);
-    match kernel {
-        AttentionKernel::Int8 => int8_operand_adapt(q.dtype(), head_dim),
-        AttentionKernel::Sol => sol_operand_adapt(q.dtype(), head_dim),
-        _ => LossyOperandAdapt::default(),
+/// The adaptation `kernel` (INT8 or Sol-Attn) applies to one call's `q`, `k` and `v`: the single
+/// plan both its eligibility rule ([`int8_eligibility`] / [`sol_eligibility`]) and its launch
+/// (`run_adapted`) read, so the shapes the rule judges are exactly the shapes the kernel gets.
+/// Padding needs one head width shared by Q, K and V (each kernel has one width for all three;
+/// different widths keep the original shapes, which the rule then refuses as `head_dim`); the
+/// cast needs all three at f32. The identity for every other kernel. Pure.
+pub fn lossy_call_adapt(
+    kernel: AttentionKernel,
+    q: FlashOperand<'_>,
+    k: FlashOperand<'_>,
+    v: FlashOperand<'_>,
+) -> LossyOperandAdapt {
+    let width = |o: FlashOperand<'_>| o.dims.last().copied().unwrap_or(0);
+    let head_dim = width(q);
+    let base = match kernel {
+        AttentionKernel::Int8 => int8_operand_adapt(q.dtype, head_dim),
+        AttentionKernel::Sol => sol_operand_adapt(q.dtype, head_dim),
+        _ => return LossyOperandAdapt::default(),
+    };
+    let one_width = width(k) == head_dim && width(v) == head_dim;
+    let all_f32 = [q.dtype, k.dtype, v.dtype] == [DType::F32; 3];
+    LossyOperandAdapt {
+        cast_f32: base.cast_f32 && all_f32,
+        pad_head_dim: base.pad_head_dim.filter(|_| one_width),
     }
 }
 
+/// [`lossy_call_adapt`] for real tensors.
+fn lossy_adapt_for(
+    kernel: AttentionKernel,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> LossyOperandAdapt {
+    lossy_call_adapt(
+        kernel,
+        FlashOperand::of(q),
+        FlashOperand::of(k),
+        FlashOperand::of(v),
+    )
+}
+
+/// The head width Q, K and V do not share, if any (`k`'s, else `v`'s): a lossy kernel has one
+/// width for all three, so such a call keeps the materialized path (which multiplies the
+/// probabilities into any value width), refused as `head_dim`.
+fn unequal_head_width(
+    q: FlashOperand<'_>,
+    k: FlashOperand<'_>,
+    v: FlashOperand<'_>,
+) -> Option<usize> {
+    let width = |o: FlashOperand<'_>| o.dims.last().copied().unwrap_or(0);
+    let d = width(q);
+    [width(k), width(v)].into_iter().find(|&w| w != d)
+}
+
 /// The pure INT8 eligibility rule (the envelope of `candle_quant_kernels::sage_attention`), on the
-/// operands as [`int8_operand_adapt`] presents them to the kernel.
+/// operands as [`lossy_call_adapt`] presents them to the kernel (the plan the launch uses).
 pub fn int8_eligibility(
     compiled: bool,
     device: Int8Device,
@@ -708,7 +754,10 @@ pub fn int8_eligibility(
     if k.dtype != q.dtype || v.dtype != q.dtype {
         return Err(Int8Refusal::MixedDtypeOrDevice);
     }
-    let adapt = int8_operand_adapt(q.dtype, q.dims.last().copied().unwrap_or(0));
+    if let Some(width) = unequal_head_width(q, k, v) {
+        return Err(Int8Refusal::HeadDim(width));
+    }
+    let adapt = lossy_call_adapt(AttentionKernel::Int8, q, k, v);
     let ((qt, qd), (kt, kd), (vt, vd)) = (
         adapted_operand(q, adapt),
         adapted_operand(k, adapt),
@@ -851,7 +900,7 @@ pub enum SolRouteRefusal {
 }
 
 /// The pure Sol-Attn eligibility rule (the envelope of `candle_quant_kernels::sol_attention`), on
-/// the operands as [`sol_operand_adapt`] presents them to the kernel.
+/// the operands as [`lossy_call_adapt`] presents them to the kernel (the plan the launch uses).
 #[allow(clippy::too_many_arguments)]
 pub fn sol_eligibility(
     compiled: bool,
@@ -887,7 +936,10 @@ pub fn sol_eligibility(
     if k.dtype != q.dtype || v.dtype != q.dtype {
         return Err(SolRouteRefusal::MixedDtypeOrDevice);
     }
-    let adapt = sol_operand_adapt(q.dtype, q.dims.last().copied().unwrap_or(0));
+    if let Some(width) = unequal_head_width(q, k, v) {
+        return Err(SolRouteRefusal::HeadDim(width));
+    }
+    let adapt = lossy_call_adapt(AttentionKernel::Sol, q, k, v);
     let ((qt, qd), (kt, kd), (vt, vd)) = (
         adapted_operand(q, adapt),
         adapted_operand(k, adapt),
@@ -1431,10 +1483,14 @@ pub(crate) fn route_ready(
 }
 
 /// Count one routed call: its path, the operand adaptation a lossy kernel applies to it
-/// ([`LossyOperandAdapt`]), and its opt-in refusals if any. `q` is the call's query.
-pub(crate) fn record_route(kernel: AttentionKernel, refusals: OptInRefusals, q: &Tensor) {
+/// ([`lossy_call_adapt`]), and its opt-in refusals if any.
+pub(crate) fn record_route(
+    kernel: AttentionKernel,
+    refusals: OptInRefusals,
+    (q, k, v): (&Tensor, &Tensor, &Tensor),
+) {
     record_attention_path(kernel);
-    record_lossy_adapt(lossy_adapt_for(kernel, q));
+    record_lossy_adapt(lossy_adapt_for(kernel, q, k, v));
     if let Some(refusal) = refusals.int8 {
         record_int8_refusal(refusal);
     }
@@ -1454,7 +1510,7 @@ pub(crate) fn take_fused(
     mask: Option<&Tensor>,
 ) -> Option<FusedKernel> {
     let (kernel, refusals, requested) = route_ready(q, k, v, mask);
-    record_route(kernel, refusals, q);
+    record_route(kernel, refusals, (q, k, v));
     // `GradTracked` is only reachable outside a materialized (training) scope: the gate refuses
     // `Materialized` first.
     if kernel == AttentionKernel::Budgeted(FlashRefusal::GradTracked)
@@ -1478,12 +1534,12 @@ pub(crate) fn fused_bhsd(
         FusedKernel::Flash => flash_bhsd(q, k, v, scale),
         FusedKernel::Int8(config) => {
             capture_int8_call(q, k, v, scale);
-            let adapt = lossy_adapt_for(AttentionKernel::Int8, q);
+            let adapt = lossy_adapt_for(AttentionKernel::Int8, q, k, v);
             run_adapted(adapt, q, k, v, |q, k, v| int8_bhsd(q, k, v, scale, config))
         }
         FusedKernel::Sol(config) => {
             capture_int8_call(q, k, v, scale);
-            let adapt = lossy_adapt_for(AttentionKernel::Sol, q);
+            let adapt = lossy_adapt_for(AttentionKernel::Sol, q, k, v);
             run_adapted(adapt, q, k, v, |q, k, v| sol_bhsd(q, k, v, scale, &config))
         }
     }
@@ -1506,6 +1562,13 @@ fn run_adapted(
     let d = q.dim(candle_core::D::Minus1)?;
     let cast = adapt.cast_f32 && q.dtype() == DType::F32;
     let prep = |t: &Tensor| -> candle_core::Result<Tensor> {
+        // `lossy_call_adapt` pads only when Q, K and V share one width; anything else here is a
+        // routing bug, never a silent mis-shape.
+        if adapt.pad_head_dim.is_some() && t.dim(candle_core::D::Minus1)? != d {
+            candle_core::bail!(
+                "lossy attention: a padded call needs one head width for q, k and v"
+            );
+        }
         let t = if cast {
             t.to_dtype(DType::BF16)?
         } else {
@@ -3994,7 +4057,7 @@ mod tests {
         // Counted like a scoped call: one path, one refusal per kernel.
         let before = attention_path_counts();
         let (kernel, refusals, _) = route_ready(&q, &k, &v, None);
-        record_route(kernel, refusals, &q);
+        record_route(kernel, refusals, (&q, &k, &v));
         let delta = attention_path_counts().since(&before);
         assert_eq!(delta.total(), 1, "{delta:?}");
         assert_eq!(delta.int8_refusals.total(), 1, "{delta:?}");
@@ -4036,16 +4099,91 @@ mod tests {
         // Only the lossy kernels adapt; flash / budgeted calls are never touched.
         let cpu = candle_core::Device::Cpu;
         let q = Tensor::zeros((1, 2, 8, 120), DType::F32, &cpu).unwrap();
+        let call = |kernel| lossy_adapt_for(kernel, &q, &q, &q);
+        assert_eq!(call(AttentionKernel::Int8), adapt(true, Some(128)));
+        assert_eq!(call(AttentionKernel::Sol), adapt(true, Some(128)));
+        assert!(call(AttentionKernel::Flash).is_identity());
+        assert!(call(AttentionKernel::Budgeted(FlashRefusal::Masked)).is_identity());
+    }
+
+    /// PR #1530 review: a call whose value width differs from Q/K (Q/K `[1,1,64,120]`, V
+    /// `[1,1,64,64]`) is not paddable — each kernel has one width for all three — so both lossy
+    /// rules refuse it as `head_dim` and it keeps the materialized path (which takes any value
+    /// width), and the shared plan pads nothing. Equal 120-wide operands still pad to 128, and the
+    /// f32 cast is unaffected by the width rule.
+    #[test]
+    fn an_unequal_value_width_keeps_the_fallback_and_equal_widths_still_pad() {
+        let sm120 = Int8Device::Cuda(Some(120));
+        let sol_cfg = SolConfig::top_k(0.25);
+        static QK: [usize; 4] = [1, 1, 64, 120];
+        static QK_ST: [usize; 4] = [64 * 120, 64 * 120, 120, 1];
+        static V64: [usize; 4] = [1, 1, 64, 64];
+        static V64_ST: [usize; 4] = [64 * 64, 64 * 64, 64, 1];
+        static W128: [usize; 4] = [1, 1, 64, 128];
+        static W128_ST: [usize; 4] = [64 * 128, 64 * 128, 128, 1];
+        let op = |dtype, dims: &'static [usize; 4], strides: &'static [usize]| FlashOperand {
+            dtype,
+            dims,
+            strides,
+        };
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let (qk, v64, w128) = (
+                op(dtype, &QK, &QK_ST),
+                op(dtype, &V64, &V64_ST),
+                op(dtype, &W128, &W128_ST),
+            );
+            // The reviewer's case: Q/K 120 wide, V 64 wide.
+            assert_eq!(
+                int8_eligibility(true, sm120, true, qk, qk, v64, false),
+                Err(Int8Refusal::HeadDim(64)),
+                "{dtype:?}"
+            );
+            assert_eq!(
+                sol_eligibility(true, sm120, true, qk, qk, v64, false, &sol_cfg),
+                Err(SolRouteRefusal::HeadDim(64)),
+                "{dtype:?}"
+            );
+            for kernel in [AttentionKernel::Int8, AttentionKernel::Sol] {
+                assert_eq!(lossy_call_adapt(kernel, qk, qk, v64).pad_head_dim, None);
+            }
+            // A natively served Q/K width with a narrower V, and a narrower K: refused too.
+            assert_eq!(
+                int8_eligibility(true, sm120, true, w128, w128, v64, false),
+                Err(Int8Refusal::HeadDim(64))
+            );
+            assert_eq!(
+                int8_eligibility(true, sm120, true, qk, v64, qk, false),
+                Err(Int8Refusal::HeadDim(64))
+            );
+            // Equal 120-wide operands: both kernels take the call, padded to 128.
+            assert_eq!(
+                int8_eligibility(true, sm120, true, qk, qk, qk, false),
+                Ok(())
+            );
+            assert_eq!(
+                sol_eligibility(true, sm120, true, qk, qk, qk, false, &sol_cfg),
+                Ok(())
+            );
+            for kernel in [AttentionKernel::Int8, AttentionKernel::Sol] {
+                let plan = lossy_call_adapt(kernel, qk, qk, qk);
+                assert_eq!(plan.pad_head_dim, Some(128), "{kernel:?} {dtype:?}");
+                // The f32 cast follows the dtype alone.
+                assert_eq!(plan.cast_f32, dtype == DType::F32, "{kernel:?} {dtype:?}");
+                assert_eq!(
+                    lossy_call_adapt(kernel, qk, qk, v64).cast_f32,
+                    dtype == DType::F32
+                );
+            }
+        }
+        // The same plan drives the launch: real tensors of unequal widths pad nothing.
+        let cpu = candle_core::Device::Cpu;
+        let q = Tensor::zeros((1, 1, 64, 120), DType::BF16, &cpu).unwrap();
+        let v = Tensor::zeros((1, 1, 64, 64), DType::BF16, &cpu).unwrap();
+        assert!(lossy_adapt_for(AttentionKernel::Int8, &q, &q, &v).is_identity());
         assert_eq!(
-            lossy_adapt_for(AttentionKernel::Int8, &q),
-            adapt(true, Some(128))
+            lossy_adapt_for(AttentionKernel::Sol, &q, &q, &q).pad_head_dim,
+            Some(128)
         );
-        assert_eq!(
-            lossy_adapt_for(AttentionKernel::Sol, &q),
-            adapt(true, Some(128))
-        );
-        assert!(lossy_adapt_for(AttentionKernel::Flash, &q).is_identity());
-        assert!(lossy_adapt_for(AttentionKernel::Budgeted(FlashRefusal::Masked), &q).is_identity());
     }
 
     /// The adapted INT8 / Sol-Attn calls are counted by adaptation, beside their path.
@@ -4055,12 +4193,21 @@ mod tests {
         let f32_narrow = Tensor::zeros((1, 2, 8, 64), DType::F32, &cpu).unwrap();
         let bf16_wide = Tensor::zeros((1, 2, 8, 128), DType::BF16, &cpu).unwrap();
         let before = attention_path_counts();
-        record_route(AttentionKernel::Sol, OptInRefusals::default(), &f32_narrow);
-        record_route(AttentionKernel::Int8, OptInRefusals::default(), &bf16_wide);
+        let call = |t| (t, t, t);
+        record_route(
+            AttentionKernel::Sol,
+            OptInRefusals::default(),
+            call(&f32_narrow),
+        );
+        record_route(
+            AttentionKernel::Int8,
+            OptInRefusals::default(),
+            call(&bf16_wide),
+        );
         record_route(
             AttentionKernel::Flash,
             OptInRefusals::default(),
-            &f32_narrow,
+            call(&f32_narrow),
         );
         let delta = attention_path_counts().since(&before);
         // Paths are shared with concurrent tests (>=); only these calls adapt operands on CPU.

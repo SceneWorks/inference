@@ -435,7 +435,7 @@ pub fn sdpa_planned_bhsd_key_prefix(
         return sdpa_planned_bhsd(q, k, v, scale, Some(mask), softmax, plan);
     };
     crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
-    record_route(route, refusals, q);
+    record_route(route, refusals, (q, k, v));
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
     }
