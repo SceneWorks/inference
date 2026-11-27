@@ -14,6 +14,7 @@
 //! ```text
 //! (vcvars) cargo run --release -p candle-gen --features cuda --example fused_kernels_bench
 //! (vcvars) cargo run --release -p candle-gen --features cuda --example fused_kernels_bench -- act_quant
+//! (vcvars) cargo run --release -p candle-gen --features cuda,flash-attn --example fused_kernels_bench -- int8_attention
 //! ```
 //!
 //! The optional arguments name the suites to run (all by default). `FUSED_BENCH_ITERS` /
@@ -24,7 +25,9 @@
 //! Add one module under `examples/fused_kernels_bench/` exposing
 //! `pub fn rows(bench: &Bench) -> Result<Vec<Row>>` (build inputs once, then one
 //! [`Bench::compare`] per shape with a reference closure and a fused closure), and one line in
-//! [`SUITES`]. The harness owns timing, memory, the device label and the table.
+//! [`SUITES`]. The harness owns timing, memory, the device label and the table. A kernel whose path
+//! telemetry is not the media fused-path counters (the attention kernels) uses
+//! [`Bench::compare_with`] with its own counter snapshot and window verifier.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -39,9 +42,16 @@ mod harness;
 #[path = "fused_kernels_bench/act_quant.rs"]
 mod act_quant;
 
+#[cfg(feature = "cuda")]
+#[path = "fused_kernels_bench/int8_attention.rs"]
+mod int8_attention;
+
 /// Every suite: `(name, rows)`. One line per kernel module.
 #[cfg(feature = "cuda")]
-const SUITES: &[(&str, harness::Suite)] = &[("act_quant", act_quant::rows)];
+const SUITES: &[(&str, harness::Suite)] = &[
+    ("act_quant", act_quant::rows),
+    ("int8_attention", int8_attention::rows),
+];
 
 #[cfg(feature = "cuda")]
 fn main() -> candle_gen::candle_core::Result<()> {

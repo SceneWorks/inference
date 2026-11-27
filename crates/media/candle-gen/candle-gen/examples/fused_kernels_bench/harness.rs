@@ -100,21 +100,57 @@ impl Bench {
         &self,
         kernel: &str,
         shape: &str,
+        reference: impl FnMut() -> Result<()>,
+        fused: impl FnMut() -> Result<()>,
+    ) -> Result<Row> {
+        self.compare_with(
+            kernel,
+            shape,
+            path_totals,
+            |column, before, after| {
+                if column == Column::Reference {
+                    return Ok(());
+                }
+                let (fused_calls, reference_calls) = (after.0 - before.0, after.1 - before.1);
+                if fused_calls == 0 || reference_calls != 0 {
+                    return Err(format!(
+                        "the fused column did not run only the fused kernel                          ({fused_calls} fused, {reference_calls} reference calls): {:?}",
+                        candle_gen::fused_path::fused_path_counts()
+                    ));
+                }
+                Ok(())
+            },
+            reference,
+            fused,
+        )
+    }
+
+    /// [`Bench::compare`] for a kernel whose path telemetry is not the media fused-path counters
+    /// (the attention kernels count in `candle_gen::fused_attention::AttentionPathCounts`).
+    ///
+    /// `snapshot` reads the kernel's counters; `verify(column, before, after)` checks each
+    /// measured window (warm-up included) and returns why it did not run only the intended path.
+    /// A refusal fails the row with that reason, so a fallback is never published as a timing.
+    pub fn compare_with<S>(
+        &self,
+        kernel: &str,
+        shape: &str,
+        snapshot: impl Fn() -> S,
+        verify: impl Fn(Column, &S, &S) -> std::result::Result<(), String>,
         mut reference: impl FnMut() -> Result<()>,
         mut fused: impl FnMut() -> Result<()>,
     ) -> Result<Row> {
-        let reference = self.measure(&mut reference)?;
-        let before = path_totals();
-        let fused = self.measure(&mut fused)?;
-        let after = path_totals();
-        let (fused_calls, reference_calls) = (after.0 - before.0, after.1 - before.1);
-        if fused_calls == 0 || reference_calls != 0 {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "{kernel} {shape}: the fused column did not run only the fused kernel \
-                 ({fused_calls} fused, {reference_calls} reference calls): {:?}",
-                candle_gen::fused_path::fused_path_counts()
-            )));
-        }
+        let window = |column: Column, f: &mut dyn FnMut() -> Result<()>| -> Result<Measure> {
+            let before = snapshot();
+            let measure = self.measure(f)?;
+            let after = snapshot();
+            verify(column, &before, &after).map_err(|why| {
+                candle_gen::candle_core::Error::Msg(format!("{kernel} {shape} {column:?}: {why}"))
+            })?;
+            Ok(measure)
+        };
+        let reference = window(Column::Reference, &mut reference)?;
+        let fused = window(Column::Fused, &mut fused)?;
         Ok(Row {
             kernel: kernel.to_string(),
             shape: shape.to_string(),
@@ -122,6 +158,13 @@ impl Bench {
             fused,
         })
     }
+}
+
+/// The column of a row a [`Bench::compare_with`] verifier is checking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Reference,
+    Fused,
 }
 
 /// Process-wide (fused, reference) call totals over every media fused-path kernel.
