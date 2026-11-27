@@ -9,7 +9,8 @@
 //! `fused_rope_gpu` and `rope::tests::cpu_rope_i_equals_the_shared_interleaved_chain`). The two GPU
 //! results therefore differ by at most one rounding of one product: in f32 `|Δ| ≤ 2⁻²³·(|a·c| +
 //! |b·s|)` per element (asserted with a 2x margin), max rel err to the operand scale far below the
-//! E2 1e-5; in bf16 / f16, after the single rounding to the output dtype, at most one output ulp.
+//! E2 1e-5; in bf16 / f16 that f32 bound plus at most one output ulp (the single rounding to the
+//! output dtype can straddle a boundary; near a cancellation the f32 term dominates).
 //! The test prints the mismatch count and the worst errors it observed.
 //!
 //! `#[ignore]`d CUDA compute (registered in `scripts/ci/test_suites.json` for the dispatch-only
@@ -39,14 +40,19 @@ fn host(t: &Tensor) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
-/// One output ulp of `v` in `dtype`.
+/// One output ulp of `v` in `dtype` (subnormals: the fixed spacing below the smallest normal).
 fn ulp(v: f32, dtype: DType) -> f32 {
-    let mantissa = match dtype {
-        DType::BF16 => 7,
-        DType::F16 => 10,
-        _ => 23,
+    let (mantissa, min_exp) = match dtype {
+        DType::BF16 => (7, -126),
+        DType::F16 => (10, -14),
+        _ => (23, -126),
     };
-    let e = v.abs().max(f32::MIN_POSITIVE).log2().floor();
+    let e = v
+        .abs()
+        .max(f32::MIN_POSITIVE)
+        .log2()
+        .floor()
+        .max(min_exp as f32);
     2f32.powf(e - mantissa as f32)
 }
 
@@ -98,11 +104,19 @@ fn apply_interleaved_rope_is_within_one_product_rounding_of_rope_i() -> Result<(
                 let (bi, si) = (row / (h * s), row % s);
                 let t = (if per_batch { bi * s } else { 0 } + si) * (d / 2) + lane / 2;
                 let (e, o) = (xin[i - lane % 2], xin[i - lane % 2 + 1]);
-                let magnitude = (e * cf[t]).abs() + (o * sf[t]).abs();
-                let bound = if dtype == DType::F32 {
-                    2.0 * 2f32.powi(-23) * magnitude
+                // even lane `e·c − o·s`, odd lane `e·s + o·c`
+                let magnitude = if lane % 2 == 0 {
+                    (e * cf[t]).abs() + (o * sf[t]).abs()
                 } else {
-                    ulp(*r, dtype)
+                    (e * sf[t]).abs() + (o * cf[t]).abs()
+                };
+                // The f32 results differ by at most one product rounding; a half-precision output
+                // adds at most one output ulp where the two straddle a rounding boundary.
+                let f32_bound = 2.0 * 2f32.powi(-23) * magnitude;
+                let bound = if dtype == DType::F32 {
+                    f32_bound
+                } else {
+                    f32_bound + ulp(a.abs().max(r.abs()), dtype)
                 };
                 worst_ratio = worst_ratio.max(delta / bound.max(f32::MIN_POSITIVE));
             }

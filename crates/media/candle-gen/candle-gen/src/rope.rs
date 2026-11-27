@@ -24,8 +24,9 @@ pub const INTERLEAVED_BHSD_F32: RopeSpec = RopeSpec::interleaved(RopeLayout::Bhs
 /// `rope_i` (both round each product, then the sum; `cpu_rope_i_equals_the_shared_interleaved_chain`
 /// pins it). On CUDA, nvcc contracts `rope_i`'s `a·c − b·s` into an fma while the fused kernel
 /// reproduces the chain's separately rounded products, so the two differ by at most one rounding of
-/// a product — the declared tolerance of `interleaved_rope_gpu` (f32 ≤ 1e-6 of the operand scale; at
-/// most one ulp of the output dtype after the cast).
+/// a product — the declared tolerance of `interleaved_rope_gpu`: in f32 `|Δ| ≤ 2⁻²²·(|a·c| + |b·s|)`;
+/// in bf16 / f16 that plus one output ulp (sm_120, Qwen-Image 1024² q: 0.002% of bf16 elements move
+/// by one ulp).
 pub fn apply_interleaved_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     apply_rope(x, cos, sin, &INTERLEAVED_BHSD_F32)
 }
