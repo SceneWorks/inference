@@ -20,6 +20,34 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::fused_path::Attempt;
+use candle_gen::vae_norm_silu_pad::{norm_silu_pad, ConvInputLayout, TemporalPad, VaeNorm};
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only mutation seam (SW-6133): when set on this thread,
+    /// [`CausalConv3d::forward_norm_silu`] writes its causal zero pad on the wrong temporal side, so
+    /// the parity tests can prove they detect that defect. Compiled out of non-test builds.
+    pub(crate) static MUTATE_PAD_SIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn pad_for_test(pad: TemporalPad) -> TemporalPad {
+    if MUTATE_PAD_SIDE.with(std::cell::Cell::get) {
+        TemporalPad {
+            zero_front: 0,
+            zero_back: pad.zero_front,
+            ..pad
+        }
+    } else {
+        pad
+    }
+}
+
+#[cfg(not(test))]
+fn pad_for_test(pad: TemporalPad) -> TemporalPad {
+    pad
+}
 
 /// Decode context threaded through the VAE forward. `streaming` selects the per-frame `feat_cache`
 /// path; `first_chunk` marks the first latent frame (the temporal-upsample "first frame un-doubled"
@@ -240,17 +268,88 @@ impl CausalConv3d {
             t + self.kd - 1,
             "causal pad must yield t+(kD-1) frames"
         );
+        self.accumulate_taps(b, t, |kd| {
+            // The T frames this tap convolves: x_pad[:, :, kd : kd+T].
+            let frames = xpad.narrow(2, kd, t)?;
+            // Merge (B, T) into the conv2d batch axis: [B, C, T, H, W] → [B*T, C, H, W].
+            frames
+                .permute((0, 2, 1, 3, 4))?
+                .reshape((b * t, c, h, w))?
+                .contiguous()
+        })
+    }
+
+    /// `conv(silu(norm(x)))` with the norm, SiLU and causal pad fused into one kernel (SW-6133) that
+    /// writes the padded conv input **frame-major** (`[B, T+kD-1, C, H, W]`): the normalized and SiLU
+    /// tensors, the `[cache ++ x]` concat and the zero-pad copy are never materialized, and each tap's
+    /// `T` frames are already the merged `[B·T, C, H, W]` conv2d batch (a view when `B == 1`, so the
+    /// per-tap permute copies go too). The streaming `feat_cache` keeps the same contents as
+    /// [`forward`](Self::forward)'s (the last `kD-1` *activated* input frames), stored frame-major and
+    /// viewed `[B, C, k, H, W]`, so the reference path and the kernel read each other's caches.
+    ///
+    /// `Attempt::Reference(reason)` (cache untouched) when the kernel does not serve the call; the
+    /// caller then runs `forward(&silu(norm(x)))` — see [`crate::vae::norm_silu_conv`].
+    pub(crate) fn forward_norm_silu(
+        &self,
+        x: &Tensor,
+        norm: &VaeNorm<'_>,
+        ctx: &Ctx,
+    ) -> Result<Attempt<Tensor>> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let want = self.kd - 1; // left context frames needed
+        let streaming = ctx.streaming && want > 0;
+        let old_cache = if streaming {
+            candle_gen::lock_recover(&self.cache).clone()
+        } else {
+            None
+        };
+        let old_n = old_cache
+            .as_ref()
+            .map(|cache| cache.dim(2))
+            .transpose()?
+            .unwrap_or(0);
+        // The still-missing `want - old_n` history frames are zeros (first chunks / single pass).
+        let pad = pad_for_test(TemporalPad {
+            zero_front: want.saturating_sub(old_n),
+            ..TemporalPad::default()
+        });
+        let attempt = norm_silu_pad(
+            x,
+            norm,
+            old_cache.as_ref(),
+            pad,
+            ConvInputLayout::FrameMajor,
+        )?;
+        attempt.try_map(|xpad| {
+            let xpad_t = xpad.dim(1)?;
+            debug_assert_eq!(xpad_t, t + want, "causal pad must yield t+(kD-1) frames");
+            if streaming {
+                // The last `want` frames of the visible history `[old_cache ++ act(x)]` — the
+                // trailing frames of `xpad`. A copy, so the cache does not pin the whole buffer.
+                let keep = want.min(old_n + t);
+                *candle_gen::lock_recover(&self.cache) = Some(
+                    xpad.narrow(1, xpad_t - keep, keep)?
+                        .force_contiguous()?
+                        .permute((0, 2, 1, 3, 4))?,
+                );
+            }
+            self.accumulate_taps(b, t, |kd| xpad.narrow(1, kd, t)?.reshape((b * t, c, h, w)))
+        })
+    }
+
+    /// `Σ_kd conv2d(tap_input(kd), W[:, :, kd]) + bias`, reshaped to `[B, O, T, H, W]`; `tap_input`
+    /// yields tap `kd`'s merged `[B·T, C, H, W]` frames.
+    fn accumulate_taps(
+        &self,
+        b: usize,
+        t: usize,
+        mut tap_input: impl FnMut(usize) -> Result<Tensor>,
+    ) -> Result<Tensor> {
         let mut acc: Option<Tensor> = None;
         for kd in 0..self.kd {
             // Tap weight W[:, :, kd] → [O, I, kH, kW].
             let wk = self.weight.narrow(2, kd, 1)?.squeeze(2)?.contiguous()?;
-            // The T frames this tap convolves: x_pad[:, :, kd : kd+T].
-            let frames = xpad.narrow(2, kd, t)?;
-            // Merge (B, T) into the conv2d batch axis: [B, C, T, H, W] → [B*T, C, H, W].
-            let merged = frames
-                .permute((0, 2, 1, 3, 4))?
-                .reshape((b * t, c, h, w))?
-                .contiguous()?;
+            let merged = tap_input(kd)?;
             // Chunked so each conv2d's im2col stays under candle's CUDA overflow band (see
             // [`chunked_conv2d`]). At the 1280×720 z16 `conv_out` (96-ch 3×3) a single output frame's
             // im2col is ~796M elems (and the merged `B·T` batch is up to 4 after the ×4 temporal upsample,

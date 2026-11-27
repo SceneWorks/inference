@@ -118,6 +118,9 @@ pub use fused_attention::{
 // with typed reasons. Lives in candle-quant-kernels (the lowest crate every kernel shares) and is
 // re-exported here for the providers; see its module docs for the recipe a new kernel follows.
 pub use candle_quant_kernels::fused_path;
+// The fused video-VAE norm + SiLU + temporal pad (SW-6133): Wan's channel-L2 and LTX's pixel-RMS
+// norm with SiLU, written straight into the padded causal-conv input (path `vae_norm_silu_pad`).
+pub use candle_quant_kernels::vae_norm_silu_pad;
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
