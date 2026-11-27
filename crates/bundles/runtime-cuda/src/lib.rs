@@ -38,6 +38,21 @@ pub fn conservative_video_decode_memory_profile(
     candle_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
 }
 
+/// The one process-wide fused-attention switch and the per-path attention call counters shared by
+/// every Candle media provider (SW-6130), re-exported from `candle_gen::fused_attention` for the
+/// product worker: [`attention::set_flash_attention_enabled`] (default on; read per attention call)
+/// and [`attention::take_attention_path_counts`] / [`attention::attention_path_counts`]
+/// ([`attention::AttentionPathCounts`]: fused calls, and materialized calls by refusal reason).
+/// [`attention::FLASH_ATTN_COMPILED`] says whether this build carries the kernel at all (the
+/// default `media-flash-attn` feature).
+#[cfg(feature = "media")]
+pub mod attention {
+    pub use candle_gen_catalog::media::fused_attention::{
+        attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
+        take_attention_path_counts, AttentionPathCounts, FLASH_ATTN_COMPILED,
+    };
+}
+
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
 #[cfg(feature = "media")]

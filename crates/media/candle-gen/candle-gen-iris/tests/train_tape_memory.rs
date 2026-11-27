@@ -363,7 +363,7 @@ fn folded_chunked_attention_gradients_are_the_plain_graphs_bit_for_bit() {
                 launches.fetch_add(1, Ordering::Relaxed);
                 candle_gen::candle_nn::ops::softmax(s, D::Minus1)
             };
-            candle_gen::sdpa_budgeted_bhsd(q, k, v, 0.35, Some(&mask), softmax, budget)
+            candle_gen::sdpa_budgeted_bhsd_materialized(q, k, v, 0.35, Some(&mask), softmax, budget)
         })
         .unwrap();
         let loss = out.mul(&weight).unwrap().sum_all().unwrap();

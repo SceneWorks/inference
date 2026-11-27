@@ -71,7 +71,11 @@ fn sdpa_planned(
     let head_plan = plan
         .budget
         .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
-    if !head_plan.chunks_heads() {
+    // The fused kernel never materializes the scores the head chunks bound, so a call the shared
+    // router sends to it runs as one launch rather than one per head chunk (SW-6130).
+    let fused = candle_gen::fused_attention::route_attention_kernel(q, k, v, None)
+        == candle_gen::AttentionKernel::Flash;
+    if fused || !head_plan.chunks_heads() {
         record_head_chunk_count(1);
         return candle_gen::sdpa_planned_bhsd(q, k, v, scale, None, softmax_last_dim, plan);
     }
@@ -1239,5 +1243,133 @@ mod tests {
             // Out-of-bounds prefix_len >= s must fail closed.
             assert!(pag_attention_bhsd(&q, &k, &v, 0.5, s, AttentionPlan::UNBOUNDED).is_err());
         }
+    }
+
+    /// SW-7284 discriminator: one production-geometry Krea 2 single-stream DiT block (hidden 6144,
+    /// GQA 48Q/12KV x 128, the 1024^2 joint sequence of 512 caption + 64x64 image tokens, real RoPE
+    /// table) on synthetic weights, on CUDA. The f32 block on the materialized path is the reference;
+    /// the bf16 block runs once pinned to the materialized path (the pre-SW-6130 route) and once
+    /// through the shared router (FlashAttention-2). Compared on the block's residual update
+    /// (`out - x`), which is what a denoise step integrates. Synthetic q/k norm scales near 2 make the
+    /// logits sharp (std ~4), the regime where a softmax / accumulation defect would show.
+    ///
+    /// Declared criterion: flash is no worse than the old bf16 path, within a small margin —
+    /// `flash_rel <= 1.1 * materialized_rel + 1e-3` and the same for max-abs (+1e-2).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_production_geometry_block_flash_matches_materialized() -> candle_gen::Result<()> {
+        use crate::loader::Weights;
+        use crate::testfix::attn_ffn;
+        use crate::transformer::rope::RopeTables;
+        use candle_gen::candle_core::DType;
+        use candle_gen::fused_attention::{attention_path_counts, with_materialized_attention};
+        use std::collections::HashMap;
+
+        let dev = Device::new_cuda(0)?;
+        let cfg = crate::config::Krea2Config::turbo();
+        let (hidden, heads, kv, hd) = (
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_kv_heads,
+            cfg.attention_head_dim,
+        );
+        // The attention is the subject; a narrow FFN keeps the synthetic block cheap.
+        let intermediate = 1024;
+        let mut draw =
+            |shape: &[usize]| Tensor::randn(0f32, 0.02f32, shape, &Device::Cpu).expect("cpu draw");
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        attn_ffn(
+            &mut draw,
+            &mut map,
+            "b",
+            hidden,
+            heads,
+            kv,
+            hd,
+            intermediate,
+        );
+        map.insert("b.scale_shift_table".into(), draw(&[6, hidden]));
+        // Raw (centered) q/k RMS scales near 1, i.e. an effective scale near 2 after the folded +1.
+        for key in ["b.attn.norm_q.weight", "b.attn.norm_k.weight"] {
+            map.insert(key.into(), Tensor::randn(1f32, 0.3f32, hd, &Device::Cpu)?);
+        }
+        let tmp = tempfile::tempdir().map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+        let path = tmp.path().join("block.safetensors");
+        candle_gen::candle_core::safetensors::save(&map, &path)?;
+        let load = |dtype: DType| -> candle_gen::Result<SingleStreamBlock> {
+            let w = Weights::from_file(&path, &dev, dtype)?;
+            Ok(SingleStreamBlock::load(
+                &w,
+                "b",
+                heads,
+                kv,
+                hd,
+                hidden,
+                cfg.norm_eps,
+            )?)
+        };
+        let (f32_block, bf16_block) = (load(DType::F32)?, load(DType::BF16)?);
+
+        let (cap_len, side) = (512usize, 64usize);
+        let s = cap_len + side * side;
+        let rope = RopeTables::build_t2i(
+            cap_len,
+            side,
+            side,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+            &dev,
+        )?;
+        let (cos, sin) = rope.joint();
+        let x = Tensor::randn(0f32, 1.0, (1, s, hidden), &dev)?;
+        let tvec = Tensor::randn(0f32, 0.1, (1, 1, 6 * hidden), &dev)?;
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            candle_gen::ATTN_SCORES_BUDGET as u64,
+            false,
+        ));
+
+        let update =
+            |block: &SingleStreamBlock, x: &Tensor, tvec: &Tensor| -> candle_gen::Result<Tensor> {
+                let out = block.forward_with_attention_plan(x, tvec, &cos, &sin, plan)?;
+                Ok((out.to_dtype(DType::F32)? - x.to_dtype(DType::F32)?)?)
+            };
+        let reference = with_materialized_attention(|| update(&f32_block, &x, &tvec))?;
+        let (xb, tb) = (x.to_dtype(DType::BF16)?, tvec.to_dtype(DType::BF16)?);
+        let materialized = with_materialized_attention(|| update(&bf16_block, &xb, &tb))?;
+        let before = attention_path_counts();
+        let fused = __model_proof_output!(update(&bf16_block, &xb, &tb))?;
+        let routed = attention_path_counts().since(&before);
+        assert!(
+            routed.flash >= 1,
+            "the bf16 block must take the fused kernel (needs candle-gen/flash-attn): {routed:?}"
+        );
+
+        let errors = |a: &Tensor| -> candle_gen::Result<(f32, f32)> {
+            let d = (a - &reference)?;
+            let max = d.abs()?.max_all()?.to_scalar::<f32>()?;
+            let num = d.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            let den = reference.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            Ok((num / den.max(f32::MIN_POSITIVE), max))
+        };
+        let (fr, fm) = errors(&fused)?;
+        let (mr, mm) = errors(&materialized)?;
+        println!(
+            "krea block (S={s}, {heads}Q/{kv}KV x {hd}, bf16) vs f32 materialized: flash rel-L2 \
+             {fr:.4e} max|d| {fm:.4e}; bf16 materialized rel-L2 {mr:.4e} max|d| {mm:.4e}; \
+             routed {routed:?}"
+        );
+        assert!(
+            fr <= 1.1 * mr + 1e-3,
+            "flash rel-L2 {fr} vs materialized {mr}"
+        );
+        assert!(
+            fm <= 1.1 * mm + 1e-2,
+            "flash max|d| {fm} vs materialized {mm}"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::block::tests::cuda_production_geometry_block_flash_matches_materialized");
+        Ok(())
     }
 }

@@ -87,6 +87,34 @@ fn lifetime<'a>(x: &'a str) -> &'a str { x }
             self.assertTrue(policy.registry_errors(root, []))
 
 
+    def test_untagged_ignored_learned_case_requires_tag_or_registration(self):
+        # SW-6130: a new ignored test running a learned `.forward` under a non-canonical reason was
+        # invisible to the registry rule; it must be tagged and registered, or sit in the baseline.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / 'crates/example/src/lib.rs'
+            path.parent.mkdir(parents=True)
+            learned = ('mod tests { #[test]\n#[ignore = "CUDA compute: run by the validation workflow"]\n'
+                       'fn block_case() { let _ = block.forward_with_attention_plan(&x); } }')
+            path.write_text(learned, encoding='utf-8')
+            errors = policy.registry_errors(root, [])
+            self.assertTrue(any('learned-model seam' in error and 'tests::block_case' in error
+                                for error in errors), errors)
+            # Raw kernels under any reason stay ordinary.
+            path.write_text(learned.replace('block.forward_with_attention_plan(&x)', 'sdpa(&q, &k, &v)'),
+                            encoding='utf-8')
+            self.assertEqual(policy.registry_errors(root, []), [])
+            # The shrink-only baseline admits a pre-rule case, and rejects a stale entry.
+            path.write_text(learned, encoding='utf-8')
+            baseline = root / policy.UNTAGGED_IGNORE_BASELINE
+            baseline.parent.mkdir(parents=True)
+            baseline.write_text(json.dumps([{'source': 'crates/example/src/lib.rs',
+                                             'test': 'tests::block_case'}]), encoding='utf-8')
+            self.assertEqual(policy.registry_errors(root, []), [])
+            path.write_text(learned.replace('block.forward_with_attention_plan(&x)', 'sdpa(&q, &k, &v)'),
+                            encoding='utf-8')
+            self.assertTrue(any('stale entry' in error for error in policy.registry_errors(root, [])))
+
 class WorkflowPolicy(unittest.TestCase):
     def test_flash_archive_builder_excludes_fork_prs_from_self_hosted_windows(self):
         import yaml

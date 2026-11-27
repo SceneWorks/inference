@@ -182,15 +182,18 @@ impl TrainAttention {
         }
         let scale = (self.head_dim as f64).powf(-0.5);
         // Composable SDPA (NOT the fused `softmax_last_dim` — that CustomOp has no backward).
-        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            None,
-            |scores| softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype()),
-            candle_gen::ATTN_SCORES_BUDGET,
-        )?; // [B,H,S,d]
+        // Training-only: pinned to the materialized path (SW-6130; the fused kernel has no backward).
+        let out = candle_gen::fused_attention::with_materialized_attention(|| {
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                |scores| softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype()),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )
+        })?; // [B,H,S,d]
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;

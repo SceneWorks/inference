@@ -1359,13 +1359,21 @@ mod tests {
         );
         assert!(control_dit_source(Some(convrot), Some(native)).is_err());
 
-        // Lazy means the DiT, VAE, and overlay stay unread — the base snapshot's text encoder is
-        // admitted against `ENCODER_CONTRACT` at construction, so the base needs the same fixture
-        // every other construction test in this module uses. The overlay and adapter paths stay
-        // nonexistent, which is what keeps the laziness claim honest.
-        let (_base, base_paths) = validation_complete_paths(OffloadPolicy::Resident);
+        // Lazy means the DiT weights, VAE, and overlay stay unread — the base snapshot's text
+        // encoder is admitted against `ENCODER_CONTRACT` at construction, so the base needs the
+        // same fixture every other construction test in this module uses. Construction does pin
+        // the selected native DiT file's identity (`PinnedWeightsFile::pin`), so that file must
+        // exist; it is a placeholder that is never parsed as weights. The overlay and adapter paths
+        // stay nonexistent, which is what keeps the laziness claim honest.
+        let (base, base_paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let native_file = base.path().join("community-krea.safetensors");
+        std::fs::write(
+            &native_file,
+            b"identity-pinned placeholder, never read as weights",
+        )
+        .unwrap();
         let model = load_control_from_native_dit_file(
-            native,
+            &native_file,
             &base_paths.root,
             "/nonexistent/control.safetensors",
             &[AdapterSpec::new(

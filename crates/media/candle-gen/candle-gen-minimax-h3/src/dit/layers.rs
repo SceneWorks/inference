@@ -11,7 +11,7 @@
 //! MLX's fused `scaled_dot_product_attention` **streams the scores**: sc-17152 measured its peak
 //! tracking `4·B·H·S·D` exactly, i.e. there is no `[B, H, Sq, Sk]` tensor in memory at all. On a
 //! `flash-attn` CUDA build candle now does the same: [`DitAttention::forward`] dispatches bf16/f16
-//! attention to FlashAttention-2 (`candle_gen::sdpa_dispatch_bhsd`, sc-26691), which streams the
+//! attention to FlashAttention-2 (the shared `candle_gen::sdpa_planned_bhsd` router, sc-26691 / SW-6130), which streams the
 //! scores. Every other build (CPU, Metal, CUDA without `flash-attn`, f32) routes through
 //! `candle_gen::sdpa_planned_bhsd`, which **does** materialize scores — in bounded row blocks
 //! rather than all at once (`ATTN_SCORES_BUDGET`, the shared i32-overflow-safe helper from

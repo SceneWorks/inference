@@ -437,7 +437,7 @@ mod tests {
                 // correct gradients to the original variables through copies.
                 let qview = q.transpose(2, 3)?.contiguous()?.transpose(2, 3)?;
                 let kview = Tensor::cat(&[k.as_tensor(), k.as_tensor()], 2)?.narrow(2, sk, sk)?;
-                let reference = crate::attention::sdpa_budgeted_bhsd(
+                let reference = crate::attention::sdpa_budgeted_bhsd_materialized(
                     &qview,
                     &crate::attention::repeat_kv(&kview, h / hk)?,
                     &crate::attention::repeat_kv(&v, h / hk)?,

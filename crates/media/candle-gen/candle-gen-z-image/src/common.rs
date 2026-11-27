@@ -782,7 +782,7 @@ mod tests {
         let scale = 1.0 / (hd as f64).sqrt();
 
         let full_sdpa = apply_attention_with_pag(&q, &k, &v, None, |qs, ks, vs| {
-            candle_gen::sdpa_planned_bhsd(
+            candle_gen::sdpa_planned_bhsd_materialized(
                 qs,
                 ks,
                 vs,
@@ -797,7 +797,7 @@ mod tests {
             assert_eq!(qs.dims(), &[b, h, cap_len, hd]);
             assert_eq!(ks.dims(), &[b, h, total_len, hd]);
             assert_eq!(vs.dims(), &[b, h, total_len, hd]);
-            candle_gen::sdpa_planned_bhsd(
+            candle_gen::sdpa_planned_bhsd_materialized(
                 qs,
                 ks,
                 vs,

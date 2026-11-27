@@ -1109,8 +1109,20 @@ pub fn attention(
         }
         let folded = crate::tape::fold3("iris-sdpa", &q, &k, &v, move |q, k, v| {
             let composable = |s: &Tensor| softmax(s, D::Minus1);
-            attention_kernel(q, k, v, scale, mask.as_ref(), &composable, scope.as_ref())
-                .map_err(candle_gen::candle_core::Error::wrap)
+            // Inside the fold the operands are detached (the tape is replayed in the node's
+            // backward), so the per-call autograd check cannot see the training step: ask for the
+            // materialized path explicitly (SW-6130).
+            attention_kernel(
+                q,
+                k,
+                v,
+                scale,
+                mask.as_ref(),
+                &composable,
+                scope.as_ref(),
+                Materialize::Always,
+            )
+            .map_err(candle_gen::candle_core::Error::wrap)
         });
         match folded {
             Ok(out) => out,
@@ -1127,14 +1139,26 @@ pub fn attention(
             mask.as_ref(),
             &softmax_last_dim,
             scope.as_ref(),
+            Materialize::Never,
         )?
     };
     let out = to(&out, compute)?;
     Ok(out.transpose(1, 2)?.reshape((b, n, h * d))?)
 }
 
+/// Which shared attention entry point [`attention_kernel`] calls (SW-6130).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Materialize {
+    /// The flash-eligible helpers: the fused kernel when the shared router allows it. Only with a
+    /// plain last-axis softmax.
+    Never,
+    /// The `*_materialized` helpers: the training fold, and any non-standard softmax.
+    Always,
+}
+
 /// [`attention`]'s kernel: the i32-overflow guard alone when no request selected the
 /// bounded-attention rung (exactly the pre-rung forward), else [`bounded_attention`].
+#[allow(clippy::too_many_arguments)]
 fn attention_kernel(
     q: &Tensor,
     k: &Tensor,
@@ -1143,9 +1167,10 @@ fn attention_kernel(
     mask: Option<&Tensor>,
     softmax: &dyn Fn(&Tensor) -> candle_gen::candle_core::Result<Tensor>,
     scope: Option<&AttentionScope>,
+    materialize: Materialize,
 ) -> Result<Tensor> {
-    match scope {
-        None => Ok(candle_gen::sdpa_budgeted_bhsd(
+    match (scope, materialize) {
+        (None, Materialize::Never) => Ok(candle_gen::sdpa_budgeted_bhsd(
             q,
             k,
             v,
@@ -1154,7 +1179,16 @@ fn attention_kernel(
             softmax,
             candle_gen::ATTN_SCORES_BUDGET,
         )?),
-        Some(scope) => bounded_attention(q, k, v, scale, mask, softmax, scope),
+        (None, Materialize::Always) => Ok(candle_gen::sdpa_budgeted_bhsd_materialized(
+            q,
+            k,
+            v,
+            scale,
+            mask,
+            softmax,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?),
+        (Some(scope), _) => bounded_attention(q, k, v, scale, mask, softmax, scope, materialize),
     }
 }
 
@@ -1213,6 +1247,7 @@ pub fn attention_batch_group(batch: usize, heads: usize, keys: usize, budget: us
 /// [`attention_batch_group`] rows, each chunked over its query rows by the shared rung-3 planner
 /// ([`candle_gen::sdpa_planned_bhsd`]). Rows and query rows are independent, so the result equals
 /// the single pass to GEMM-order rounding.
+#[allow(clippy::too_many_arguments)]
 fn bounded_attention(
     q: &Tensor,
     k: &Tensor,
@@ -1221,7 +1256,17 @@ fn bounded_attention(
     mask: Option<&Tensor>,
     softmax: &dyn Fn(&Tensor) -> candle_gen::candle_core::Result<Tensor>,
     scope: &AttentionScope,
+    materialize: Materialize,
 ) -> Result<Tensor> {
+    let planned =
+        |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, plan| match materialize {
+            Materialize::Never => {
+                candle_gen::sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
+            }
+            Materialize::Always => {
+                candle_gen::sdpa_planned_bhsd_materialized(q, k, v, scale, mask, softmax, plan)
+            }
+        };
     let (b, h, _, _) = q.dims4()?;
     let sk = k.dim(2)?;
     let plan = AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
@@ -1230,7 +1275,7 @@ fn bounded_attention(
     .with_cancel(&scope.cancel);
     let group = attention_batch_group(b, h, sk, scope.budget);
     if group >= b {
-        return candle_gen::sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan);
+        return planned(q, k, v, mask, plan);
     }
     let mut parts = Vec::with_capacity(b.div_ceil(group));
     let mut start = 0;
@@ -1244,13 +1289,11 @@ fn bounded_attention(
             Some(m) if m.dim(0)? == b => Some(m.narrow(0, start, len)?),
             other => other.cloned(),
         };
-        parts.push(candle_gen::sdpa_planned_bhsd(
+        parts.push(planned(
             &q.narrow(0, start, len)?,
             &k.narrow(0, start, len)?,
             &v.narrow(0, start, len)?,
-            scale,
             mask.as_ref(),
-            softmax,
             plan,
         )?);
         start += len;
@@ -1470,7 +1513,7 @@ mod tests {
         let k = ramp((b, h, s, d), 0.7);
         let v = ramp((b, h, s, d), 1.3);
         let scale = 1.0 / (d as f64).sqrt();
-        let single = candle_gen::sdpa_budgeted_bhsd(
+        let single = candle_gen::sdpa_budgeted_bhsd_materialized(
             &q,
             &k,
             &v,
@@ -1494,7 +1537,17 @@ mod tests {
                 budget,
                 cancel: CancelFlag::new(),
             };
-            let out = bounded_attention(&q, &k, &v, scale, None, &recording, &scope).unwrap();
+            let out = bounded_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                &recording,
+                &scope,
+                Materialize::Always,
+            )
+            .unwrap();
             assert!(
                 largest.get() <= budget,
                 "budget {budget}: a launch built {} score elements",
@@ -1540,7 +1593,7 @@ mod tests {
         }
         let mask = Tensor::from_vec(mask, (b, 1, s, s), &Device::Cpu).unwrap();
         let scale = 0.5;
-        let single = candle_gen::sdpa_budgeted_bhsd(
+        let single = candle_gen::sdpa_budgeted_bhsd_materialized(
             &q,
             &k,
             &v,
@@ -1554,8 +1607,17 @@ mod tests {
             budget: 8,
             cancel: CancelFlag::new(),
         };
-        let out =
-            bounded_attention(&q, &k, &v, scale, Some(&mask), &softmax_last_dim, &scope).unwrap();
+        let out = bounded_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&mask),
+            &softmax_last_dim,
+            &scope,
+            Materialize::Always,
+        )
+        .unwrap();
         let diff = (&out - &single)
             .unwrap()
             .abs()
@@ -1570,7 +1632,16 @@ mod tests {
 
         scope.cancel.cancel();
         assert!(matches!(
-            bounded_attention(&q, &k, &v, scale, Some(&mask), &softmax_last_dim, &scope),
+            bounded_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                Some(&mask),
+                &softmax_last_dim,
+                &scope,
+                Materialize::Always,
+            ),
             Err(Error::Canceled)
         ));
     }

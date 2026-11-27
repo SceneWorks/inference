@@ -962,15 +962,18 @@ fn packed_attention_impl(
             )
         };
         let o = if training {
-            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-                &q,
-                &k,
-                &v,
-                scale,
-                None,
-                |scores| candle_gen::candle_nn::ops::softmax(scores, D::Minus1),
-                candle_gen::ATTN_SCORES_BUDGET,
-            )?
+            // Pinned to the materialized path (SW-6130; the fused kernel has no backward).
+            candle_gen::fused_attention::with_materialized_attention(|| {
+                candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    None,
+                    |scores| candle_gen::candle_nn::ops::softmax(scores, D::Minus1),
+                    candle_gen::ATTN_SCORES_BUDGET,
+                )
+            })?
         } else {
             candle_gen::sdpa_budgeted_bhsd(
                 &q,

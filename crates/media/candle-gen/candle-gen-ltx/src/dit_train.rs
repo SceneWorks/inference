@@ -196,15 +196,18 @@ impl TrainAttention {
         let q = q.to_dtype(DType::F32)?.contiguous()?;
         let k = k.to_dtype(DType::F32)?.contiguous()?;
         let v = v.to_dtype(DType::F32)?.contiguous()?;
-        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            None,
-            |scores| softmax(scores, D::Minus1),
-            candle_gen::ATTN_SCORES_BUDGET,
-        )?;
+        // Training-only: pinned to the materialized path (SW-6130; the fused kernel has no backward).
+        let out = candle_gen::fused_attention::with_materialized_attention(|| {
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                |scores| softmax(scores, D::Minus1),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )
+        })?;
         let (b, s, _) = x.dims3()?;
         let inner = self.heads * self.dim_head;
         let mut out = out

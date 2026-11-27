@@ -41,6 +41,9 @@ model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-p
 default = []
 metal = ["candle-gen/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-perceptual/cuda"]
+# FlashAttention-2 through the shared candle-gen router (SW-7284): selected by the explicit
+# block-level flash-vs-materialized model proof.
+flash-attn = ["cuda", "candle-gen/flash-attn"]
 # SC-20686 K/V campaign observer (epic 20669 measurement tooling, sc-27296). Off by default: the
 # production build compiles an inert hook stub (`src/sc20686_observer_off.rs`). The candle-cuda
 # campaign builds the Wan campaign examples with this feature; never selected by runtime bundles.

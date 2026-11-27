@@ -398,9 +398,12 @@ fn block_causal_attention_pag(
     let (_b, _h, s, _d) = q.dims4()?;
     let attention = |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>| {
         if training {
-            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-                q, k, v, scale, mask, softmax, budget,
-            )
+            // Pinned to the materialized path (SW-6130; the fused kernel has no backward).
+            candle_gen::fused_attention::with_materialized_attention(|| {
+                candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                    q, k, v, scale, mask, softmax, budget,
+                )
+            })
         } else {
             candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
         }
