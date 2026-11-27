@@ -1890,7 +1890,7 @@
       "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::checkpoint_kernel_per_token_states_match_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
-      "reason": "Five verify/batch/tiny geometries x three dtypes x two carried-state modes, comparing every per-token checkpoint as well as output/final state.",
+      "reason": "Eight verify/batch/tiny/Qwen-dims/reduction-class geometries x three dtypes x two carried-state modes, comparing every per-token checkpoint as well as output/final state bit for bit.",
       "platforms": [
         "darwin"
       ]
@@ -1934,7 +1934,18 @@
       "target": "mlx_llm",
       "test": "primitives::gated_delta::tests::metal_kernel_matches_ops_reference",
       "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
-      "reason": "Helper assert_matches_reference expands six shapes x three dtypes x zero/carried state; includes 512/2048-token prefill with 128x128 state compared to per-token ops reference.",
+      "reason": "Helper assert_bitwise_reference expands fifteen shapes (Qwen3.6/3.8 decode/verify dims, 512/2048-token prefill, every MLX row-reduction class) x three dtypes x zero/carried state; bitwise comparison to the per-token GPU ops reference.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::kernel_matches_each_reference_op_step_by_step",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "SW-6139 diagnostic: probe variant of the Metal GDN kernel vs the per-step GPU ops chain (kv_mem, delta, state, y from the kernel's own pre-step state) at Qwen3.8 verify dims and three reduction classes x two dtypes x two state modes, bitwise, printing first divergence and ULP distance.",
       "platforms": [
         "darwin"
       ]
@@ -2160,6 +2171,36 @@
       "test": "dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block",
       "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
       "reason": "SW-6130 CUDA parity of one random-weight Z-Image DiT block (6x128 bf16): masked materialized vs the trimmed-caption fused route, both against the f32 masked block. cfg(cuda); asserts a candle-gen/flash-attn build.",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::w4a8_int8::tests::w4a8_linear_gpu_fused_activation_prep_is_byte_identical",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+      "reason": "SW-6134 CUDA W4A8 activation-prep parity: the fused ConvRot FHT + Kitchen int8 row quantizer kernel vs the eager convrot_fht_f32 + quantize_kitchen_int8 reference, codes byte-identical and scales bit-identical for bf16/f16/f32 incl. outlier, zero and tie rows. Device::new_cuda(0).",
+      "platforms": [
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::w4a8_int8::tests::w4a8_gemm_gpu_refuses_misaligned_operand_views_and_realigns_them",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+      "reason": "SW-6134 CUDA W4A8 GEMM operand-alignment regression (review finding 4717213323): contiguous U8 activation / packed-weight views at non-16-byte offsets are refused with the typed misaligned reason before launch (no misaligned-address fault), w4a8_gemm_aligned realigns them, and the output is bit-identical to the aligned baseline; 16-byte aligned nonzero offsets are served uncopied. Device::new_cuda(0).",
       "platforms": [
         "linux",
         "win32"

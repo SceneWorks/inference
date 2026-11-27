@@ -43,6 +43,9 @@
 //!   `candle_layers::fused`).
 //! - [`act_quant`] — the fused per-tensor fp8 / int8 activation quantizer (SW-6126): amax → scale
 //!   → cast on the device, byte-identical to the op chain it replaces, scale kept on the device.
+//! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
+//!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
+//!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
 //!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
@@ -90,6 +93,7 @@ pub mod training_attention;
 pub mod vae_norm_silu_pad;
 pub mod veda_int8;
 pub mod veda_score;
+pub mod w4a8_gemm;
 pub mod yue2_stable_conv;
 
 pub use act_quant::{
@@ -152,7 +156,8 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 and fp8 / int8 activation quantizers, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
-/// frozen Veda tile scorer, streaming training attention and the video-VAE norm + SiLU + pad.
+/// frozen Veda tile scorer, streaming training attention and the SW-F287 fused kernels (activation
+/// quantizers, W4A8 GEMM, video-VAE norm + SiLU + pad, INT8 QK and Sol-Attn attention).
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -166,6 +171,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
+    w4a8_gemm::W4A8_GEMM_SRC,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     GATED_DELTA_SRC,
