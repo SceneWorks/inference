@@ -119,9 +119,9 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             height: 1024,
             steps: Some(1),
             conditioning: vec![refs[0].clone()],
-            flux3_reference_output: Some(ReferenceOutputSize::default()),
             ..request()
         };
+        edit.extensions.flux3_mut().reference_output = Some(ReferenceOutputSize::default());
         if id != "flux3_klein" {
             edit.guidance = Some(1.0);
         }
@@ -164,7 +164,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             },
             refs[0].clone(),
         ];
-        narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
+        narrow.extensions.flux3_mut().reference_output = Some(ReferenceOutputSize::default());
         // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
         // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
         let plan = gen_core_flux3::references::normalize_request(&mut narrow)
@@ -176,7 +176,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
         assert_eq!((narrow_image.width, narrow_image.height), (48, 64));
         let mut narrow_t2i = narrow;
         narrow_t2i.conditioning.clear();
-        narrow_t2i.flux3_reference_output = None;
+        narrow_t2i.extensions.flux3_mut().reference_output = None;
         assert!(
             g.validate(&narrow_t2i).is_err(),
             "legacy no-reference minimum is unchanged"
@@ -230,7 +230,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 (96, 128),
             ),
         ] {
-            edit.flux3_reference_output = Some(intent);
+            edit.extensions.flux3_mut().reference_output = Some(intent);
             let image = render(&edit);
             assert_eq!(
                 (image.width, image.height),
@@ -239,14 +239,14 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             );
         }
         edit.conditioning = refs.clone();
-        edit.flux3_reference_output = Some(ReferenceOutputSize::default());
+        edit.extensions.flux3_mut().reference_output = Some(ReferenceOutputSize::default());
         let ten = render(&edit);
         assert_eq!((ten.width, ten.height), (80, 64));
         let mut text_only = edit.clone();
         text_only.width = 80;
         text_only.height = 64;
         text_only.conditioning.clear();
-        text_only.flux3_reference_output = None;
+        text_only.extensions.flux3_mut().reference_output = None;
         let plain = render(&text_only);
         assert_ne!(
             ten.pixels, plain.pixels,
@@ -774,10 +774,11 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
             Err(CoreError::Unsupported(_))
         ));
         let mut progress = Vec::new();
-        let GenerationOutput::Images(images) = generator
-            .generate(&request, &mut |p| progress.push(p))
-            .unwrap()
-        else {
+        let gen_report = generator
+            .generate_with_report(&request, &mut |p| progress.push(p))
+            .unwrap();
+        let reports = &gen_report.adapter_apply_reports;
+        let Some(GenerationOutput::Images(images)) = gen_report.output else {
             panic!("image output required")
         };
         assert_eq!(images.len(), 1);
@@ -790,7 +791,6 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
                 total: 3
             }
         )));
-        let reports = generator.adapter_apply_reports();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].applied, 6);
         assert!(reports[0].skipped.is_empty());

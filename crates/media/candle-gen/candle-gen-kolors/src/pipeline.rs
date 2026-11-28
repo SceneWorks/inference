@@ -1396,7 +1396,7 @@ mod tests {
             width: 512,
             height: 512,
             steps: Some(10),
-            sampler: sampler.map(str::to_owned),
+            sampler: sampler.map(Into::into),
             conditioning: vec![Conditioning::Reference {
                 image: Image::default(),
                 strength: Some(0.0),

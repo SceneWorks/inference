@@ -27,10 +27,10 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, require_base_dir, require_control, AcceptedControlKinds, Capabilities,
-    ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
+    gen_core, require_base_dir, require_control, AcceptedControlKinds, ConditioningKind,
+    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator,
+    LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
+    Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_wan::OwnedWanSingleFrameDecoder;
@@ -40,8 +40,8 @@ use crate::control_transformer::QwenFunControlBranch;
 use crate::loader;
 use crate::model::{pag_capability, validate_request, SIZE_MULTIPLE};
 use crate::pipeline::{
-    create_noise, encode_fun_control_context, encode_prompt, negative_or_fallback, qwen_samplers,
-    qwen_schedulers, resolve_run_params, PID_BACKBONE,
+    create_noise, encode_fun_control_context, encode_prompt, negative_or_fallback,
+    resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -50,45 +50,38 @@ use crate::vae::QwenVae;
 /// Registry id for the Qwen-Image ControlNet (strict pose) variant.
 pub const MODEL_ID: &str = "qwen_image_control";
 
+/// Primary typed route declaration for Qwen-Image ControlNet (`REG-1`, `AP5`).
+pub(crate) fn route_qwen_image_control() -> gen_core::RouteRecord {
+    let mut route = crate::model::route_qwen_image();
+    route.route_id = MODEL_ID;
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(accepted_kinds());
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["qwen_fun_controlnet_union"];
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("qwen_image_mmdit_control").with_pag(pag_capability()),
+    );
+    route.structure.adapters.install_policy = gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.structure.output.preview = gen_core::PreviewSupport::Unsupported;
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::control_component_footprint)
+            .with_render_plan(compile_render_plan)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
 /// The control variant's identity + capabilities — the base Qwen-Image T2I surface (true CFG /
 /// negative prompt / guidance / Lightning) plus the **required** `Control` (pose skeleton)
 /// conditioning. LoRA/LoKr (character identity) is on the base transformer.
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: Some(accepted_kinds()),
-        required_components: &[],
-        id: MODEL_ID,
-        family: "qwen-image",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // Advertised so a weights-free caller can reject a bad `kind` before
-            // paying for a load. Same expression the `ControlBranch` override
-            // returns, so the two cannot drift.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Control (required, pose) only in v1 — no img2img Reference / edit compose yet.
-            conditioning: vec![ConditioningKind::Control],
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
-            samplers: qwen_samplers(),
-            schedulers: qwen_schedulers(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            requires_sigma_shift: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            pag: Some(pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_qwen_image_control().compute_descriptor()
 }
 
 /// A loaded control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
@@ -550,7 +543,7 @@ impl QwenImageControl {
         // borrows the warm encoder. `neg` is `None` under Lightning (CFG-distilled → one forward/step).
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |te: &QwenTextEncoder| {
                 let encode_body = || -> Result<_> {
@@ -734,13 +727,6 @@ pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
         compile: compile_render_plan,
     };
 
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::control_component_footprint
-}
-
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -759,6 +745,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Modality;
 
     #[test]
     fn descriptor_is_qwen_image_control() {

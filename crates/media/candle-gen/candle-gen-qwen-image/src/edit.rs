@@ -52,8 +52,8 @@ const ENC_DTYPE: DType = DType::F32;
 
 pub(crate) const EDIT_2511_BASE_ROUTE: &str = "qwen_image_edit_2511";
 pub(crate) const EDIT_2511_LIGHTNING_ROUTE: &str = "qwen_image_edit_2511_lightning";
-const EDIT_2511_REPO_DIR: &str = "models--SceneWorks--qwen-image-edit-2511-mlx";
-const EDIT_2511_REVISION: &str = "0dfbf3a018bcee42d77de14494c35f97a7531def";
+pub(crate) const EDIT_2511_REPO_DIR: &str = "models--SceneWorks--qwen-image-edit-2511-mlx";
+pub(crate) const EDIT_2511_REVISION: &str = "0dfbf3a018bcee42d77de14494c35f97a7531def";
 const EDIT_2511_LIGHTNING_REPO_DIR: &str = "models--lightx2v--Qwen-Image-Edit-2511-Lightning";
 const EDIT_2511_LIGHTNING_REVISION: &str = "d74eba145674fd7e31b949324e148e21e7118abd";
 const EDIT_2511_LIGHTNING_FILE: &str =
@@ -616,6 +616,10 @@ impl QwenEdit {
             spec.resolved_route.as_deref() == Some(EDIT_2511_LIGHTNING_ROUTE)
         );
         Ok(model)
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT

@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::{io::Read, io::Seek, io::SeekFrom};
 
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use gen_core_family::mage_plan::{
     build_mage_render_plan, MageBackendKind, MageBatchSemantics, MageRenderPlan,
@@ -141,49 +141,165 @@ pub(crate) fn resolved_component_dirs(spec: &LoadSpec) -> gen_core::Result<MageC
     resolve_component_dirs(root, spec)
 }
 
-fn generation_descriptor(
-    id: &'static str,
-    supports_guidance: bool,
-    supports_negative_prompt: bool,
-) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
-        control_kinds: None,
-        id,
+/// Primary typed route declaration for a Candle Mage-Flow generation variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_generation(id: &'static str) -> gen_core::RouteRecord {
+    let (default_steps, default_guidance, driver_id) = match id {
+        config::BASE_MODEL_ID => (30u32, 5.0f32, "candle_mage_base"),
+        config::TURBO_MODEL_ID => (4u32, 1.0f32, "candle_mage_turbo"),
+        _ => (20u32, 5.0f32, "candle_mage_rl"),
+    };
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = match id {
+        config::BASE_MODEL_ID => gen_core::RouteBindings::generator(descriptor_base, load_base),
+        config::TURBO_MODEL_ID => gen_core::RouteBindings::generator(descriptor_turbo, load_turbo),
+        _ => gen_core::RouteBindings::generator(descriptor, load),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        bindings = match id {
+            config::BASE_MODEL_ID => bindings
+                .with_memory_registration(BASE_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_base,
+                )
+                .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR),
+            config::TURBO_MODEL_ID => bindings
+                .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_turbo,
+                )
+                .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR),
+            _ => bindings
+                .with_memory_registration(RL_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_rl,
+                )
+                .with_memory_behavior_registration(RL_MEMORY_BEHAVIOR),
+        };
+    }
+
+    gen_core::RouteRecord {
+        route_id: id,
         family: config::FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        required_components: REQUIRED_COMPONENTS,
-        capabilities: Capabilities {
-            supports_negative_prompt,
-            supports_guidance,
-            min_size: config::MIN_SIZE,
-            max_size: config::MAX_SIZE,
-            max_count: 8,
-            mac_only: false,
-            supported_quants: &[
-                candle_gen::gen_core::Quant::Q4,
-                candle_gen::gen_core::Quant::Q8,
-            ],
-            component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
-            supports_lora: true,
-            supports_lokr: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec![],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                pipeline::mage_driver_support(driver_id),
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("mage_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
+                pixel_stride: Some(config::SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["mage_nr_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["mage_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[
+                    candle_gen::gen_core::Quant::Q4,
+                    candle_gen::gen_core::Quant::Q8,
+                ],
+                component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
+                required_components: REQUIRED_COMPONENTS,
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: config::MIN_SIZE,
+            max_size: config::MAX_SIZE,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(default_steps),
+            guidance: Some(default_guidance),
+            sampler: None,
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
 }
 
 pub fn descriptor() -> ModelDescriptor {
-    generation_descriptor(MODEL_ID, true, true)
+    route_generation(MODEL_ID).compute_descriptor()
 }
 
 pub fn descriptor_base() -> ModelDescriptor {
-    generation_descriptor(config::BASE_MODEL_ID, true, true)
+    route_generation(config::BASE_MODEL_ID).compute_descriptor()
 }
 
 pub fn descriptor_turbo() -> ModelDescriptor {
-    generation_descriptor(config::TURBO_MODEL_ID, true, true)
+    route_generation(config::TURBO_MODEL_ID).compute_descriptor()
 }
 
 pub struct MageGenerator {
@@ -982,40 +1098,70 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_generation_variant(spec, descriptor_turbo(), 4, 1.0)
 }
 
-pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
-        control_kinds: None,
-        id: variant.id(),
-        family: config::FAMILY,
-        backend: "candle",
-        modality: Modality::Image,
-        required_components: REQUIRED_COMPONENTS,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Mage exposes its two-forward CFG scale through `guidance`; `true_cfg` is a distinct
-            // request field and is not consumed by this provider.
-            supports_true_cfg: false,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            min_size: config::MIN_SIZE,
-            max_size: config::MAX_SIZE,
-            max_count: 8,
-            mac_only: false,
-            supported_quants: &[
-                candle_gen::gen_core::Quant::Q4,
-                candle_gen::gen_core::Quant::Q8,
-            ],
-            component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
-            supports_lora: true,
-            supports_lokr: true,
-            ..Default::default()
-        },
+/// Primary typed route declaration for a Candle Mage-Flow edit variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_edit(variant: MageEditVariant) -> gen_core::RouteRecord {
+    let mut route = route_generation(MODEL_ID);
+    route.route_id = variant.id();
+    route.structure.conditioning.kinds = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["qwen3_vl_vision"];
+    let driver_id = match variant {
+        MageEditVariant::Edit => "candle_mage_edit",
+        MageEditVariant::EditBase => "candle_mage_edit_base",
+        MageEditVariant::EditTurbo => "candle_mage_edit_turbo",
+    };
+    route.structure.denoiser = gen_core::ModelBinding::family_driver(
+        gen_core::FamilyDriverSpec::new(pipeline::mage_driver_support(driver_id)),
+    );
+    let (default_steps, default_guidance) = variant.defaults();
+    route.defaults.steps = Some(default_steps as u32);
+    route.defaults.guidance = Some(default_guidance);
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = match variant {
+        MageEditVariant::Edit => gen_core::RouteBindings::generator(descriptor_edit, load_edit),
+        MageEditVariant::EditBase => {
+            gen_core::RouteBindings::generator(descriptor_edit_base, load_edit_base)
+        }
+        MageEditVariant::EditTurbo => {
+            gen_core::RouteBindings::generator(descriptor_edit_turbo, load_edit_turbo)
+        }
+    };
+    #[cfg(feature = "cuda")]
+    {
+        bindings = match variant {
+            MageEditVariant::Edit => bindings
+                .with_memory_registration(EDIT_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_edit,
+                )
+                .with_memory_behavior_registration(EDIT_MEMORY_BEHAVIOR),
+            MageEditVariant::EditBase => bindings
+                .with_memory_registration(EDIT_BASE_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_edit_base,
+                )
+                .with_memory_behavior_registration(EDIT_BASE_MEMORY_BEHAVIOR),
+            MageEditVariant::EditTurbo => bindings
+                .with_memory_registration(EDIT_TURBO_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::contract_edit_turbo,
+                )
+                .with_memory_behavior_registration(EDIT_TURBO_MEMORY_BEHAVIOR),
+        };
     }
+    route.bindings = bindings;
+    route
+}
+
+pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
+    route_edit(variant).compute_descriptor()
 }
 
 pub fn descriptor_edit() -> ModelDescriptor {
@@ -1112,23 +1258,14 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(TURBO_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION)
-        .register_generator(EDIT_BASE_REGISTRATION)
-        .register_generator(EDIT_TURBO_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION);
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(RL_MEMORY_BEHAVIOR)
-        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
-        .register_memory_behavior(EDIT_BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(EDIT_TURBO_MEMORY_BEHAVIOR);
     registry
+        .register_route(route_generation(MODEL_ID))
+        .register_route(route_generation(config::BASE_MODEL_ID))
+        .register_route(route_generation(config::TURBO_MODEL_ID))
+        .register_route(route_edit(MageEditVariant::Edit))
+        .register_route(route_edit(MageEditVariant::EditBase))
+        .register_route(route_edit(MageEditVariant::EditTurbo))
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Register the exhaustive weights-free memory-contract surface on every build platform.
@@ -1142,36 +1279,42 @@ pub fn register_memory_contract_surfaces(
             provider_id: config::MODEL_ID,
             contract: memory_strategy::contract_rl,
         })
+        .register_memory_behavior(RL_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::BASE_MODEL_ID,
             contract: memory_strategy::contract_base,
         })
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::TURBO_MODEL_ID,
             contract: memory_strategy::contract_turbo,
         })
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_MODEL_ID,
             contract: memory_strategy::contract_edit,
         })
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_BASE_MODEL_ID,
             contract: memory_strategy::contract_edit_base,
         })
+        .register_memory_behavior(EDIT_BASE_MEMORY_BEHAVIOR)
         .register_memory_strategy(EDIT_TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::EDIT_TURBO_MODEL_ID,
             contract: memory_strategy::contract_edit_turbo,
         })
+        .register_memory_behavior(EDIT_TURBO_MEMORY_BEHAVIOR)
 }
 
 const RL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -1207,7 +1350,6 @@ const EDIT_TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
 
 macro_rules! memory_behavior {
     ($name:ident, $id:expr) => {
-        #[cfg(feature = "cuda")]
         const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
             provider_id: $id,
             valid_fixtures: memory_strategy::registered_valid_fixture,
@@ -1225,6 +1367,25 @@ memory_behavior!(EDIT_TURBO_MEMORY_BEHAVIOR, config::EDIT_TURBO_MODEL_ID);
 
 pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 6);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

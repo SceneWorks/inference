@@ -18,9 +18,8 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -45,35 +44,138 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
     }
 }
 
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id,
+fn route_for(
+    id: &'static str,
+    desc_fn: fn() -> ModelDescriptor,
+    load_fn: fn(&LoadSpec) -> mlx_gen::gen_core::Result<Box<dyn Generator>>,
+) -> mlx_gen::gen_core::RouteRecord {
+    let model_id = if id == MODEL_ID_7B {
+        "seedvr2_dit_7b"
+    } else {
+        "seedvr2_dit_3b"
+    };
+    mlx_gen::gen_core::RouteRecord {
+        route_id: id,
         family: "seedvr2",
         backend: "mlx",
         modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
-        capabilities: Capabilities {
-            // `supports_negative_prompt` is deferred to its `false` default rather than declared:
-            // SeedVR2 carries a precomputed negative embedding and exposes no prompt surface.
-            supports_guidance: false, // one-step, guidance fixed at 1.0
-            supports_true_cfg: false,
-            // the LR input image (image upscale) or LR frame sequence (video upscale)
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            samplers: vec!["seedvr2_euler"],
-            schedulers: vec!["seedvr2_euler"],
-            min_size: VAE_SCALE,
-            max_size: 4096,
-            max_count: 8,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5198)
-            component_precision_floors: &[],
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+        mac_only: true,
+        structure: mlx_gen::gen_core::RouteStructure {
+            text_encoders: mlx_gen::gen_core::TextEncoderSurface::default(),
+            conditioning: mlx_gen::gen_core::ConditioningSurface {
+                // the LR input image (image upscale) or LR frame sequence (video upscale)
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
+                control_kinds: None,
+                pass0_requirement:
+                    mlx_gen::gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: false,
+                modules: Vec::new(),
+                ..Default::default()
+            },
+            sampling: mlx_gen::gen_core::SamplingSurface {
+                samplers: vec!["seedvr2_euler"],
+                schedulers: vec!["seedvr2_euler"],
+                guidance_methods: Vec::new(),
+                supports_guidance: false, // one-step, guidance fixed at 1.0
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: mlx_gen::gen_core::ModelBinding::family_model(
+                mlx_gen::gen_core::FamilyModelSpec::new(model_id),
+            ),
+            latent_codec: mlx_gen::gen_core::LatentCodecDeclaration {
+                codec_id: Some("seedvr2_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(VAE_SCALE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: mlx_gen::gen_core::UpsamplerSurface::default(),
+            adapters: mlx_gen::gen_core::AdapterSurface::unsupported(),
+            residency: mlx_gen::gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Denoise,
+                        [model_id],
+                        false,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Decode,
+                        ["seedvr2_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: mlx_gen::gen_core::WeightPlanDeclaration {
+                source_kind: mlx_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: mlx_gen::gen_core::OutputSurface {
+                preview: mlx_gen::gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: mlx_gen::gen_core::ProductLimits {
+            min_size: VAE_SCALE,
+            max_size: 4096,
+            size_floor: mlx_gen::gen_core::SizeFloor::RangeChecked,
+            supported_steps: mlx_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: mlx_gen::gen_core::SeedAndBatchSemantics {
+            seed_scheme: mlx_gen::gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: mlx_gen::gen_core::RouteDefaults {
+            steps: Some(1),
+            guidance: None,
+            sampler: Some("seedvr2_euler"),
+            schedule: Some("seedvr2_euler"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: mlx_gen::gen_core::RouteBindings::generator(desc_fn, load_fn),
+    }
+}
+
+pub(crate) fn route_base() -> mlx_gen::gen_core::RouteRecord {
+    route_for(MODEL_ID, descriptor, |spec| {
+        load_base(spec).map_err(Into::into)
+    })
+}
+
+pub(crate) fn route_3b() -> mlx_gen::gen_core::RouteRecord {
+    route_for(MODEL_ID_3B, descriptor_3b, |spec| {
+        load_3b(spec).map_err(Into::into)
+    })
+}
+
+pub(crate) fn route_7b() -> mlx_gen::gen_core::RouteRecord {
+    route_for(MODEL_ID_7B, descriptor_7b, |spec| {
+        load_7b(spec).map_err(Into::into)
+    })
+}
+
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    match id {
+        MODEL_ID_3B => route_3b().compute_descriptor(),
+        MODEL_ID_7B => route_7b().compute_descriptor(),
+        _ => route_base().compute_descriptor(),
     }
 }
 
@@ -324,16 +426,6 @@ fn load_3b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 fn load_7b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_7B)
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load_base
-}
-mlx_gen::register_generators! {
-    pub(crate) const THREE_B_REGISTRATION = descriptor_3b => load_3b
-}
-mlx_gen::register_generators! {
-    pub(crate) const SEVEN_B_REGISTRATION = descriptor_7b => load_7b
 }
 
 /// Fold one image's per-tile progress onto the whole-batch bar (F-162 / F-164, sc-11133). Image

@@ -275,9 +275,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress,
+    Quant, WeightsSource,
 };
 use candle_gen::{
     check_cancel as product_check_cancel, run_three_stage_sequential, CandleError,
@@ -1404,7 +1404,15 @@ fn validate_dense_request(
                 .into(),
         ));
     }
-    if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
+    if image_conditioned
+        && req
+            .extensions
+            .wan
+            .as_ref()
+            .and_then(|w| w.trim_first_frames)
+            .unwrap_or(0)
+            > 0
+    {
         return Err(gen_core::Error::Msg(
             "wan: trim_first_frames is not supported with Reference/Keyframe conditioning".into(),
         ));
@@ -1508,62 +1516,113 @@ impl Generator for WanGenerator {
     }
 }
 
-/// Wan2.2 TI2V-5B descriptor: CFG text-to-video plus z48-encoded `Reference` / latent-index
-/// `Keyframe` mask blending, with UniPC / Euler samplers. **LoRA/LoKr** apply at load
-/// (sc-10095: folded on a dense tier, additive on a packed one). Advertises the Q4/Q8 packed tiers
-/// (sc-10025) — pre-quantized snapshots the packed-detect loaders read directly (no on-the-fly quant).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z48_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Wan2.2 TI2V-5B (`REG-1`, `AP5`).
+pub(crate) fn route_ti2v() -> gen_core::RouteRecord {
+    let bindings = gen_core::RouteBindings::generator(descriptor, load).with_video_plan(
+        gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: dense_video_layout,
+        },
+    );
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "wan",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
-            // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
-            // packed q4/q8 tier. Structured LoKr is packed-safe; LoHa fails closed. The env-only native
-            // GGUF loader is not a registered product tier.
-            supports_lora: true,
-            supports_lokr: true,
-            // Native flow samplers (curated `uni_pc` default / `euler` / flow-SNR `dpmpp_2m`, sc-27309,
-            // matching the MLX twin's menu) + the epic 7114 P4 (sc-7124)
-            // curated fold-in: the gen-core-only solvers over Wan's native flow σ schedule. The curated
-            // `uni_pc` (sc-7296) is honored by Wan's OWN native UniPC; gen-core's VE-space `uni_pc`/
-            // `dpmpp_2m` solvers are NOT routed through the fold-in (they would diverge from Wan's
-            // diffusers FLOW-SNR parity). Legacy `unipc`/`dpmpp2m` retained as aliases for recipe back-compat. No
-            // scheduler axis (the flow shift is the `scheduler_shift` knob).
-            samplers: vec![
-                "uni_pc",
-                "euler",
-                "dpmpp_2m",
-                "euler_ancestral",
-                "heun",
-                "dpmpp_sde",
-                "ddim",
-                "unipc",
-                "dpmpp2m",
-            ],
-            // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
-            // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
-            // (dense + packed alike, sc-10306). Enforced by `Capabilities::validate_request`.
-            min_size: MIN_SIZE,
-            max_size: 1280,
-            max_count: 1,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
-            // `render_sequential` keeps the ~11 GB bf16 UMT5 encoder off-GPU for the whole denoise and
-            // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
-            // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
-            supports_sequential_offload: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec![
+                    "uni_pc",
+                    "euler",
+                    "dpmpp_2m",
+                    "euler_ancestral",
+                    "heun",
+                    "dpmpp_sde",
+                    "ddim",
+                    "unipc",
+                    "dpmpp2m",
+                ],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "wan2_2_ti2v_5b_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z48_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z48_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["wan2_2_ti2v_5b_dit"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z48_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("uni_pc"),
+            shift: Some(5.0),
+            dimensions: Some((1280, 704)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Wan2.2 TI2V-5B descriptor — computed from `route_ti2v`.
+pub fn descriptor() -> ModelDescriptor {
+    route_ti2v().compute_descriptor()
 }
 
 /// Construct a lazy candle Wan generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at
@@ -1643,38 +1702,42 @@ fn build_generator_with_source(
     })
 }
 
-candle_gen::register_generators! {
-    pub(crate) const TI2V_REGISTRATION = descriptor => load
-}
-
-/// Add all Candle Wan generators and trainers to an explicit media registry builder.
+/// Add all Candle Wan generators and trainers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(TI2V_REGISTRATION)
-        .register_video_plan(gen_core::VideoPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: dense_video_layout,
-        })
-        .register_generator(wan14b::T2V_14B_REGISTRATION)
-        .register_generator(wan14b::I2V_14B_REGISTRATION)
-        .register_generator(model_vace::VACE_REGISTRATION)
-        .register_generator(model_vace_fun::VACE_FUN_REGISTRATION);
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(unused_mut))]
+    let mut ti2v = route_ti2v();
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(unused_mut))]
+    let mut t2v_14b = wan14b::route_t2v_14b();
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(unused_mut))]
+    let mut i2v_14b = wan14b::route_i2v_14b();
     #[cfg(any(feature = "cuda", test))]
-    let registry = registry
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        // sc-22736 (epic sc-22723, E1): the pre-load half for the two A14B routes, which loaded
-        // with a full receipt but resolved nothing before their weights existed.
-        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
-        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
-        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
-        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR);
+    {
+        ti2v.bindings = ti2v
+            .bindings
+            .with_memory_registration(memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(memory_strategy::MEMORY_FIXTURE)
+            .with_memory_behavior_registration(memory_strategy::MEMORY_BEHAVIOR);
+        t2v_14b.bindings = t2v_14b
+            .bindings
+            .with_memory_registration(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
+            .with_memory_behavior_registration(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR);
+        i2v_14b.bindings = i2v_14b
+            .bindings
+            .with_memory_registration(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
+            .with_memory_behavior_registration(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR);
+    }
     registry
+        .register_route(ti2v)
+        .register_route(t2v_14b)
+        .register_route(i2v_14b)
+        .register_route(model_vace::route())
+        .register_route(model_vace_fun::route())
         // The Wan 2.2 ComfyUI expert pair (epic 20398, sc-20644). Registering it is what makes
         // `ProviderRegistry::checkpoint_adapters` — and therefore SceneWorks'
         // `inference_runtime::checkpoint_adapter("wan-video")` — actually resolve; the portable
@@ -1705,6 +1768,23 @@ pub fn register_providers(
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
         .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
+}
+
+/// Register Wan's CUDA memory contract surfaces without requiring `--features cuda`, used by
+/// hosted hardware-free CUDA capability export (`SW-6980`, `REG-3`).
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
+        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Wan provider catalog.
@@ -2159,7 +2239,7 @@ mod tests {
             Some("dpmpp2m"),
         ] {
             let native = GenerationRequest {
-                sampler: name.map(str::to_owned),
+                sampler: name.map(Into::into),
                 ..Default::default()
             };
             assert!(dense_curated_phase(&native, 37).unwrap().is_none());

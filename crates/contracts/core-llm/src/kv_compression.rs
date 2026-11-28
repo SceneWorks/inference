@@ -20,7 +20,10 @@
 pub const KV_CACHE_FORMAT_VERSION: u32 = 1;
 
 /// The product's opt-in for the compressed KV cache on one generation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum KvCompressionPolicy {
     /// Always dense (the default). Reported as [`KvCacheFallbackReason::PolicyDisabled`].
     #[default]
@@ -34,9 +37,10 @@ pub enum KvCompressionPolicy {
 ///
 /// Only formats with qualifying evidence are listed: the 4-bit (K4V4) and 2-bit group-affine
 /// candidates were No-Go in the SC-20669 proof of concept and are deliberately not advertised.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum KvCompressionFormat {
     /// Packed group-affine, 8-bit key and value codes, group 32, f16 scale/zero.
+    #[serde(rename = "group-affine-k8v8")]
     GroupAffineK8V8,
 }
 
@@ -409,7 +413,8 @@ pub const KV_COMPRESSION_QUALIFICATIONS: &[KvQualification] = &[
 ];
 
 /// Why a generation ran (or finished) on the dense KV cache.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KvCacheFallbackReason {
     /// The request did not opt in ([`KvCompressionPolicy::Off`]).
     PolicyDisabled,
@@ -539,7 +544,7 @@ fn qualify_against(
 }
 
 /// Counters of one generation's KV cache, measured by the backend. All zero on a dense run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KvCacheCounters {
     /// Attention calls the fused compressed-domain reader served.
     pub fused_attention_calls: u64,
@@ -564,17 +569,21 @@ pub struct KvCacheCounters {
 
 /// The KV cache one generation ran on, carried on
 /// [`TextLlmOutput::kv_cache`](crate::TextLlmOutput::kv_cache).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KvCacheReport {
     /// [`KV_CACHE_FORMAT_VERSION`] of the backend that produced this report.
     pub format_version: u32,
     /// The compressed format the generation was started on; `None` when it ran dense throughout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<KvCompressionFormat>,
     /// Why the generation ran (or finished) dense; `None` exactly when it ran wholly compressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<KvCacheFallbackReason>,
     /// The backend's own words for the fallback, when it has more than the reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Measured cache counters.
+    #[serde(default)]
     pub counters: KvCacheCounters,
 }
 

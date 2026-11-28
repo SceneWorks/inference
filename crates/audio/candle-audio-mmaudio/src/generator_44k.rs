@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::{Device, Tensor};
 use candle_audio::gen_core::{
-    self, reject_unknown_components, require_component, AudioTrack, Capabilities, ConditioningKind,
+    self, reject_unknown_components, require_component, AudioTrack, ConditioningKind,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
     Progress, StepSupport, WeightsSource,
 };
@@ -74,41 +74,102 @@ pub const MAX_STEPS: u32 = 500;
 /// Prompt language the CLIP text tower was trained on.
 pub const LANGUAGES: &[&str] = &["en"];
 
-/// The 44k provider's identity + capabilities — constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        // Same five named component ids as the 16k provider (epic 13657, sc-13666) — `clip` /
-        // `synchformer` / `dit` / `vae` / `vocoder`. The ids match; the underlying checkpoints differ
-        // (the `large_44k_v2` MM-DiT + 44k mel-VAE from `hkchengrex/MMAudio`, and — unlike the 16k
-        // path's in-repo BigVGAN — the `vocoder` from `nvidia/bigvgan_v2_44khz_128band_512x`).
-        required_components: REQUIRED_COMPONENTS,
-        id: MODEL_ID,
+/// Primary typed route declaration for MMAudio 44.1 kHz video→audio Foley (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: FAMILY,
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::VideoSync],
-            max_count: 1,
-            // The Euler flow-matching ladder's 500-step bound, advertised rather than hidden
-            // (sc-19559). This module's `MAX_STEPS` previously had NO reader: enforcement runs off
-            // `generator::MAX_STEPS` through the shared `validate_request` both variants call, so
-            // the 44 kHz copy of the number could drift from the enforced one in silence.
-            // Declaring from it gives it a reader and puts the shared floor on the bound too.
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "dfn5b_clip",
+                    Some(77),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::VideoSync],
+                supports_negative_prompt: true,
+                modules: vec!["synchformer", "dfn5b_clip"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "mmaudio_large_44k_v2_mmdit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("mmaudio_mel_vae_bigvgan_v2_44k"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["dfn5b_clip", "synchformer"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["mmaudio_large_44k_v2_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["mmaudio_mel_vae_44k", "bigvgan_v2_44k"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: REQUIRED_COMPONENTS,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                voices: vec![],
+                languages: LANGUAGES.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_languages: LANGUAGES.to_vec(),
             ..Default::default()
         },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_CFG),
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// The 44k provider's identity + capabilities — computed from `route` without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// The `(latent_seq_len, clip_seq_len, sync_seq_len)` for a duration — the port of `SequenceConfig`

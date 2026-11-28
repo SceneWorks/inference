@@ -313,39 +313,33 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         ..Default::default()
     };
     let run = |g: &crate::model::MiniMaxH3, r: &GenerationRequest| {
-        let out = g.generate(r, &mut |_| {}).unwrap();
-        let GenerationOutput::Video { frames, fps, audio } = out else {
+        let gen_report = g.generate_with_report(r, &mut |_| {}).unwrap();
+        let veda_report = gen_report.veda_report().cloned().unwrap();
+        let Some(GenerationOutput::Video { frames, fps, audio }) = gen_report.output else {
             panic!("video output")
         };
         assert_eq!(frames.len(), 124);
         assert_eq!(fps, 24);
         assert!(audio.is_some());
-        frames
+        (frames, veda_report)
     };
     // A configured but missing optional component must not be touched by omitted/off settings.
     let missing_predictor = root.path().join("missing-veda-predictor.safetensors");
     assert!(!missing_predictor.exists());
     generator.veda_component = Some(missing_predictor);
-    let dense = run(&generator, &request);
-    let off_report = generator.veda_execution_report().unwrap();
+    let (dense, off_report) = run(&generator, &request);
     assert!(!off_report.requested);
     assert_eq!(off_report.predictor_load_attempts, 0);
     assert_eq!(off_report.workspace_bytes, 0);
-    request.veda = Some(VedaRequest::default());
-    assert_eq!(run(&generator, &request), dense);
-    assert_eq!(
-        generator
-            .veda_execution_report()
-            .unwrap()
-            .predictor_load_attempts,
-        0
-    );
-    request.veda = Some(VedaRequest {
+    request.extensions.h3_mut().veda = Some(VedaRequest::default());
+    let (off_frames, off_default_report) = run(&generator, &request);
+    assert_eq!(off_frames, dense);
+    assert_eq!(off_default_report.predictor_load_attempts, 0);
+    request.extensions.h3_mut().veda = Some(VedaRequest {
         enabled: true,
         ..Default::default()
     });
-    let sparse = run(&generator, &request);
-    let report = generator.veda_execution_report().unwrap();
+    let (sparse, report) = run(&generator, &request);
     assert_eq!(report.sparse_calls, 2);
     assert!(report.predictor_score_calls > 0);
     assert!(report.selected_token_pairs < report.dense_token_pairs);
@@ -365,8 +359,8 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         "learned sparse path must affect output assembly"
     );
     generator.fixture.as_mut().unwrap().predictor = false;
-    assert_eq!(run(&generator, &request), dense);
-    let missing = generator.veda_execution_report().unwrap();
+    let (missing_frames, missing) = run(&generator, &request);
+    assert_eq!(missing_frames, dense);
     assert_eq!(missing.sparse_calls, 0);
     assert_eq!(missing.dense_calls, 2);
     assert_eq!(missing.outcome_json()["effective"], "dense");
@@ -378,8 +372,8 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         .contains("managed component"));
     generator.fixture.as_mut().unwrap().predictor = true;
     generator.fixture.as_mut().unwrap().fail_self_test = true;
-    assert_eq!(run(&generator, &request), dense);
-    let failed = generator.veda_execution_report().unwrap();
+    let (failed_frames, failed) = run(&generator, &request);
+    assert_eq!(failed_frames, dense);
     assert_eq!(failed.sparse_calls, 0);
     assert_eq!(failed.dense_calls, 2);
     assert_eq!(failed.outcome_json()["effective"], "dense");
@@ -391,14 +385,11 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         .contains("self-test forced failure"));
     // No sparse call ran under the chosen plan, so none is reported as executed.
     assert!(failed.plan.is_none() && failed.plan_grid.is_none());
-    request.veda = None;
-    assert_eq!(run(&generator, &request), dense);
-    assert!(generator
-        .veda_execution_report()
-        .unwrap()
-        .fallback_reason
-        .is_none());
-    let later = generator.veda_execution_report().unwrap().outcome_json();
+    request.extensions.h3_mut().veda = None;
+    let (later_frames, later_report) = run(&generator, &request);
+    assert_eq!(later_frames, dense);
+    assert!(later_report.fallback_reason.is_none());
+    let later = later_report.outcome_json();
     assert_eq!(later["requested"], false);
     assert!(later["kernel"].is_null());
     assert!(later["plan"].is_null());

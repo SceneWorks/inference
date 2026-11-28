@@ -33,9 +33,9 @@ use candle_gen::driver::{
     DriverRunState, DriverSupport, FamilyDriver, SliceInput, SliceSpec, SliceTransition, StepHooks,
 };
 use candle_gen::gen_core::{
-    self, BoundaryState, CancelFlag, Capabilities, Conditioning, ConditioningKind,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
-    Quant, WeightsSource,
+    self, BoundaryState, CancelFlag, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -65,44 +65,138 @@ const Z_DIM: usize = 16;
 /// engine across backends). A still image is `num_frames == 1`.
 pub const MODEL_ID: &str = "bernini_renderer";
 
-/// Stable identity + advertised capabilities for the Bernini renderer (Wan2.2-A14B dual-expert with
-/// APG guidance; caption→video/image). `backend = "candle"`, `mac_only = false`.
-///
-/// Advertises the **packed source-id conditioning** surface (sc-11004): a single `Reference` (i2i), a
-/// `MultiReference` set (r2v reference images), or a `VideoClip` (v2v/rv2v) — each VAE-encoded to a z16
-/// source latent and packed on the DiT token axis with its own source-id RoPE. The text-only render
-/// (t2v/t2v_apg) stays the default when no conditioning is present. Q4/Q8 are **packed tiers**
-/// (pre-quantized; the loaders read the `.scales` siblings).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for the Bernini renderer (`SW-6979`, `REG-1`).
+pub(crate) fn route_renderer() -> gen_core::RouteRecord {
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load);
+    #[cfg(any(feature = "cuda", test))]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::memory_strategy::RENDERER_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::RENDERER_MEMORY_FIXTURE)
+            .with_memory_behavior_registration(crate::memory_strategy::RENDERER_MEMORY_BEHAVIOR);
+    }
+
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "bernini",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-                ConditioningKind::VideoClip,
-            ],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                    ConditioningKind::VideoClip,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy
+                // `unipc` alias.
+                samplers: vec!["uni_pc", "euler", "unipc"],
+                schedulers: vec![],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(
+                gen_core::FamilyDriverSpec::new(stage2_driver_support("candle_bernini_renderer"))
+                    .with_expert_switching(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(16),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
             // User LoRA/LoKr stacks apply to both dense bf16 and packed q4/q8 renderer tiers.
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
-            samplers: vec!["uni_pc", "euler", "unipc"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            supported_quants: &[Quant::Q4, Quant::Q8],
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["wan_a14b_high_expert", "wan_a14b_low_expert"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(Defaults::STEPS as u32),
+            guidance: Some(Defaults::OMEGA_TXT),
+            sampler: Some("uni_pc"),
+            schedule: None,
+            shift: Some(BerniniKnobs::default().shift),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Stable identity + advertised capabilities for the Bernini renderer (Wan2.2-A14B dual-expert with
+/// APG guidance; caption→video/image). `backend = "candle"`, `mac_only = false`.
+///
+/// Computed from `route_renderer`.
+pub fn descriptor() -> ModelDescriptor {
+    route_renderer().compute_descriptor()
 }
 
 /// A loaded Bernini renderer: resolved Bernini knobs + the snapshot dir, with the heavy components
@@ -274,28 +368,32 @@ pub struct BerniniDualExpertDriver<F> {
     support: DriverSupport,
 }
 
+pub(crate) fn stage2_driver_support(driver_id: &'static str) -> DriverSupport {
+    DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean:
+                "native Candle Bernini Stage 2 driver does not re-noise from clean estimates",
+            geometry_change:
+                "native Candle Bernini Stage 2 driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "native Candle Bernini Stage 2 driver does not expose read-only boundary clean estimates",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F: BerniniStage2Forward> BerniniDualExpertDriver<F> {
     fn build_support(driver_id: &'static str) -> DriverSupport {
-        DriverSupport {
-            driver_id,
-            arbitrary_slice: true,
-            carry_history: true,
-            reset_history: true,
-            renoise_from_clean: false,
-            geometry_change: false,
-            read_only_boundary_estimate: false,
-            previous_estimate_capture: false,
-            uses_global_rng: false,
-            refusal_reasons: DriverRefusalReasons {
-                renoise_from_clean:
-                    "native Candle Bernini Stage 2 driver does not re-noise from clean estimates",
-                geometry_change:
-                    "native Candle Bernini Stage 2 driver does not support geometry-changing phase boundaries",
-                read_only_boundary_estimate:
-                    "native Candle Bernini Stage 2 driver does not expose read-only boundary clean estimates",
-                ..DriverRefusalReasons::default()
-            },
-        }
+        stage2_driver_support(driver_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -891,10 +989,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         memory_refusal,
         loaded_spec: spec.clone(),
     }))
-}
-
-candle_gen::register_generators! {
-    pub(crate) const RENDERER_REGISTRATION = descriptor => load
 }
 
 impl Generator for BerniniRenderer {

@@ -148,7 +148,7 @@ fn pulid_flux_end_to_end() {
     let mut cfg_req = req_with(&face_img, prompt, 1.0, steps, size);
     cfg_req.true_cfg = Some(2.0);
     cfg_req.negative_prompt = Some("low quality, blurry, deformed, disfigured".into());
-    cfg_req.timestep_to_start_cfg = Some(4); // sc-3336: exercise the new core CFG-start knob
+    cfg_req.extensions.pulid_mut().timestep_to_start_cfg = Some(4); // sc-3336: exercise the new core CFG-start knob
     let id0_plan = compile_constructed_plan(&id0_req).unwrap();
     let id1_plan = compile_constructed_plan(&id1_req).unwrap();
     let cfg_plan = compile_constructed_plan(&cfg_req).unwrap();

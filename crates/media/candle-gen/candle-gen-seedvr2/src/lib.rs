@@ -43,9 +43,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, WeightsSource,
 };
 
 pub use config::{DitConfig, TIMESTEP, VAE_SCALE};
@@ -70,38 +69,99 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
     }
 }
 
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id,
+pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
+    let bindings = if id == MODEL_ID_7B {
+        gen_core::RouteBindings::generator(descriptor_7b, load_registered_7b)
+    } else if id == MODEL_ID_3B {
+        gen_core::RouteBindings::generator(descriptor_3b, load_registered_3b)
+    } else {
+        gen_core::RouteBindings::generator(descriptor, load_registered)
+    };
+    let dit_id = if id == MODEL_ID_7B {
+        "seedvr2_7b_dit"
+    } else {
+        "seedvr2_3b_dit"
+    };
+    gen_core::RouteRecord {
+        route_id: id,
         family: "seedvr2",
         backend: "candle",
-        modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
-        capabilities: Capabilities {
-            // `supports_negative_prompt` is deferred to its `false` default rather than declared:
-            // SeedVR2 carries a precomputed negative embedding and exposes no prompt surface.
-            supports_guidance: false, // one-step, guidance fixed at 1.0
-            supports_true_cfg: false,
-            // the LR input image (image upscale) or LR frame sequence (video upscale)
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            // Bespoke-by-architecture (epic 7114 P4, sc-7123): SeedVR2 is a ONE-STEP restoration
-            // transformer (fixed timestep 1000.0, `denoised = noise − dit_out`), NOT a multi-step
-            // rectified-flow ODE — there is no sigma schedule to integrate and no sampler/scheduler axis
-            // to expose. It keeps its native single-step `seedvr2_euler` descriptor verbatim; the unified
-            // curated solvers/schedulers do not apply.
-            samplers: vec!["seedvr2_euler"],
-            schedulers: vec!["seedvr2_euler"],
-            min_size: VAE_SCALE,
-            max_size: 4096,
-            max_count: 8,
-            supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
-            component_precision_floors: &[],
+        modality: Modality::Both,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: false,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["seedvr2_euler"],
+                schedulers: vec!["seedvr2_euler"],
+                supports_guidance: false,
+                supports_true_cfg: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(dit_id)),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("seedvr2_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["seedvr2_video_vae"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        [dit_id],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["seedvr2_video_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: VAE_SCALE,
+            max_size: 4096,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(1),
+            sampler: Some("seedvr2_euler"),
+            schedule: Some("seedvr2_euler"),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    route_for(id).compute_descriptor()
 }
 
 pub fn descriptor() -> ModelDescriptor {
@@ -333,24 +393,16 @@ fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_7B)
 }
 
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor => load_registered
-}
-candle_gen::register_generators! {
-    pub(crate) const THREE_B_REGISTRATION = descriptor_3b => load_registered_3b
-}
-candle_gen::register_generators! {
-    pub(crate) const SEVEN_B_REGISTRATION = descriptor_7b => load_registered_7b
-}
-
-/// Add all Candle SeedVR2 generators to an explicit media registry builder.
+/// Add all Candle SeedVR2 generators to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(THREE_B_REGISTRATION)
-        .register_generator(SEVEN_B_REGISTRATION)
+        .register_route(route_for(MODEL_ID))
+        .register_route(route_for(MODEL_ID_3B))
+        .register_route(route_for(MODEL_ID_7B))
 }
 
 /// Build the complete explicit Candle SeedVR2 provider catalog.

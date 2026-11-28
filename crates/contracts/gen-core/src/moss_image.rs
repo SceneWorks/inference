@@ -257,27 +257,40 @@ pub fn moss_policy_request(request: &GenerationRequest) -> policy::MossPolicyReq
         steps: request.steps,
         guidance: request.guidance,
         scheduler_shift: request.scheduler_shift,
-        sampler: request.sampler.clone(),
-        scheduler: request.scheduler.clone(),
-        guidance_method: request.guidance_method.clone(),
+        sampler: request.sampler.as_deref().map(str::to_owned),
+        scheduler: request.scheduler.as_deref().map(str::to_owned),
+        guidance_method: request.guidance_method.as_deref().map(str::to_owned),
         guidance_eta: request.guidance_eta,
         guidance_momentum: request.guidance_momentum,
         guidance_norm_threshold: request.guidance_norm_threshold,
         true_cfg: request.true_cfg,
-        timestep_to_start_cfg: request.timestep_to_start_cfg,
+        timestep_to_start_cfg: request
+            .extensions
+            .pulid
+            .and_then(|p| p.timestep_to_start_cfg),
         cfg_interval: request.cfg_interval,
-        phases_present: request.phases.is_some(),
+        phases_present: request.features.phases.is_some(),
         conditioning_present: !request.conditioning.is_empty(),
         negative_prompt: request.negative_prompt.clone(),
-        pag: request.pag.clone(),
-        moss_image: request.moss_image.clone().map(Into::into),
+        pag: request.features.pag.clone(),
+        moss_image: request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|m| m.options.clone())
+            .map(Into::into),
     }
 }
 impl MossImageResolved {
     pub fn resolve(variant: MossImageVariant, request: &GenerationRequest) -> Result<Self> {
         // The native request also carries other families' float knobs. Keep its exhaustive
         // finiteness floor before projecting the MOSS controls into the portable owner.
-        let options = request.moss_image.clone().unwrap_or_default();
+        let options = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|m| m.options.clone())
+            .unwrap_or_default();
         require(
             options.first_nonfinite_float().is_none(),
             "nonfinite MOSS control",
@@ -421,6 +434,14 @@ pub enum MossImageAdvancedOutput {
     Images(Vec<Image>),
     Latents { values: Vec<f32>, shape: [usize; 4] },
 }
+impl From<MossImageAdvancedOutput> for crate::GenerationOutput {
+    fn from(output: MossImageAdvancedOutput) -> Self {
+        match output {
+            MossImageAdvancedOutput::Images(images) => Self::Images(images),
+            MossImageAdvancedOutput::Latents { values, shape } => Self::Latents { values, shape },
+        }
+    }
+}
 impl Serialize for MossImageAcceleration {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -523,7 +544,7 @@ impl MossImageAssetReceipt {
             repository: IMPORTED_TRANSFORMER_REPOSITORY.into(),
             revision: IMPORTED_TRANSFORMER_REVISION.into(),
             relative_path: IMPORTED_TRANSFORMER_PATH.into(),
-            sha256: hex_digest(pin.content_sha256()),
+            sha256: hex_digest(pin.require_content_sha256()?),
         })
     }
 
@@ -544,7 +565,7 @@ impl MossImageAssetReceipt {
             repository: repository.into(),
             revision: revision.into(),
             relative_path: relative_path.into(),
-            sha256: hex_digest(pin.content_sha256()),
+            sha256: hex_digest(pin.require_content_sha256()?),
         })
     }
 }
@@ -1090,10 +1111,13 @@ mod execution_receipt_tests {
         let resolved = MossImageResolved::resolve(
             MossImageVariant::Sft,
             &GenerationRequest {
-                moss_image: Some(MossImageOptions {
-                    acceleration: mode,
+                extensions: crate::FamilyExtensions {
+                    moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                        acceleration: mode,
+                        ..Default::default()
+                    })),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             },
         )
@@ -1425,22 +1449,28 @@ mod execution_receipt_tests {
         for noop_req in [
             GenerationRequest::default(),
             GenerationRequest {
-                pag: Some(crate::PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![20]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            GenerationRequest {
-                moss_image: Some(MossImageOptions {
+                features: crate::FeatureParams {
                     pag: Some(crate::PagConfig {
                         scale: 0.0,
-                        layers: Some(vec![0, 41]),
+                        layers: Some(vec![20]),
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
+                },
+                ..Default::default()
+            },
+            GenerationRequest {
+                extensions: crate::FamilyExtensions {
+                    moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                        pag: Some(crate::PagConfig {
+                            scale: 0.0,
+                            layers: Some(vec![0, 41]),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         ] {
@@ -1493,7 +1523,10 @@ mod execution_receipt_tests {
         )
         .unwrap();
         assert_eq!(receipt.relative_path, "transformer/config.json");
-        assert_eq!(receipt.sha256, hex_digest(pin.content_sha256()));
+        assert_eq!(
+            receipt.sha256,
+            hex_digest(pin.require_content_sha256().unwrap())
+        );
         assert!(!pin.loader_path().ends_with("transformer/config.json"));
         for (repo, rev, path) in [
             (SFT_REPO, "main", "transformer/config.json"),

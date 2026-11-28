@@ -99,7 +99,13 @@ fn h3_image_sampler_ab_renders_2048_bf16() {
                     height: 2048,
                     count: 1,
                     seed: Some(seed),
-                    h3_image_sampler: Some(sampler),
+                    extensions: mlx_gen::gen_core::FamilyExtensions {
+                        h3: Some(mlx_gen::gen_core::H3Extension {
+                            image_sampler: Some(sampler),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 generator.validate(&req).unwrap();

@@ -1168,7 +1168,7 @@ impl Pipeline {
             }
             None => None,
         };
-        if req.use_pid || clean_init.is_some() {
+        if req.use_pid() || clean_init.is_some() {
             self.device.synchronize()?;
             run.end_conditioning()?;
         }
@@ -1806,7 +1806,7 @@ mod tests {
         let encode = after(&lib, "|text| {");
         let pid_branch = &encode[..encode.find("} else {").unwrap()];
         assert!(
-            pid_branch.contains("if req.use_pid || req.source_image.is_some() {")
+            pid_branch.contains("if req.use_pid() || req.source_image.is_some() {")
                 && pid_branch.contains("run.begin_conditioning()?;")
         );
         let plain = &encode[encode.find("} else {").unwrap()..];

@@ -65,6 +65,11 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
     provider_descriptor_on(crate::device::decode_backend_for(cfg!(feature = "cuda")))
 }
 
+/// CUDA-target descriptor for hardware-free hosted capability export (`SW-6980`, `REG-3`).
+pub fn cuda_provider_descriptor() -> TextLlmDescriptor {
+    provider_descriptor_on(core_llm::DecodeBackend::CandleCuda)
+}
+
 /// [`provider_descriptor`] for a model decoding on `backend`'s row of the defaults table.
 pub(super) fn provider_descriptor_on(backend: core_llm::DecodeBackend) -> TextLlmDescriptor {
     TextLlmDescriptor {
@@ -218,6 +223,13 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     // descriptor stays `supports_audio=false` and this probe carries the per-snapshot truth.
     weightless_audio: Some(can_load_audio),
 };
+
+/// Hardware-free CUDA-target descriptor registration for hosted capability export (`SW-6980`).
+pub const CUDA_DESCRIPTOR_REGISTRATION: core_llm::TextLlmRegistration =
+    core_llm::TextLlmRegistration {
+        descriptor: cuda_provider_descriptor,
+        ..REGISTRATION
+    };
 
 pub(super) fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))

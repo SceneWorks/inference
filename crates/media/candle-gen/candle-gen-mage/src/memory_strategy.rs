@@ -863,8 +863,9 @@ impl RequestBinding {
                 reference_count: request.image_reference_count(),
             },
             memory: request.memory,
-            use_pid: request.use_pid,
+            use_pid: request.use_pid(),
             has_phases: request
+                .features
                 .phases
                 .as_ref()
                 .is_some_and(|phases| !phases.is_empty()),
@@ -1130,10 +1131,11 @@ impl MemoryRequestScope for MageMemoryScope {
             )));
         }
         let has_phases = request
+            .features
             .phases
             .as_ref()
             .is_some_and(|phases| !phases.is_empty());
-        if request.use_pid != self.use_pid || has_phases != self.has_phases {
+        if request.use_pid() != self.use_pid || has_phases != self.has_phases {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: forbidden request axes changed after admission",
                 self.provider_id
@@ -2037,9 +2039,11 @@ mod tests {
             assert!(admission.consume_for_generate(&request).is_err());
         };
 
-        assert_mutation_rejected(|request| request.use_pid = true);
         assert_mutation_rejected(|request| {
-            request.phases = Some(vec![gen_core::GenerationPhase {
+            request.features.pid = Some(candle_gen::gen_core::PidParams::enabled())
+        });
+        assert_mutation_rejected(|request| {
+            request.features.phases = Some(vec![gen_core::GenerationPhase {
                 steps: 1,
                 ..Default::default()
             }]);

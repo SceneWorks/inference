@@ -1111,10 +1111,16 @@ mod tests {
             height: 768,
             frames: Some(345),
             steps: Some(8),
-            veda: Some(VedaRequest {
-                enabled: true,
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                h3: Some(mlx_gen::gen_core::H3Extension {
+                    veda: Some(VedaRequest {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             memory: Some(GenerationMemory {
                 stage_residency: true,
                 stream_transformer_blocks: true,

@@ -334,7 +334,7 @@ pub fn verify_moss_image_asset(
     })?;
     pin.verify_unchanged()?;
     let digest: String = pin
-        .content_sha256()
+        .require_content_sha256()?
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();

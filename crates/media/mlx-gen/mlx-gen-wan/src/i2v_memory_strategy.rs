@@ -675,7 +675,7 @@ mod tests {
                 } else {
                     "text_to_video"
                 }
-                .to_owned(),
+                .into(),
             ),
             conditioning: if image_to_video {
                 vec![gen_core::Conditioning::Reference {
@@ -795,7 +795,7 @@ mod tests {
         let overlap = gen_core_memory_wan::DECODE_OVERLAPS[0];
         for mode in ["text_to_video", "image_to_video"] {
             let request = GenerationRequest {
-                video_mode: Some(mode.to_owned()),
+                video_mode: Some(mode.into()),
                 memory: Some(gen_core::GenerationMemory {
                     tile_vae_decode: true,
                     decode_tile_edge: Some(edge),

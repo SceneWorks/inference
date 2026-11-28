@@ -1706,7 +1706,13 @@ fn encode_prompt_context(text: &KreaText, req: &GenerationRequest) -> Result<Ten
     let context = text
         .te
         .forward(&text.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
-    maybe_apply_style_gain(context, req.text_style_gain)
+    maybe_apply_style_gain(
+        context,
+        req.extensions
+            .krea
+            .as_ref()
+            .and_then(|ext| ext.text_style_gain),
+    )
 }
 
 /// Encode the **unconditional** (CFG negative) context for the Raw/Edit full-CFG paths — the plain
@@ -2199,7 +2205,7 @@ pub(crate) fn compile_multiphase_plan(
     spec: &gen_core::LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<gen_core::RenderPlan> {
-    let authored = req.phases.as_deref().ok_or_else(|| {
+    let authored = req.features.phases.as_deref().ok_or_else(|| {
         gen_core::Error::Unsupported("Krea multi-phase plan requires phases".into())
     })?;
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
@@ -2674,7 +2680,10 @@ pub(crate) fn encode_edit_context(
     // (CFG-uncond) grounded context is left untouched so the knob steers only the conditional prediction.
     let context = maybe_apply_style_gain(
         grounding.condition(&text.tok, &text.te, &req.prompt)?,
-        req.text_style_gain,
+        req.extensions
+            .krea
+            .as_ref()
+            .and_then(|ext| ext.text_style_gain),
     )?;
     let neg_context = if krea_uses_cfg(guidance) {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
@@ -4028,35 +4037,38 @@ mod tests {
             count: 1,
             seed: Some(0x5eed),
             guidance: Some(0.0),
-            phases: Some(vec![
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![PhaseAdapter {
-                        adapter: 0,
-                        weight: None,
-                    }],
-                },
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![
-                        PhaseAdapter {
-                            adapter: 1,
-                            weight: Some(0.75),
-                        },
-                        PhaseAdapter {
-                            adapter: 1,
-                            weight: Some(-0.25),
-                        },
-                    ],
-                },
-                GenerationPhase {
-                    steps: 1,
-                    guidance: None,
-                    adapters: vec![],
-                },
-            ]),
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![PhaseAdapter {
+                            adapter: 0,
+                            weight: None,
+                        }],
+                    },
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![
+                            PhaseAdapter {
+                                adapter: 1,
+                                weight: Some(0.75),
+                            },
+                            PhaseAdapter {
+                                adapter: 1,
+                                weight: Some(-0.25),
+                            },
+                        ],
+                    },
+                    GenerationPhase {
+                        steps: 1,
+                        guidance: None,
+                        adapters: vec![],
+                    },
+                ]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan =
@@ -4608,7 +4620,10 @@ mod tests {
             prompt: "make it autumn".into(),
             width: 512,
             height: 512,
-            use_pid: true,
+            features: candle_gen::gen_core::FeatureParams {
+                pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         // (`PidDecoder` is not `Debug`, so match the seam result rather than `unwrap_err`.)
@@ -4628,7 +4643,10 @@ mod tests {
             prompt: "make it autumn".into(),
             width: 512,
             height: 512,
-            use_pid: false,
+            features: candle_gen::gen_core::FeatureParams {
+                pid: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved =

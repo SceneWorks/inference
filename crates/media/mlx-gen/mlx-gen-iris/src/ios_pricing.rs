@@ -128,7 +128,7 @@ impl SamplingTemplate {
     pub fn from_request(request: &GenerationRequest) -> Self {
         Self {
             steps: request.steps,
-            sampler: request.sampler.clone(),
+            sampler: request.sampler.as_deref().map(str::to_owned),
             guidance_bits: request.guidance.map(f32::to_bits),
             scheduler_shift_bits: request.scheduler_shift.map(f32::to_bits),
             interval_bits: request
@@ -169,7 +169,7 @@ impl SamplingTemplate {
 
     fn apply_raw(&self, request: &mut GenerationRequest) {
         request.steps = self.steps;
-        request.sampler = self.sampler.clone();
+        request.sampler = self.sampler.clone().map(Into::into);
         request.guidance = self.guidance_bits.map(f32::from_bits);
         request.scheduler_shift = self.scheduler_shift_bits.map(f32::from_bits);
         request.cfg_interval = self

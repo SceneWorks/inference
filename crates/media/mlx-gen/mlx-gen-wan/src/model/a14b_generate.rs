@@ -79,6 +79,23 @@ impl Generator for Wan14b {
         self.generate_with_scoped_execution_report(req, None, on_progress)
     }
 
+    fn generate_with_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, None, on_progress)
+        })?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.adapter_apply_reports = self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(report)
+    }
+
     fn generate_with_scoped_execution_report(
         &self,
         req: &mlx_gen::GenerationRequest,
@@ -86,22 +103,21 @@ impl Generator for Wan14b {
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, scope, &mut |event| {
+            let output = self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
-            })
-            .map(mlx_gen::gen_core::GenerationReport::from_output)
+            })?;
+            let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+            report.adapter_apply_reports = self
+                .adapter_reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            Ok(report)
         })
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
-    }
-
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     fn validate(&self, request: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -218,7 +234,14 @@ impl Wan14b {
                      whose mask-blend honors it"
                 )));
             }
-            if req.trim_first_frames.unwrap_or(0) > 0 {
+            if req
+                .extensions
+                .wan
+                .as_ref()
+                .and_then(|w| w.trim_first_frames)
+                .unwrap_or(0)
+                > 0
+            {
                 return Err(Error::Msg(format!(
                     "{id}: trim_first_frames is not supported for I2V (the conditioning `y` is built \
                      from num_frames)"

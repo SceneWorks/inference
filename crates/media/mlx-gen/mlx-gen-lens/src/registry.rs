@@ -21,6 +21,15 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
+    LENS_LATENT_SPACE,
+};
 use mlx_gen::residency::StagedHeavy;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
@@ -116,70 +125,166 @@ ArtifactInput,
     Ok(TextEncoderStorage::Unknown)
 }
 
-/// Lens' identity + capabilities for `id` — constructible without loading weights (registry
-/// introspection). Advertises the wired + parity-proven surface: T2I with negative-prompt /
-/// guidance CFG, no conditioning, LoRA + LoKr (DiT joint-attention, sc-3174), and Q4/Q8 load-time
-/// quant (gpt-oss MoE experts sc-3172 + DiT linears sc-3175).
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::LENS_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id,
+/// Primary typed route declaration for a Lens variant (`REG-1`, `AP5`).
+fn route_for(defaults: Defaults) -> RouteRecord {
+    let mut samplers = curated_sampler_names();
+    samplers.push("flow_match_euler");
+    let mut schedulers = curated_scheduler_names();
+    schedulers.push("flow_match");
+    let id = defaults.id;
+    let bindings = if id == MODEL_ID_TURBO {
+        RouteBindings::generator(descriptor_turbo, |spec| {
+            load_turbo(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(|spec, req| compile_base(MODEL_ID_TURBO, spec, req))
+        .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_TURBO, spec)
+            },
+        )
+        .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR)
+    } else {
+        RouteBindings::generator(descriptor_base, |spec| load_base(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_render_plan(|spec, req| compile_base(MODEL_ID_BASE, spec, req))
+            .with_memory_registration(BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(
+                        MODEL_ID_BASE,
+                        spec,
+                    )
+                },
+            )
+            .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR)
+    };
+
+    RouteRecord {
+        route_id: id,
         family: "lens",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // The norm-rescaled CFG path is always present; turbo simply defaults guidance to 1.0.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // `conditioning` is deferred to its empty default: pure T2I — no img2img / control /
-            // IP in the Lens port.
-            // sc-3174: LoRA + LoKr merge into the DiT's joint-attention projections at load.
-            supports_lora: true,
-            supports_lokr: true,
-            // epic 7114 sc-7305: advertise the curated sampler/scheduler menu (mirrors the candle Lens
-            // adoption) so the per-generation knobs route through the unified `Sampler<MlxLatentOps>` +
-            // `FlowModelSampling`. The legacy native aliases stay valid for old recipes; both N3-fall
-            // back to the default (`flow_match_euler` → euler, `flow_match` → the native empirical-μ
-            // schedule), so they never hard-fail a generation.
-            samplers: {
-                let mut s = curated_sampler_names();
-                s.push("flow_match_euler");
-                s
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("gpt_oss_20b", None)],
+                ..Default::default()
             },
-            schedulers: {
-                let mut s = curated_scheduler_names();
-                s.push("flow_match");
-                s
+            conditioning: ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
             },
-            // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
-            supported_guidance_methods: vec![],
-            min_size: 256,
-            max_size: 2080,
-            max_count: 8,
-            mac_only: true,
-            // Q4/Q8 quantize the gpt-oss encoder's MoE experts (sc-3172 — the ~38 GB / 20 B-param
-            // bulk → ~12 GB) and the DiT's linears (sc-3175) at load.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
-            requires_sigma_shift: false,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
+            sampling: SamplingSurface {
+                samplers,
+                schedulers,
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_model(
+                FamilyModelSpec::new("lens_mmdit").with_low_res_start(),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("flux2_ae"),
+                output_latent_space: Some(&LENS_LATENT_SPACE),
+                pixel_stride: Some(VAE_SCALE_FACTOR),
+                token_width: Some(128),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::FusedMerge),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["gpt_oss_20b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["lens_mmdit"], false),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux2_ae"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: 256,
+            max_size: 2080,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(defaults.steps),
+            guidance: Some(defaults.guidance),
+            sampler: Some("euler"),
+            schedule: Some("flow_match"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
 }
 
-/// Public descriptor accessors (used by the registry submits + tests).
+pub fn route_turbo() -> RouteRecord {
+    route_for(TURBO_DEFAULTS)
+}
+
+pub fn route_base() -> RouteRecord {
+    route_for(BASE_DEFAULTS)
+}
+
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    if id == MODEL_ID_TURBO {
+        descriptor_turbo()
+    } else {
+        descriptor_base()
+    }
+}
+
+/// Public descriptor accessors, computed from `route_turbo` / `route_base`.
 pub fn descriptor_turbo() -> ModelDescriptor {
-    descriptor_for(MODEL_ID_TURBO)
+    route_turbo().compute_descriptor()
 }
 pub fn descriptor_base() -> ModelDescriptor {
-    descriptor_for(MODEL_ID_BASE)
+    route_base().compute_descriptor()
 }
 
 /// A loaded, dispatchable Lens generator: the variant's descriptor & sampling defaults + the
@@ -618,7 +723,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     resolve_root(spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         )));
@@ -802,10 +907,10 @@ impl LensGenerator {
             self.default_stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &LensText| {
-                if req.use_pid {
+                if req.use_pid() {
                     run.begin_conditioning()?;
                     text.encode_prompt_windowed(
                         &req.prompt,
@@ -852,7 +957,7 @@ impl LensGenerator {
                     self.defaults.id,
                     plan.capture_sigma(),
                 )?;
-                if req.use_pid {
+                if req.use_pid() {
                     run.end_conditioning()?;
                 }
                 let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
@@ -984,7 +1089,7 @@ impl LensGenerator {
             memory.stage_residency,
             memory.stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text| {
                 run.encode(|| {
@@ -1168,7 +1273,7 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let defaults = if id == MODEL_ID_TURBO {
             TURBO_DEFAULTS
         } else {
@@ -1265,11 +1370,6 @@ pub(crate) fn component_footprint(
     Ok(footprint)
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
-    footprint = component_footprint
-}
-
 pub const TURBO_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID_TURBO,
@@ -1304,10 +1404,6 @@ pub const BASE_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
             crate::memory_strategy::registered_begin_request(MODEL_ID_BASE, spec, contract, context)
         },
     };
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
-    footprint = component_footprint
-}
 
 #[cfg(test)]
 mod tests {

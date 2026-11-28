@@ -4,10 +4,18 @@
 //! architecture (Cosmos-Predict2 DiT + `AnimaTextConditioner` + Qwen3-0.6B TE + Qwen-Image VAE) and
 //! differ only in the DiT weights file + default steps/CFG.
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, WeightPlanDeclaration, WeightSourceKind, QWEN_KREA_Z16_LATENT_SPACE,
+};
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result,
+    curated_sampler_names, curated_scheduler_names, Error, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    Residency, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -20,52 +28,188 @@ const RES_MIN: u32 = 512;
 /// within the 120-position max_size), so the guard is unreachable via the normal path. See [`crate::rope`].
 pub(crate) const RES_MAX: u32 = 1536;
 
-/// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
-/// prompt); Base/Aesthetic run true classifier-free guidance.
-fn descriptor_for(variant: Variant) -> ModelDescriptor {
+/// Primary typed route declaration for an Anima variant (`REG-1`, `AP5`).
+///
+/// Turbo is the merged CFG-free student (default guidance 1.0); Base/Aesthetic run true
+/// classifier-free guidance (default guidance 4.5).
+pub fn route_for(variant: Variant) -> RouteRecord {
     let cfg_capable = true;
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.id(),
+    let id = variant.id();
+    type LoadFn = fn(&LoadSpec) -> mlx_gen::gen_core::Result<Box<dyn Generator>>;
+    let (descriptor_fn, load_fn, mem_reg, mem_beh): (
+        fn() -> ModelDescriptor,
+        LoadFn,
+        mlx_gen::gen_core::MemoryRegistration,
+        mlx_gen::gen_core::MemoryBehaviorRegistration,
+    ) = match variant {
+        Variant::Base => (
+            descriptor_base,
+            |spec| load_base(spec).map_err(Into::into),
+            BASE_MEMORY_REGISTRATION,
+            BASE_MEMORY_BEHAVIOR,
+        ),
+        Variant::Aesthetic => (
+            descriptor_aesthetic,
+            |spec| load_aesthetic(spec).map_err(Into::into),
+            AESTHETIC_MEMORY_REGISTRATION,
+            AESTHETIC_MEMORY_BEHAVIOR,
+        ),
+        Variant::Turbo => (
+            descriptor_turbo,
+            |spec| load_turbo(spec).map_err(Into::into),
+            TURBO_MEMORY_REGISTRATION,
+            TURBO_MEMORY_BEHAVIOR,
+        ),
+    };
+    let mut bindings = RouteBindings::generator(descriptor_fn, load_fn)
+        .with_footprint(crate::loader::component_footprint)
+        .with_render_plan(match variant {
+            Variant::Base => |spec, req| compile_variant_plan(Variant::Base, spec, req),
+            Variant::Aesthetic => |spec, req| compile_variant_plan(Variant::Aesthetic, spec, req),
+            Variant::Turbo => |spec, req| compile_variant_plan(Variant::Turbo, spec, req),
+        })
+        .with_memory_registration(mem_reg)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            match variant {
+                Variant::Base => |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(
+                        "anima_base",
+                        spec,
+                    )
+                },
+                Variant::Aesthetic => |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(
+                        "anima_aesthetic",
+                        spec,
+                    )
+                },
+                Variant::Turbo => |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(
+                        "anima_turbo",
+                        spec,
+                    )
+                },
+            },
+        )
+        .with_memory_behavior_registration(mem_beh);
+    if variant == Variant::Base {
+        bindings =
+            bindings.with_activation_memory(crate::BASE_ACTIVATION_MEMORY_REGISTRATION.anchor);
+    }
+
+    RouteRecord {
+        route_id: id,
         family: "anima",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: cfg_capable,
-            supports_guidance: cfg_capable,
-            // LoRA/LoKr injection is sc-10521; every projection is an adapter-ready `AdaptableLinear`.
-            supports_lora: true,
-            supports_lokr: true,
-            // Rectified-flow over the unified curated-sampler framework (epic 7114). The native default
-            // (req.sampler == None) is the recommended er_sde solver; the full menu is advertised.
-            samplers: curated_sampler_names(),
-            schedulers: curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // Q4/Q8 quant tiers (sc-10517). Anima is convert-at-install: the SceneWorks worker packs
-            // the Cosmos DiT on-device (the conditioner + Qwen3 TE + VAE stay dense bf16), and this
-            // crate's loader packed-detects the tier off the on-disk `{base}.scales` — so `load`
-            // ACCEPTS any `spec.quantize` (it is advisory; the resolved tier dir dictates precision,
-            // like SANA). The worker reads `supported_quants` for its capability advertisement
-            // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            requires_sigma_shift: true,
-            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
-            // (F-176). Under `Sequential` the Qwen3-0.6B text encoder is encoded, materialized, then
-            // dropped before the DiT + bundled conditioner + VAE load — bounding peak unified memory to
-            // `max(Qwen3-TE, DiT+conditioner+VAE)`. Q4/Q8 are packed convert-at-install tiers (no
-            // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![
+                    TextEncoderDeclaration::new("qwen3_0_6b", None),
+                    TextEncoderDeclaration::new("anima_text_conditioner", Some(512)),
+                ],
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: cfg_capable,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: cfg_capable,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_model(
+                FamilyModelSpec::new("cosmos_dit").with_low_res_start(),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("qwen_image_vae"),
+                output_latent_space: Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["qwen3_0_6b"], true),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["anima_text_conditioner", "cosmos_dit"],
+                        false,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["qwen_image_vae"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: Some(variant.default_guidance()),
+            sampler: Some(crate::pipeline::DEFAULT_SAMPLER),
+            schedule: None,
+            shift: Some(crate::config::SIGMA_SHIFT),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+pub fn route_base() -> RouteRecord {
+    route_for(Variant::Base)
+}
+pub fn route_aesthetic() -> RouteRecord {
+    route_for(Variant::Aesthetic)
+}
+pub fn route_turbo() -> RouteRecord {
+    route_for(Variant::Turbo)
+}
+
+/// Build the descriptor for a variant from its primary [`RouteRecord`].
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 pub fn descriptor_base() -> ModelDescriptor {
@@ -593,7 +737,7 @@ pub(crate) fn resolved_sampling(
             .scheduler
             .as_deref()
             .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
-            .map(str::to_owned),
+            .map(Into::into),
         scheduler_shift: req.scheduler_shift,
         steps: Some(steps as u32),
         guidance: Some(guidance),
@@ -643,7 +787,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (_, sigmas) = resolved_sampling(variant, req)?;
         low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
@@ -681,7 +825,7 @@ pub(crate) fn compile_variant_plan(
     req: &GenerationRequest,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
     validate_load_precision(spec, variant.id())?;
-    if req.use_pid {
+    if req.use_pid() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{}: anima has no PiD decoder",
             variant.id()
@@ -690,28 +834,6 @@ pub(crate) fn compile_variant_plan(
     compile_trajectory_for(variant, req)
         .map(|plan| plan.bind_load(spec))
         .map(Some)
-}
-
-pub(crate) const BASE_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
-    mlx_gen::gen_core::RenderPlanRegistration {
-        provider_id: "anima_base",
-        compile: |spec, req| compile_variant_plan(Variant::Base, spec, req),
-    };
-pub(crate) const AESTHETIC_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
-    mlx_gen::gen_core::RenderPlanRegistration {
-        provider_id: "anima_aesthetic",
-        compile: |spec, req| compile_variant_plan(Variant::Aesthetic, spec, req),
-    };
-pub(crate) const TURBO_RENDER_PLAN: mlx_gen::gen_core::RenderPlanRegistration =
-    mlx_gen::gen_core::RenderPlanRegistration {
-        provider_id: "anima_turbo",
-        compile: |spec, req| compile_variant_plan(Variant::Turbo, spec, req),
-    };
-
-// Explicit registration constants for all three variants.
-mlx_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base;
-    footprint = crate::loader::component_footprint
 }
 
 /// The shared-ladder registration pair every Anima catalog entry publishes. All three route to the
@@ -754,14 +876,6 @@ memory_registration!(
     TURBO_MEMORY_BEHAVIOR,
     "anima_turbo"
 );
-mlx_gen::register_generators! {
-    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic;
-    footprint = crate::loader::component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
-    footprint = crate::loader::component_footprint
-}
 
 #[cfg(test)]
 mod tests {

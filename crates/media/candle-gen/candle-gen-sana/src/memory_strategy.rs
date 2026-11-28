@@ -357,7 +357,7 @@ fn build_contract(
     });
     for pin in files {
         assembly.update(pin.loader_path().to_string_lossy().as_bytes());
-        assembly.update(pin.content_sha256());
+        assembly.update(pin.content_or_identity_digest());
     }
     Ok(assemble_contract(
         variant,
@@ -748,7 +748,7 @@ impl Binding {
                 reference_count: req.memory_reference_count(),
             },
             memory: req.memory,
-            use_pid: req.use_pid,
+            use_pid: req.use_pid(),
             public_identity: digest.finalize().into(),
         }
     }

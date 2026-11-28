@@ -22,9 +22,9 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
+    gen_core, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_wan::OwnedWanSingleFrameDecoder;
@@ -35,9 +35,7 @@ use std::path::Path;
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
 use crate::model::{pag_capability, validate_request, SIZE_MULTIPLE};
-use crate::pipeline::{
-    create_noise, qwen_samplers, qwen_schedulers, resolve_run_params, PID_BACKBONE,
-};
+use crate::pipeline::{create_noise, resolve_run_params, PID_BACKBONE};
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
 use crate::transformer::QwenTransformer;
@@ -49,48 +47,40 @@ use crate::vl_tokenizer::{
 /// Registry id for Qwen-Image-Edit.
 pub const MODEL_ID: &str = "qwen_image_edit";
 
+/// Primary typed route declaration for Qwen-Image-Edit (`REG-1`, `AP5`).
+pub(crate) fn route_qwen_image_edit() -> gen_core::RouteRecord {
+    let mut route = crate::model::route_qwen_image();
+    route.route_id = MODEL_ID;
+    route.structure.conditioning.kinds = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.conditioning.modules = vec!["qwen2_5_vl_vision"];
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("qwen_image_mmdit_edit").with_pag(pag_capability()),
+    );
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::edit_component_footprint)
+            .with_render_plan(compile_render_plan)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            })
+            .with_memory_surface_resolver(|surface| {
+                crate::memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
 /// Qwen-Image-Edit's identity + capabilities. Accepts one `Reference` or N `MultiReference`
 /// conditioning images — the fork's `use_picture_prefix=False` edit path, where every reference is
 /// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "qwen-image",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-            ],
-            // LoRA/LoKr wired (sc-2528): shared `QwenTransformer` host; stacked + mixed.
-            supports_lora: true,
-            supports_lokr: true,
-            // `lightning` = the few-step Lightning sampler (sc-2909), e.g.
-            // `lightx2v/Qwen-Image-Edit-2511-Lightning`; an unset sampler is the production path.
-            // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
-            samplers: qwen_samplers(),
-            schedulers: qwen_schedulers(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            requires_sigma_shift: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            pag: Some(pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_qwen_image_edit().compute_descriptor()
 }
 
 /// A loaded Qwen-Image-Edit generator: the cached descriptor, the (tiny, always-warm) tokenizer +
@@ -548,7 +538,7 @@ impl QwenImageEdit {
         // encode carries no RNG, so ordering it before the dual-latent VAE-encode is byte-identical.
         let output = self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |vl: &QwenVisionLanguageEncoder| {
                 let encode_body = || -> Result<_> {
@@ -795,15 +785,6 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
     Ok(())
 }
 
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`. The `impl
-// Generator` above stays hand-written because `validate` adds a reference-image check beyond the
-// shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::edit_component_footprint
-}
-
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -822,6 +803,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Modality;
 
     #[test]
     fn descriptor_is_qwen_image_edit() {

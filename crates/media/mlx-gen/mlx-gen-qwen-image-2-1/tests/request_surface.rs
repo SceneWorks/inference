@@ -942,10 +942,10 @@ fn turbo_refuses_an_off_menu_sampler_or_scheduler_exactly_as_base_does() {
     let base = load_with(BASE, &tiny_snapshot(), Vec::new());
 
     let mut sampler = request();
-    sampler.sampler = Some("not-a-sampler".to_owned());
+    sampler.sampler = Some("not-a-sampler".into());
     assert_refused_as_on_base(generator.as_ref(), base.as_ref(), &sampler, "sampler");
     let mut scheduler = request();
-    scheduler.scheduler = Some("flow_match_euler".to_owned());
+    scheduler.scheduler = Some("flow_match_euler".into());
     assert_refused_as_on_base(generator.as_ref(), base.as_ref(), &scheduler, "scheduler");
 }
 

@@ -100,7 +100,10 @@ fn krea_turbo_pid_decode_vs_vae() {
 
     // --- PiD path ---
     let pid_req = GenerationRequest {
-        use_pid: true,
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base.clone()
     };
     let t = Instant::now();
@@ -156,7 +159,6 @@ fn run_pid_ladder(model: &dyn mlx_gen::Generator, size: u32, full: bool) -> Ladd
         count: 1,
         steps: Some(1),
         seed: Some(7),
-        use_pid: true,
         memory: Some(GenerationMemory {
             stage_residency: true,
             tile_vae_decode: true,
@@ -171,6 +173,10 @@ fn run_pid_ladder(model: &dyn mlx_gen::Generator, size: u32, full: bool) -> Ladd
             transformer_window_component: full.then_some(TransformerComponent::Dit),
             ..Default::default()
         }),
+        features: mlx_gen::gen_core::FeatureParams {
+            pid: Some(mlx_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     clear_cache();

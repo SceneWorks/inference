@@ -453,7 +453,10 @@ impl MemoryBehaviorFixture {
             height: context.geometry.height,
             count: context.geometry.batch,
             frames: (context.geometry.frames > 0).then_some(context.geometry.frames),
-            use_pid: context.use_pid,
+            features: crate::FeatureParams {
+                pid: context.use_pid.then(crate::PidParams::enabled),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for _ in 0..context.geometry.reference_count {

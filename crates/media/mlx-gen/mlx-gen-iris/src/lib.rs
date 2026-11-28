@@ -121,17 +121,10 @@ pub fn register_inference_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
+        .register_route(model::route())
+        .register_route(model::route_depth())
+        .register_route(model::route_restore())
         .register_transform(restoration::REGISTRATION)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
-        .register_composed_memory_strategy(memory_strategy::RESTORE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
-        .register_memory_contract_fixture(memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
-        .register_memory_contract_fixture(memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_behavior(memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_behavior(memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Iris provider catalog.
@@ -177,6 +170,7 @@ mod tests {
         };
         assert_eq!(trainers, expected_trainers);
         assert!(registry.descriptor_conformance_errors().is_empty());
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 }
 

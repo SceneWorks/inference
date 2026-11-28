@@ -125,7 +125,8 @@ impl AdapterReceipt {
         pin.ensure_unchanged()?;
         let canonical_path = pin.canonical_target_path().to_path_buf();
         // The seal's acquisition-time content digest: hashed once per file identity, not re-read.
-        let digest = pin.content_sha256_hex();
+        let digest =
+            mlx_gen::gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest());
         let (realization, physical_bytes, resident_bytes, transient_bytes) =
             pin.read_unchanged(|path| {
                 let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
@@ -641,8 +642,8 @@ pub fn request_evidence_revision(
         fps: request.fps.unwrap_or_default(),
         reference_count: request.memory_reference_count(),
         seed: request.seed,
-        sampler: request.sampler.clone(),
-        scheduler: request.scheduler.clone(),
+        sampler: request.sampler.as_deref().map(str::to_owned),
+        scheduler: request.scheduler.as_deref().map(str::to_owned),
         steps: request.steps,
         guidance: request.guidance,
         scheduler_shift: request.scheduler_shift,
@@ -1068,8 +1069,8 @@ pub(crate) fn validate_generation_request(request: &GenerationRequest) -> gen_co
             .chain(carrier.driving_masks)
             .any(|image| !is_exact_rgb8(image))
         || request.count != 1
-        || request.use_pid
-        || request.phases.is_some()
+        || request.use_pid()
+        || request.features.phases.is_some()
         || request
             .memory
             .is_some_and(|memory| memory != gen_core::GenerationMemory::default())
@@ -1371,7 +1372,7 @@ pub(crate) mod tests {
             count: 1,
             frames: Some(frames),
             fps: Some(16),
-            video_mode: Some(mode.to_owned()),
+            video_mode: Some(mode.into()),
             conditioning: vec![
                 Conditioning::Reference {
                     image: image(2, 2),
@@ -1417,7 +1418,7 @@ pub(crate) mod tests {
         wrong.fps = Some(24);
         assert!(validate_generation_request(&wrong).is_err());
         let mut wrong = request("animation", 832, 480, 45);
-        wrong.video_mode = Some("other".to_owned());
+        wrong.video_mode = Some("other".into());
         assert!(validate_generation_request(&wrong).is_err());
         let mut wrong = request("replacement", 832, 480, 45);
         wrong

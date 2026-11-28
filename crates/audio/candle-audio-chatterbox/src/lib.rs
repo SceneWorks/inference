@@ -104,13 +104,13 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::Pro
     components: &[model::COMPONENT_KEY],
 }];
 
-/// Add the Chatterbox clone-TTS generator (`chatterbox_tts`) to an explicit audio registry builder.
-/// `candle-audio-catalog` calls this in stable catalog order (sc-13239); this crate's own
-/// [`provider_registry`] also uses it for descriptor introspection / conformance.
+/// Add the Chatterbox clone-TTS generator (`chatterbox_tts`) to an explicit audio registry builder
+/// via one-call [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry.register_route(model::route())
 }
 
 /// Build this crate's own explicit provider catalog (descriptor introspection / conformance).

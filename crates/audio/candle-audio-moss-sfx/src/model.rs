@@ -34,8 +34,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, StepSupport, WeightsSource,
+    self, AudioTrack, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 
 use crate::pipeline::{
@@ -89,53 +89,101 @@ pub const GUIDANCE_RANGE: (f32, f32) = (1.0, 20.0);
 /// the language code is advisory, not a model switch).
 pub const LANGUAGES: &[&str] = &["en", "zh"];
 
-/// MOSS-SoundEffect's identity + capabilities — constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for MOSS-SoundEffect v2.0 (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "moss_soundeffect",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            // CFG with a real negative-prompt branch (the reference `negative_prompt` +
-            // `cfg_scale` pair).
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // The native flow-match Euler integrator is the only sampler; no selectable
-            // sampler/scheduler surface is advertised (an explicit request is a typed
-            // Unsupported via the shared floor).
-            samplers: vec![],
-            // Audio models skip the size floor (validate_request_audio); these bounds are the
-            // audio-lane convention for a size-less descriptor.
-            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
-            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
-            // unused 0 rather than a nominal placeholder bound.
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_1_7b", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "moss_sfx_wan_1d_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("dac_continuous_vae"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_1_7b"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["moss_sfx_wan_1d_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["dac_continuous_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                voices: vec![],
+                languages: LANGUAGES.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: 0,
-            // One clip per request (GenerationOutput::Audio carries a single track).
-            max_count: 1,
-            // The 1000-timestep training grid's ceiling, advertised rather than hidden
-            // (sc-19559).
+            max_size: 0,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            // No voice surface — this is SFX/ambience, not TTS; an explicit `audio.voice`
-            // is rejected by the shared floor as Unsupported.
-            audio_voices: vec![],
-            audio_languages: LANGUAGES.to_vec(),
             ..Default::default()
         },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS as u32),
+            guidance: Some(DEFAULT_CFG_SCALE),
+            shift: Some(5.0),
+            audio_sample_rate: Some(SAMPLE_RATE),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
 }
 
+/// MOSS-SoundEffect's identity + capabilities — computed from `route` without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
+}
+
 /// Capability-driven request validation, factored out for weightless unit tests. Shared floor
-/// checks ([`Capabilities::validate_request_audio`]) plus this model's own bounds.
+/// checks ([`gen_core::Capabilities::validate_request_audio`]) plus this model's own bounds.
 pub(crate) fn validate_request(
     desc: &ModelDescriptor,
     req: &GenerationRequest,

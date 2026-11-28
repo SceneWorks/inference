@@ -53,7 +53,7 @@ ROUTES = {
 }
 
 # These library APIs are composed by other registered routes or by the product worker itself.
-DIRECT = {"depth", "face", "instantid", "pid", "pulid", "sam3"}
+DIRECT = {"depth", "face", "pid", "sam3"}
 
 
 def check_candle_media(root: Path) -> list[str]:

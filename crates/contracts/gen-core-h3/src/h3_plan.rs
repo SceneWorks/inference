@@ -655,7 +655,7 @@ impl H3RenderPlan {
                 "minimax_h3: steps must be in 1..={H3_MAX_VIDEO_STEPS}, got {steps}"
             )));
         }
-        if let Some(veda) = &req.veda {
+        if let Some(veda) = req.extensions.h3.as_ref().and_then(|h3| h3.veda.as_ref()) {
             veda.validate(H3_DIT_LAYERS, steps as usize)
                 .map_err(Error::Msg)?;
         }
@@ -790,7 +790,8 @@ impl H3RenderPlan {
             };
 
         let streamed_window = H3StreamedWindowPolicy::from_request_memory(req)?;
-        let veda_enabled = req.veda.as_ref().is_some_and(|v| v.enabled);
+        let veda = req.extensions.h3.as_ref().and_then(|h3| h3.veda.clone());
+        let veda_enabled = veda.as_ref().is_some_and(|v| v.enabled);
         let footprint = H3MemoryFootprintSpec::streamed_default(domain, &envelope, veda_enabled);
 
         Self::build(H3RenderPlanInput {
@@ -811,7 +812,7 @@ impl H3RenderPlan {
             image_sampler: None,
             image_scheduler: None,
             pag_active_steps: 0,
-            veda: req.veda.clone(),
+            veda,
             streamed_window,
             envelope,
             footprint,
@@ -850,14 +851,20 @@ impl H3RenderPlan {
         let pag_active_steps = resolve_pag(
             Some(&minimax_h3_image_pag_capability()),
             "minimax_h3_image",
-            req.pag.as_ref(),
+            req.features.pag.as_ref(),
         )
         .map_err(|e| match e.kind {
             PagPolicyErrorKind::Unsupported => Error::Unsupported(e.message),
             PagPolicyErrorKind::Invalid => Error::Msg(e.message),
         })?
         .map_or(0, |p| p.active_steps(steps));
-        if req.veda.as_ref().is_some_and(|v| v.enabled) {
+        if req
+            .extensions
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.veda.as_ref())
+            .is_some_and(|v| v.enabled)
+        {
             return Err(Error::Unsupported(
                 "minimax_h3_image: Veda sparse attention is a video-only control".into(),
             ));
@@ -1678,11 +1685,17 @@ mod tests {
             height: 768,
             frames: Some(345),
             steps: Some(8),
-            veda: Some(VedaRequest {
-                enabled: true,
-                generated: VedaBudget::SparsityPercent(70.0),
+            extensions: gen_core::FamilyExtensions {
+                h3: Some(gen_core::H3Extension {
+                    veda: Some(VedaRequest {
+                        enabled: true,
+                        generated: VedaBudget::SparsityPercent(70.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             memory: Some(GenerationMemory {
                 stage_residency: true,
                 stream_transformer_blocks: true,
@@ -1727,7 +1740,7 @@ mod tests {
         m5.assert_matched_policy(&control).unwrap();
 
         // Removing Veda fails matched-policy comparison (`Compare against matched policy only`).
-        req.veda = None;
+        req.extensions.h3 = None;
         let m5_dense = H3RenderPlan::from_video_generation_request(
             &req,
             H3BudgetDomainKey::DeviceVram,
@@ -1851,10 +1864,13 @@ mod tests {
             width: 2048,
             height: 2048,
             steps: Some(8),
-            pag: Some(PagConfig {
-                scale: 1.2,
+            features: gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(H3RenderPlan::from_image_generation_request(
@@ -1919,7 +1935,10 @@ mod tests {
 
         // Video Ref2VA with `Max` mode (short edge capped at 2048 -> 2784x2048).
         let mut video_max_req = video_req;
-        video_max_req.reference_image_resize_mode = Some(gen_core::ReferenceImageResizeMode::Max);
+        video_max_req.extensions.h3 = Some(gen_core::H3Extension {
+            reference_image_resize_mode: Some(gen_core::ReferenceImageResizeMode::Max),
+            ..Default::default()
+        });
         let (max_vw, max_vh) = crate::resolve_reference_image_size(
             4096,
             3000,

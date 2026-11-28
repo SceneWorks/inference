@@ -1373,8 +1373,16 @@ impl GenerationParams {
 /// `cfg_interval` / `prompt_batch` / `caption_overflow` support; this covers the remaining
 /// per-request knobs, so none is ever accepted and ignored.
 pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequest) -> Result<()> {
+    let h3 = req.extensions.h3.as_ref();
+    let svd = req.extensions.svd;
     let set: [(&str, bool); 25] = [
-        ("timestep_to_start_cfg", req.timestep_to_start_cfg.is_some()),
+        (
+            "timestep_to_start_cfg",
+            req.extensions
+                .pulid
+                .and_then(|p| p.timestep_to_start_cfg)
+                .is_some(),
+        ),
         ("guidance_eta", req.guidance_eta.is_some()),
         ("guidance_momentum", req.guidance_momentum.is_some()),
         (
@@ -1383,30 +1391,63 @@ pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequ
         ),
         ("strength", req.strength.is_some()),
         ("control_scale", req.control_scale.is_some()),
-        ("text_style_gain", req.text_style_gain.is_some()),
+        (
+            "text_style_gain",
+            req.extensions
+                .krea
+                .and_then(|k| k.text_style_gain)
+                .is_some(),
+        ),
         ("image_guidance", req.image_guidance.is_some()),
         ("frames", req.frames.is_some()),
         ("fps", req.fps.is_some()),
         ("duration", req.duration.is_some()),
         ("video_mode", req.video_mode.is_some()),
-        ("trim_first_frames", req.trim_first_frames.is_some()),
+        (
+            "trim_first_frames",
+            req.extensions
+                .wan
+                .and_then(|w| w.trim_first_frames)
+                .is_some(),
+        ),
         (
             "reference_image_short_edge",
-            req.reference_image_short_edge.is_some(),
+            h3.and_then(|ext| ext.reference_image_short_edge).is_some(),
         ),
         (
             "reference_image_resize_mode",
-            req.reference_image_resize_mode.is_some(),
+            h3.and_then(|ext| ext.reference_image_resize_mode).is_some(),
         ),
-        ("motion_bucket_id", req.motion_bucket_id.is_some()),
-        ("noise_aug_strength", req.noise_aug_strength.is_some()),
-        ("decode_chunk_size", req.decode_chunk_size.is_some()),
-        ("conditioning_fps", req.conditioning_fps.is_some()),
-        ("softness", req.softness.is_some()),
-        ("use_pid", req.use_pid),
-        ("pid_capture_sigma", req.pid_capture_sigma.is_some()),
-        ("use_uncensored_enhancer", req.use_uncensored_enhancer),
-        ("phases", req.phases.is_some()),
+        (
+            "motion_bucket_id",
+            svd.and_then(|s| s.motion_bucket_id).is_some(),
+        ),
+        (
+            "noise_aug_strength",
+            svd.and_then(|s| s.noise_aug_strength).is_some(),
+        ),
+        (
+            "decode_chunk_size",
+            svd.and_then(|s| s.decode_chunk_size).is_some(),
+        ),
+        (
+            "conditioning_fps",
+            svd.and_then(|s| s.conditioning_fps).is_some(),
+        ),
+        (
+            "softness",
+            req.extensions.seedvr2.and_then(|s| s.softness).is_some(),
+        ),
+        ("use_pid", req.use_pid()),
+        ("pid_capture_sigma", req.pid_capture_sigma().is_some()),
+        (
+            "use_uncensored_enhancer",
+            req.extensions
+                .ltx
+                .as_ref()
+                .is_some_and(|ltx| ltx.use_uncensored_enhancer),
+        ),
+        ("phases", req.features.phases.is_some()),
         ("audio", req.audio.is_some()),
     ];
     for (field, is_set) in set {
@@ -1843,7 +1884,12 @@ flow:
         let ok = GenerationRequest::default();
         reject_unhonored_generation_controls("iris_3b", &ok).unwrap();
         let req = GenerationRequest {
-            timestep_to_start_cfg: Some(2),
+            extensions: gen_core::FamilyExtensions {
+                pulid: Some(gen_core::PulidExtension {
+                    timestep_to_start_cfg: Some(2),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let err = reject_unhonored_generation_controls("iris_3b", &req).unwrap_err();

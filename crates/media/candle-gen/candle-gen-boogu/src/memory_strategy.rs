@@ -103,7 +103,7 @@ impl ArtifactReceipt {
             } else {
                 gen_core::PinnedWeightsFile::pin(&path)?
             };
-            let digest = gen_core::snapshot_inventory::hex_lower(pin.content_sha256());
+            let digest = gen_core::snapshot_inventory::hex_lower(&pin.content_or_identity_digest());
             inventory.push((path, pin, digest));
         }
         let receipt = Self {
@@ -935,15 +935,16 @@ impl RequestBinding {
                 reference_count: request.memory_reference_count(),
             },
             memory: request.memory,
-            use_pid: request.use_pid,
+            use_pid: request.use_pid(),
             has_phases: request
+                .features
                 .phases
                 .as_ref()
                 .is_some_and(|phases| !phases.is_empty()),
             seed: request.seed,
             steps: request.steps,
-            sampler: request.sampler.clone(),
-            scheduler: request.scheduler.clone(),
+            sampler: request.sampler.as_deref().map(str::to_owned),
+            scheduler: request.scheduler.as_deref().map(str::to_owned),
             guidance_bits: request.guidance.map(f32::to_bits),
             true_cfg_bits: request.true_cfg.map(f32::to_bits),
             shift_bits: request.scheduler_shift.map(f32::to_bits),
@@ -1157,7 +1158,7 @@ pub(crate) fn validate_generation_request(
     if request.video_mode.as_deref() != Some(expected_mode)
         || request.frames != Some(1)
         || request.count != 1
-        || request.phases.is_some()
+        || request.features.phases.is_some()
     {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider}: generation request crossed its admitted memory identity"
@@ -1167,7 +1168,7 @@ pub(crate) fn validate_generation_request(
         m.chunk_attention
             || m.stream_transformer_blocks
             || m.tile_vae_decode
-            || (m.stage_residency && request.use_pid)
+            || (m.stage_residency && request.use_pid())
     }) {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider}: request carries an unsupported memory mechanism"

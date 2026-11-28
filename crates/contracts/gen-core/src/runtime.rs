@@ -66,6 +66,8 @@ use crate::memory_strategy::{
 mod source;
 pub use source::*;
 
+mod produced;
+pub use produced::*;
 mod seal;
 pub use seal::*;
 

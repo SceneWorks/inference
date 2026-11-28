@@ -49,11 +49,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::BASE_REGISTRATION)
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_generator(model::EDIT_REGISTRATION)
-        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
-        .register_render_plan(model::EDIT_RENDER_PLAN_REGISTRATION)
+        .register_route(model::route_base())
+        .register_route(model::route_turbo())
+        .register_route(model::route_edit())
 }
 
 /// Build the complete explicit MLX Boogu provider catalog.
@@ -75,6 +73,7 @@ mod explicit_registry_tests {
             explicit,
             ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
         );
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 }
 

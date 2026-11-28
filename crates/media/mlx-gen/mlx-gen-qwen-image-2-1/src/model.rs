@@ -231,105 +231,178 @@ impl Schedule {
     }
 }
 
-/// The distilled Turbo checkpoint's identity + capabilities (sc-25900): [`descriptor`] under
-/// [`TURBO_MODEL_ID`]. Nothing else differs on the advertised surface — the checkpoint shares the
-/// base architecture, presets, reference/RGBA routes, adapter host and tiers, and upstream still
-/// accepts a negative prompt with `true_cfg_scale > 1` on it. Its own defaults are not descriptor
-/// fields: the step count is the number of sigmas the snapshot saves ([`Schedule::default_steps`])
-/// and true CFG is off unless asked for ([`DEFAULT_TRUE_CFG`]).
-pub fn descriptor_turbo() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = TURBO_MODEL_ID;
-    d.capabilities.pag = Some(qwen_image_2_1_turbo_pag_capability());
-    d
-}
-
-/// Qwen-Image 2.1's identity + capabilities — constructible without loading weights.
-pub fn descriptor() -> ModelDescriptor {
+/// Primary typed route declaration for Qwen-Image 2.1 Base (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
     let max_size = PRESETS
         .iter()
         .map(|p| p.width.max(p.height))
         .max()
         .unwrap_or(2048);
-    ModelDescriptor {
-        // The Qwen3-VL tower is loaded from the snapshot's own `text_encoder/`; substituting one
-        // through `LoadSpec::text_encoder` is not advertised for this route.
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: FAMILY,
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // True CFG: a negative prompt plus `true_cfg`/`guidance` above 1 runs the negative
-            // branch (upstream default 1.0 = off).
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Reference conditioning (sc-24110). `Reference` and `MultiReference` reach the same
-            // upstream call — one ordered list of one to ten condition images — so both kinds are
-            // advertised and flattened in request order, matching the seam the 2512 edit provider
-            // already exposes to SceneWorks routing. `Mask` is deliberately **not** advertised:
-            // upstream has no mask input (see UPSTREAM.md), and a mask travels as an ordinary
-            // extra reference the prompt names.
-            // `ReferenceRgba` (sc-24111) joins them: upstream converts every condition image
-            // to RGBA anyway, so a reference that already carries alpha is the general case and
-            // an RGB one the opaque special case. Advertising it is what lets a transparent layer
-            // be edited (its alpha reaches the VAE encode) instead of being flattened at the
-            // contract boundary.
-            conditioning: vec![
-                gen_core::ConditioningKind::Reference,
-                gen_core::ConditioningKind::ReferenceRgba,
-                gen_core::ConditioningKind::MultiReference,
-            ],
-            // Native transparency (sc-24111). The VAE is four-channel in and out on **every**
-            // route behind this descriptor — T2I and reference alike — so there is no sub-path
-            // that would have to fabricate an alpha to honour the flag. Whether a given render is
-            // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
-            supports_alpha_output: true,
-            // LoRA + LoKr (sc-24156): installed onto every DiT Linear through the
-            // transformer's `AdaptableHost`, stacked and mixed via the shared strict seam, as
-            // residuals after any Q4/Q8 — so on every tier and on every route (T2I and the
-            // reference/edit path share the one DiT `load_heavy` builds).
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: curated_sampler_names(),
-            schedulers: curated_scheduler_names(),
-            min_size: MIN_SIZE,
-            max_size,
-            max_count: 8,
-            mac_only: true,
-            // Both affine tiers ship as **pre-quantized** snapshots ([`crate::convert`]); against
-            // one, `spec.quantize` only selects the tier on disk. Against a dense snapshot a Q4/Q8
-            // request still quantizes the DiT and the Qwen3 tower at load (the tower's is a typed
-            // refusal for a geometry the group size cannot cover). A non-affine request, a request
-            // that disagrees with a packed tier, or no request against one is a typed refusal
-            // ([`crate::quant::needs_load_time_quant`]), never a silent mis-serve.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // No `component_precision_floors`: a tier is a whole-pipeline contract, so every
-            // packable component runs the tier the caller selected (`crate::quant`).
-            requires_sigma_shift: true,
-            supports_sequential_offload: true,
-            // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
-            size_floor: SizeFloor::RangeCheckedOnGrid {
-                multiple: SIZE_MULTIPLE,
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl_8b", None)],
+                // The Qwen3-VL tower is loaded from the snapshot's own `text_encoder/`;
+                // substituting one through `LoadSpec::text_encoder` is not advertised.
+                encoder_contract: None,
+                ..Default::default()
             },
-            // The prefix KV cache (sc-25905) is a request-selected execution domain: both modes
-            // are implemented, an unset field is the prefill path, and the shared floor refuses
-            // nothing this declares.
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    gen_core::ConditioningKind::Reference,
+                    gen_core::ConditioningKind::ReferenceRgba,
+                    gen_core::ConditioningKind::MultiReference,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["qwen3_vl_vision"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: curated_scheduler_names(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("qwen_image_2_1_dit")
+                    .with_low_res_start()
+                    .with_pag(qwen_image_2_1_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_image_2_1_vae"),
+                output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
+                pixel_stride: Some(VAE_SCALE_FACTOR),
+                token_width: Some(TransformerConfig::production().in_channels as u32),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_8b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["qwen_image_2_1_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_image_2_1_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: true,
+            },
             execution: ExecutionSurface {
                 prefix_kv_cache: PrefixKvCacheDomain::Modes(
                     crate::memory_strategy::PREFIX_KV_CACHE_MODES.to_vec(),
                 ),
                 ..ExecutionSurface::default()
             },
-            supports_low_res_start: true,
-            pag: Some(qwen_image_2_1_pag_capability()),
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: MIN_SIZE,
+            max_size,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_TRUE_CFG),
+            sampler: Some("euler"),
+            schedule: Some("normal"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(compile_render_plan)
+        .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+        .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        })
+        .with_memory_behavior_registration(crate::memory_strategy::MEMORY_BEHAVIOR_REGISTRATION),
     }
+}
+
+/// Primary typed route declaration for Qwen-Image 2.1 Turbo (`REG-1`, `AP5`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = TURBO_MODEL_ID;
+    route.structure.denoiser = gen_core::ModelBinding::family_model(
+        gen_core::FamilyModelSpec::new("qwen_image_2_1_dit")
+            .with_low_res_start()
+            .with_pag(qwen_image_2_1_turbo_pag_capability()),
+    );
+    route.defaults.steps = Some(8);
+    route.bindings = gen_core::RouteBindings::generator(descriptor_turbo, |spec| {
+        load_turbo(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(compile_render_plan_turbo)
+    .with_memory_registration(crate::memory_strategy::TURBO_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(TURBO_MODEL_ID, spec)
+    })
+    .with_memory_behavior_registration(crate::memory_strategy::TURBO_MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
+/// The distilled Turbo checkpoint's identity + capabilities (sc-25900), computed from
+/// `route_turbo`.
+pub fn descriptor_turbo() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
+}
+
+/// Qwen-Image 2.1's identity + capabilities — constructible without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
 }
 
 /// A loaded Qwen-Image 2.1 generator.
@@ -1126,6 +1199,8 @@ impl QwenImage21 {
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 }
@@ -1234,7 +1309,7 @@ pub(crate) fn validate_request_with_schedule(
             )));
         }
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if !req.conditioning.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with pass-0 reference/edit conditioning",
@@ -1378,16 +1453,6 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<mlx_gen::
         &["transformer"],
         &["vae"],
     )
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
-    footprint = component_footprint
 }
 
 #[cfg(test)]
@@ -1846,11 +1911,14 @@ mod tests {
         let turbo = descriptor_turbo();
         let zero = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![16]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![16]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(Variant::Base, &base.capabilities, &zero).is_ok());
@@ -1864,11 +1932,14 @@ mod tests {
 
         let oob = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(mlx_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![32]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![32]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(Variant::Turbo, &turbo.capabilities, &oob).is_err());
@@ -1907,7 +1978,10 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(20),
-            low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let base_plan = compile_render_plan(&spec, &base_req)
@@ -1922,7 +1996,10 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let turbo_plan = compile_render_plan_turbo(&spec, &turbo_req)

@@ -347,7 +347,7 @@ impl Sd35LoadReceipt {
                 &mut digest,
                 adapter.file.canonical_path.as_os_str().as_encoded_bytes(),
             );
-            update_framed(&mut digest, adapter.file.pin.content_sha256());
+            update_framed(&mut digest, &adapter.file.pin.content_or_identity_digest());
         }
         Some(format!(
             "{ADAPTER_RECEIPT_PREFIX}{}",
@@ -820,7 +820,7 @@ fn physical_identity(
             &mut digest,
             pin.canonical_target_path().as_os_str().as_encoded_bytes(),
         );
-        update_framed(&mut digest, pin.content_sha256());
+        update_framed(&mut digest, &pin.content_or_identity_digest());
     }
     for adapter in adapters {
         update_framed(&mut digest, &(adapter.order as u64).to_le_bytes());
@@ -1313,8 +1313,8 @@ impl RequestBinding {
             seed: request.seed,
             steps: request.steps,
             guidance_bits: request.guidance.map(f32::to_bits),
-            sampler: request.sampler.clone(),
-            scheduler: request.scheduler.clone(),
+            sampler: request.sampler.as_deref().map(str::to_owned),
+            scheduler: request.scheduler.as_deref().map(str::to_owned),
             shift_bits: request.scheduler_shift.map(f32::to_bits),
             strength_bits: request.strength.map(f32::to_bits),
         }
@@ -2509,13 +2509,16 @@ mod tests {
             width: 1024,
             height: 1024,
             steps: Some(10),
-            low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
             source_image: Some(gen_core::Image {
                 width: 1200,
                 height: 700,
                 pixels: vec![64u8; 1200 * 700 * 3],
             }),
             strength: Some(0.4),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

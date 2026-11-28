@@ -115,7 +115,7 @@ fn few_step_renders_are_coherent() {
             width: w,
             height: h,
             seed: Some(seed),
-            sampler: Some(sampler.to_string()),
+            sampler: Some(sampler.into()),
             // steps/guidance left unset → the per-variant default table (sc-2758: LCM 8, Lightning/
             // Hyper 4; CFG 1). The `variants()` step count is what we assert was actually run.
             ..Default::default()

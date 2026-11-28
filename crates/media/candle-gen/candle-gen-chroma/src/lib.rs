@@ -334,7 +334,7 @@ fn validate_request_for_variant(
             "{id}: bounded decode, attention, and transformer residency are Missing"
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let sigmas = pipeline::resolved_sigmas(variant, req)?;
         low_res.resolve_for_descriptor(
             &descriptor,
@@ -400,7 +400,7 @@ fn compile_variant_plan(
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_load_spec(variant, spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
             variant.id()
@@ -474,41 +474,167 @@ pub fn load_flash(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(ChromaVariant::Flash, spec)
 }
 
-// Link-time self-registration into gen-core's model registry — one descriptor per variant.
-candle_gen::register_generators! {
-    pub(crate) const HD_REGISTRATION = descriptor_hd => load_hd
-}
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
-}
-candle_gen::register_generators! {
-    pub(crate) const FLASH_REGISTRATION = descriptor_flash => load_flash
+/// Primary typed route declaration for a Candle Chroma variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_for(variant: ChromaVariant) -> gen_core::RouteRecord {
+    let bindings = match variant {
+        ChromaVariant::Hd => gen_core::RouteBindings::generator(descriptor_hd, load_hd)
+            .with_render_plan(|spec, req| compile_variant_plan(ChromaVariant::Hd, spec, req))
+            .with_memory_registration(HD_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                hd_weights_free_contract,
+            )
+            .with_memory_surface_resolver(hd_surface_contract)
+            .with_memory_behavior_registration(HD_MEMORY_BEHAVIOR),
+        ChromaVariant::Base => gen_core::RouteBindings::generator(descriptor_base, load_base)
+            .with_render_plan(|spec, req| compile_variant_plan(ChromaVariant::Base, spec, req))
+            .with_memory_registration(BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                base_weights_free_contract,
+            )
+            .with_memory_surface_resolver(base_surface_contract)
+            .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR),
+        ChromaVariant::Flash => gen_core::RouteBindings::generator(descriptor_flash, load_flash)
+            .with_render_plan(|spec, req| compile_variant_plan(ChromaVariant::Flash, spec, req))
+            .with_memory_registration(FLASH_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                flash_weights_free_contract,
+            )
+            .with_memory_surface_resolver(flash_surface_contract)
+            .with_memory_behavior_registration(FLASH_MEMORY_BEHAVIOR),
+    };
+
+    gen_core::RouteRecord {
+        route_id: variant.id(),
+        family: "chroma",
+        backend: "candle",
+        modality: gen_core::Modality::Image,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("t5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) plus the legacy
+                // aliases (`flow_match` / `linear`), which fall back to euler / the native
+                // per-variant schedule (N3) so a request the worker builds for either backend still
+                // validates.
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &[config::DEFAULT_SAMPLER],
+                ),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["linear"],
+                ),
+                guidance_methods: vec![],
+                supports_guidance: false,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("chroma_mmdit").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["t5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["chroma_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: None,
+            sampler: Some("euler"),
+            schedule: None,
+            shift: (!variant.use_beta_sigmas()).then_some(variant.sigma_shift()),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
+    }
 }
 
-/// Add all Candle Chroma providers to an explicit media registry builder.
+/// Add all Candle Chroma providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(HD_REGISTRATION)
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(FLASH_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_HD_ID,
-            compile: |spec, req| compile_variant_plan(ChromaVariant::Hd, spec, req),
-        })
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_BASE_ID,
-            compile: |spec, req| compile_variant_plan(ChromaVariant::Base, spec, req),
-        })
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: CHROMA1_FLASH_ID,
-            compile: |spec, req| compile_variant_plan(ChromaVariant::Flash, spec, req),
-        });
-    register_memory_contract_surfaces(registry)
-        .register_memory_behavior(HD_MEMORY_BEHAVIOR)
-        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(FLASH_MEMORY_BEHAVIOR)
+    registry
+        .register_route(route_for(ChromaVariant::Hd))
+        .register_route(route_for(ChromaVariant::Base))
+        .register_route(route_for(ChromaVariant::Flash))
 }
 
 fn hd_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -629,6 +755,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Chroma provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 3);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -852,7 +997,10 @@ mod tests {
                 height: 512,
                 steps: Some(6),
                 seed: Some(77),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

@@ -343,7 +343,7 @@ impl PinnedFile {
 /// for an inventory it does not admit).
 fn pinned_file(path: &Path) -> Option<PinnedFile> {
     let seal = ArtifactSeal::pin(path).ok()?;
-    let digest = seal.content_sha256_hex();
+    let digest = seal.require_content_sha256_hex().ok()?;
     Some(PinnedFile { seal, digest })
 }
 
@@ -2533,8 +2533,8 @@ mod tests {
                     {
                         assert_eq!(fixture.context.mode, mode);
                         assert!(!fixture.context.has_phases, "{provider_id}");
-                        assert!(fixture.request.phases.is_none(), "{provider_id}");
-                        assert!(!fixture.context.use_pid && !fixture.request.use_pid);
+                        assert!(fixture.request.features.phases.is_none(), "{provider_id}");
+                        assert!(!fixture.context.use_pid && !fixture.request.use_pid());
                         assert_eq!(fixture.context.overlay, None);
                         assert_eq!(
                             fixture.request.conditioning.len(),

@@ -640,7 +640,7 @@ pub fn render_staged(
     // Source encoding is genuinely optional. Preview and PiD conversion also need the VAE's tiny
     // BN tensors before decode, so those request axes intentionally stage the VAE here and clone
     // only the statistics before synchronized release. Plain native T2I skips this phase entirely.
-    let needs_encode_phase = resolved_edit.is_some() || req.preview.is_active() || req.use_pid;
+    let needs_encode_phase = resolved_edit.is_some() || req.preview.is_active() || req.use_pid();
     let (edit, mut preview_stats) = if needs_encode_phase {
         let encode = SynchronizedPhase::new(
             load_vae(root, device)?,
@@ -697,7 +697,7 @@ pub fn render_staged(
     denoise_components.release()?;
 
     candle_gen::check_cancel(&req.cancel)?;
-    let pid = if req.use_pid {
+    let pid = if req.use_pid() {
         Some(SynchronizedPhase::new(
             load_pid(pid_spec, device)?.ok_or_else(|| {
                 CandleError::Msg("ideogram: PiD requested without a sealed PiD load".into())
@@ -708,7 +708,7 @@ pub fn render_staged(
     } else {
         None
     };
-    let vae = if req.use_pid {
+    let vae = if req.use_pid() {
         None
     } else {
         Some(SynchronizedPhase::new(
@@ -844,28 +844,32 @@ pub struct IdeogramEulerDriver<F> {
     support: DriverSupport,
 }
 
+pub(crate) fn euler_driver_support(driver_id: &'static str) -> DriverSupport {
+    DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean:
+                "native Candle Ideogram Euler driver does not re-noise from clean boundary estimates",
+            geometry_change:
+                "native Candle Ideogram Euler driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "native Candle Ideogram Euler driver does not expose read-only boundary clean estimates",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F: IdeogramVelocityForward> IdeogramEulerDriver<F> {
     fn build_support(driver_id: &'static str) -> DriverSupport {
-        DriverSupport {
-            driver_id,
-            arbitrary_slice: true,
-            carry_history: true,
-            reset_history: true,
-            renoise_from_clean: false,
-            geometry_change: false,
-            read_only_boundary_estimate: false,
-            previous_estimate_capture: false,
-            uses_global_rng: false,
-            refusal_reasons: DriverRefusalReasons {
-                renoise_from_clean:
-                    "native Candle Ideogram Euler driver does not re-noise from clean boundary estimates",
-                geometry_change:
-                    "native Candle Ideogram Euler driver does not support geometry-changing phase boundaries",
-                read_only_boundary_estimate:
-                    "native Candle Ideogram Euler driver does not expose read-only boundary clean estimates",
-                ..DriverRefusalReasons::default()
-            },
-        }
+        euler_driver_support(driver_id)
     }
 
     pub fn new(

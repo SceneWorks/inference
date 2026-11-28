@@ -5,16 +5,38 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, ModelDescriptor, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
 };
 
+pub(crate) fn route_control() -> gen_core::RouteRecord {
+    let mut route = crate::route_turbo();
+    route.route_id = "krea_2_turbo_control";
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
+    route.structure.conditioning.control_kinds =
+        Some(gen_core::control::AcceptedControlKinds::Only(vec![
+            ControlKind::Pose,
+        ]));
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["krea2_pose_control"];
+    route.structure.weight_plan.supported_quants = &[Quant::Q4, Quant::Q8];
+    route.structure.denoiser =
+        gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("krea2_dit"));
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = gen_core::RouteBindings::generator(descriptor, load);
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::CONTROL_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_nvfp4_memory_contract_surface_specs,
+                crate::weights_free_krea_control_memory_strategy_contract,
+            )
+            .with_memory_behavior_registration(crate::CONTROL_MEMORY_BEHAVIOR);
+    }
+    route.bindings = bindings;
+    route
+}
+
 pub(crate) fn descriptor() -> ModelDescriptor {
-    let mut descriptor = crate::descriptor();
-    descriptor.id = "krea_2_turbo_control";
-    descriptor.capabilities.conditioning = vec![ConditioningKind::Control];
-    descriptor.control_kinds = Some(gen_core::control::AcceptedControlKinds::Only(vec![
-        ControlKind::Pose,
-    ]));
-    descriptor.capabilities.supported_quants = &[Quant::Q4, Quant::Q8];
-    descriptor.capabilities.pag = None;
-    descriptor
+    route_control().compute_descriptor()
 }
 
 struct ControlGenerator {
@@ -106,10 +128,11 @@ impl Generator for ControlGenerator {
             .capabilities
             .validate_request(self.descriptor.id, request)?;
         if request
+            .features
             .phases
             .as_ref()
             .is_some_and(|phases| !phases.is_empty())
-            || request.use_pid
+            || request.use_pid()
         {
             return Err(gen_core::Error::Unsupported(
                 "Krea pose control does not compose multi-phase or PiD requests".into(),
@@ -175,8 +198,8 @@ impl Generator for ControlGenerator {
             let control_request = Krea2ControlRequest {
                 guidance: request.guidance,
                 negative_prompt: request.negative_prompt.clone(),
-                sampler: request.sampler.clone(),
-                scheduler: request.scheduler.clone(),
+                sampler: request.sampler.as_deref().map(str::to_owned),
+                scheduler: request.scheduler.as_deref().map(str::to_owned),
                 scheduler_shift: request.scheduler_shift,
                 prompt: request.prompt.clone(),
                 width: request.width,
@@ -186,7 +209,11 @@ impl Generator for ControlGenerator {
                 control_scale: scale
                     .or(request.control_scale)
                     .unwrap_or(crate::DEFAULT_CONTROL_SCALE),
-                text_style_gain: request.text_style_gain,
+                text_style_gain: request
+                    .extensions
+                    .krea
+                    .as_ref()
+                    .and_then(|ext| ext.text_style_gain),
                 tile_vae_decode: request.memory.is_some_and(|memory| memory.tile_vae_decode),
                 stage_residency: request.memory.is_some_and(|memory| memory.stage_residency),
                 cancel: request.cancel.clone(),
@@ -268,10 +295,6 @@ pub(crate) fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         memory_contract,
         loaded_quant,
     }))
-}
-
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

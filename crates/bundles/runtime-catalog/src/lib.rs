@@ -9,6 +9,14 @@ pub use gen_core;
 pub use gen_core::memory_strategy;
 pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
+pub mod export;
+pub mod reconcile;
+pub mod starvector;
+pub use export::{
+    assemble_capabilities_export, run_export_cli, run_export_cli_with_args,
+    verify_catalog_against_export, ExportAssemblyOptions, ExportCliTarget,
+};
+
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
 use gen_core::{
     ConditioningKind, Modality, ModelDescriptor, ProviderRegistry, Quant, TrainerDescriptor,
@@ -215,27 +223,82 @@ impl RuntimeCatalog {
         self.audio.as_ref().map(|audio| &audio.preparers)
     }
 
+    /// Every media [`gen_core::RouteRecord`] registered via `register_route`.
+    pub fn route_records(&self) -> &[gen_core::RouteRecord] {
+        self.media.route_records()
+    }
+
+    /// Every audio-lane [`gen_core::RouteRecord`] registered via `register_route`.
+    pub fn audio_route_records(&self) -> &[gen_core::RouteRecord] {
+        self.audio
+            .as_ref()
+            .map_or(&[], |audio| audio.registry.route_records())
+    }
+
+    /// Look up a registered [`gen_core::RouteRecord`] across media and audio lanes in `O(log N)`.
+    pub fn route_record(&self, id: &str) -> Option<&gen_core::RouteRecord> {
+        self.media.route_record(id).or_else(|| {
+            self.audio
+                .as_ref()
+                .and_then(|a| a.registry.route_record(id))
+        })
+    }
+
+    /// Assemble a versioned, hardware-free `sga.capabilities/2` capability export from this
+    /// validated catalog (`SW-6980`, `REG-3`).
+    pub fn capabilities_export(
+        &self,
+        options: &ExportAssemblyOptions,
+    ) -> gen_core::export::CapabilitiesExportV2 {
+        assemble_capabilities_export(self, options)
+    }
+
+    /// Verify that this authoritative linked catalog agrees with a `sga.capabilities/2` export,
+    /// returning a typed [`gen_core::export::ExportDisagreementError`] on any mismatch (`REG-3`).
+    pub fn verify_against_export(
+        &self,
+        expected: &gen_core::export::CapabilitiesExportV2,
+        options: &ExportAssemblyOptions,
+    ) -> std::result::Result<(), gen_core::export::ExportDisagreementError> {
+        verify_catalog_against_export(self, expected, options)
+    }
+
     /// Return a stable, serializable inventory without loading model weights.
     pub fn snapshot(&self) -> RuntimeCatalogSnapshot {
+        let mut routes = std::collections::BTreeMap::new();
+        for record in self.media.route_records() {
+            routes.insert(
+                record.route_id.to_string(),
+                RouteCapabilitySnapshot::from_route_record(record),
+            );
+        }
+        if let Some(audio) = &self.audio {
+            for record in audio.registry.route_records() {
+                routes.insert(
+                    record.route_id.to_string(),
+                    RouteCapabilitySnapshot::from_route_record(record),
+                );
+            }
+        }
         RuntimeCatalogSnapshot {
             platform: self.platform.to_string(),
             backend: self.backend.to_string(),
             generator_ids: self
                 .media
-                .generators()
-                .map(|registration| (registration.descriptor)().id.to_string())
+                .generator_descriptors()
+                .iter()
+                .map(|descriptor| descriptor.id.to_string())
                 .collect(),
             generator_capabilities: self
                 .media
-                .generators()
-                .map(|registration| {
-                    GeneratorCapabilitySnapshot::from_registry_descriptor(
-                        &self.media,
-                        &(registration.descriptor)(),
-                    )
+                .generator_descriptors()
+                .iter()
+                .map(|descriptor| {
+                    GeneratorCapabilitySnapshot::from_registry_descriptor(&self.media, descriptor)
                 })
                 .collect(),
             features: self.media.all_route_feature_applicability(),
+            routes,
             transform_ids: self
                 .media
                 .transforms()
@@ -576,6 +639,43 @@ pub struct GeneratorCapabilitySnapshot {
     pub supported_guidance_methods: Vec<String>,
     pub pag: Option<gen_core::PagCapability>,
     pub features: std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
+    /// Primary model defaults when registered via [`gen_core::RouteRecord`].
+    pub defaults: Option<gen_core::RouteDefaults>,
+    /// Primary product limits when registered via [`gen_core::RouteRecord`].
+    pub limits: Option<gen_core::ProductLimits>,
+}
+
+/// Primary route defaults, product limits, and structural summary exported from a
+/// [`gen_core::RouteRecord`] (`SW-6979`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteCapabilitySnapshot {
+    pub route_id: String,
+    pub family: String,
+    pub backend: String,
+    pub modality: String,
+    pub defaults: gen_core::RouteDefaults,
+    pub limits: gen_core::ProductLimits,
+    pub seed_and_batch: gen_core::SeedAndBatchSemantics,
+    pub json: serde_json::Value,
+}
+
+impl RouteCapabilitySnapshot {
+    pub fn from_route_record(record: &gen_core::RouteRecord) -> Self {
+        Self {
+            route_id: record.route_id.to_string(),
+            family: record.family.to_string(),
+            backend: record.backend.to_string(),
+            modality: modality_name(record.modality).to_string(),
+            defaults: record.defaults.clone(),
+            limits: record.limits.clone(),
+            seed_and_batch: record.seed_and_batch.clone(),
+            json: record.to_json(),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        self.json.clone()
+    }
 }
 
 impl GeneratorCapabilitySnapshot {
@@ -590,7 +690,7 @@ impl GeneratorCapabilitySnapshot {
         let route =
             gen_core::FeatureRouteStructure::from_descriptor_and_plan(descriptor, render_plan);
         let features = gen_core::FeatureRegistry::standard().evaluate_route(&route);
-        Self::from_descriptor_and_features(descriptor, features)
+        Self::from_descriptor_and_features(descriptor, features, None, None)
     }
 
     pub fn from_registry_descriptor(
@@ -598,12 +698,20 @@ impl GeneratorCapabilitySnapshot {
         descriptor: &ModelDescriptor,
     ) -> Self {
         let features = registry.generator_feature_applicability(descriptor);
-        Self::from_descriptor_and_features(descriptor, features)
+        let route = registry.route_record(descriptor.id);
+        Self::from_descriptor_and_features(
+            descriptor,
+            features,
+            route.map(|r| r.defaults.clone()),
+            route.map(|r| r.limits.clone()),
+        )
     }
 
     fn from_descriptor_and_features(
         descriptor: &ModelDescriptor,
         features: std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
+        defaults: Option<gen_core::RouteDefaults>,
+        limits: Option<gen_core::ProductLimits>,
     ) -> Self {
         Self {
             id: descriptor.id.to_string(),
@@ -650,6 +758,8 @@ impl GeneratorCapabilitySnapshot {
                 .collect(),
             pag: descriptor.capabilities.pag.clone(),
             features,
+            defaults,
+            limits,
         }
     }
 
@@ -678,6 +788,12 @@ impl GeneratorCapabilitySnapshot {
         if let Some(pag) = &self.pag {
             object["pag"] = serde_json::to_value(pag).expect("PagCapability serializes");
         }
+        if let Some(defaults) = &self.defaults {
+            object["defaults"] = serde_json::to_value(defaults).expect("RouteDefaults serializes");
+        }
+        if let Some(limits) = &self.limits {
+            object["limits"] = serde_json::to_value(limits).expect("ProductLimits serializes");
+        }
         object
     }
 }
@@ -688,6 +804,7 @@ fn modality_name(modality: Modality) -> &'static str {
         Modality::Video => "video",
         Modality::Both => "both",
         Modality::Audio => "audio",
+        Modality::Vector => "vector",
     }
 }
 
@@ -838,6 +955,8 @@ pub struct RuntimeCatalogSnapshot {
         String,
         std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
     >,
+    /// Primary route declarations, defaults, and product limits keyed by `route_id` (`SW-6979`).
+    pub routes: std::collections::BTreeMap<String, RouteCapabilitySnapshot>,
     /// Standalone transform ids (empty at this release).
     pub transform_ids: Vec<String>,
     /// Trainer ids — each a `load_trainer` key.
@@ -905,12 +1024,18 @@ impl RuntimeCatalogSnapshot {
                 (route_id.clone(), serde_json::Value::Object(per_feature))
             })
             .collect();
+        let routes_json: serde_json::Map<String, serde_json::Value> = self
+            .routes
+            .iter()
+            .map(|(route_id, route)| (route_id.clone(), route.to_json()))
+            .collect();
         serde_json::json!({
             "platform": self.platform,
             "backend": self.backend,
             "generator_ids": self.generator_ids,
             "generator_capabilities": self.generator_capabilities.iter().map(GeneratorCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "features": serde_json::Value::Object(route_features),
+            "routes": serde_json::Value::Object(routes_json),
             "transform_ids": self.transform_ids,
             "trainer_ids": self.trainer_ids,
             "trainer_capabilities": self.trainer_capabilities.iter().map(TrainerCapabilitySnapshot::to_json).collect::<Vec<_>>(),
@@ -2072,5 +2197,193 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("missing_spatial_unpack_repack")));
+    }
+
+    #[test]
+    fn route_record_defaults_limits_and_hook4_surface_in_runtime_catalog_snapshot() {
+        fn build_route(with_latent: bool) -> gen_core::RouteRecord {
+            gen_core::RouteRecord {
+                route_id: "route_pilot_dev",
+                family: "flux",
+                backend: "mlx",
+                modality: gen_core::Modality::Image,
+                mac_only: true,
+                structure: gen_core::RouteStructure {
+                    sampling: gen_core::SamplingSurface {
+                        samplers: vec!["euler"],
+                        schedulers: vec!["simple"],
+                        supports_guidance: true,
+                        ..Default::default()
+                    },
+                    denoiser: gen_core::ModelBinding::family_model(
+                        gen_core::FamilyModelSpec::new("flux1_mmdit").with_low_res_start(),
+                    ),
+                    latent_codec: gen_core::LatentCodecDeclaration {
+                        codec_id: Some("flux1_ae"),
+                        output_latent_space: with_latent.then_some(&gen_core::FLUX1_LATENT_SPACE),
+                        pixel_stride: Some(16),
+                        token_width: Some(64),
+                        supports_diffusion_decoder: false,
+                    },
+                    adapters: gen_core::AdapterSurface::lora_and_lokr(
+                        gen_core::AdapterInstallPolicy::ForwardResidual,
+                    ),
+                    output: gen_core::OutputSurface {
+                        preview: gen_core::PreviewSupport::LatentProjection,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                limits: gen_core::ProductLimits {
+                    min_size: 256,
+                    max_size: 2048,
+                    size_floor: gen_core::SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+                    supported_steps: gen_core::StepSupport::Unconstrained,
+                    max_audio_duration_secs: None,
+                },
+                seed_and_batch: gen_core::SeedAndBatchSemantics {
+                    seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+                    max_count: 8,
+                    supports_prompt_batch: false,
+                },
+                defaults: gen_core::RouteDefaults {
+                    steps: Some(25),
+                    guidance: Some(3.5),
+                    sampler: Some("euler"),
+                    schedule: Some("simple"),
+                    shift: Some(1.15),
+                    strength: None,
+                    dimensions: Some((1024, 1024)),
+                    ..Default::default()
+                },
+                bindings: gen_core::RouteBindings::generator(
+                    if with_latent {
+                        route_desc_with_latent
+                    } else {
+                        route_desc_without_latent
+                    },
+                    never_load_generator,
+                )
+                .with_render_plan(compile_probe),
+            }
+        }
+        fn route_desc_with_latent() -> gen_core::ModelDescriptor {
+            build_route(true).compute_descriptor()
+        }
+        fn route_desc_without_latent() -> gen_core::ModelDescriptor {
+            build_route(false).compute_descriptor()
+        }
+        fn never_load_generator(
+            _spec: &gen_core::LoadSpec,
+        ) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+            Err(gen_core::Error::Msg("unused".into()))
+        }
+        fn compile_probe(
+            _spec: &gen_core::LoadSpec,
+            _req: &gen_core::GenerationRequest,
+        ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+            Ok(None)
+        }
+
+        let catalog = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            gen_core::ProviderRegistryBuilder::new()
+                .register_route(build_route(true))
+                .build(),
+            empty_text(),
+            mlx_preparers(),
+        )
+        .expect("route-record catalog validates");
+
+        assert_eq!(catalog.route_records().len(), 1);
+        assert!(catalog.route_record("route_pilot_dev").is_some());
+        let snapshot = catalog.snapshot();
+        let json = snapshot.to_json();
+        assert_eq!(json["routes"]["route_pilot_dev"]["defaults"]["steps"], 25);
+        assert_eq!(
+            json["routes"]["route_pilot_dev"]["defaults"]["guidance"],
+            3.5
+        );
+        assert_eq!(
+            json["routes"]["route_pilot_dev"]["limits"]["max_size"],
+            2048
+        );
+        assert_eq!(json["generator_capabilities"][0]["defaults"]["steps"], 25);
+        assert_eq!(json["generator_capabilities"][0]["limits"]["min_size"], 256);
+        assert_eq!(
+            json["features"]["route_pilot_dev"]["low_res_start"]["applicable"],
+            true
+        );
+
+        // Removing the latent codec structural precondition flips applicability with zero table edits.
+        let catalog_no_latent = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            gen_core::ProviderRegistryBuilder::new()
+                .register_route(build_route(false))
+                .build(),
+            empty_text(),
+            mlx_preparers(),
+        )
+        .expect("route without latent space still conforms");
+        let json_no_latent = catalog_no_latent.snapshot().to_json();
+        assert_eq!(
+            json_no_latent["features"]["route_pilot_dev"]["low_res_start"]["applicable"],
+            false
+        );
+        assert!(
+            json_no_latent["features"]["route_pilot_dev"]["low_res_start"]
+                ["inapplicability_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("missing_spatial_unpack_repack"))
+        );
+
+        // Verify CapabilitiesExportV2 (`sga.capabilities/2`, SW-6980) reflects the exact HOOK-4
+        // flip, byte-for-byte determinism, and typed runtime-vs-export disagreement refusal.
+        let opts = ExportAssemblyOptions::new("macos-mlx");
+        let export_with = catalog.capabilities_export(&opts);
+        let export_without = catalog_no_latent.capabilities_export(&opts);
+        assert_eq!(
+            export_with.schema_version,
+            gen_core::export::CAPABILITIES_EXPORT_SCHEMA_VERSION
+        );
+        let lrs_with = export_with.routes["route_pilot_dev"]
+            .features
+            .iter()
+            .find(|f| f.feature_id == "low_res_start")
+            .unwrap();
+        assert!(lrs_with.applicable);
+        assert!(lrs_with.reasons.is_empty());
+
+        let lrs_without = export_without.routes["route_pilot_dev"]
+            .features
+            .iter()
+            .find(|f| f.feature_id == "low_res_start")
+            .unwrap();
+        assert!(!lrs_without.applicable);
+        assert!(lrs_without
+            .reasons
+            .iter()
+            .any(|r| r.code == "missing_spatial_unpack_repack"));
+
+        let bytes_a = export_with.to_canonical_json_bytes().unwrap();
+        let bytes_b = catalog
+            .capabilities_export(&opts)
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(bytes_a, bytes_b);
+        assert!(gen_core::export::canonical_bytes_equal(&bytes_a, &bytes_b).unwrap());
+
+        catalog
+            .verify_against_export(&export_with, &opts)
+            .expect("matching catalog must verify against its own export");
+        let disagreement = catalog_no_latent
+            .verify_against_export(&export_with, &opts)
+            .expect_err("catalog with removed structural precondition must refuse disagreement");
+        assert!(disagreement.disagreements.iter().any(|d| {
+            d.kind == gen_core::export::ExportDisagreementKind::RouteFeatureApplicabilityMismatch
+        }));
     }
 }

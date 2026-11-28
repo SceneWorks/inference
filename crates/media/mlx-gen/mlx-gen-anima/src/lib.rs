@@ -103,37 +103,14 @@ pub fn register_providers(
 pub fn register_base_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::BASE_REGISTRATION)
-        .register_render_plan(model::BASE_RENDER_PLAN)
-        .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
-        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "anima_base",
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract("anima_base", spec)
-            },
-        })
-        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
+    registry.register_route(model::route_base())
 }
 
 /// Add the `anima_aesthetic` generator with its complete memory-strategy registration. No trainer.
 pub fn register_aesthetic_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::AESTHETIC_REGISTRATION)
-        .register_render_plan(model::AESTHETIC_RENDER_PLAN)
-        .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "anima_aesthetic",
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract("anima_aesthetic", spec)
-            },
-        })
-        .register_memory_behavior(model::AESTHETIC_MEMORY_BEHAVIOR)
+    registry.register_route(model::route_aesthetic())
 }
 
 /// Add the `anima_turbo` generator with its complete memory-strategy registration — the same
@@ -142,18 +119,7 @@ pub fn register_aesthetic_generator(
 pub fn register_turbo_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_render_plan(model::TURBO_RENDER_PLAN)
-        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: "anima_turbo",
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract("anima_turbo", spec)
-            },
-        })
-        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
+    registry.register_route(model::route_turbo())
 }
 
 /// Build the complete explicit MLX Anima provider catalog.
@@ -185,6 +151,7 @@ mod explicit_registry_tests {
             &[]
         };
         assert_eq!(explicit_trainers, expected_trainers);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
@@ -222,7 +189,10 @@ mod explicit_registry_tests {
                 height: 1024,
                 steps: Some(6),
                 seed: Some(19),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

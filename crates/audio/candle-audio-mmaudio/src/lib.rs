@@ -135,15 +135,15 @@ pub use generator_44k::{
 
 pub use output::AudioDecoder44k;
 
-/// Add the shipping MMAudio video→audio generators to an explicit audio registry builder (catalog
-/// composition): the 16 kHz `mmaudio_small_16k` (sc-12843) then the 44.1 kHz quality-ceiling sibling
-/// `mmaudio_large_44k` (sc-13441), in that stable order.
+/// Add the shipping MMAudio video→audio generators to an explicit audio registry builder via
+/// one-call [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`): `mmaudio_small_16k` then `mmaudio_large_44k`, in that stable order.
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(generator::REGISTRATION)
-        .register_generator(generator_44k::REGISTRATION)
+        .register_route(generator::route())
+        .register_route(generator_44k::route())
 }
 
 /// Build the complete explicit MMAudio provider catalog (this crate's own surface).

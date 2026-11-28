@@ -36,29 +36,43 @@ pub const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
 /// Turbo default steps (CFG-free distilled few-step), shared with the base [`crate::model`] Turbo path.
 const DEFAULT_STEPS: u32 = 8;
 
-/// Krea 2 Turbo pose-control identity + capabilities. Derived from the base Turbo [`crate::model::descriptor`]
-/// so the shared surface (family/backend/samplers/size bounds/LoRA/mac_only/**supported_quants**) stays in
-/// lockstep; the pose control lane only swaps the Turbo img2img `Reference` surface for a required `Control`
-/// conditioning.
-///
-/// Q4/Q8 base (sc-11727, candle-gen PR #471): the earlier "dense-only" gate assumed a packed base would
-/// desync the main-stream activations the residual was trained against. That assumption was refuted — a
-/// q8 base is visually indistinguishable from bf16 and q4 keeps the pose-lock fully intact (GPU-proven on
-/// the candle twin). mlx-gen's control lane reuses the same packed-capable
-/// [`crate::transformer::Krea2Transformer`] as txt2img,
-/// so a packed snapshot runs a **true packed forward** (real memory savings), not candle's dequant-to-bf16
-/// VRAM overlay — so we inherit the base Turbo `&[Q4, Q8]` rather than blanking it.
+/// Primary typed route declaration for Krea 2 Turbo pose-ControlNet (`REG-1`, `AP5`).
+pub fn route_control() -> gen_core::RouteRecord {
+    let mut route = crate::model::route_turbo();
+    route.route_id = KREA_2_TURBO_CONTROL_ID;
+    route.structure.conditioning.kinds = vec![ConditioningKind::Control];
+    route.structure.conditioning.control_kinds =
+        Some(AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose]));
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["krea2_pose_controlnet"];
+    route.structure.denoiser =
+        gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("krea2_dit_control"));
+    route.structure.adapters.install_policy = gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.bindings =
+        gen_core::RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(crate::model::control_component_footprint)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(
+                    KREA_2_TURBO_CONTROL_ID,
+                    spec,
+                )
+            })
+            .with_memory_surface_resolver(|surface| {
+                crate::memory_strategy::weights_free_memory_strategy_surface_contract(
+                    KREA_2_TURBO_CONTROL_ID,
+                    surface,
+                )
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
+/// Krea 2 Turbo pose-control identity + capabilities, computed from `route_control`.
 pub fn descriptor() -> ModelDescriptor {
-    let mut d = crate::model::descriptor();
-    d.id = KREA_2_TURBO_CONTROL_ID;
-    // Pose ControlNet: a required Control conditioning replaces Turbo's optional img2img Reference.
-    d.capabilities.conditioning = vec![ConditioningKind::Control];
-    // Pose only — this branch is a single-signal ControlNet, not a Fun-Union.
-    d.control_kinds = Some(AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose]));
-    // Pose control is outside the Krea 2 PAG surface (SW-7176); clear the inherited Turbo PAG
-    // advertisement so PAG requests fail closed at the capability floor rather than dropping it.
-    d.capabilities.pag = None;
-    d
+    route_control().compute_descriptor()
 }
 
 /// A loaded Krea 2 Turbo pose-control generator: the cached descriptor + a component-residency strategy
@@ -199,8 +213,8 @@ impl AdmittedControlGeometry {
             height: self.0.height,
             steps,
             seed,
-            sampler: req.sampler.clone(),
-            scheduler: req.scheduler.clone(),
+            sampler: req.sampler.as_deref().map(str::to_owned),
+            scheduler: req.scheduler.as_deref().map(str::to_owned),
             transformer_window_size,
             memory: req.memory.unwrap_or_default(),
             provider_id: KREA_2_TURBO_CONTROL_ID,
@@ -692,11 +706,16 @@ impl KreaTurboControl {
         // drops it and clears the cache before loading the DiT/VAE/branch below.
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &KreaText| {
-                let context =
-                    maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+                let context = maybe_apply_style_gain(
+                    text.encode(&req.prompt)?,
+                    req.extensions
+                        .krea
+                        .as_ref()
+                        .and_then(|ext| ext.text_style_gain),
+                )?;
                 let negative = (req.guidance.unwrap_or(0.0) != 0.0)
                     .then(|| text.encode(req.negative_prompt.as_deref().unwrap_or("")))
                     .transpose()?;
@@ -896,11 +915,6 @@ impl KreaTurboControl {
 // Explicit registration for `krea_2_turbo_control`. The `impl Generator` stays hand-written
 // because `validate` adds the control-present check beyond the shared `validate_request`, so it is not
 // the plain delegation `impl_generator!` expresses (the z-image control precedent).
-mlx_gen::register_generators! {
-    pub(crate) const CONTROL_REGISTRATION = descriptor => load;
-    footprint = crate::model::control_component_footprint
-}
-
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: KREA_2_TURBO_CONTROL_ID,

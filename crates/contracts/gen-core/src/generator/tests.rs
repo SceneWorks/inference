@@ -251,7 +251,7 @@ fn img(w: u32, h: u32) -> Image {
 #[test]
 fn scail2_typed_carrier_is_one_reference_and_rejects_crossed_shapes() {
     let exact = GenerationRequest {
-        video_mode: Some("animation".to_owned()),
+        video_mode: Some(VideoMode::Animation),
         conditioning: vec![
             Conditioning::Reference {
                 image: img(2, 2),
@@ -292,7 +292,7 @@ fn scail2_typed_carrier_is_one_reference_and_rejects_crossed_shapes() {
     assert!(mismatched.scail2_animation_conditioning().is_err());
 
     let mut replacement = exact;
-    replacement.video_mode = Some("replacement".to_owned());
+    replacement.video_mode = Some(VideoMode::Replacement);
     assert_eq!(replacement.memory_reference_count(), 1);
     let carrier = replacement.scail2_animation_conditioning().unwrap();
     assert_eq!(
@@ -629,15 +629,19 @@ fn enhancement_token_limits_are_canonical_model_scoped_without_changing_defaults
         supports_prompt_enhancement: true,
         ..caps()
     };
-    for (id, limit) in [
-        ("flux2_dev", 2_048),
-        ("ltx_2_3", 2_048),
-        ("unknown", 2_048),
-        ("flux3_klein_alias", 2_048),
-        ("flux3_klein", 3_584),
-        ("flux3_klein_base", 3_584),
+    for (id, declared_limit, limit) in [
+        ("flux2_dev", None, 2_048),
+        ("ltx_2_3", None, 2_048),
+        ("unknown", None, 2_048),
+        ("flux3_klein_alias", None, 2_048),
+        ("flux3_klein", Some(3_584), 3_584),
+        ("flux3_klein_base", Some(3_584), 3_584),
     ] {
-        assert_eq!(max_enhance_tokens_for_model(id), limit, "{id}");
+        let caps_for_route = Capabilities {
+            max_enhance_tokens: declared_limit,
+            ..supported.clone()
+        };
+        assert_eq!(caps_for_route.effective_max_enhance_tokens(), limit, "{id}");
         for tokens in [0, 2_048, 2_049, 3_584, 3_585] {
             let request = GenerationRequest {
                 enhance_prompt: true,
@@ -645,7 +649,7 @@ fn enhancement_token_limits_are_canonical_model_scoped_without_changing_defaults
                 ..base_req()
             };
             assert_eq!(
-                supported.validate_request(id, &request).is_ok(),
+                caps_for_route.validate_request(id, &request).is_ok(),
                 tokens > 0 && tokens <= limit,
                 "{id}: {tokens} tokens"
             );
@@ -1433,15 +1437,30 @@ fn non_finite_extended_float_knobs_are_rejected() {
             ..base_req()
         }),
         ("motion_bucket_id", |v| GenerationRequest {
-            motion_bucket_id: Some(v),
+            extensions: FamilyExtensions {
+                svd: Some(SvdExtension {
+                    motion_bucket_id: Some(v),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..base_req()
         }),
         ("noise_aug_strength", |v| GenerationRequest {
-            noise_aug_strength: Some(v),
+            extensions: FamilyExtensions {
+                svd: Some(SvdExtension {
+                    noise_aug_strength: Some(v),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..base_req()
         }),
         ("softness", |v| GenerationRequest {
-            softness: Some(v),
+            extensions: FamilyExtensions {
+                seedvr2: Some(SeedVr2Extension { softness: Some(v) }),
+                ..Default::default()
+            },
             ..base_req()
         }),
         ("enhance_temperature", |v| GenerationRequest {
@@ -1449,7 +1468,10 @@ fn non_finite_extended_float_knobs_are_rejected() {
             ..base_req()
         }),
         ("pid_capture_sigma", |v| GenerationRequest {
-            pid_capture_sigma: Some(v),
+            features: FeatureParams {
+                pid: Some(PidParams::with_capture_sigma(v)),
+                ..Default::default()
+            },
             ..base_req()
         }),
     ];
@@ -2108,7 +2130,7 @@ fn generate_with_report_defaults_to_the_bare_output() {
             ..Default::default()
         },
     });
-    assert_eq!(generator.moss_image_owned_weight_bytes(), None);
+    assert_eq!(generator.retained_weight_bytes(), None);
     let mut progress = Vec::new();
     let report = generator
         .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))
@@ -3338,7 +3360,7 @@ fn keyframe_video_clip_control_clip_and_redux_floats_join_the_finiteness_floor()
 #[test]
 fn phases_default_none_and_round_trip() {
     // Default = single-phase, unaffected.
-    assert_eq!(GenerationRequest::default().phases, None);
+    assert_eq!(GenerationRequest::default().features.phases, None);
 
     // A two-phase Raw→Raw+turbo-LoRA split: phase 1 = 20 steps, CFG on, base-only; phase 2 = 8
     // steps, CFG off, turbo LoRA (load-time adapter 0) at weight 0.8.
@@ -3359,27 +3381,27 @@ fn phases_default_none_and_round_trip() {
     ];
     let req = GenerationRequest {
         prompt: "a phased render".into(),
-        phases: Some(phases.clone()),
+        features: FeatureParams {
+            phases: Some(phases.clone()),
+            ..Default::default()
+        },
         ..Default::default()
     };
-    // The typed phases survive a clone unchanged (no serde in this contract — Clone is the
-    // transport the worker uses to hand a request across the thread boundary).
-    assert_eq!(req.clone().phases, Some(phases));
-    // The flat steps knob is left at its default None — the total budget is the phases' sum.
+    assert_eq!(req.clone().features.phases, Some(phases));
     assert_eq!(req.steps, None);
 }
 
-/// sc-13884: a NaN/Inf on a phase guidance OR a phase-adapter weight is caught by the shared
-/// finiteness floor, exactly like the flat float knobs (a NaN in the phase forward would silently
-/// poison the guidance / adapter-scale math otherwise).
 #[test]
 fn phase_floats_join_the_finiteness_floor() {
     let bad_guidance = GenerationRequest {
-        phases: Some(vec![GenerationPhase {
-            steps: 4,
-            guidance: Some(f32::NAN),
-            adapters: vec![],
-        }]),
+        features: FeatureParams {
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(f32::NAN),
+                adapters: vec![],
+            }]),
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3389,14 +3411,17 @@ fn phase_floats_join_the_finiteness_floor() {
     assert!(bad_guidance.ensure_finite_floats().is_err());
 
     let bad_weight = GenerationRequest {
-        phases: Some(vec![GenerationPhase {
-            steps: 4,
-            guidance: Some(0.0),
-            adapters: vec![PhaseAdapter {
-                adapter: 0,
-                weight: Some(f32::INFINITY),
-            }],
-        }]),
+        features: FeatureParams {
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(0.0),
+                adapters: vec![PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(f32::INFINITY),
+                }],
+            }]),
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert_eq!(
@@ -3404,37 +3429,40 @@ fn phase_floats_join_the_finiteness_floor() {
         Some("phases.adapter.weight")
     );
 
-    // A finite two-phase request passes the floor untouched.
     let ok = GenerationRequest {
-        phases: Some(vec![
-            GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            },
-            GenerationPhase {
-                steps: 4,
-                guidance: None,
-                adapters: vec![PhaseAdapter {
-                    adapter: 1,
-                    weight: None,
-                }],
-            },
-        ]),
+        features: FeatureParams {
+            phases: Some(vec![
+                GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                },
+                GenerationPhase {
+                    steps: 4,
+                    guidance: None,
+                    adapters: vec![PhaseAdapter {
+                        adapter: 1,
+                        weight: None,
+                    }],
+                },
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     };
     assert_eq!(ok.first_nonfinite_float(), None);
 }
 
-/// sc-23402 — the reference-image short edge is admitted over 1024..=2048 INCLUSIVE, and an
-/// out-of-range value is refused rather than clamped.
-///
-/// The two boundary pairs are the whole point: an exclusive upper bound, an off-by-one floor, or
-/// a `clamp` in place of the refusal each flips exactly one of these four.
 #[test]
 fn reference_image_short_edge_admits_1024_through_2048_inclusive_and_refuses_outside() {
     let with = |edge: Option<u32>| GenerationRequest {
-        reference_image_short_edge: edge,
+        extensions: FamilyExtensions {
+            h3: edge.map(|e| H3Extension {
+                reference_image_short_edge: Some(e),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -3455,12 +3483,10 @@ fn reference_image_short_edge_admits_1024_through_2048_inclusive_and_refuses_out
     }
 }
 
-/// The effective value is the request's, or upstream's 2048 when absent — the one resolver the
-/// engine applies and the consumer records, so a recipe cannot drift from the render.
 #[test]
 fn effective_reference_image_short_edge_defaults_to_upstreams_2048() {
     let default_request = GenerationRequest::default();
-    assert_eq!(default_request.reference_image_short_edge, None);
+    assert_eq!(default_request.extensions.h3, None);
     assert_eq!(
         effective_reference_image_short_edge(&default_request),
         REFERENCE_IMAGE_SHORT_EDGE_DEFAULT
@@ -3475,7 +3501,13 @@ fn effective_reference_image_short_edge_defaults_to_upstreams_2048() {
         REFERENCE_IMAGE_SHORT_EDGE_MAX,
     ] {
         let req = GenerationRequest {
-            reference_image_short_edge: Some(asked),
+            extensions: FamilyExtensions {
+                h3: Some(H3Extension {
+                    reference_image_short_edge: Some(asked),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(

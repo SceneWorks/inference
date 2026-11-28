@@ -27,6 +27,12 @@ fn base_spec(paths: &PulidFluxPaths) -> LoadSpec {
     spec
 }
 
+fn base_spec_from_load_spec(spec: &LoadSpec) -> LoadSpec {
+    let mut base = spec.clone();
+    base.identity = None;
+    base
+}
+
 fn resident_component(
     id: &str,
     path: &std::path::Path,
@@ -93,12 +99,136 @@ pub fn resolved_numeric_tier(
 }
 
 /// The PuLID-FLUX memory profile (sc-27307): the shared pipeline, then the identity-route refusals
-/// once it has admitted. The tier is the FLUX base snapshot's, resolved from [`PulidFluxPaths`]
-/// rather than a [`LoadSpec`], so [`safety_check`] resolves it before entering the profile.
+/// once it has admitted.
 const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[gen_core::MemoryFixtureRoute::new(
+        gen_core::MemoryFixtureMode::Other("character_image"),
+        1,
+    )
+    .with_overlay(gen_core::MemoryFixtureOverlay::Fixed("identity"))]),
     gates: gen_core::MemoryProfileGates::after(identity_route_gate),
     ..gen_core::ProviderMemoryProfile::STANDARD
 };
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<gen_core::MemoryNumericTier> {
+    candle_gen_flux::memory_strategy::resolved_numeric_tier(
+        &base_spec_from_load_spec(spec),
+        PROVIDER_ID,
+    )
+}
+
+/// Weights-free contract surface specs carrying the mandatory PuLID identity slots.
+pub fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .map(|mut surface| {
+            surface.spec.identity = Some(gen_core::IdentityWeights {
+                encoder: Some(WeightsSource::File(
+                    "/__sceneworks_memory_contract_pulid_weights__".into(),
+                )),
+                eva: Some(WeightsSource::File(
+                    "/__sceneworks_memory_contract_pulid_eva__".into(),
+                )),
+                face_dir: Some(WeightsSource::Dir(
+                    "/__sceneworks_memory_contract_pulid_face__".into(),
+                )),
+            });
+            surface
+        })
+        .collect()
+}
+
+/// Registered [`LoadSpec`]-driven contract factory for `pulid_flux`.
+///
+/// Prices all 5 resident PuLID identity networks when materialized on disk; on weights-free
+/// sentinel surfaces where none of the overlay paths exist, produces the exact structural contract
+/// without reading weights.
+pub fn registered_provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    let base = base_spec_from_load_spec(spec);
+    let components = match crate::registry::paths_from_spec(spec) {
+        Ok(paths)
+            if paths.pulid_weights.exists()
+                || paths.eva_weights.exists()
+                || paths.face_dir.exists() =>
+        {
+            resident_components(&paths)?
+        }
+        _ => Vec::new(),
+    };
+    candle_gen_flux::memory_strategy::reference_backbone_contract(
+        PROVIDER_ID,
+        &base,
+        components,
+        CALIBRATION_FINGERPRINT,
+    )
+}
+
+pub(crate) fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+pub(crate) fn registered_valid_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: gen_core::MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: gen_core::MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    Ok(Some(
+        candle_gen_flux::memory_strategy::reference_backbone_request_scope(
+            provider_id,
+            candle_core::Device::Cpu,
+            contract,
+            context,
+        ),
+    ))
+}
+
+pub(crate) fn registered_begin_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        PROVIDER_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+pub(crate) const PULID_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: PROVIDER_ID,
+        contract: registered_provider_contract,
+        safety_check: registered_safety_check,
+    };
+
+pub(crate) const PULID_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: PROVIDER_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_request,
+    };
 
 fn identity_route_gate(
     _contract: &MemoryProviderContract,

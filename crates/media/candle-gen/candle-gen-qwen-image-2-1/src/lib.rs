@@ -256,92 +256,155 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     descriptor_for(Variant::Turbo)
 }
 
-fn descriptor_for(variant: Variant) -> ModelDescriptor {
+/// Primary typed route declaration for a Candle Qwen-Image 2.1 variant (`REG-1`, `AP5`).
+pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
     let max_size = PRESETS
         .iter()
         .map(|p| p.width.max(p.height))
         .max()
         .unwrap_or(2048);
-    ModelDescriptor {
-        // The Qwen3-VL tower is loaded from the snapshot's own `text_encoder/`; substituting one
-        // through `LoadSpec::text_encoder` is not advertised for this route.
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.id(),
+    let (dit_id, pag, default_steps, bindings) = match variant {
+        Variant::Base => (
+            "qwen_image_2_1_dit",
+            qwen_image_2_1_pag_capability(),
+            DEFAULT_STEPS,
+            gen_core::RouteBindings::generator(descriptor, load)
+                .with_render_plan(compile_render_plan)
+                .with_memory_registration(memory_strategy::MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    candle_gen::gen_core::mlx_memory_contract_surface_specs,
+                    |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+                )
+                .with_memory_behavior_registration(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION),
+        ),
+        Variant::Turbo => (
+            "qwen_image_2_1_turbo_dit",
+            qwen_image_2_1_turbo_pag_capability(),
+            8,
+            gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+                .with_render_plan(compile_render_plan_turbo)
+                .with_memory_registration(memory_strategy::TURBO_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    candle_gen::gen_core::mlx_memory_contract_surface_specs,
+                    |spec| {
+                        memory_strategy::weights_free_memory_strategy_contract(TURBO_MODEL_ID, spec)
+                    },
+                )
+                .with_memory_behavior_registration(
+                    memory_strategy::TURBO_MEMORY_BEHAVIOR_REGISTRATION,
+                ),
+        ),
+    };
+    gen_core::RouteRecord {
+        route_id: variant.id(),
         family: FAMILY,
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // True CFG: a negative prompt plus `true_cfg`/`guidance` above 1 runs the negative
-            // branch (upstream default 1.0 = off).
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Reference conditioning (sc-24110). `Reference` and `MultiReference` reach the same
-            // upstream call — one ordered list of one to ten condition images — so both kinds are
-            // advertised and flattened in request order, matching the seam the 2512 edit provider
-            // already exposes to SceneWorks routing. `Mask` is deliberately **not** advertised:
-            // upstream has no mask input (see UPSTREAM.md), and a mask travels as an ordinary
-            // extra reference the prompt names.
-            // `ReferenceRgba` (sc-24111) joins them: upstream converts every condition image
-            // to RGBA anyway, so a reference that already carries alpha is the general case and
-            // an RGB one the opaque special case. Advertising it is what lets a transparent layer
-            // be edited (its alpha reaches the VAE encode) instead of being flattened at the
-            // contract boundary.
-            conditioning: vec![
-                gen_core::ConditioningKind::Reference,
-                gen_core::ConditioningKind::ReferenceRgba,
-                gen_core::ConditioningKind::MultiReference,
-            ],
-            // Native transparency (sc-24111). The VAE is four-channel in and out on **every**
-            // route behind this descriptor — T2I and reference alike — so there is no sub-path
-            // that would have to fabricate an alpha to honour the flag. Whether a given render is
-            // actually transparent is decided by the prompt, not by this bit; see UPSTREAM.md.
-            supports_alpha_output: true,
-            // sc-24157: LoRA and PEFT LoKr ride as stacked additive residuals over every tier
-            // (dense bf16 and packed q8/q4); LyCORIS LoHa folds into the dense weights on the bf16
-            // tier and is a typed refusal on a packed one — see `crate::adapters`.
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: MIN_SIZE,
-            max_size,
-            max_count: 8,
-            // **Installable** tiers, not on-the-fly ones (sc-24112). Candle still has no
-            // affine-quantize-at-load path — `validate_load_spec` refuses `quantize` against a
-            // dense snapshot with the same typed `Unsupported` as before — but the pre-quantized
-            // Q4/Q8 tiers `mlx_gen_qwen_image_2_1::convert` writes DO install here: the DiT and the
-            // Qwen3 tower both bind through `AdaptLinear::linear_detect_gs`. Advertising the tiers
-            // is what lets the worker's A-B tier toggle reach this backend; see `crate::quant`.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // No `component_precision_floors`: a tier is a whole-pipeline contract, so every
-            // packable component runs the tier the caller selected (`crate::quant`).
-            requires_sigma_shift: true,
-            supports_sequential_offload: true,
-            // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
-            size_floor: SizeFloor::RangeCheckedOnGrid {
-                multiple: SIZE_MULTIPLE,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_vl", None)],
+                ..Default::default()
             },
-            // The prefix KV cache (sc-25905) is a request-selected execution domain: both modes
-            // are implemented, an unset field is the prefill path, and the shared floor refuses
-            // nothing this declares.
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    gen_core::ConditioningKind::Reference,
+                    gen_core::ConditioningKind::ReferenceRgba,
+                    gen_core::ConditioningKind::MultiReference,
+                ],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                requires_sigma_shift: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new(dit_id)
+                    .with_low_res_start()
+                    .with_pag(pag),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_image_2_1_z64_vae"),
+                output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
+                pixel_stride: Some(VAE_SCALE_FACTOR),
+                token_width: Some(TransformerConfig::production().in_channels as u32),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        [dit_id],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_image_2_1_z64_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: true,
+            },
             execution: gen_core::ExecutionSurface {
                 prefix_kv_cache: gen_core::PrefixKvCacheDomain::Modes(
                     memory_strategy::PREFIX_KV_CACHE_MODES.to_vec(),
                 ),
                 ..gen_core::ExecutionSurface::default()
             },
-            supports_low_res_start: true,
-            pag: Some(match variant {
-                Variant::Base => qwen_image_2_1_pag_capability(),
-                Variant::Turbo => qwen_image_2_1_turbo_pag_capability(),
-            }),
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: MIN_SIZE,
+            max_size,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(default_steps),
+            guidance: Some(DEFAULT_TRUE_CFG),
+            sampler: Some("euler"),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 /// The heavy render-phase components — everything but the text encoder.
@@ -1057,6 +1120,8 @@ impl QwenImage21 {
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 }
@@ -1150,7 +1215,7 @@ pub(crate) fn validate_request_with_schedule(
             )));
         }
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if !req.conditioning.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start conflicts with pass-0 reference/edit conditioning",
@@ -1292,27 +1357,17 @@ pub const TURBO_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
         compile: compile_render_plan_turbo,
     };
 
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-
 /// Add the Candle Qwen-Image 2.1 generators — base and Turbo (sc-25901) — and the base id's
-/// LoRA/LoKr trainer (sc-24160) to an explicit media registry builder. There is no trainer under
-/// the Turbo id: a distilled checkpoint is not a training base.
+/// LoRA/LoKr trainer (sc-24160) to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(
-        registry
-            .register_generator(REGISTRATION)
-            .register_render_plan(RENDER_PLAN_REGISTRATION)
-            .register_generator(TURBO_REGISTRATION)
-            .register_render_plan(TURBO_RENDER_PLAN_REGISTRATION)
-            .register_trainer(training::TRAINER_REGISTRATION),
-    )
+    registry
+        .register_route(route_for(Variant::Base))
+        .register_route(route_for(Variant::Turbo))
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// The shared-ladder registrations (sc-24112). Split out the way the sibling Candle providers do so
@@ -1928,11 +1983,14 @@ mod execution_policy_tests {
         );
         let zero = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![16]),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(candle_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![16]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(&base.capabilities, &zero).is_ok());
@@ -1946,11 +2004,14 @@ mod execution_policy_tests {
 
         let oob = GenerationRequest {
             prompt: "a red fox".into(),
-            pag: Some(candle_gen::gen_core::PagConfig {
-                scale: 0.0,
-                layers: Some(vec![32]),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(candle_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![32]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(&turbo.capabilities, &oob).is_err());
@@ -2029,7 +2090,10 @@ mod execution_policy_tests {
             width: 1024,
             height: 1024,
             steps: Some(20),
-            low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let base_plan = compile_render_plan(&spec, &base_req)
@@ -2044,7 +2108,10 @@ mod execution_policy_tests {
             width: 1024,
             height: 1024,
             steps: Some(8),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let turbo_plan = compile_render_plan_turbo(&spec, &turbo_req)

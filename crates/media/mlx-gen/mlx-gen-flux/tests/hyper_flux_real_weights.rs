@@ -267,7 +267,7 @@ fn hyper_flux_public_render_differs_from_base() {
         seed: Some(seed),
         steps: Some(steps),
         guidance: Some(guidance),
-        sampler: sampler.map(String::from),
+        sampler: sampler.map(Into::into),
         ..Default::default()
     };
     let pixels = |spec: LoadSpec, sampler: Option<&str>| -> Vec<u8> {

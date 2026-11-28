@@ -58,7 +58,12 @@ impl Ltx {
             max_tokens: enhance::clamp_max_tokens(req.enhance_max_tokens),
             seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
         };
-        if req.use_uncensored_enhancer {
+        if req
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             let (model, tokenizer) = self.load_uncensored_enhancer()?;
             let system = if is_i2v {
                 enhance::I2V_SYSTEM_PROMPT
@@ -184,7 +189,12 @@ impl Ltx {
         if !req.enhance_prompt {
             return Ok(None);
         }
-        if req.use_uncensored_enhancer {
+        if req
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             return Err(Error::Unsupported(
                 "ltx_2_5: use_uncensored_enhancer is unsupported; this route uses only the \
                  licensed stock google/gemma-4-12B-it enhancer staged at enhancer/"
@@ -502,7 +512,7 @@ pub(super) fn validate_ltx25_enhancer_file(
     }
     // SHA-256 once per immutable file identity (shared, single-flight `ArtifactSeal` memo), so
     // repeated enhanced requests do not re-read the stock model.
-    let actual = ArtifactSeal::pin(&path)?.content_sha256_hex();
+    let actual = ArtifactSeal::pin(&path)?.require_content_sha256_hex()?;
     if actual != expected_sha256 {
         return Err(Error::Msg(format!(
             "ltx_2_5: enhancer asset `{name}` digest mismatch (got {actual}, expected \

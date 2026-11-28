@@ -35,9 +35,9 @@ use std::sync::Mutex;
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
-    ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
+    self, reject_unknown_components, require_component, AudioTrack, Conditioning, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
+    VoiceEmbedder, WeightsSource,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -160,37 +160,85 @@ pub const COMPONENT_VOICE_EMBEDDING: &str = "voice_embedding";
 /// fail-fast at load via [`gen_core::require_component`], the descriptor advertising the same set.
 pub const REQUIRED_COMPONENTS: &[&str] = &[COMPONENT_PERTH, COMPONENT_VOICE_EMBEDDING];
 
-/// Chatterbox clone-TTS identity + capabilities — constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: REQUIRED_COMPONENTS,
-        id: MODEL_ID,
+/// Primary typed route declaration for Chatterbox clone-TTS (`REG-1`, `AP5`).
+pub fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "chatterbox",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            // The two voice-cloning conditioning paths (see module docs).
-            conditioning: vec![
-                ConditioningKind::VoiceEmbedding,
-                ConditioningKind::ReferenceAudio,
-            ],
-            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
-            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
-            // unused 0 rather than a nominal placeholder bound.
-            min_size: 0,
-            max_count: 1,
-            audio_sample_rates: vec![S3GEN_SR],
-            max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            // The voice is supplied by conditioning, not a named voice id.
-            audio_voices: vec![],
-            audio_languages: LANGUAGES.to_vec(),
-            supports_kv_cache: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("en_bpe", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::VoiceEmbedding,
+                    ConditioningKind::ReferenceAudio,
+                ],
+                modules: vec!["chatterbox_ve", "s3tokenizer", "campplus"],
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::non_diffusion("t3_llama_s3gen"),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("s3gen_hift"),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["chatterbox_ve", "s3tokenizer", "campplus"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::AudioSynthesize,
+                        ["t3_llama", "s3gen_flow", "s3gen_hift", "perth"],
+                        false,
+                    ),
+                ],
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: REQUIRED_COMPONENTS,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![S3GEN_SR],
+                voices: vec![],
+                languages: LANGUAGES.to_vec(),
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
+            max_audio_duration_secs: Some(MAX_DURATION_SECS),
+            ..Default::default()
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            audio_sample_rate: Some(S3GEN_SR),
+            audio_language: Some("en"),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// Chatterbox clone-TTS identity + capabilities — computed from `route` without loading weights.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Capability-driven request validation (factored out for weightless unit tests): non-empty

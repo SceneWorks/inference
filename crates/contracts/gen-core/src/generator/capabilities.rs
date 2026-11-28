@@ -18,13 +18,11 @@ use super::*;
 /// # ;
 /// ```
 ///
-/// This is not a style preference. Every descriptor in the workspace constructs `Capabilities`
-/// from another crate, so a new field lands in ~70 files at once unless each construction ends in
-/// `..Default::default()` (or another base). `#[non_exhaustive]` cannot enforce it — that
-/// attribute makes cross-crate construction impossible outright (E0639), and so does a private
-/// field (E0451) — so the invariant is enforced by the
-/// `capabilities_are_constructed_additively` integration test instead, which reads every `.rs`
-/// file in the workspace and fails on any `Capabilities { .. }` literal with no base expression.
+/// This is not a style preference. In production code, every provider's [`Capabilities`] is
+/// computed exhaustively by [`crate::RouteRecord::compute_capabilities`] rather than constructed
+/// directly from provider crates (enforced by the `route_record_registration` integration test),
+/// so adding a new field is a single exhaustive update in `gen-core`. Test fixtures outside
+/// `gen-core` that construct a `Capabilities` literal should still use `..Default::default()`.
 ///
 /// # Measured cost of adding a field (sc-19561 AC1)
 ///
@@ -45,7 +43,7 @@ use super::*;
 ///
 /// Reproduce the parent count with the same parser the guard uses — it is the guard, run over a
 /// different revision.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
     pub supports_guidance: bool,
@@ -180,7 +178,7 @@ pub struct Capabilities {
     /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
     /// is `false`; the shared floor refuses a `Some` policy otherwise.
     pub supports_caption_overflow_policy: bool,
-    /// Whether this model honours [`GenerationRequest::h3_image_sampler`] (SW-7106). `Default` is
+    /// Whether this model honours [`crate::H3Extension::image_sampler`] (SW-7106). `Default` is
     /// `false`; the shared floor refuses a `Some` sampler block otherwise.
     pub supports_h3_image_sampler: bool,
     /// The longest prompt, in the model's own text-encoder tokens, that this model conditions on
@@ -192,6 +190,9 @@ pub struct Capabilities {
     /// (Supra2-IMG: code `prompt_truncated`, 128 Flan-T5 tokens). The field exists so a consumer can
     /// size a prompt control or warn before dispatch without a per-model table of its own.
     pub max_prompt_tokens: Option<u32>,
+    /// Optional provider-specific prompt-enhancement token ceiling (`REG-4`).
+    /// `None` resolves to [`MAX_ENHANCE_TOKENS`] (`2048`).
+    pub max_enhance_tokens: Option<u32>,
     /// Whether this model can emit **RGBA** images with a straight alpha channel through
     /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
     ///
@@ -300,7 +301,7 @@ pub struct Capabilities {
     // `Default`, so every pre-2.5 provider keeps refusing these requests without editing its
     // descriptor — declaration and enforcement move together.
     /// Whether this model predicts clip length from a **duration head** when the request opts in
-    /// via [`GenerationRequest::auto_duration`] (reference `--auto-duration`).
+    /// via [`crate::LtxExtension::auto_duration`] (reference `--auto-duration`).
     ///
     /// `Default` is `false`, and the shared floor then rejects an `auto_duration` request as the
     /// typed [`Error::Unsupported`] rather than silently rendering the model's default length — an
@@ -310,7 +311,7 @@ pub struct Capabilities {
     /// `gen_core_ltx::duration_head::resolve_request_num_frames`.
     pub supports_auto_duration: bool,
     /// Whether this model places **generated keyframe slots** at interior positions when the
-    /// request sets [`GenerationRequest::num_generated_keyframes`] (reference
+    /// request sets [`crate::LtxExtension::num_generated_keyframes`] (reference
     /// `--num-generated-keyframes`).
     ///
     /// Requires a transformer with the learned `use_keyframes_abs_pos_embedding` slot marker
@@ -318,7 +319,7 @@ pub struct Capabilities {
     /// as unmarked tokens — wasted compute carrying no conditioning — so the floor refuses a
     /// positive count as the typed [`Error::Unsupported`].
     pub supports_generated_keyframes: bool,
-    /// The largest [`GenerationRequest::temporal_upsample_rounds`] this model honours (reference
+    /// The largest [`crate::LtxExtension::temporal_upsample_rounds`] this model honours (reference
     /// `--temporal-upsample-rounds`). `0` (the `Default`) means the DFR temporal path is not
     /// implemented and the floor refuses any positive round count as the typed
     /// [`Error::Unsupported`].
@@ -380,6 +381,9 @@ pub struct Capabilities {
     /// load is uniformly q4 across every packable component. This is a binding provider contract:
     /// callers use it for effective-tier labels and memory-evidence identity.
     pub component_precision_floors: &'static [ComponentPrecisionFloor],
+    /// Whether this route honors autoregressive load-time mode/compute policies (e.g. YuE2 AR mode
+    /// and compute policy). Replaces model-id string gating in registry load admission (`REG-4`).
+    pub supports_ar_load_controls: bool,
     // Loader hints.
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
@@ -447,18 +451,26 @@ pub struct Capabilities {
     pub approximation: ApproximationSurface,
     /// Perturbed-Attention Guidance (PAG) capability descriptor (SW-7173). `None` (the `Default`)
     /// means this model/backend does not support PAG, and the shared request floor rejects any
-    /// `Some` [`GenerationRequest::pag`] as [`Error::Unsupported`].
+    /// `Some` [`crate::FeatureParams::pag`] as [`Error::Unsupported`].
     pub pag: Option<crate::PagCapability>,
-    /// Whether this model route honours [`GenerationRequest::phases`] multi-phase denoise
+    /// Whether this model route honours [`crate::FeatureParams::phases`] multi-phase denoise
     /// (SW-6938). `Default` is `false`, and the shared floor refuses any `Some` `phases` on a
     /// non-supporting route with [`Error::Unsupported`] rather than letting a provider silently
     /// ignore it and render a single-phase trajectory.
     pub supports_phases: bool,
-    /// Whether this model route honours [`GenerationRequest::low_res_start`] two-phase low-res
+    /// Whether this model route honours [`FeatureParams::low_res_start`] two-phase low-res
     /// start denoising (SW-6939). `Default` is `false`, and the shared floor refuses any `Some`
     /// `low_res_start` on a non-supporting route with [`Error::Unsupported`] rather than letting
     /// an unmigrated provider silently ignore it and render a single-phase full-resolution trajectory.
     pub supports_low_res_start: bool,
+    /// Primary pass-0 conditioning requirement projected from [`crate::ConditioningSurface::pass0_requirement`].
+    /// Eliminates model-id string heuristics in shared feature/request validation (`REG-4`).
+    pub pass0_requirement: crate::Pass0ConditioningRequirement,
+    /// Whether single-reference `Conditioning::Reference` img2img can combine with `low_res_start`
+    /// on this route. Derived from [`crate::RouteRecord`] primary declarations (`REG-4`).
+    pub allows_low_res_start_single_ref_img2img: bool,
+    /// Typed family request extensions explicitly supported by this route (`REG-4`).
+    pub supported_family_extensions: Vec<FamilyExtensionKind>,
 }
 
 /// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
@@ -497,22 +509,28 @@ pub(super) const MAX_STEPS: u32 = 100_000;
 pub(super) const MAX_FRAMES: u32 = 1_000_000;
 pub(super) const MAX_FPS: u32 = 100_000;
 pub(super) const MAX_DURATION_SECS: f32 = 1_000_000.0;
-/// Legacy prompt-enhancement token ceiling. Unrelated providers must not inherit FLUX 3's cap.
+/// Legacy prompt-enhancement token ceiling. Routes needing a higher ceiling declare
+/// [`Capabilities::max_enhance_tokens`] via [`crate::TextEncoderSurface::max_enhance_tokens`].
 pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
 
-/// Resolve the provider's token ceiling, distinct from the effective-caption character bound.
-/// Only the two canonical FLUX 3 ids opt into the frozen PUP source's 3584-token budget.
-/// Unknown ids and every legacy enhancer retain their existing 2048-token limit.
-pub fn max_enhance_tokens_for_model(model_id: &str) -> u32 {
-    match model_id {
-        "flux3_klein" | "flux3_klein_base" => crate::flux3::pup::MAX_TOKENS,
-        _ => MAX_ENHANCE_TOKENS,
-    }
-}
 /// Shared temperature range for prompt enhancement sampling.
 pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 
 impl Capabilities {
+    /// Resolve this route's effective prompt-enhancement token ceiling from its primary
+    /// capability declaration (`REG-4`), defaulting to [`MAX_ENHANCE_TOKENS`] (`2048`).
+    pub const fn effective_max_enhance_tokens(&self) -> u32 {
+        match self.max_enhance_tokens {
+            Some(limit) => limit,
+            None => MAX_ENHANCE_TOKENS,
+        }
+    }
+
+    /// Whether this route explicitly supports the given typed family extension (`REG-4`).
+    pub fn supports_family_extension(&self, kind: FamilyExtensionKind) -> bool {
+        self.supported_family_extensions.contains(&kind)
+            || (kind == FamilyExtensionKind::H3ImageSampler && self.supports_h3_image_sampler)
+    }
     /// Static descriptor view of staged-residency availability. Unconditional physical staging wins
     /// the derived classification when both independent bits are true; callers that need to know
     /// whether the stronger selectable control also exists must inspect
@@ -655,6 +673,13 @@ impl Capabilities {
         self.validate_request_inner(id, req, false)
     }
 
+    /// The vector-aware floor (`PIPE-12`): the shared floor **minus the width/height range check**,
+    /// for vector models (`Modality::Vector`, e.g. StarVector) whose output geometry comes from the
+    /// sanitized SVG `viewBox` rather than a pixel canvas floor.
+    pub fn validate_request_vector(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        self.validate_request_inner(id, req, false)
+    }
+
     /// The **approximate-capability plan** for one request — what a provider's denoise will actually
     /// run (sc-18322).
     ///
@@ -673,8 +698,8 @@ impl Capabilities {
         self.approximation.resolve(id, req.approximation.as_ref())
     }
 
-    /// Resolve [`GenerationRequest::effective_pag`] (covering both top-level
-    /// [`GenerationRequest::pag`] and [`crate::moss_image::MossImageOptions::pag`]) against
+    /// Resolve [`GenerationRequest::effective_pag`] (covering both
+    /// [`crate::FeatureParams::pag`] and [`crate::moss_image::MossImageOptions::pag`]) against
     /// [`Capabilities::pag`] (SW-7173).
     ///
     /// Returns `Ok(None)` when neither PAG field is set or the effective config resolves to
@@ -705,25 +730,21 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
-        if (req.flux3_layout.is_some() || !req.flux3_layout_bindings.is_empty())
-            && !matches!(
-                id,
-                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
-            )
-        {
-            return Err(Error::Unsupported(format!(
-                "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"
-            )));
-        }
-        if req.flux3_reference_output.is_some()
-            && !matches!(
-                id,
-                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
-            )
-        {
-            return Err(Error::Unsupported(format!(
-                "{id}: flux3_reference_output is supported only by FLUX 3 reference editing; remove it"
-            )));
+        if let Some(flux3) = &req.extensions.flux3 {
+            if (flux3.layout.is_some() || !flux3.layout_bindings.is_empty())
+                && !self.supports_family_extension(FamilyExtensionKind::Flux3)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"
+                )));
+            }
+            if flux3.reference_output.is_some()
+                && !self.supports_family_extension(FamilyExtensionKind::Flux3)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{id}: flux3_reference_output is supported only by FLUX 3 reference editing; remove it"
+                )));
+            }
         }
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
@@ -736,22 +757,43 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
-        if req.moss_image.is_some()
-            && crate::moss_image::MossImageVariant::from_provider_id(id).is_none()
+        if req
+            .extensions
+            .vector
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+            && !self.supports_family_extension(FamilyExtensionKind::Vector)
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: vector extension controls require a vector generation provider"
+            )));
+        }
+        if req
+            .extensions
+            .moss_image
+            .as_ref()
+            .is_some_and(|m| !m.is_empty())
+            && !self.supports_family_extension(FamilyExtensionKind::MossImage)
         {
             return Err(Error::Unsupported(format!(
                 "{id}: MOSS controls require a MOSS-Image provider"
             )));
         }
-        if req.h3_image_sampler.is_some() && !self.supports_h3_image_sampler {
-            return Err(Error::Unsupported(format!(
-                "{id}: `h3_image_sampler` is supported only by MiniMax-H3-Image"
-            )));
-        }
-        if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
-            return Err(Error::Unsupported(format!(
-                "{id}: Veda attention requires MiniMax-H3"
-            )));
+        if let Some(h3) = &req.extensions.h3 {
+            if h3.image_sampler.is_some()
+                && !self.supports_family_extension(FamilyExtensionKind::H3ImageSampler)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{id}: `h3_image_sampler` is supported only by MiniMax-H3-Image"
+                )));
+            }
+            if h3.veda.as_ref().is_some_and(|v| v.enabled)
+                && !self.supports_family_extension(FamilyExtensionKind::H3Veda)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{id}: Veda attention requires MiniMax-H3"
+                )));
+            }
         }
         let effective_pag = req
             .effective_pag()
@@ -761,10 +803,10 @@ impl Capabilities {
                 "{id}: Perturbed-Attention Guidance (PAG) is not supported by this model"
             )));
         }
-        if let Some(phases) = &req.phases {
-            if !self.supports_phases && id != "krea_2_raw" {
+        if let Some(phases) = &req.features.phases {
+            if !self.supports_phases {
                 return Err(Error::Unsupported(format!(
-                    "{id}: multi-phase denoise (phases) is not supported by this model (supported on krea_2_raw only)"
+                    "{id}: multi-phase denoise (phases) is not supported by this model"
                 )));
             }
             if phases.is_empty() {
@@ -979,37 +1021,37 @@ impl Capabilities {
         // A provider that wants a MORE actionable message (naming the checkpoint generation that
         // does support the axis, say) runs its own check BEFORE calling the floor — that is what
         // `ltx_2_3` does, and why its typed refusals still name 2.5.
-        if req.num_generated_keyframes.is_some_and(|n| n > 0) && !self.supports_generated_keyframes
-        {
-            return Err(Error::Unsupported(format!(
-                "{id}: num_generated_keyframes is not supported by this engine (it requires a \
-                 checkpoint whose transformer carries the learned generated-keyframe slot marker)"
-            )));
-        }
-        if let Some(rounds) = req.temporal_upsample_rounds {
-            if rounds > self.max_temporal_upsample_rounds {
-                return Err(if self.max_temporal_upsample_rounds == 0 {
-                    // Distinguish "this engine has no DFR temporal path at all" from "you asked for
-                    // more rounds than it runs" — the first is a capability gap the caller cannot
-                    // fix by lowering the number, the second is a range error they can.
-                    Error::Unsupported(format!(
-                        "{id}: temporal_upsample_rounds is not supported by this engine (it \
-                         requires the LTX-2.5 DFR pipeline: generated keyframe slots + the \
-                         temporal latent upsampler)"
-                    ))
-                } else {
-                    Error::Msg(format!(
-                        "{id}: temporal_upsample_rounds {rounds} exceeds this engine's maximum {}",
-                        self.max_temporal_upsample_rounds
-                    ))
-                });
+        if let Some(ltx) = &req.extensions.ltx {
+            if ltx.num_generated_keyframes.is_some_and(|n| n > 0)
+                && !self.supports_generated_keyframes
+            {
+                return Err(Error::Unsupported(format!(
+                    "{id}: num_generated_keyframes is not supported by this engine (it requires a \
+                     checkpoint whose transformer carries the learned generated-keyframe slot marker)"
+                )));
             }
-        }
-        if req.auto_duration.is_some() && !self.supports_auto_duration {
-            return Err(Error::Unsupported(format!(
-                "{id}: auto_duration is not supported by this engine (it requires a checkpoint \
-                 that ships a duration head)"
-            )));
+            if let Some(rounds) = ltx.temporal_upsample_rounds {
+                if rounds > self.max_temporal_upsample_rounds {
+                    return Err(if self.max_temporal_upsample_rounds == 0 {
+                        Error::Unsupported(format!(
+                            "{id}: temporal_upsample_rounds is not supported by this engine (it \
+                             requires the LTX-2.5 DFR pipeline: generated keyframe slots + the \
+                             temporal latent upsampler)"
+                        ))
+                    } else {
+                        Error::Msg(format!(
+                            "{id}: temporal_upsample_rounds {rounds} exceeds this engine's maximum {}",
+                            self.max_temporal_upsample_rounds
+                        ))
+                    });
+                }
+            }
+            if ltx.auto_duration.is_some() && !self.supports_auto_duration {
+                return Err(Error::Unsupported(format!(
+                    "{id}: auto_duration is not supported by this engine (it requires a checkpoint \
+                     that ships a duration head)"
+                )));
+            }
         }
         if let Some(fps) = req.fps {
             if fps == 0 {
@@ -1239,7 +1281,7 @@ impl Capabilities {
                     "{id}: enhance_max_tokens requires enhance_prompt=true"
                 )));
             }
-            let max_tokens = max_enhance_tokens_for_model(id);
+            let max_tokens = self.effective_max_enhance_tokens();
             if tokens == 0 || tokens > max_tokens {
                 return Err(Error::Msg(format!(
                     "{id}: enhance_max_tokens {tokens} outside supported range 1..={max_tokens}"
@@ -1314,7 +1356,8 @@ impl Capabilities {
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
                 return Err(Error::Unsupported(format!(
-                    "{id}: unsupported sampler {s:?} (supported: {:?})",
+                    "{id}: unsupported sampler {:?} (supported: {:?})",
+                    s.as_str(),
                     self.samplers
                 )));
             }
@@ -1322,7 +1365,8 @@ impl Capabilities {
         if let Some(s) = &req.scheduler {
             if !self.schedulers.contains(&s.as_str()) {
                 return Err(Error::Unsupported(format!(
-                    "{id}: unsupported scheduler {s:?} (supported: {:?})",
+                    "{id}: unsupported scheduler {:?} (supported: {:?})",
+                    s.as_str(),
                     self.schedulers
                 )));
             }
@@ -1330,7 +1374,8 @@ impl Capabilities {
         if let Some(m) = &req.guidance_method {
             if !self.supported_guidance_methods.contains(&m.as_str()) {
                 return Err(Error::Unsupported(format!(
-                    "{id}: unsupported guidance_method {m:?} (supported: {:?})",
+                    "{id}: unsupported guidance_method {:?} (supported: {:?})",
+                    m.as_str(),
                     self.supported_guidance_methods
                 )));
             }
@@ -1521,25 +1566,19 @@ impl Capabilities {
                 }
             }
         }
-        if let Some(spec) = &req.low_res_start {
+        if let Some(spec) = &req.features.low_res_start {
             if !self.supports_low_res_start {
                 return Err(Error::Unsupported(format!(
                     "{id}: low_res_start is not supported by this model route"
                 )));
             }
             spec.validate_parameters(id)?;
-            if req.phases.is_some() {
+            if req.features.phases.is_some() {
                 return Err(Error::Unsupported(format!(
                     "{id}: low_res_start conflicts with multi-phase denoise (phases)"
                 )));
             }
-            let is_plain_single_reference_img2img = self.accepts(ConditioningKind::Reference)
-                && !id.starts_with("flux1_")
-                && !id.contains("ip_adapter")
-                && !id.contains("edit")
-                && !id.contains("fill")
-                && !id.contains("pulid")
-                && !id.contains("instantid")
+            let is_plain_single_reference_img2img = self.allows_low_res_start_single_ref_img2img
                 && req.source_image.is_none()
                 && req.conditioning.len() == 1
                 && matches!(req.conditioning[0], Conditioning::Reference { .. });

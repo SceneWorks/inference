@@ -254,6 +254,18 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "nvidia_pid_students",
         ],
     },
+    // --- instantid ---------------------------------------------------------------------------
+    ProviderComponents {
+        provider_id: "instantid",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+            "instantid",
+            "nvidia_pid_students",
+        ],
+    },
     // --- iris --------------------------------------------------------------------------------
     // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
     // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
@@ -854,6 +866,7 @@ mod tests {
         ),
         ("ideogram_4", &["ideogram_qwen3_vl_8b"]),
         ("ideogram_4_turbo", &["ideogram_qwen3_vl_8b"]),
+        ("instantid", &["clip_vit_large_patch14"]),
         (
             "kolors",
             &[
@@ -988,8 +1001,9 @@ mod tests {
         // sc-26323: both MOSS providers join the union (79 / 69).
         // sc-24213: `supra2_img` registers with its own complete row (80 / 70).
         // SW-7090: `minimax_h3_image` registers with its own complete row (81 / 71).
-        assert_eq!(registered.len(), 81, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 71);
+        // SW-6982: `instantid` joins as a registered MLX generator (82 / 72).
+        assert_eq!(registered.len(), 82, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 72);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1048,7 +1062,7 @@ mod tests {
             .collect();
 
         assert_eq!(incomplete.len(), INCOMPLETE_MAPPED_IDS.len());
-        assert_eq!(incomplete.len(), 39);
+        assert_eq!(incomplete.len(), 40);
         let unknown: Vec<&String> = incomplete.difference(&mapped).collect();
         assert!(
             unknown.is_empty(),

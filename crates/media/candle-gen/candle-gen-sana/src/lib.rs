@@ -87,17 +87,15 @@ pub use pipeline::{
 pub use text_encoder::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};
 pub use transformer::SanaTransformer;
 
-/// Add the Candle SANA base and Sprint generators to an explicit media registry builder.
+/// Add the Candle SANA base and Sprint generators to an explicit media registry builder via
+/// one-call [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(model::REGISTRATION)
-        .register_generator(model::SPRINT_REGISTRATION);
-    register_memory_contract_surfaces(registry)
-        .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(memory_strategy::SPRINT_MEMORY_BEHAVIOR)
-        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
+    registry
+        .register_route(model::route_base())
+        .register_route(model::route_sprint())
 }
 
 /// Register SANA's pre-load memory contract and its weights-free contract fixture for both routes.

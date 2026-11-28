@@ -237,7 +237,7 @@ fn sdxl_cfg_off_guidance_one_render() {
             seed: Some(124),
             steps: Some(4),
             guidance: Some(guidance),
-            sampler: sampler.map(str::to_string),
+            sampler: sampler.map(Into::into),
             ..Default::default()
         };
         let mut last_step = (0u32, 0u32);

@@ -19,7 +19,6 @@ pub use model::{descriptor_base, descriptor_sft, load_base, load_sft, MossImage}
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    use mlx_gen::gen_core::{moss_image::MossImageVariant, MemoryContractFixtureRegistration};
     registry
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[mlx_gen::gen_core::CheckpointBackendBindingRegistration {
@@ -34,20 +33,8 @@ pub fn register_providers(
         })
         .register_trainer(training::BASE_REGISTRATION)
         .register_trainer(training::SFT_REGISTRATION)
-        .register_generator(model::BASE_REGISTRATION)
-        .register_generator(model::SFT_REGISTRATION)
-        .register_memory_strategy(model::BASE_MEMORY)
-        .register_memory_strategy(model::SFT_MEMORY)
-        .register_memory_contract_fixture(MemoryContractFixtureRegistration {
-            provider_id: "moss_image_base",
-            contract: |s| memory_strategy::fixture(MossImageVariant::Base, s),
-            surface_specs: memory_strategy::surface_specs,
-        })
-        .register_memory_contract_fixture(MemoryContractFixtureRegistration {
-            provider_id: "moss_image_sft",
-            contract: |s| memory_strategy::fixture(MossImageVariant::Sft, s),
-            surface_specs: memory_strategy::surface_specs,
-        })
+        .register_route(model::route_base())
+        .register_route(model::route_sft())
 }
 
 /// Frozen MOSS canvas lattice in output pixels.

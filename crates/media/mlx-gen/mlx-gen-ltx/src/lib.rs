@@ -157,18 +157,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_generator(model::REGISTRATION_25)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_strategy(memory_strategy_2_5::LTX_2_5_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            provider_id: MODEL_ID,
-            contract: memory_strategy::weights_free_memory_strategy_contract,
-            surface_specs: memory_strategy::memory_contract_surface_specs,
-        })
-        .register_memory_contract_fixture(memory_strategy_2_5::LTX_2_5_MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_behavior(memory_strategy_2_5::LTX_2_5_MEMORY_BEHAVIOR)
+        .register_route(model::route())
+        .register_route(model::route_25())
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
 }
@@ -359,6 +349,7 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["ltx_2_3", "ltx_2_5"]);
         assert_eq!(explicit_trainers, ["ltx_2_3", "ltx_2_5"]);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     #[test]

@@ -1183,6 +1183,7 @@ mod tests {
             ("base.rs", include_str!("base.rs")),
             ("comfyui.rs", include_str!("comfyui.rs")),
             ("common.rs", include_str!("common.rs")),
+            ("control_registry.rs", include_str!("control_registry.rs")),
             ("dit.rs", include_str!("dit.rs")),
             ("memory_strategy.rs", include_str!("memory_strategy.rs")),
             ("preview.rs", include_str!("preview.rs")),
@@ -1231,6 +1232,7 @@ mod tests {
                 "comfyui.rs",
                 "common.rs",
                 "control.rs",
+                "control_registry.rs",
                 "control_validate.rs", // #[cfg(test)] mod — not shipped code
                 "dit.rs",
                 "edit.rs",

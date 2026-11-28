@@ -59,24 +59,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::QUALITY_REGISTRATION)
-        .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
-        })
-        .register_memory_behavior(model::QUALITY_MEMORY_BEHAVIOR)
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID_TURBO,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_TURBO, spec)
-            },
-        })
-        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
+        .register_route(model::route_quality())
+        .register_route(model::route_turbo())
 }
 
 /// Build the complete explicit MLX Ideogram provider catalog.
@@ -109,6 +93,7 @@ mod explicit_registry_tests {
             preview_ids, explicit,
             "every and only Ideogram 4 route previews"
         );
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     /// sc-22732: both routes now carry a memory-strategy registration, a weights-free contract

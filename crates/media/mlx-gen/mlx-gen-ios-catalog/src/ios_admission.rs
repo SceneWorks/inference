@@ -661,7 +661,7 @@ pub fn validate_actual(
             }
             // A PiD decode is not an iOS route (no provider's iOS contract offers it): a typed mode
             // refusal, never an untyped mismatch.
-            if req.use_pid {
+            if req.use_pid() {
                 return Err(AdmissionError::refused(
                     RefusalKind::Mode,
                     format!("{provider}: a PiD decode (`use_pid`) is not served on iOS"),

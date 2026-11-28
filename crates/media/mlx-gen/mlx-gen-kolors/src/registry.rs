@@ -16,6 +16,15 @@ use mlx_rs::{random, Array, Dtype};
 use std::path::Path;
 
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, CfgBatchingDomain, ConditioningSurface, ExecutionSurface,
+    FamilyModelSpec, LatentCodecDeclaration, ModelBinding, OutputSurface,
+    Pass0ConditioningRequirement, PreviewSupport, ProductLimits, ResidencyPhaseKind,
+    ResidencyPhaseNode, ResidencySurface, RouteBindings, RouteDefaults, RouteRecord,
+    RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme, SizeFloor,
+    TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration,
+    WeightSourceKind, SDXL_LATENT_SPACE,
+};
 use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
@@ -60,95 +69,149 @@ const SAMPLER: &str = "euler_discrete";
 /// advertised Kolors image bucket to (sc-12612); the model and registry share the same constant.
 pub const SIZE_MULTIPLE: u32 = crate::model::PRODUCTION_SPATIAL_MULTIPLE as u32;
 
-/// Kolors' identity + capabilities — constructible without loading weights (registry
-/// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
-/// guard): T2I + img2img (`Reference`) + ControlNet-pose (`Control`) + IP-Adapter (`Reference` in
-/// IP mode) + Q8/Q4 + **LoRA/LoKr** (sc-4733 — merged into the SDXL-family U-Net at load via
-/// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Kolors (`REG-1`, `AP5`).
+pub fn route() -> RouteRecord {
+    let mut samplers = vec![SAMPLER];
+    samplers.extend([
+        "euler",
+        "euler_ancestral",
+        "heun",
+        "dpmpp_2m",
+        "dpmpp_sde",
+        "uni_pc",
+        "lcm",
+        "ddim",
+    ]);
+    let mut schedulers = vec!["discrete"];
+    schedulers.extend(curated_scheduler_names());
+
+    RouteRecord {
+        route_id: MODEL_ID,
         family: "kolors",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Reference = img2img init (sc-3095) OR the IP-Adapter image prompt when an IP-Adapter is
-            // loaded (sc-3098); Control = the Kolors ControlNet-pose branch (sc-3097).
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Control],
-            // LoRA/LoKr merge into the SDXL-family U-Net at load (sc-4733).
-            supports_lora: true,
-            supports_lokr: true,
-            // `euler_discrete` is the native leading-Euler default; the rest are the unified curated
-            // solvers (epic 7114, sc-7121) — the additive k-diffusion path over `DiscreteModelSampling`.
-            // Selecting one (or a non-`discrete` scheduler) routes to `Kolors::denoise_curated_latents`,
-            // which now covers EVERY mode incl. the conditioned sub-providers (ControlNet-pose,
-            // IP-Adapter, the combined pose tier — sc-7297, via `denoise_curated`'s control/ip support);
-            // the native default stays byte-exact.
-            samplers: {
-                let mut s = vec![SAMPLER];
-                s.extend([
-                    "euler",
-                    "euler_ancestral",
-                    "heun",
-                    "dpmpp_2m",
-                    "dpmpp_sde",
-                    "uni_pc",
-                    "lcm",
-                    "ddim",
-                ]);
-                s
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("chatglm3_6b", Some(256))],
+                ..Default::default()
             },
-            // `discrete` is the native schedule; the rest are the curated σ schedulers (epic 7114).
-            schedulers: {
-                let mut s = vec!["discrete"];
-                s.extend(curated_scheduler_names());
-                s
+            conditioning: ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::Control],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["kolors_controlnet_pose", "kolors_ip_adapter_plus"],
+                ..Default::default()
             },
+            sampling: SamplingSurface {
+                samplers,
+                schedulers,
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_model(
+                FamilyModelSpec::new("kolors_sdxl_unet").with_low_res_start(),
+            ),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("sdxl_vae"),
+                output_latent_space: Some(&SDXL_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(4),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::FusedMerge),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["chatglm3_6b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["kolors_sdxl_unet"],
+                        false,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["sdxl_vae"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            execution: ExecutionSurface {
+                cfg_batching: CfgBatchingDomain::Modes(crate::model::CFG_BATCHING_MODES.to_vec()),
+                ..ExecutionSurface::default()
+            },
+            ..Default::default()
+        },
+        limits: ProductLimits {
             min_size: 512,
             max_size: 2048,
-            max_count: 8,
-            // Kolors' train-timestep count is a real upper bound: above it `step_ratio` floors to
-            // 0 and every timestep collapses to 1 — silent garbage, not an error (F-124). It was
-            // checked only inside `validate_request` below; declaring it makes it discoverable
-            // (sc-19559).
+            size_floor: SizeFloor::RangeChecked,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: NUM_TRAIN_TIMESTEPS as u32,
             },
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
-            // (F-176). The monolithic `Kolors` was split into a droppable `KolorsText` (6B ChatGLM3 +
-            // tokenizer) phase and a `KolorsHeavy` (SDXL U-Net + VAE) phase (`crate::model`): under
-            // `Sequential` the ChatGLM3 encoder — the dominant footprint — is encoded, materialized,
-            // then dropped before the U-Net + VAE (+ ControlNet / IP-Adapter / PiD) load, bounding
-            // peak unified memory to `max(ChatGLM3, U-Net+VAE)`. Kolors quantizes the U-Net + ChatGLM3
-            // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
-            // advisory in `load`).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
-            // sc-18317: Kolors' guidance is real classifier-free guidance, and the one convention it
-            // implements is the doubled `[cond, uncond]` batch every assembly in `model.rs` builds.
-            // Declaring the single mode — rather than leaving the domain `Unsupported` — is what makes
-            // a planner able to select it explicitly and makes `sequential` a refusal by name instead
-            // of a silently batched run.
-            execution: mlx_gen::gen_core::ExecutionSurface {
-                cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Modes(
-                    crate::model::CFG_BATCHING_MODES.to_vec(),
-                ),
-                ..mlx_gen::gen_core::ExecutionSurface::default()
-            },
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some(SAMPLER),
+            schedule: Some("discrete"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
             ..Default::default()
         },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_render_plan(compile_kolors)
+            .with_memory_registration(MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+                },
+            )
+            .with_memory_surface_resolver(|surface| {
+                crate::memory_strategy::weights_free_surface_contract(MODEL_ID, surface)
+            })
+            .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION),
     }
+}
+
+/// Kolors' identity + capabilities, computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// A loaded, dispatchable Kolors generator: the component-residency strategy (epic 10834, sc-10840)
@@ -556,7 +619,7 @@ impl KolorsGenerator {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &KolorsText| {
                 run.encode(|| {
@@ -678,7 +741,7 @@ impl KolorsGenerator {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: encode the positive (+ negative when CFG is on) ChatGLM3 conditioning.
             // Seed-independent; under `Sequential` the shared seam materializes these + DROPS the 6B
@@ -1232,7 +1295,7 @@ fn resolve_vp_plan(
     mode: &KolorsBoundMode<'_, '_>,
 ) -> Result<Option<VpCapturePlan>> {
     let req = request.req;
-    if !(req.use_pid && req.pid_capture_sigma.is_some()) {
+    if !(req.use_pid() && req.pid_capture_sigma().is_some()) {
         return Ok(None);
     }
     let steps = request.steps;
@@ -1248,7 +1311,7 @@ fn resolve_vp_plan(
         // Mirrors the curated init: combined-pose + img2img are strength-sliced; txt2img runs the
         // full schedule.
         match mode.curated_init() {
-            Some((_, strength)) if req.low_res_start.is_some() => {
+            Some((_, strength)) if req.features.low_res_start.is_some() => {
                 let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                     full_sigmas.len().saturating_sub(1),
                     Some(strength),
@@ -1283,7 +1346,7 @@ fn resolve_vp_plan(
                 .to_vec(),
         }
     };
-    Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma))
+    Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma()))
 }
 
 /// Stages 2–3 for one Kolors output, over the request's bound mode and init (sc-27336).
@@ -1529,7 +1592,7 @@ pub(crate) fn validate_low_res_start_kolors(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if has_ip || spec.is_some_and(|s| s.ip_adapter.is_some()) {
@@ -1584,8 +1647,8 @@ pub(crate) fn validate_low_res_start_kolors(
         None => full_sigmas,
     };
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,
@@ -1662,7 +1725,7 @@ fn compile_kolors_for_mode(
         let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
         let sigmas = match mode.curated_init() {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     let raw_strength = reference
                         .and_then(|(_, s)| s)
                         .or(req.strength)
@@ -1704,8 +1767,8 @@ fn compile_kolors_for_mode(
     };
 
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,
@@ -1807,11 +1870,6 @@ pub(crate) fn footprint_with_source_qualification(
         }
     }
     Ok((components, encoded))
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
 }
 
 /// The weights-free memory-strategy registration (SC-15521) — the shared registry conformance

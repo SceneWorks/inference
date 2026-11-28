@@ -464,10 +464,15 @@ mod tests {
     }
     fn dmd_request() -> GenerationRequest {
         GenerationRequest {
-            moss_image: Some(MossImageOptions {
-                acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+            extensions: gen_core::FamilyExtensions {
+                moss_image: Some(gen_core::MossImageExtension::from_options(
+                    MossImageOptions {
+                        acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         }
     }
@@ -489,7 +494,7 @@ mod tests {
                 .steps,
             8
         );
-        req.moss_image = None;
+        req.extensions.moss_image = None;
         assert_eq!(
             MossImageResolved::resolve(MossImageVariant::Sft, &req)
                 .unwrap()
@@ -505,7 +510,14 @@ mod tests {
             for steps in 1..=8 {
                 let mut req = dmd_request();
                 req.steps = Some(steps);
-                req.moss_image.as_mut().unwrap().acceleration = MossImageAcceleration::Dmd(policy);
+                req.extensions
+                    .moss_image
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .as_mut()
+                    .unwrap()
+                    .acceleration = MossImageAcceleration::Dmd(policy);
                 assert!(MossImageResolved::resolve(MossImageVariant::Sft, &req).is_ok());
             }
         }
@@ -519,10 +531,35 @@ mod tests {
             |r| r.scheduler_shift = Some(5.0),
             |r| r.true_cfg = Some(3.0),
             |r| r.guidance_method = Some("cfg".into()),
-            |r| r.moss_image.as_mut().unwrap().training_shift = Some(1.0),
-            |r| r.moss_image.as_mut().unwrap().uncond_skip_layers = Some(vec![]),
             |r| {
-                r.moss_image.as_mut().unwrap().slg = Some(MossSkipLayerGuidance {
+                r.extensions
+                    .moss_image
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .as_mut()
+                    .unwrap()
+                    .training_shift = Some(1.0)
+            },
+            |r| {
+                r.extensions
+                    .moss_image
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .as_mut()
+                    .unwrap()
+                    .uncond_skip_layers = Some(vec![])
+            },
+            |r| {
+                r.extensions
+                    .moss_image
+                    .as_mut()
+                    .unwrap()
+                    .options
+                    .as_mut()
+                    .unwrap()
+                    .slg = Some(MossSkipLayerGuidance {
                     layers: vec![24],
                     scale: 3.0,
                     start: 0.0,
@@ -545,27 +582,42 @@ mod tests {
             width: 1280,
             height: 768,
             guidance: Some(1.0),
-            moss_image: Some(MossImageOptions {
-                max_sequence_length: 1,
-                uncond_skip_layers: Some(vec![]),
-                slg: Some(MossSkipLayerGuidance {
-                    layers: vec![0, 41],
-                    scale: 3.0,
-                    start: 0.25,
-                    stop: 0.75,
-                }),
+            extensions: gen_core::FamilyExtensions {
+                moss_image: Some(gen_core::MossImageExtension::from_options(
+                    MossImageOptions {
+                        max_sequence_length: 1,
+                        uncond_skip_layers: Some(vec![]),
+                        slg: Some(MossSkipLayerGuidance {
+                            layers: vec![0, 41],
+                            scale: 3.0,
+                            start: 0.25,
+                            stop: 0.75,
+                        }),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         let resolved = MossImageResolved::resolve(MossImageVariant::Base, &r).unwrap();
         assert!(!resolved.skipping_active(0, 4));
         assert!(resolved.skipping_active(1, 4));
         assert!(!resolved.skipping_active(3, 4));
-        r.moss_image.as_mut().unwrap().slg.as_mut().unwrap().scale = f32::NAN;
+        r.extensions
+            .moss_image
+            .as_mut()
+            .unwrap()
+            .options
+            .as_mut()
+            .unwrap()
+            .slg
+            .as_mut()
+            .unwrap()
+            .scale = f32::NAN;
         assert_eq!(r.first_nonfinite_float().unwrap().0, "moss_image.slg.scale");
         assert!(MossImageResolved::resolve(MossImageVariant::Base, &r).is_err());
-        r.moss_image = None;
+        r.extensions.moss_image = None;
         r.width = 1023;
         assert!(MossImageResolved::resolve(MossImageVariant::Base, &r).is_err());
         r.width = 1024;
@@ -724,23 +776,31 @@ mod tests {
         let ordinary_pag_req = GenerationRequest {
             steps: Some(10),
             guidance: Some(3.5),
-            pag: Some(PagConfig {
-                scale: 2.5,
-                layers: None,
-                start: Some(0.2),
-                stop: Some(0.8),
-                adaptive_scale: Some(1.0),
-            }),
-            moss_image: Some(MossImageOptions {
-                uncond_skip_layers: Some(vec![22]),
-                slg: Some(MossSkipLayerGuidance {
-                    layers: vec![24],
-                    scale: 1.5,
-                    start: 0.1,
-                    stop: 0.9,
+            features: gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 2.5,
+                    layers: None,
+                    start: Some(0.2),
+                    stop: Some(0.8),
+                    adaptive_scale: Some(1.0),
                 }),
                 ..Default::default()
-            }),
+            },
+            extensions: gen_core::FamilyExtensions {
+                moss_image: Some(gen_core::MossImageExtension::from_options(
+                    MossImageOptions {
+                        uncond_skip_layers: Some(vec![22]),
+                        slg: Some(MossSkipLayerGuidance {
+                            layers: vec![24],
+                            scale: 1.5,
+                            start: 0.1,
+                            stop: 0.9,
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
@@ -754,7 +814,7 @@ mod tests {
         }
 
         let mut dmd_pag_req = dmd_request();
-        dmd_pag_req.pag = Some(PagConfig {
+        dmd_pag_req.features.pag = Some(PagConfig {
             scale: 2.0,
             layers: Some(vec![41, 0, 20]),
             start: Some(0.0),
@@ -1050,7 +1110,12 @@ mod package_tests {
             ..Default::default()
         };
         let request = GenerationRequest {
-            moss_image: Some(MossImageOptions::default()),
+            extensions: gen_core::FamilyExtensions {
+                moss_image: Some(gen_core::MossImageExtension::from_options(
+                    MossImageOptions::default(),
+                )),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(caps

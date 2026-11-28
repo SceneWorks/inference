@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::Device;
 use candle_audio::gen_core::{
-    self, AdapterSpec, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, StepSupport, WeightsSource,
+    self, AdapterSpec, AudioEditMode, AudioTrack, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, StepSupport, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -1007,7 +1007,7 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
 ///
 /// `stable_audio_3_medium` is the only released SA3 checkpoint Stability tags for **both** `music`
 /// and `sound-effects`; `stable_audio_3_small_music` and `stable_audio_3_small_sfx` are
-/// single-domain specialists. [`Capabilities`] has no field that can carry that, and `family` is
+/// single-domain specialists. [`gen_core::Capabilities`] has no field that can carry that, and `family` is
 /// deliberately not overloaded to carry it either. sc-14545 therefore accepts **documentation-only**
 /// domain metadata: the ids, this doc comment, and the crate-level module doc are the entire signal
 /// a consumer gets, and no typed domain coverage is claimed. Adding typed domain / channel-count /
@@ -1023,78 +1023,159 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
 /// signals it. The reasoning for keeping the default equal to the cap, and for treating the missing
 /// capability field as the actual gap, is on [`Variant::default_duration_secs`]; the field itself is
 /// tracked with the other additive descriptor gaps as `sc-15041`.
-pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        required_components: &[],
-        id: variant.model_id(),
+/// Primary typed route declaration for a Stable Audio 3 variant (`REG-1`, `AP5`).
+pub fn route_for(variant: Variant) -> gen_core::RouteRecord {
+    let bindings = match variant {
+        Variant::SmallMusic => gen_core::RouteBindings::generator(descriptor, load),
+        Variant::SmallSfx => gen_core::RouteBindings::generator(sfx_descriptor, sfx_load),
+        Variant::Medium => gen_core::RouteBindings::generator(medium_descriptor, medium_load),
+        Variant::SmallMusicBase => {
+            gen_core::RouteBindings::generator(music_base_descriptor, music_base_load)
+        }
+        Variant::SmallSfxBase => {
+            gen_core::RouteBindings::generator(sfx_base_descriptor, sfx_base_load)
+        }
+        Variant::MediumBase => {
+            gen_core::RouteBindings::generator(medium_base_descriptor, medium_base_load)
+        }
+    };
+    let (dit_id, codec_id) = match variant {
+        Variant::Medium | Variant::MediumBase => ("sa3_medium_diff_dit", "same_l_ae"),
+        Variant::SmallMusic
+        | Variant::SmallSfx
+        | Variant::SmallMusicBase
+        | Variant::SmallSfxBase => ("sa3_small_dit", "same_s_ae"),
+    };
+    let default_sampler = if variant.is_base() {
+        "euler"
+    } else {
+        "pingpong"
+    };
+    gen_core::RouteRecord {
+        route_id: variant.model_id(),
         family: "stable_audio_3",
         backend: "candle",
         modality: Modality::Audio,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Audio→audio restyle (sc-14547) and bounded source editing (sc-14548), on all six
-            // checkpoints. Advertising a kind is what makes `Capabilities::validate_request_audio`
-            // *stop* rejecting the variant; both are consumed identically by every id, because the
-            // seams are the shared SAME encoder, the shared partial-strength schedule, and the
-            // shared `[inpaint_mask, inpaint_masked_input]` local conditioner — none of which is
-            // variant-specific.
-            conditioning: vec![
-                ConditioningKind::ReferenceAudio,
-                ConditioningKind::AudioEdit,
-                // Multi-region editing (sc-14549) is its **own** kind, not a flag on the one
-                // above, and advertising it here is the entire opt-in. A family that did not add
-                // this line keeps rejecting multi-region requests as typed `Unsupported` through
-                // the shared allowlist with no code of its own — which is why no capability flag
-                // and no other descriptor in the repository needed to change.
-                ConditioningKind::AudioEditRegions,
-            ],
-            // sc-14550. The full eight-type native adapter family — `lora`, `dora-rows`,
-            // `dora-cols`, `bora` and their four `-xs` siblings — plus the legacy `dora` alias,
-            // stacked in request order and folded at load time. See [`crate::adapters`].
-            //
-            // `supports_lokr` stays false and `AdapterKind::Lokr` is refused as typed
-            // `Unsupported`: no published Stable Audio 3 adapter is a Kronecker factorization, and
-            // accepting one would mean guessing a decomposition this family does not have.
-            supports_lora: true,
-            samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
-            supported_guidance_methods: vec!["cfg", "apg", "cfg_rescale"],
-            max_count: 1,
-            // The provider's 500-step model limit, advertised rather than hidden (sc-19559).
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("t5gemma", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::ReferenceAudio,
+                    ConditioningKind::AudioEdit,
+                    ConditioningKind::AudioEditRegions,
+                ],
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
+                guidance_methods: vec!["cfg", "apg", "cfg_rescale"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(dit_id)),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some(codec_id),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface {
+                supports_lora: true,
+                supports_lokr: false,
+                install_policy: gen_core::AdapterInstallPolicy::FusedMerge,
+            },
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["t5gemma"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        [dit_id],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        [codec_id],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                ..Default::default()
+            },
+            audio: gen_core::AudioSurface {
+                sample_rates: vec![SAMPLE_RATE],
+                edit_modes: vec![
+                    AudioEditMode::Inpaint,
+                    AudioEditMode::Repaint,
+                    AudioEditMode::Extend,
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 0,
+            max_size: 0,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(variant.max_duration_secs()),
-            // sc-14548. Three modes, and `AudioEditMode::Cover` is deliberately **not** among them.
-            //
-            // Upstream Stable Audio 3 exposes three paths in total — text-to-audio, audio-to-audio
-            // (`init_audio`), and inpaint — and every one of the six checkpoints pins its complete
-            // conditioner surface in config: `global = [seconds_total]`,
-            // `local = [inpaint_mask, inpaint_masked_input]`. There is no style/cover conditioner in
-            // any of them, so `Cover` has nothing to map onto here; gen-core's own doc for that mode
-            // names ACE-Step, which does ship it. Leaving it off removes no capability: the thing a
-            // caller means by "cover" is a whole-clip restyle, and that is
-            // `Conditioning::ReferenceAudio` above, advertised on all six ids with a retention
-            // `strength` knob this surface does not have.
-            //
-            // `Inpaint` and `Repaint` are listed separately because gen-core defines them
-            // separately, but for this family they are **aliases**: gen-core's distinction
-            // (silence-substituted vs context-conditioned) describes ACE-Step's two native tasks,
-            // and SA3 has one mechanism. They are byte-identical for the same request and seed —
-            // structurally, because `pipeline::AudioEdit` carries no mode field at all.
-            audio_edit_modes: vec![
-                AudioEditMode::Inpaint,
-                AudioEditMode::Repaint,
-                AudioEditMode::Extend,
-            ],
             ..Default::default()
         },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps() as u32),
+            guidance: Some(variant.default_guidance() as f32),
+            sampler: Some(default_sampler),
+            strength: Some(DEFAULT_REFERENCE_STRENGTH),
+            audio_sample_rate: Some(SAMPLE_RATE),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+pub fn route() -> gen_core::RouteRecord {
+    route_for(Variant::SmallMusic)
+}
+
+pub fn sfx_route() -> gen_core::RouteRecord {
+    route_for(Variant::SmallSfx)
+}
+
+pub fn medium_route() -> gen_core::RouteRecord {
+    route_for(Variant::Medium)
+}
+
+pub fn music_base_route() -> gen_core::RouteRecord {
+    route_for(Variant::SmallMusicBase)
+}
+
+pub fn sfx_base_route() -> gen_core::RouteRecord {
+    route_for(Variant::SmallSfxBase)
+}
+
+pub fn medium_base_route() -> gen_core::RouteRecord {
+    route_for(Variant::MediumBase)
+}
+
+/// Stable Audio 3 descriptor for `variant` — computed from `route_for` without loading weights.
+pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 pub fn descriptor() -> ModelDescriptor {

@@ -46,38 +46,130 @@ const DEFAULT_GUIDANCE: f32 = 4.5;
 /// Mochi renders ~30 fps.
 const DEFAULT_FPS: u32 = 30;
 
-/// Stable identity + advertised capabilities for Mochi 1 (text-to-video, true CFG, no audio).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Mochi 1 (`REG-1`, `AP5`).
+pub(crate) fn route_mochi() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "mochi",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // Not distilled → true classifier-free guidance over a [neg, pos] batch.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Text-to-video only in the base preview (I2V = sc-11998, a follow-on).
-            conditioning: Vec::new(),
-            // A single fixed flow-match Euler integrator; a selectable sampler/scheduler axis is not
-            // wired for Mochi, so advertising one would be a false capability.
-            samplers: Vec::new(),
-            // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6 sc-11990), selected by
-            // pointing `WeightsSource` at the tier dir — NOT on-the-fly requant. So no on-the-fly levels.
-            supported_quants: &[],
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("t5_xxl", Some(256))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Text-to-video only in the base preview (I2V = sc-11998, a follow-on).
+                kinds: Vec::new(),
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // Not distilled -> true classifier-free guidance over a [neg, pos] batch.
+                supports_negative_prompt: true,
+                modules: Vec::new(),
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // A single fixed flow-match Euler integrator; a selectable sampler/scheduler axis is
+                // not wired for Mochi, so advertising one would be a false capability.
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "mochi_asymm_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("mochi_asymm_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["t5_xxl"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["mochi_asymm_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["mochi_asymm_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6 sc-11990),
+                // selected by pointing `WeightsSource` at the tier dir -- NOT on-the-fly requant.
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            // Width/height must be divisible by SIZE_MULTIPLE (VAE 8x spatial x DiT patch 2).
+            // 480p target = 848x480.
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(64),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: None,
+            schedule: None,
+            shift: Some(MOCHI_SHIFT),
+            strength: None,
+            dimensions: Some((848, 480)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        }),
     }
+}
+
+/// Stable identity + advertised capabilities for Mochi 1 (text-to-video, true CFG, no audio).
+pub fn descriptor() -> ModelDescriptor {
+    route_mochi().compute_descriptor()
 }
 
 /// The loaded Mochi 1 model: the reused T5-XXL encoder + tokenizer, the AsymmDiT transformer, and the
@@ -382,11 +474,6 @@ impl mlx_gen::Generator for Mochi {
                 .map_err(Into::into)
         })
     }
-}
-
-// The registration constant bridges the crate's rich `Result` into backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

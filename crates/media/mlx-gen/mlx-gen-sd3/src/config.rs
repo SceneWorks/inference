@@ -15,8 +15,8 @@
 //! real 8.1B Large model and a tiny parity fixture, so the converter / validator run against both.
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, ConditioningKind, Modality, ModelDescriptor,
+    Quant,
 };
 
 pub const SD3_5_LARGE_ID: &str = "sd3_5_large";
@@ -176,7 +176,7 @@ impl Sd3Variant {
     /// Large / Medium run a negative prompt + a guidance scale >1. Turbo is distilled to a single
     /// (cond-only) forward — guidance 1.0, no negative prompt.
     ///
-    /// This is deliberately distinct from [`Capabilities::supports_true_cfg`], which describes the
+    /// This is deliberately distinct from [`mlx_gen::Capabilities::supports_true_cfg`], which describes the
     /// separate [`mlx_gen::GenerationRequest::true_cfg`] request field. SD3.5's MLX render path
     /// consumes `guidance` and `negative_prompt`, but never consumes `true_cfg`.
     pub fn uses_classifier_free_guidance(self) -> bool {
@@ -203,61 +203,130 @@ impl Sd3Variant {
         }
     }
 
-    pub fn descriptor(self) -> ModelDescriptor {
-        ModelDescriptor {
-            encoder_contract: None,
-            denoiser_output_latent_space: Some(&mlx_gen::gen_core::SD3_LATENT_SPACE),
-            control_kinds: None,
-            required_components: &[],
-            id: self.id(),
+    /// Primary typed route declaration for this SD3.5 variant (`REG-1`, `AP5`).
+    pub fn route_record(self) -> mlx_gen::gen_core::RouteRecord {
+        let mut samplers = curated_sampler_names();
+        samplers.push(DEFAULT_SAMPLER);
+        let mut schedulers = curated_scheduler_names();
+        schedulers.push("linear");
+        let model_id = match self {
+            Self::Large | Self::LargeTurbo => "sd3_5_mmdit",
+            Self::Medium => "sd3_5_mmdit_x",
+        };
+        mlx_gen::gen_core::RouteRecord {
+            route_id: self.id(),
             family: "sd3",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities {
-                // Large / Medium consume guidance + a negative prompt; Turbo is guidance-free. The
-                // separate request.true_cfg field is not read by any SD3.5 MLX render path.
-                supports_negative_prompt: self.uses_classifier_free_guidance(),
-                supports_guidance: self.uses_classifier_free_guidance(),
-                // Reference-image conditioning = img2img latent-init (epic 8588 slice A4, sc-10189):
-                // a single `Conditioning::Reference { image, strength }` seeds the flow-match denoise
-                // from the VAE-encoded reference (see model.rs `generate_impl` → pipeline
-                // `denoise_img2img_cfg`). All three variants share the 16-ch VAE (encoder loaded) +
-                // sliceable static-shift schedule, so Large (true-CFG), Medium (true-CFG), and the
-                // distilled Large-Turbo all support it; inpaint/mask remains a later story.
-                conditioning: vec![ConditioningKind::Reference],
-                supported_quants: &[Quant::Q4, Quant::Q8],
-                supports_lora: true,
-                supports_lokr: true,
-                samplers: {
-                    let mut s = curated_sampler_names();
-                    s.push(DEFAULT_SAMPLER);
-                    s
+            mac_only: true,
+            structure: mlx_gen::gen_core::RouteStructure {
+                text_encoders: mlx_gen::gen_core::TextEncoderSurface {
+                    encoders: vec![
+                        mlx_gen::gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                        mlx_gen::gen_core::TextEncoderDeclaration::new("clip_g", Some(77)),
+                        mlx_gen::gen_core::TextEncoderDeclaration::new("t5_xxl", Some(256)),
+                    ],
+                    ..Default::default()
                 },
-                schedulers: {
-                    let mut s = curated_scheduler_names();
-                    s.push("linear");
-                    s
+                conditioning: mlx_gen::gen_core::ConditioningSurface {
+                    kinds: vec![ConditioningKind::Reference],
+                    control_kinds: None,
+                    pass0_requirement:
+                        mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                    supports_negative_prompt: self.uses_classifier_free_guidance(),
+                    modules: Vec::new(),
+                    ..Default::default()
                 },
-                min_size: 256,
-                max_size: 1440,
-                max_count: 8,
-                mac_only: true,
-                // SD3.5 uses a STATIC flow-match shift of 3.0 (FlowMatchEulerDiscreteScheduler
-                // { shift: 3.0 }, no dynamic shifting) baked into the schedule — resolution-
-                // independent, identical to the Z-Image path. So this loader hint is false: a
-                // consumer must NOT additionally apply the resolution-aware dynamic shift this flag
-                // requests (doing so would double-shift). See model.rs `for_static_shift(steps, 3.0)`.
-                requires_sigma_shift: false,
-                // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload
-                // (F-176). Under `Sequential` the triple text encoder (CLIP-L + CLIP-G + T5-XXL) is
-                // encoded, materialized, then dropped before the MMDiT + VAE load — bounding peak to
-                // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
-                supports_sequential_offload: true,
-                supports_preview: true,
-                supports_low_res_start: true,
+                sampling: mlx_gen::gen_core::SamplingSurface {
+                    samplers,
+                    schedulers,
+                    guidance_methods: Vec::new(),
+                    supports_guidance: self.uses_classifier_free_guidance(),
+                    supports_true_cfg: false,
+                    supports_cfg_interval: false,
+                    requires_sigma_shift: false,
+                    supports_h3_image_sampler: false,
+                },
+                denoiser: mlx_gen::gen_core::ModelBinding::family_model(
+                    mlx_gen::gen_core::FamilyModelSpec::new(model_id).with_low_res_start(),
+                ),
+                latent_codec: mlx_gen::gen_core::LatentCodecDeclaration {
+                    codec_id: Some("sd3_vae"),
+                    output_latent_space: Some(&mlx_gen::gen_core::SD3_LATENT_SPACE),
+                    pixel_stride: Some(crate::SIZE_MULTIPLE),
+                    token_width: Some(64),
+                    supports_diffusion_decoder: false,
+                },
+                upsamplers: mlx_gen::gen_core::UpsamplerSurface::default(),
+                adapters: mlx_gen::gen_core::AdapterSurface::lora_and_lokr(
+                    mlx_gen::gen_core::AdapterInstallPolicy::ForwardResidual,
+                ),
+                residency: mlx_gen::gen_core::ResidencySurface {
+                    lifetime_graph: vec![
+                        mlx_gen::gen_core::ResidencyPhaseNode::new(
+                            mlx_gen::gen_core::ResidencyPhaseKind::PromptEncode,
+                            ["clip_l", "clip_g", "t5_xxl"],
+                            true,
+                        ),
+                        mlx_gen::gen_core::ResidencyPhaseNode::new(
+                            mlx_gen::gen_core::ResidencyPhaseKind::Denoise,
+                            [model_id],
+                            false,
+                        ),
+                        mlx_gen::gen_core::ResidencyPhaseNode::new(
+                            mlx_gen::gen_core::ResidencyPhaseKind::Decode,
+                            ["sd3_vae"],
+                            false,
+                        ),
+                    ],
+                    supports_sequential_offload: true,
+                    ..Default::default()
+                },
+                weight_plan: mlx_gen::gen_core::WeightPlanDeclaration {
+                    source_kind: mlx_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                    supported_quants: &[Quant::Q4, Quant::Q8],
+                    component_precision_floors: &[],
+                    required_components: &[],
+                    requires_control_overlay: false,
+                    requires_ip_adapter_overlay: false,
+                    requires_identity_overlay: false,
+                    ..Default::default()
+                },
+                output: mlx_gen::gen_core::OutputSurface {
+                    preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,
+                    supports_hdr: false,
+                    supports_alpha_output: false,
+                },
                 ..Default::default()
             },
+            limits: mlx_gen::gen_core::ProductLimits {
+                min_size: 256,
+                max_size: 1440,
+                size_floor: mlx_gen::gen_core::SizeFloor::RangeChecked,
+                supported_steps: mlx_gen::gen_core::StepSupport::Unconstrained,
+                max_audio_duration_secs: None,
+            },
+            seed_and_batch: mlx_gen::gen_core::SeedAndBatchSemantics {
+                seed_scheme: mlx_gen::gen_core::SeedScheme::BackendGlobalSeeded,
+                max_count: 8,
+                supports_prompt_batch: false,
+            },
+            defaults: mlx_gen::gen_core::RouteDefaults {
+                steps: Some(self.default_steps()),
+                guidance: Some(self.default_guidance()),
+                sampler: Some(DEFAULT_SAMPLER),
+                schedule: Some("linear"),
+                shift: Some(crate::pipeline::SCHEDULE_SHIFT),
+                strength: None,
+                dimensions: Some((DEFAULT_WIDTH, DEFAULT_HEIGHT)),
+                ..Default::default()
+            },
+            bindings: mlx_gen::gen_core::RouteBindings::default(),
         }
+    }
+
+    pub fn descriptor(self) -> ModelDescriptor {
+        self.route_record().compute_descriptor()
     }
 }
 

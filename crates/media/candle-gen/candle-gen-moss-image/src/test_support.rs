@@ -34,7 +34,7 @@ impl Fixture {
             let pin = PinnedWeightsFile::pin(self.data.root.join(relative))?;
             if relative.ends_with(".safetensors") {
                 headers.insert(
-                    *pin.content_sha256(),
+                    *pin.require_content_sha256()?,
                     gen_core::weightsmeta::safetensors_path_tensor_headers(pin.loader_path())?,
                 );
             }
@@ -48,7 +48,7 @@ impl Fixture {
                 MossImageAssetRole::Vae
             };
             ordinary.push(Asset {
-                fixture_digest: Some(*pin.content_sha256()),
+                fixture_digest: Some(*pin.require_content_sha256()?),
                 pin,
                 role,
                 repo: "sceneworks/synthetic-test-fixture",
@@ -149,7 +149,7 @@ impl Fixture {
             },
             &mut |_| {},
         )?;
-        let reports = model.adapter_apply_reports();
+        let reports = model.last_adapter_apply_reports();
         match output {
             MossImageAdvancedOutput::Latents { values, shape } => Ok((values, shape, reports)),
             _ => Err(gen_core::Error::Msg(
@@ -178,11 +178,17 @@ pub fn generation_request() -> gen_core::GenerationRequest {
         steps: Some(2),
         guidance: Some(1.),
         seed: Some(173),
-        moss_image: Some(MossImageOptions {
-            max_sequence_length: 32,
-            uncond_skip_layers: Some(Vec::new()),
+        extensions: gen_core::FamilyExtensions {
+            moss_image: Some(gen_core::MossImageExtension {
+                options: Some(MossImageOptions {
+                    max_sequence_length: 32,
+                    uncond_skip_layers: Some(Vec::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     }
 }

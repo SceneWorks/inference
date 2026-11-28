@@ -68,19 +68,25 @@ TEXT_ROUTES = {
 # Most crates expose exactly one model::REGISTRATION. These are the catalog's variant factories,
 # including families which register an array via fold and those re-exporting their builder.
 VARIANT_REGISTRATIONS = {
-    "mmaudio": {"generator::REGISTRATION", "generator_44k::REGISTRATION"},
+    "acestep": {"model::route"},
+    "chatterbox": {"model::route"},
+    "kokoro": {"model::route"},
+    "mmaudio": {"generator::route", "generator_44k::route"},
+    "moss-sfx": {"model::route"},
+    "moss-tts": {"route"},
+    "moss-tts-realtime": {"route"},
     "stable-audio-3": {"model::" + symbol for symbol in (
-        "REGISTRATION", "SFX_REGISTRATION", "MEDIUM_REGISTRATION", "MUSIC_BASE_REGISTRATION",
-        "SFX_BASE_REGISTRATION", "MEDIUM_BASE_REGISTRATION")},
-    "yue": {"REGISTRATION_" + language + "_" + mode for language in ("EN", "ZH", "JP_KR") for mode in ("COT", "ICL")},
-    "yue2": {"REGISTRATION"},
+        "route", "sfx_route", "medium_route", "music_base_route",
+        "sfx_base_route", "medium_base_route")},
+    "yue": {"model::route_" + language + "_" + mode for language in ("en", "zh", "jp_kr") for mode in ("cot", "icl")},
+    "yue2": {"provider::route"},
 }
 
 
 def _audio_registrations(folder):
     code = "\n".join(_production(path) for path in sorted(folder.glob("*.rs")))
     body = next(_bodies(code, "register_providers"), "")
-    entries = set(re.findall(r"\.register_\w+\(\s*([\w:]+)\s*\)", body))
+    entries = set(re.findall(r"\.register_\w+\(\s*([\w:]+)(?:\(\))?\s*\)", body))
     if "REGISTRATIONS" in body:
         array = re.search(r"const REGISTRATIONS\s*:\s*\[[^\]]+\]\s*=\s*\[([^\]]*)\]", code)
         if array:

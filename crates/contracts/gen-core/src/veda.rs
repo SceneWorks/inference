@@ -339,10 +339,16 @@ mod tests {
             ..Default::default()
         };
         let request = crate::GenerationRequest {
-            veda: Some(VedaRequest {
-                enabled: true,
+            extensions: crate::FamilyExtensions {
+                h3: Some(crate::H3Extension {
+                    veda: Some(VedaRequest {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         let error = caps

@@ -54,10 +54,9 @@ pub mod providers {
 }
 
 /// Platform-owned crates consumed through provider-specific APIs rather than the registry
-/// `load(id, spec)` path (depth maps, face analysis, segmentation, identity conditioning,
-/// the PiD latent decoder). Listed here so their platform membership is as explicit as a
-/// registered generator. Note `pulid` is bespoke here, whereas MLX ships it as `pulid_flux`.
-pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
+/// `load(id, spec)` path (depth maps, face analysis, segmentation, the PiD latent decoder).
+/// Listed here so their platform membership is as explicit as a registered generator.
+pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "pid", "sam3"];
 
 /// Machine-readable disposition for a provider-owned memory contract that intentionally cannot be
 /// represented by an ordinary [`candle_gen::gen_core::MemoryRegistration`].
@@ -73,18 +72,8 @@ pub struct BespokeMemoryRouteWaiver {
 
 /// Descriptor-less Candle memory routes excluded from ordinary registry reconciliation.
 ///
-/// PuLID is worker-owned and constructs a path-shaped FLUX + identity-stack contract through
-/// `PulidFlux::load_with_memory_context`; inventing a generator registration would make the public
-/// provider topology false. Consumers must reconcile this explicit waiver instead.
-pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
-    &[BespokeMemoryRouteWaiver {
-        provider_id: candle_gen_pulid::memory_strategy::PROVIDER_ID,
-        crate_name: "pulid",
-        owner: "candle-gen-pulid",
-        reason: "worker-owned bespoke route with a path-shaped memory contract and no LoadSpec/Generator registration",
-        contract_path: "crates/media/candle-gen/candle-gen-pulid/src/memory_strategy.rs",
-        verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
-    }];
+/// Empty after `SW-6982` registered `pulid_flux` and `instantid` as full `RouteRecord` generators.
+pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] = &[];
 
 /// Whether a registered provider's model attention runs through `candle-gen`'s shared SDPA helpers
 /// (`sdpa_budgeted_*` / `sdpa_planned_*` / the `training_sdpa_*` inference entry points) — the one
@@ -148,9 +137,8 @@ impl SharedAttentionRouting {
     }
 }
 
-/// Every provider this catalog registers (generators, transforms, captioners, embedders) plus the
-/// worker-owned bespoke routes ([`BESPOKE_MEMORY_ROUTE_WAIVERS`], InstantID), and how its model
-/// attention routes. Trainers are not listed: training attention always runs the
+/// Every provider this catalog registers (generators, transforms, captioners, embedders) and how
+/// its model attention routes. Trainers are not listed: training attention always runs the
 /// materialized path (epic E9), whatever the job switches say. `catalog_attention_routing_covers_every_provider`
 /// (tests) pins this table to the registry, so a new provider must state its routing here.
 pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
@@ -183,8 +171,19 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("chroma1_flash", ALL),
         ("flux1_schnell", ALL),
         ("flux1_dev", ALL),
+        // FLUX.1 ControlNet: the control blocks' joint attention is the DiT's `sdpa_planned_flat`.
+        ("flux1_dev_control", ALL),
+        // XLabs IP-Adapter: the DiT attention is shared; the small decoupled image-token
+        // cross-attention residual runs materialized beside it (as PuLID's identity CA does).
+        ("flux1_dev_ip_adapter", ALL),
+        ("flux1_schnell_ip_adapter", ALL),
         ("flux2_klein_9b", ALL),
         ("flux2_dev", ALL),
+        // FLUX.2 edit / control: reference or control tokens join the one unmasked joint sequence
+        // through the DiT's `sdpa_planned_bhsd`.
+        ("flux2_dev_control", ALL),
+        ("flux2_dev_edit", ALL),
+        ("flux2_klein_9b_edit", ALL),
         ("flux3_klein", ALL),
         ("flux3_klein_base", ALL),
         ("ideogram_4", R::exact_only(HD256)),
@@ -193,6 +192,9 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         // Kolors: a lossy opt-in loads its dense snapshot through the vendored SDXL UNet (shared
         // helpers, f32 at bf16, 64-wide heads padded for Sol-Attn); the default keeps the stock UNet.
         ("kolors", ALL),
+        // Kolors IP-Adapter / ControlNet Pose always load the vendored SDXL UNet (f32 at bf16).
+        ("kolors_ip_adapter", ALL),
+        ("kolors_control", ALL),
         ("krea_2_turbo", ALL),
         ("krea_2_raw", ALL),
         ("krea_2_edit", ALL),
@@ -223,6 +225,13 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("moss_image_base", BESPOKE),
         ("moss_image_sft", BESPOKE),
         ("qwen_image", ALL),
+        // Qwen-Image edit (reference tokens in the joint sequence) and Fun control (the control
+        // branch reuses the base dual-stream `Block`): the DiT's `sdpa_planned_bhsd`.
+        ("qwen_image_edit", ALL),
+        ("qwen_image_edit_2509", ALL),
+        ("qwen_image_edit_2511", ALL),
+        ("qwen_image_edit_2511_lightning", ALL),
+        ("qwen_image_control", ALL),
         ("qwen_image_2_1", R::int8_only(BLOCK_CAUSAL)),
         ("qwen_image_2_1_turbo", R::int8_only(BLOCK_CAUSAL)),
         // Sana: ReLU linear self-attention plus its own masked cross-attention.
@@ -233,6 +242,12 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("sd3_5_large_turbo", ALL),
         ("sd3_5_medium", ALL),
         ("sdxl", ALL),
+        // The edit / detail / control / IP-Adapter routes run the vendored SDXL UNet (and its
+        // ControlNet), whose `CrossAttention` is the shared `sdpa_budgeted_bhsd`.
+        ("sdxl_edit", ALL),
+        ("sdxl_detail", ALL),
+        ("sdxl_control", ALL),
+        ("sdxl_ip_adapter", ALL),
         ("seedvr2", ALL),
         ("seedvr2_3b", ALL),
         ("seedvr2_7b", ALL),
@@ -260,8 +275,11 @@ pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
         ("wan2_2_vace_fun_14b", ALL),
         ("z_image_turbo", ALL),
         ("z_image", ALL),
+        // Z-Image control: the base DiT's blocks and caption-padding trim (unmasked when trimmed).
+        ("z_image_control", ALL),
+        ("z_image_turbo_control", ALL),
         ("iris_3b_restore", ALL),
-        // The worker-owned bespoke identity routes denoise with FLUX.1 / the SDXL UNet.
+        // The identity routes denoise with FLUX.1 / the vendored SDXL UNet.
         (candle_gen_pulid::memory_strategy::PROVIDER_ID, ALL),
         (candle_gen_instantid::memory_strategy::PROVIDER_ID, ALL),
         // The captioner and the CLIP embedders run their own attention.
@@ -339,8 +357,10 @@ pub fn admit_lossy_attention(
     Ok(())
 }
 
-/// Add every provider shipped by the Candle media platform to an explicit registry builder.
-pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+fn register_providers_with_flux3_mode(
+    registry: ProviderRegistryBuilder,
+    cuda_flux3_target: bool,
+) -> ProviderRegistryBuilder {
     // The engine's checkpoint codec table is registered here, exactly once, before any family
     // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
     // register one, and the builder refuses a duplicate row outright.
@@ -357,8 +377,13 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_clip::register_providers(registry);
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
-    let registry = candle_gen_flux3::register_providers(registry);
+    let registry = if cuda_flux3_target {
+        candle_gen_flux3::register_cuda_descriptor_providers(registry)
+    } else {
+        candle_gen_flux3::register_providers(registry)
+    };
     let registry = candle_gen_ideogram::register_providers(registry);
+    let registry = candle_gen_instantid::register_providers(registry);
     let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
     let registry = candle_gen_kolors::register_providers(registry);
@@ -372,6 +397,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_moss_image::register_providers(registry);
+    let registry = candle_gen_pulid::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_qwen_image_2_1::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -387,9 +413,55 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     candle_gen_z_image::register_providers(registry)
 }
 
+/// Add every provider shipped by the Candle media platform to an explicit registry builder.
+pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    register_providers_with_flux3_mode(registry, false)
+}
+
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
+}
+
+/// Register the hardware-free descriptor-only Candle media providers representing the shipping
+/// CUDA feature set onto `registry` (`SW-6980`, `SW-6982`, `REG-3`).
+pub fn register_cuda_descriptor_providers(
+    registry: ProviderRegistryBuilder,
+) -> ProviderRegistryBuilder {
+    let registry = register_providers_with_flux3_mode(registry, true);
+    #[cfg(not(feature = "cuda"))]
+    let registry = {
+        let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_pulid::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+        let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
+        candle_gen_wan::register_memory_contract_surfaces(registry)
+    };
+    registry
+}
+
+/// Build the hardware-free descriptor-only Candle media provider catalog representing the
+/// shipping CUDA feature set (`SW-6980`, `REG-3`).
+///
+/// Produces the exact route, descriptor, quantization-tier (including FLUX 3 FP8R / NVFP4),
+/// and memory-contract surface of [`provider_registry`] under `--features cuda` without
+/// requiring the NVIDIA CUDA toolkit.
+pub fn cuda_descriptor_provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    register_cuda_descriptor_providers(ProviderRegistryBuilder::new()).build()
+}
+
+/// Advanced quant tiers surfaced by the shipping CUDA feature set, usable in hardware-free
+/// descriptor-only exports without `--features cuda` (`SW-6980`, `REG-3`).
+pub fn cuda_descriptor_nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
+    &[media::gen_core::Quant::Nvfp4]
 }
 
 /// Build the complete Candle registry contract surface without loading model weights or requiring
@@ -411,6 +483,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_pulid::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
@@ -576,88 +650,6 @@ pub fn nvfp4_quant_tiers() -> &'static [media::gen_core::Quant] {
 /// CUDA, and MLX are mutually exclusive platform targets, never additive features), but a bundle-side
 /// assertion should stay honest under it rather than fail spuriously.
 pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
-
-/// Bidirectional guard for `Capabilities::supports_preview` on the Candle catalog (epic 16948,
-/// sc-16951) — the candle counterpart of `mlx-gen-catalog`'s
-/// `preview_capability_matches_every_wired_shipped_route_bidirectionally`.
-///
-/// ## Why the ported MLX guard is not enough on its own
-///
-/// The MLX guard compares two things that are both hand-maintained: an allowlist of ids and the
-/// `supports_preview` flags on the descriptors. That pins the two lists to each other, which is
-/// worth having — a descriptor cannot advertise without a deliberate edit here — but it says
-/// nothing about whether the wiring exists. Edit both sides and it stays green.
-///
-/// So this module adds a second, **derived** half. Whether a provider crate actually emits is read
-/// out of that crate's own sources, in either of the two shapes candle families come in:
-///
-/// * a **shared-driver** family passes a preview hook where it could pass `None` to
-///   `candle_gen::run_flow_sampler` / `run_curated_sampler` / `run_scm_sampler`;
-/// * a **bespoke** family owns its denoise loop and emits by calling the shared preview module —
-///   `PreviewHook::emit` / `PreviewHook::emit_step`, or the `emit_preview` / `emit_preview_at`
-///   free functions underneath them.
-///
-/// Both shapes are declared per crate in `PROVIDER_CRATES` and checked against the sources, so a
-/// crate cannot silently change shape and have its emission fact read as `no`. Neither fact can be
-/// produced by editing an allowlist, so the two halves cannot be made to agree by editing one place.
-///
-/// The source-level scan follows the sc-16950 route inventory in `candle-gen-krea/src/preview.rs`,
-/// widened from one crate and one driver to every registered crate, all three drivers, and the
-/// bespoke emission calls.
-///
-/// ## What the scan reads, and what it deliberately does not
-///
-/// Only the crate's **shipped** module tree is scanned: the walk starts at `src/lib.rs` and follows
-/// `mod` declarations, so an out-of-line `#[cfg(test)] mod NAME;` file (`candle-gen-krea`'s
-/// `testfix.rs`, `candle-gen-z-image`'s four `*_validate.rs` GPU-validation modules, twenty-odd
-/// others) is never read as shipped code. Reading them would be actively harmful in both
-/// directions: a hooked call in an `#[ignore]`d validation file would demand a **false**
-/// advertisement, and a `None` call in a test fixture would force a test file into a dark
-/// declaration. Every `.rs` file under `src` must land in exactly one of those two buckets — an
-/// unreachable file fails the scan rather than being silently skipped.
-///
-/// Test-only items are stripped from the shipped files first, by the *meaning* of their `cfg`
-/// predicate rather than by its spelling: `#[cfg(test)]` and `#[cfg(all(test, …))]` are test-only
-/// and go, while `#[cfg(any(test, feature = "testkit"))]` and `#[cfg(not(test))]` genuinely ship in
-/// some configuration and stay.
-///
-/// ## The amendment protocol — read this before adding a family
-///
-/// This guard lands once, holding Krea alone, and is then **amended by each later family story in
-/// that story's own PR**: sc-16952…sc-16960 each wire a family and, in the same PR,
-///
-/// 1. add its exact route ids to `PREVIEW_ROUTE_IDS`,
-/// 2. flip its descriptors' `supports_preview`, and
-/// 3. add that family's own **route inventory** — the per-file `hooked` / `direct` counts and the
-///    pinned `DarkSite`s — to its `ProviderCrate` row, the way sc-16950 pinned Krea's.
-///
-/// Do not file a follow-up story for any of the three. The derived half is what makes (1) and (2)
-/// self-enforcing: the moment a family's sources emit, its descriptors must advertise and the build
-/// fails until they do. Step (3) is what keeps a **wired** family honest afterwards — without an
-/// exact per-file count, blanking one route of an already-inventoried file changes nothing any
-/// assertion can see.
-///
-/// ## Three classes, and a route is in exactly one (sc-16961)
-///
-/// A route that does not advertise previews is **not** thereby a rejected one, and the difference is
-/// the difference between "someone should wire this" and "do not spend GPU time on this":
-///
-/// * `PREVIEW_ROUTE_IDS` — **wired**. Emits, and advertises `supports_preview: true`.
-/// * `PREVIEW_INERT_ROUTE_IDS` — **no-go**, carried over from epic 16624 rather than re-measured. A
-///   fit is a property of the VAE latent space, not of the backend, so a linear approximation that
-///   misses the holdout bar on MLX misses it on candle too. **Do not re-run these fits**; the
-///   `NoGo` basis on each row says whether it rides a measurement or a deliberate non-measurement.
-/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Empty after sc-17218 wired the last
-///   deferred family, but retained as an explicit class so a future measured-but-unwired route cannot
-///   be mistaken for a no-go.
-///
-/// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` makes those three total over the
-/// registered surface, so a newly registered route must be classified rather than defaulting into
-/// silence, and the no-go set cannot go stale as the catalog grows. The full record —
-/// numbers, per-family lineage, and the four VAE-relation shapes this epic observed — is
-/// `docs/migration/evidence/sc-16961-preview-no-go-carry-over.md`.
-#[cfg(test)]
-mod preview_advertising;
 
 #[cfg(test)]
 mod tests;

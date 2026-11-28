@@ -120,6 +120,16 @@ pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
             .copied()
             .chain(images.iter().flat_map(|i| i.pixels.iter().copied()))
             .collect(),
+        GenerationOutput::Vector(vector) => vector
+            .svg
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(vector.preview.iter().flat_map(|i| i.pixels.iter().copied()))
+            .collect(),
+        GenerationOutput::Latents { values, .. } => {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
     }
 }
 
@@ -191,7 +201,7 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
     // Positive: every advertised sampler must be accepted.
     for &s in &caps.samplers {
         let mut r = base_request(profile);
-        r.sampler = Some(s.to_owned());
+        r.sampler = Some(s.into());
         if let Err(e) = g.validate(&r) {
             return Err(format!(
                 "validate-honesty[{id}]: advertised sampler {s:?} was rejected by validate(): {e}"
@@ -428,6 +438,8 @@ pub(super) fn output_variant_name(out: &GenerationOutput) -> &'static str {
         GenerationOutput::Video { .. } => "GenerationOutput::Video",
         GenerationOutput::Audio(_) => "GenerationOutput::Audio",
         GenerationOutput::Interleaved { .. } => "GenerationOutput::Interleaved",
+        GenerationOutput::Vector(_) => "GenerationOutput::Vector",
+        GenerationOutput::Latents { .. } => "GenerationOutput::Latents",
     }
 }
 

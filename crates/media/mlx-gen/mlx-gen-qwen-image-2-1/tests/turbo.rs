@@ -448,12 +448,12 @@ fn turbo_honours_the_curated_scheduler_and_sampler_axes() {
     // A name outside the advertised menu never reaches the schedule: it is refused at validate,
     // exactly as on the base id.
     let mut unknown = request(None);
-    unknown.scheduler = Some("flow_match_euler".to_owned());
+    unknown.scheduler = Some("flow_match_euler".into());
     let err = generator.validate(&unknown).unwrap_err().to_string();
     assert!(err.contains("unsupported scheduler"), "{err}");
 
     let mut curated = request(None);
-    curated.scheduler = Some("simple".to_owned());
+    curated.scheduler = Some("simple".into());
     generator.validate(&curated).unwrap();
     let unshifted = mlx_gen::resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero());
     let (pixels, steps) = render(generator.as_ref(), &curated);
@@ -462,7 +462,7 @@ fn turbo_honours_the_curated_scheduler_and_sampler_axes() {
     assert_ne!(pixels, native);
 
     let mut sampler = request(None);
-    sampler.sampler = Some("heun".to_owned());
+    sampler.sampler = Some("heun".into());
     generator.validate(&sampler).unwrap();
     // A second-order solver reports its stages too; what matters is that it integrates the saved
     // eight-interval schedule and lands somewhere other than Euler does.

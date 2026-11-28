@@ -47,8 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         count: 1,
         seed: Some(seed),
         steps: if steps == 0 { None } else { Some(steps) },
-        sampler,
-        scheduler,
+        sampler: sampler.map(Into::into),
+        scheduler: scheduler.map(Into::into),
         ..Default::default()
     };
 

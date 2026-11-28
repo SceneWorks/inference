@@ -674,7 +674,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         )));
     }
     single_reference(req)?;
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
         let executed_steps = sigmas[start_step..].len().saturating_sub(1);
         low_res.resolve_for_descriptor(desc, req, executed_steps, SIZE_MULTIPLE)?;
@@ -746,7 +746,7 @@ pub(crate) fn compile_base(
         )));
     }
     resolve_root(spec, id)?;
-    if req.use_pid {
+    if req.use_pid() {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
             "{id}: PiD decode is not supported on SD3.5"
         )));
@@ -841,11 +841,6 @@ fn projected_conditioning_bytes(root: &std::path::Path) -> Option<u64> {
     Some(total)
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const LARGE_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
 macro_rules! memory_registration {
     ($registration:ident, $behavior:ident, $provider_id:expr) => {
         pub(crate) const $registration: mlx_gen::gen_core::MemoryRegistration =
@@ -874,13 +869,52 @@ memory_registration!(
     MEDIUM_MEMORY_BEHAVIOR,
     MEDIUM_MODEL_ID
 );
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = turbo_descriptor => load_turbo;
-    footprint = component_footprint
+pub(crate) fn route_large() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Sd3Variant::Large.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor, |spec| {
+        load(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(Sd3Variant::Large, spec, req))
+    .with_memory_registration(LARGE_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(MODEL_ID, spec),
+    )
+    .with_memory_behavior_registration(LARGE_MEMORY_BEHAVIOR);
+    route
 }
-mlx_gen::register_generators! {
-    pub(crate) const MEDIUM_REGISTRATION = medium_descriptor => load_medium;
-    footprint = component_footprint
+
+pub(crate) fn route_turbo() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Sd3Variant::LargeTurbo.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(turbo_descriptor, |spec| {
+        load_turbo(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(Sd3Variant::LargeTurbo, spec, req))
+    .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(TURBO_MODEL_ID, spec),
+    )
+    .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    route
+}
+
+pub(crate) fn route_medium() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = Sd3Variant::Medium.route_record();
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(medium_descriptor, |spec| {
+        load_medium(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(Sd3Variant::Medium, spec, req))
+    .with_memory_registration(MEDIUM_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_contract(MEDIUM_MODEL_ID, spec),
+    )
+    .with_memory_behavior_registration(MEDIUM_MEMORY_BEHAVIOR);
+    route
 }
 
 #[cfg(test)]

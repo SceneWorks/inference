@@ -222,10 +222,15 @@ mod tests {
         let r = MossImageResolved::resolve(
             MossImageVariant::Sft,
             &GenerationRequest {
-                moss_image: Some(MossImageOptions {
-                    acceleration: mode,
+                extensions: gen_core::FamilyExtensions {
+                    moss_image: Some(gen_core::MossImageExtension::from_options(
+                        MossImageOptions {
+                            acceleration: mode,
+                            ..Default::default()
+                        },
+                    )),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             },
         )

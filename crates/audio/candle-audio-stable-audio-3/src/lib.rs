@@ -149,7 +149,9 @@ pub use pipeline::{
     VariantGeometry,
 };
 
-/// Add every registered Stable Audio 3 generator to an explicit audio registry builder.
+/// Add every registered Stable Audio 3 generator to an explicit audio registry builder via
+/// one-call [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 ///
 /// Registration order is stable and contiguous: music (sc-14543), SFX (sc-14544), medium
 /// (sc-14545), then the three `-base` siblings in the same order (sc-14546). New variants append,
@@ -158,12 +160,12 @@ pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_generator(model::SFX_REGISTRATION)
-        .register_generator(model::MEDIUM_REGISTRATION)
-        .register_generator(model::MUSIC_BASE_REGISTRATION)
-        .register_generator(model::SFX_BASE_REGISTRATION)
-        .register_generator(model::MEDIUM_BASE_REGISTRATION)
+        .register_route(model::route())
+        .register_route(model::sfx_route())
+        .register_route(model::medium_route())
+        .register_route(model::music_base_route())
+        .register_route(model::sfx_base_route())
+        .register_route(model::medium_base_route())
 }
 
 /// Build this crate's complete explicit provider registry.

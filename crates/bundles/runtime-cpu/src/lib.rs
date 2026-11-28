@@ -41,6 +41,20 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+#[cfg(feature = "media")]
+mod facades;
+#[cfg(all(
+    feature = "media",
+    any(
+        feature = "test-support",
+        feature = "testkit",
+        feature = "model-inference-proof"
+    )
+))]
+pub use facades::test_support;
+#[cfg(feature = "media")]
+pub use facades::{calibration, converters, memory_helpers, utilities};
+
 /// Descriptor-less provider memory routes that the CPU bundle intentionally reconciles outside the
 /// ordinary generator registry.
 #[cfg(feature = "media")]
@@ -65,10 +79,26 @@ pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &[
 /// Native (non-Cargo) prerequisites required to build and run this bundle (none for CPU).
 pub const NATIVE_PREREQUISITES: &[&str] = &[];
 
+#[cfg(feature = "media")]
+fn load_starvector_1b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+    let text_registry = candle_llm::text_registry()
+        .map_err(|err| gen_core::Error::Msg(format!("candle cpu text registry: {err}")))?;
+    runtime_catalog::starvector::load_from_text_registry(
+        runtime_catalog::starvector::descriptor_candle_1b(),
+        &text_registry,
+        runtime_catalog::starvector::CANDLE_STARVECTOR_1B_LLM_ID,
+        spec,
+    )
+}
+
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
-        candle_gen_catalog::provider_registry()
+        candle_gen_catalog::register_providers(gen_core::ProviderRegistryBuilder::new())
+            .register_route(runtime_catalog::starvector::route_candle_1b(
+                load_starvector_1b,
+            ))
+            .build()
     }
 
     #[cfg(not(feature = "media"))]
@@ -153,6 +183,105 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             candle_llm::snapshot_preparer_registry(),
         )
     }
+}
+
+/// Platform export options for the CPU Candle bundle (`SW-6980`, `REG-3`).
+pub fn export_assembly_options() -> runtime_catalog::ExportAssemblyOptions {
+    #[cfg_attr(not(any(feature = "media", feature = "audio")), allow(unused_mut))]
+    let mut options =
+        runtime_catalog::ExportAssemblyOptions::new(gen_core::export::FEATURE_SET_CANDLE_CPU);
+    #[cfg(feature = "media")]
+    {
+        options.advanced_quant_tiers = candle_gen_catalog::nvfp4_quant_tiers().to_vec();
+        options.bespoke_utility_crates = candle_gen_catalog::BESPOKE_UTILITY_CRATES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        options.memory_route_waivers = BESPOKE_MEMORY_ROUTE_WAIVERS
+            .iter()
+            .map(|w| gen_core::export::ExportedBespokeMemoryWaiverV2 {
+                provider_id: w.provider_id.to_string(),
+                crate_name: w.crate_name.to_string(),
+                owner: w.owner.to_string(),
+                reason: w.reason.to_string(),
+            })
+            .collect();
+    }
+    #[cfg(feature = "audio")]
+    {
+        options.crate_api_providers = candle_audio_catalog::CRATE_API_PROVIDERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    options
+}
+
+/// Export the canonical `sga.capabilities/2` build product for the shipping `candle-cpu` feature
+/// set without loading weights or touching GPU hardware (`SW-6980`, `REG-3`).
+pub fn capabilities_export() -> runtime_catalog::Result<gen_core::export::CapabilitiesExportV2> {
+    let catalog = catalog()?;
+    Ok(catalog.capabilities_export(&export_assembly_options()))
+}
+
+/// Build the hardware-free descriptor-only catalog representing the shipping `candle-cuda`
+/// feature set without requiring the NVIDIA CUDA toolkit (`SW-6980`, `REG-3`).
+#[cfg(all(feature = "media", feature = "audio"))]
+pub fn cuda_descriptor_catalog() -> runtime_catalog::Result<RuntimeCatalog> {
+    let media = candle_gen_catalog::register_cuda_descriptor_providers(
+        gen_core::ProviderRegistryBuilder::new(),
+    )
+    .register_route(runtime_catalog::starvector::route_candle_1b(
+        runtime_catalog::starvector::unavailable_loader,
+    ))
+    .register_route(runtime_catalog::starvector::route_candle_8b(
+        runtime_catalog::starvector::unavailable_loader,
+    ))
+    .build();
+    RuntimeCatalog::try_new_with_audio(
+        "cuda",
+        BACKEND,
+        media,
+        candle_llm::cuda_descriptor_text_registry(),
+        candle_llm::snapshot_preparer_registry(),
+        audio_lane(),
+    )
+}
+
+/// Platform export options for the shipping `candle-cuda` feature set (`SW-6980`, `REG-3`).
+#[cfg(all(feature = "media", feature = "audio"))]
+pub fn cuda_descriptor_export_assembly_options() -> runtime_catalog::ExportAssemblyOptions {
+    let mut options =
+        runtime_catalog::ExportAssemblyOptions::new(gen_core::export::FEATURE_SET_CANDLE_CUDA);
+    options.advanced_quant_tiers = candle_gen_catalog::cuda_descriptor_nvfp4_quant_tiers().to_vec();
+    options.bespoke_utility_crates = candle_gen_catalog::BESPOKE_UTILITY_CRATES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    options.crate_api_providers = candle_audio_catalog::CRATE_API_PROVIDERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    options.memory_route_waivers = BESPOKE_MEMORY_ROUTE_WAIVERS
+        .iter()
+        .map(|w| gen_core::export::ExportedBespokeMemoryWaiverV2 {
+            provider_id: w.provider_id.to_string(),
+            crate_name: w.crate_name.to_string(),
+            owner: w.owner.to_string(),
+            reason: w.reason.to_string(),
+        })
+        .collect();
+    options
+}
+
+/// Export the canonical `sga.capabilities/2` build product for the shipping `candle-cuda` feature
+/// set purely from hosted descriptor-only registration without the CUDA toolkit (`SW-6980`,
+/// `REG-3`).
+#[cfg(all(feature = "media", feature = "audio"))]
+pub fn cuda_descriptor_capabilities_export(
+) -> runtime_catalog::Result<gen_core::export::CapabilitiesExportV2> {
+    let catalog = cuda_descriptor_catalog()?;
+    Ok(catalog.capabilities_export(&cuda_descriptor_export_assembly_options()))
 }
 
 #[cfg(test)]
@@ -449,7 +578,7 @@ mod tests {
             assert!(snapshot.audio_embedder_ids.is_empty());
         }
         #[cfg(feature = "media")]
-        assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
+        assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 4);
         assert_eq!(snapshot.to_json()["platform"], "cpu");
     }
 
@@ -594,9 +723,8 @@ mod tests {
         // and it is what a bundle that quietly grew a registration would break.
         let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
         assert!(
-            !waivers.is_empty(),
-            "the CPU bundle exposes descriptor-less memory routes; an empty waiver table would make \
-             every check below vacuous"
+            waivers.is_empty(),
+            "all bespoke memory routes are registered in SW-6982"
         );
         let registry = super::media_registry().expect("CPU media registry");
         assert!(
@@ -638,5 +766,356 @@ mod tests {
             std::any::TypeId::of::<super::layers::Linear>(),
             std::any::TypeId::of::<super::media::Linear>()
         );
+    }
+
+    /// SW-6980 (`REG-3`, `HOOK-4`, `M8`, `AC1`): hosted Candle descriptor-only exports represent
+    /// both shipping feature sets (`candle-cpu` and `candle-cuda`) without CUDA toolkit, preserve
+    /// 1-to-1 registry parity, emit byte-deterministic canonical JSON with zero pin/timestamp
+    /// metadata, and refuse runtime-vs-export disagreements with typed reasons.
+    #[cfg(all(feature = "media", feature = "audio"))]
+    #[test]
+    fn descriptor_only_exports_cover_candle_cpu_and_candle_cuda_with_parity() {
+        use super::gen_core::export::{
+            canonical_bytes_equal, semantic_equal, verify_runtime_against_export,
+            CapabilitiesExportV2, ExportDisagreementKind, CAPABILITIES_EXPORT_SCHEMA_VERSION,
+            FEATURE_SET_CANDLE_CPU, FEATURE_SET_CANDLE_CUDA,
+        };
+
+        let cpu_catalog = super::catalog().expect("cpu catalog");
+        let cpu_export = super::capabilities_export().expect("candle-cpu export");
+        let cuda_catalog = super::cuda_descriptor_catalog().expect("cuda descriptor catalog");
+        let cuda_export = super::cuda_descriptor_capabilities_export().expect("candle-cuda export");
+
+        assert_eq!(
+            cpu_export.schema_version,
+            CAPABILITIES_EXPORT_SCHEMA_VERSION
+        );
+        assert_eq!(cpu_export.platform, "cpu");
+        assert_eq!(cpu_export.backend, "candle");
+        assert_eq!(cpu_export.feature_set, FEATURE_SET_CANDLE_CPU);
+        assert_eq!(cpu_export.audio_backend.as_deref(), Some("candle"));
+
+        assert_eq!(
+            cuda_export.schema_version,
+            CAPABILITIES_EXPORT_SCHEMA_VERSION
+        );
+        assert_eq!(cuda_export.platform, "cuda");
+        assert_eq!(cuda_export.backend, "candle");
+        assert_eq!(cuda_export.feature_set, FEATURE_SET_CANDLE_CUDA);
+        assert_eq!(cuda_export.audio_backend.as_deref(), Some("candle"));
+
+        // Byte-for-byte determinism across repeated exports (and simulated pin-only change).
+        let cpu_bytes_1 = cpu_export.to_canonical_json_bytes().unwrap();
+        let cpu_bytes_2 = super::capabilities_export()
+            .unwrap()
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(cpu_bytes_1, cpu_bytes_2);
+        assert!(canonical_bytes_equal(&cpu_bytes_1, &cpu_bytes_2).unwrap());
+
+        let cuda_bytes_1 = cuda_export.to_canonical_json_bytes().unwrap();
+        let cuda_bytes_2 = super::cuda_descriptor_capabilities_export()
+            .unwrap()
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(cuda_bytes_1, cuda_bytes_2);
+        assert!(canonical_bytes_equal(&cuda_bytes_1, &cuda_bytes_2).unwrap());
+
+        let parsed_cuda = CapabilitiesExportV2::from_json_bytes(&cuda_bytes_1).unwrap();
+        assert!(semantic_equal(&cuda_export, &parsed_cuda));
+
+        // M8: zero git SHA / pin hash / timestamp / host path in canonical bytes.
+        let cuda_text = String::from_utf8(cuda_bytes_1).unwrap();
+        for forbidden in [
+            "\"git_sha\":",
+            "\"commit_sha\":",
+            "\"pin_hash\":",
+            "\"generated_at\":",
+            "\"built_at\":",
+            "\"timestamp\":",
+            "/Users/",
+            "/home/",
+        ] {
+            assert!(
+                !cuda_text.contains(forbidden),
+                "canonical export must not contain {forbidden}"
+            );
+        }
+
+        // 1-to-1 registry parity for media routes, audio routes, LLMs, trainers, captioners,
+        // transcribers, embedders, transforms, bespoke boundaries.
+        let cpu_snapshot = cpu_catalog.snapshot();
+        let cuda_snapshot = cuda_catalog.snapshot();
+        let expected_cpu_media_ids: std::collections::BTreeSet<String> =
+            cpu_snapshot.generator_ids.iter().cloned().collect();
+        let expected_cuda_media_ids: std::collections::BTreeSet<String> =
+            cuda_snapshot.generator_ids.iter().cloned().collect();
+        let exported_cpu_ids: std::collections::BTreeSet<String> =
+            cpu_export.routes.keys().cloned().collect();
+        let exported_cuda_ids: std::collections::BTreeSet<String> =
+            cuda_export.routes.keys().cloned().collect();
+        assert_eq!(exported_cpu_ids, expected_cpu_media_ids);
+        assert_eq!(exported_cuda_ids, expected_cuda_media_ids);
+        let cuda_only_media: std::collections::BTreeSet<String> = exported_cuda_ids
+            .difference(&exported_cpu_ids)
+            .cloned()
+            .collect();
+        assert_eq!(
+            cuda_only_media,
+            std::collections::BTreeSet::from(["starvector_8b".to_string()]),
+            "candle-starvector-8b is CUDA-only by design; no other media routes should diverge"
+        );
+
+        let expected_audio_ids: std::collections::BTreeSet<String> =
+            cpu_snapshot.audio_generator_ids.iter().cloned().collect();
+        assert_eq!(
+            cpu_export
+                .audio_routes
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_audio_ids
+        );
+        assert_eq!(
+            cuda_export
+                .audio_routes
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_audio_ids
+        );
+
+        // Distinguish text-LLM vs vector entrypoints, and CUDA vs CPU LLM sets.
+        assert_eq!(
+            cpu_export.llm_models.keys().cloned().collect::<Vec<_>>(),
+            vec!["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
+        assert_eq!(
+            cuda_export.llm_models.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
+        );
+        assert_eq!(
+            cpu_export.llm_models["candle-llama"].entrypoint_kind,
+            "text_llm"
+        );
+        assert_eq!(
+            cuda_export.llm_models["candle-starvector-8b"].entrypoint_kind,
+            "vector"
+        );
+
+        // CUDA-specific descriptor differences represented hardware-free:
+        assert_eq!(cuda_export.advanced_quant_tiers, vec!["nvfp4"]);
+        assert!(cuda_export.routes["flux3_klein"]
+            .quant
+            .supported_tiers
+            .contains(&"nvfp4".to_string()));
+        assert!(cuda_export.routes["flux3_klein"]
+            .quant
+            .supported_tiers
+            .contains(&"fp8r".to_string()));
+        assert!(cuda_export.routes["flux3_klein_base"]
+            .quant
+            .supported_tiers
+            .contains(&"nvfp4".to_string()));
+        assert!(
+            cuda_export.routes["krea_2_turbo"]
+                .memory
+                .has_memory_contract
+        );
+        assert!(
+            cuda_export.routes["wan2_2_ti2v_5b"]
+                .memory
+                .has_memory_contract
+        );
+        // Every CUDA-gated behavior-bearing route (all 20 routes across flux, flux2, krea, lens,
+        // mage, qwen-image, z-image plus bernini, ltx, minimax-h3, wan) must report
+        // `has_memory_behavior == true` in hosted `candle-cuda` export so it matches live
+        // `runtime-cuda`.
+        for route_id in [
+            "flux1_schnell",
+            "flux1_dev",
+            "flux2_dev",
+            "flux2_klein_9b",
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+            "krea_2_turbo_control",
+            "lens",
+            "lens_turbo",
+            "mage_flow",
+            "mage_flow_base",
+            "mage_flow_turbo",
+            "mage_flow_edit",
+            "mage_flow_edit_base",
+            "mage_flow_edit_turbo",
+            "qwen_image",
+            "z_image",
+            "z_image_turbo",
+            "bernini",
+            "bernini_renderer",
+            "ltx_2_3_distilled",
+            "ltx_2_5_distilled",
+            "minimax_h3",
+            "minimax_h3_image",
+            "wan2_2_ti2v_5b",
+            "wan2_2_t2v_14b",
+            "wan2_2_i2v_14b",
+        ] {
+            assert!(
+                cuda_export.routes[route_id].memory.has_memory_behavior,
+                "hosted candle-cuda export must report has_memory_behavior=true for `{route_id}`"
+            );
+        }
+        // Conditioned-only routes must not advertise false text_to_image / text_to_video modes.
+        for route_id in [
+            "krea_2_turbo_control",
+            "krea_2_edit",
+            "boogu_image_edit",
+            "mage_flow_edit",
+            "seedvr2",
+        ] {
+            assert!(
+                !cuda_export.routes[route_id]
+                    .modes
+                    .contains(&"text_to_image".to_string()),
+                "conditioned-only route `{route_id}` must not advertise text_to_image"
+            );
+            assert!(
+                !cuda_export.routes[route_id].modes.is_empty(),
+                "conditioned-only route `{route_id}` must still advertise its real modes"
+            );
+        }
+        for route_id in ["wan2_2_i2v_14b", "svd_xt", "scail2_14b", "seedvr2"] {
+            assert!(
+                !cuda_export.routes[route_id]
+                    .modes
+                    .contains(&"text_to_video".to_string()),
+                "conditioned-only route `{route_id}` must not advertise text_to_video"
+            );
+            assert!(
+                !cuda_export.routes[route_id].modes.is_empty(),
+                "conditioned-only route `{route_id}` must still advertise its real modes"
+            );
+        }
+        if !candle_gen_catalog::SURFACES_NVFP4_TIER {
+            assert!(cpu_export.advanced_quant_tiers.is_empty());
+            assert!(!cpu_export.routes["flux3_klein"]
+                .quant
+                .supported_tiers
+                .contains(&"nvfp4".to_string()));
+            assert!(!cpu_export.routes["krea_2_turbo"].memory.has_memory_contract);
+            assert!(!cpu_export.routes["krea_2_turbo"].memory.has_memory_behavior);
+        }
+
+        // Independent non-generator entrypoints populated cleanly.
+        assert_eq!(cpu_export.trainers.len(), cpu_snapshot.trainer_ids.len());
+        assert_eq!(
+            cpu_export.captioners.len(),
+            cpu_snapshot.captioner_ids.len()
+        );
+        assert_eq!(
+            cpu_export.transcribers.len(),
+            cpu_snapshot.audio_transcriber_ids.len()
+        );
+        assert_eq!(
+            cpu_export.embedders.image.len(),
+            cpu_snapshot.image_embedder_ids.len()
+        );
+        assert_eq!(
+            cpu_export.embedders.text.len(),
+            cpu_snapshot.text_embedder_ids.len()
+        );
+        assert_eq!(
+            cpu_export.embedders.voice.len(),
+            cpu_snapshot.audio_voice_embedder_ids.len()
+        );
+        assert_eq!(
+            cpu_export.embedders.audio.len(),
+            cpu_snapshot.audio_embedder_ids.len()
+        );
+        assert_eq!(
+            cpu_export.transforms.image.len(),
+            cpu_snapshot.transform_ids.len()
+        );
+        assert_eq!(
+            cpu_export.transforms.audio.len(),
+            cpu_snapshot.audio_transform_ids.len()
+        );
+        assert_eq!(cpu_export.bespoke_waivers.utility_crates.len(), 4);
+        assert!(cpu_export.bespoke_waivers.memory_route_waivers.is_empty());
+        assert_eq!(
+            cpu_export.bespoke_waivers.crate_api_providers,
+            vec!["sheetsage2"]
+        );
+
+        // PIPE-18 / B1 / E4: hosted candle-cuda export reconciles StarVector 1B/8B (`image_to_svg`),
+        // all 4 Candle Qwen edit aliases + control, and every shipping bespoke provider independently
+        // of registration, while preserving XL-4 TextLlmRegistry StarVector IDs.
+        runtime_catalog::reconcile::reconcile_callable_routes(&[&cuda_export], false)
+            .expect("candle-cuda export must pass callable-route reconciliation");
+        assert!(
+            cpu_export.routes.contains_key("starvector_1b")
+                && !cpu_export.routes.contains_key("starvector_8b"),
+            "candle-cpu registers starvector_1b only (8B stays CUDA-only)"
+        );
+        assert_eq!(cuda_export.routes["starvector_1b"].modality, "vector");
+        assert_eq!(
+            cuda_export.routes["starvector_1b"].modes,
+            vec!["image_to_svg".to_string()]
+        );
+        assert_eq!(cuda_export.routes["starvector_8b"].modality, "vector");
+        assert_eq!(
+            cuda_export.routes["starvector_8b"].modes,
+            vec!["image_to_svg".to_string()]
+        );
+        let mut without_starvector = cuda_export.clone();
+        without_starvector.routes.remove("starvector_1b");
+        without_starvector.routes.remove("starvector_8b");
+        let sv_err =
+            runtime_catalog::reconcile::reconcile_callable_routes(&[&without_starvector], false)
+                .expect_err("deleting StarVector bindings must fail reconciliation");
+        assert_eq!(
+            sv_err.missing_cells(),
+            vec![
+                "cuda/candle/starvector_1b/operation/image_to_svg",
+                "cuda/candle/starvector_8b/operation/image_to_svg",
+            ]
+        );
+        let mut without_kolors_ip = cuda_export.clone();
+        without_kolors_ip.routes.remove("kolors_ip_adapter");
+        let bespoke_err =
+            runtime_catalog::reconcile::reconcile_callable_routes(&[&without_kolors_ip], false)
+                .expect_err("removing shipping bespoke route must fail reconciliation");
+        assert_eq!(
+            bespoke_err.missing_cells(),
+            vec!["cuda/candle/kolors_ip_adapter/operation/image_to_image"]
+        );
+
+        // REG-3: linked engine verification passes on match and refuses with typed reasons on mismatch.
+        cpu_catalog
+            .verify_against_export(&cpu_export, &super::export_assembly_options())
+            .expect("cpu catalog verifies against candle-cpu export");
+        cuda_catalog
+            .verify_against_export(
+                &cuda_export,
+                &super::cuda_descriptor_export_assembly_options(),
+            )
+            .expect("cuda descriptor catalog verifies against candle-cuda export");
+        let err = verify_runtime_against_export(&cpu_export, &cuda_export)
+            .expect_err("candle-cpu runtime must refuse candle-cuda export with typed reasons");
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::PlatformMismatch));
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::LlmModelsMismatch));
     }
 }

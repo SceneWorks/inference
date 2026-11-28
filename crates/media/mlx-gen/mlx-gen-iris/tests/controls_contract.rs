@@ -397,8 +397,11 @@ fn adapters_load_through_the_catalog_and_report_provenance_body() {
     let g = load_with(vec![lora.clone(), lokr.clone()]).unwrap();
     let caps = &g.descriptor().capabilities;
     assert!(caps.supports_lora && caps.supports_lokr);
-    let adapted = images(g.as_ref(), &request());
-    let reports = g.adapter_apply_reports();
+    let gen_report = g.generate_with_report(&request(), &mut |_| {}).unwrap();
+    let reports = &gen_report.adapter_apply_reports;
+    let Some(GenerationOutput::Images(adapted)) = gen_report.output else {
+        panic!("expected image output");
+    };
     assert_eq!(
         reports
             .iter()
@@ -461,7 +464,12 @@ fn controls_the_route_does_not_have_are_refused_body() {
         (
             "timestep_to_start_cfg",
             GenerationRequest {
-                timestep_to_start_cfg: Some(2),
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    pulid: Some(mlx_gen::gen_core::PulidExtension {
+                        timestep_to_start_cfg: Some(2),
+                    }),
+                    ..Default::default()
+                },
                 ..request()
             },
         ),

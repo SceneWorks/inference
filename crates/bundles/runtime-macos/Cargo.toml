@@ -58,11 +58,19 @@ perf-bench = [
   "dep:sha2",
   "dep:tempfile",
 ]
+# Opt-in test fixtures and trainer probes for downstream integration tests (REG-5).
+# Never enabled in default/production builds.
+test-support = ["media", "mlx-gen-catalog?/test-support"]
 
 [[bin]]
 name = "mlx-perf-bench"
 path = "src/bin/mlx_perf_bench.rs"
 required-features = ["perf-bench"]
+
+[[bin]]
+name = "sga-capabilities-export-macos"
+path = "src/bin/sga_capabilities_export.rs"
+required-features = ["media", "audio"]
 
 [dev-dependencies]
 # The shared weights-free conformance suite (epic SC-22657): this bundle owns the registry-wide

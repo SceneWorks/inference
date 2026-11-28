@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    CancelFlag, Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadPhase, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+    CancelFlag, Conditioning, Error, FamilyExtensions, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadPhase, LoadSpec, OffloadPolicy, Progress, SvdExtension, WeightsSource,
 };
 use candle_gen::testkit::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water};
 
@@ -46,13 +46,19 @@ fn request(width: u32, height: u32, frames: u32, chunk: u32, steps: u32) -> Gene
         frames: Some(frames),
         steps: Some(steps),
         fps: Some(7),
-        conditioning_fps: Some(7),
-        decode_chunk_size: Some(chunk),
         seed: Some(42),
         conditioning: vec![Conditioning::Reference {
             image: source_image(width, height),
             strength: None,
         }],
+        extensions: FamilyExtensions {
+            svd: Some(SvdExtension {
+                conditioning_fps: Some(7),
+                decode_chunk_size: Some(chunk),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -171,7 +177,12 @@ fn run_profile(
         request.width,
         request.height,
         expected_frames,
-        request.decode_chunk_size.unwrap(),
+        request
+            .extensions
+            .svd
+            .as_ref()
+            .and_then(|s| s.decode_chunk_size)
+            .unwrap(),
         request.steps.unwrap(),
         fps,
         wall.as_secs_f64(),

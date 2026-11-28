@@ -1212,11 +1212,14 @@ fn run_oracle(cpu_only: bool) {
                 guidance: Some(4.0),
                 width: 48,
                 height: 32,
-                pag: Some(mlx_gen::gen_core::PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![0]),
+                features: mlx_gen::gen_core::FeatureParams {
+                    pag: Some(mlx_gen::gen_core::PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![0]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             })
             .unwrap(),
@@ -1252,11 +1255,14 @@ fn run_oracle(cpu_only: bool) {
                     guidance: Some(guidance),
                     width: 48,
                     height: 32,
-                    pag: Some(mlx_gen::gen_core::PagConfig {
-                        scale: 2.0,
-                        layers: Some(vec![0]),
+                    features: mlx_gen::gen_core::FeatureParams {
+                        pag: Some(mlx_gen::gen_core::PagConfig {
+                            scale: 2.0,
+                            layers: Some(vec![0]),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
+                    },
                     ..Default::default()
                 })
                 .unwrap(),

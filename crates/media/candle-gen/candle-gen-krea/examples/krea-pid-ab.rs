@@ -98,7 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height * 4
     );
     let pid_req = GenerationRequest {
-        use_pid: true,
+        features: candle_gen::gen_core::FeatureParams {
+            pid: Some(candle_gen::gen_core::PidParams::enabled()),
+            ..Default::default()
+        },
         ..base_req
     };
     let GenerationOutput::Images(mut imgs) = gen.generate(&pid_req, &mut on_progress)? else {

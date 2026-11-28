@@ -63,7 +63,7 @@ pub mod providers {
 /// Platform-owned crates consumed through provider-specific APIs rather than the registry
 /// `load(id, spec)` path (depth maps, face analysis, segmentation, the PiD latent decoder).
 /// Listed here so their platform membership is as explicit as a registered generator.
-pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "sam2", "sam3"];
+pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "pid", "sam2", "sam3"];
 
 /// Provider crates deliberately compiled but not yet composed into this platform registry.
 ///
@@ -101,6 +101,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_flux2::register_providers(registry);
     let registry = mlx_gen_flux3::register_providers(registry);
     let registry = mlx_gen_ideogram::register_providers(registry);
+    let registry = mlx_gen_instantid::register_providers(registry);
     let registry = mlx_gen_iris::register_providers(registry);
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
@@ -878,7 +879,7 @@ mod tests {
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "flux" | "boogu" | "chroma" | "z-image" | "pulid" => Some(&FLUX1_LATENT_SPACE),
                 "sd3" => Some(&SD3_LATENT_SPACE),
-                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "sdxl" | "kolors" | "instantid" => Some(&SDXL_LATENT_SPACE),
                 "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 // FLUX 3's packed 16× latent (its own autoencoder with BatchNorm-stat tokens)
                 // has no shared decoder consumer, so nothing is advertised (sc-26234).
@@ -973,11 +974,13 @@ mod tests {
             !svd.capabilities.supports_preview,
             "SVD temporal previews remain scoped to sc-16636"
         );
+        let instantid = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == "instantid")
+            .expect("InstantID is registered as a callable route in SW-6982");
         assert!(
-            descriptors
-                .iter()
-                .all(|descriptor| descriptor.id != "instantid"),
-            "InstantID is a struct-only composition API and must not gain invented registration"
+            !instantid.capabilities.supports_preview,
+            "InstantID does not advertise live latent previews"
         );
     }
 
@@ -1605,9 +1608,9 @@ mod tests {
             assert_eq!(fixtures.len(), 1, "{provider_id}");
             let fixture = &fixtures[0];
             assert!(!fixture.context.has_phases, "{provider_id}");
-            assert!(fixture.request.phases.is_none(), "{provider_id}");
+            assert!(fixture.request.features.phases.is_none(), "{provider_id}");
             assert!(!fixture.context.use_pid, "{provider_id}");
-            assert!(!fixture.request.use_pid, "{provider_id}");
+            assert!(!fixture.request.use_pid(), "{provider_id}");
             if provider_id == "flux1_dev_control" {
                 assert_eq!(fixture.context.mode, MemoryMode::ImageToImage);
                 assert_eq!(fixture.context.geometry.reference_count, 1);
@@ -1664,7 +1667,7 @@ mod tests {
             .map(|fixture| {
                 assert_eq!(fixture.context.overlay, None, "{provider_id}");
                 assert!(!fixture.context.has_phases, "{provider_id}");
-                assert!(fixture.request.phases.is_none(), "{provider_id}");
+                assert!(fixture.request.features.phases.is_none(), "{provider_id}");
                 assert!(!fixture.context.use_pid, "{provider_id}");
                 let shape = match (
                     &fixture.context.mode,
@@ -1758,15 +1761,16 @@ mod tests {
             .map(|fixture| {
                 assert_eq!(fixture.context.overlay, None, "{provider_id}");
                 assert_eq!(
-                    fixture.request.use_pid, fixture.context.use_pid,
+                    fixture.request.use_pid(),
+                    fixture.context.use_pid,
                     "{provider_id}"
                 );
                 assert_eq!(
-                    fixture.request.phases.is_some(),
+                    fixture.request.features.phases.is_some(),
                     fixture.context.has_phases,
                     "{provider_id}"
                 );
-                if let Some(phases) = &fixture.request.phases {
+                if let Some(phases) = &fixture.request.features.phases {
                     assert_eq!(phases.len(), 2, "{provider_id}");
                     assert!(phases.iter().all(|phase| phase.steps > 0), "{provider_id}");
                 }
@@ -1947,6 +1951,7 @@ mod tests {
                 "flux3_klein_base",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "instantid",
                 "iris_3b",
                 "kolors",
                 "krea_2_turbo",
@@ -2065,8 +2070,9 @@ mod tests {
         // sc-26323 adds both MOSS providers: 79 distinct ids / 69 complete rows.
         // sc-24213 adds `supra2_img` (its own complete row): 80 / 70.
         // SW-7090 adds `minimax_h3_image` (a generator with its own complete row): 81 / 71.
-        assert_eq!(distinct.len(), 81);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 71);
+        // SW-6982 adds `instantid` (a generator with its own component row): 82 / 72.
+        assert_eq!(distinct.len(), 82);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 72);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface
@@ -2177,5 +2183,103 @@ mod tests {
             .to_string();
         assert!(error.contains("Nvfp4"), "{error}");
         assert!(error.contains(super::NVFP4_UNSUPPORTED_REASON), "{error}");
+    }
+
+    /// SW-6979 (`REG-1`, `REG-2`, `AP5`): every registered generator in the MLX media catalog is
+    /// backed by a [`RouteRecord`], and both route-record and descriptor conformance sweeps pass.
+    #[test]
+    fn every_registered_generator_is_backed_by_a_conforming_route_record() {
+        let registry = super::provider_registry().unwrap();
+        let generators: Vec<&'static str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert!(
+            !generators.is_empty(),
+            "MLX catalog registered no generators"
+        );
+        for id in &generators {
+            assert!(
+                registry.route_record(id).is_some(),
+                "MLX generator `{id}` must register through a RouteRecord (REG-1)"
+            );
+        }
+        assert_eq!(
+            registry.route_conformance_errors(),
+            Vec::<String>::new(),
+            "MLX route-record conformance sweep failed"
+        );
+        assert_eq!(
+            registry.descriptor_conformance_errors(),
+            Vec::<String>::new(),
+            "MLX descriptor conformance sweep failed"
+        );
+    }
+
+    /// SW-6979 (`HOOK-4`, `AP5`): `krea_2_raw`'s render-plan compiler only compiles explicit
+    /// multi-phase requests (`req.phases.is_some()`), so its `RouteRecord` must declare
+    /// `RenderPlanScope::MultiphaseOnly`: `krea_multiphase` stays applicable while `hires_fix`
+    /// and `inert_phase_split` are refused with typed inapplicability codes.
+    #[test]
+    fn krea_2_raw_advertises_multiphase_only_feature_applicability() {
+        use mlx_gen::gen_core::{FeatureInapplicabilityCode, RenderPlanScope};
+
+        let registry = super::provider_registry().unwrap();
+        let raw_record = registry
+            .route_record("krea_2_raw")
+            .expect("krea_2_raw must be registered via RouteRecord");
+        assert_eq!(
+            raw_record.bindings.render_plan_scope,
+            RenderPlanScope::MultiphaseOnly
+        );
+
+        let raw_desc = registry
+            .generator_descriptor("krea_2_raw")
+            .expect("krea_2_raw descriptor");
+        let raw_features = registry.generator_feature_applicability(raw_desc);
+        assert!(
+            raw_features["krea_multiphase"].applicable,
+            "krea_2_raw must advertise krea_multiphase as applicable: {:?}",
+            raw_features["krea_multiphase"]
+        );
+        assert!(
+            !raw_features["hires_fix"].applicable,
+            "krea_2_raw must refuse hires_fix (compile_raw_render_plan rejects Reference with phases and returns Ok(None) without phases)"
+        );
+        assert!(
+            raw_features["hires_fix"]
+                .reasons
+                .iter()
+                .any(|r| r.code == FeatureInapplicabilityCode::MissingProducedReferenceSupport),
+            "expected MissingProducedReferenceSupport for krea_2_raw hires_fix, got {:?}",
+            raw_features["hires_fix"].reasons
+        );
+        assert!(
+            !raw_features["inert_phase_split"].applicable,
+            "krea_2_raw must refuse inert_phase_split"
+        );
+        assert!(
+            raw_features["inert_phase_split"]
+                .reasons
+                .iter()
+                .any(|r| r.code == FeatureInapplicabilityCode::MissingPackedImageTrajectory),
+            "expected MissingPackedImageTrajectory for krea_2_raw inert_phase_split, got {:?}",
+            raw_features["inert_phase_split"].reasons
+        );
+
+        let turbo_record = registry
+            .route_record("krea_2_turbo")
+            .expect("krea_2_turbo must be registered via RouteRecord");
+        assert_eq!(
+            turbo_record.bindings.render_plan_scope,
+            RenderPlanScope::SingleAndMultiPass
+        );
+        let turbo_desc = registry
+            .generator_descriptor("krea_2_turbo")
+            .expect("krea_2_turbo descriptor");
+        let turbo_features = registry.generator_feature_applicability(turbo_desc);
+        assert!(turbo_features["hires_fix"].applicable);
+        assert!(turbo_features["inert_phase_split"].applicable);
+        assert!(!turbo_features["krea_multiphase"].applicable);
     }
 }
