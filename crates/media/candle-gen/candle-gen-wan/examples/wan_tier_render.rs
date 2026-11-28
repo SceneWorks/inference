@@ -87,7 +87,20 @@ impl QuantizationArtifactCache for CountingCache {
     }
 }
 
+/// Run the render on a thread with a worker-sized stack: the Windows main thread's 1 MiB default
+/// overflows in the Wan load path, which production only ever reaches from worker threads.
 fn main() {
+    let stack_mib: usize = env_or("WAN_TIER_STACK_MIB", 16);
+    std::thread::Builder::new()
+        .name("wan-tier-render".into())
+        .stack_size(stack_mib << 20)
+        .spawn(run)
+        .expect("spawn render thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn run() {
     let tier_dir = PathBuf::from(env("WAN_TIER_DIR").expect("WAN_TIER_DIR"));
     let out = PathBuf::from(env("WAN_TIER_OUT").expect("WAN_TIER_OUT"));
     let tier = env("WAN_TIER").unwrap_or_else(|| "q4".into());
