@@ -1078,14 +1078,15 @@ mod tests {
             .join("\n");
         assert_eq!(
             stripped.matches("fn generate").count(),
-            10,
+            12,
             "control_provider.rs must expose exactly the three planned entry points, their four \
-             attempt-report wrappers, the two Generator trait wrappers, and the one scoped body \
-             this row reasons about"
+             attempt-report wrappers, the four Generator trait wrappers (ordinary + planned), and \
+             the one scoped body this row reasons about"
         );
         assert!(
             stripped.contains("preview: req.preview.clone(),")
-                && stripped.contains("self.model\n            .generate_with_execution_report("),
+                && stripped.contains("self.model\n            .generate_with_execution_report(")
+                && stripped.contains("fn generate_planned("),
             "Flux1DevControlGenerator must forward req.preview and delegate to self.model.generate_with_execution_report"
         );
         assert_eq!(

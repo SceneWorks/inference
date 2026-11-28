@@ -1,8 +1,11 @@
 //! Registered `Generator` wrappers for Candle Qwen-Image-Edit aliases and Qwen-Image Fun Control
 //! (`SW-6982`, `REG-6`, `B1`, `E4`).
 
+use std::sync::{Arc, Mutex};
+
 use candle_gen::gen_core::{
     self, Conditioning, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    MemoryGeometry, MemoryPhase, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
     ModelDescriptor, Progress, WeightsSource,
 };
 
@@ -78,12 +81,146 @@ fn build_edit_request(
     }
 }
 
+struct ActiveEditAdmission {
+    context: MemoryRunContext,
+    model: QwenEdit,
+}
+
+struct QwenEditMemoryScope {
+    inner: crate::memory_strategy::QwenMemoryScope,
+    active_admission: Arc<Mutex<Option<ActiveEditAdmission>>>,
+}
+
+impl QwenEditMemoryScope {
+    fn clear_admission(&self) {
+        *candle_gen::lock_recover(&self.active_admission) = None;
+    }
+}
+
+impl Drop for QwenEditMemoryScope {
+    fn drop(&mut self) {
+        self.clear_admission();
+    }
+}
+
+impl MemoryRequestScope for QwenEditMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.inner.configure_request(request)
+    }
+
+    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+        self.inner.enter_phase(phase)
+    }
+
+    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+        self.inner.leave_phase(phase)
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        geometry: MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.inner.configure_decode(tile_edge, overlap, geometry)
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.inner.configure_attention(chunk_size)
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.inner
+            .materialize_transformer_window(first_block, block_count)
+    }
+
+    fn finish(&mut self, outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.clear_admission();
+        self.inner.finish(outcome)
+    }
+}
+
 struct QwenEditGenerator {
     descriptor: ModelDescriptor,
+    paths: QwenEditPaths,
     loaded_spec: LoadSpec,
     model: QwenEdit,
     lightning: bool,
+    loaded_quant: Option<gen_core::Quant>,
     memory_contract: Option<gen_core::MemoryProviderContract>,
+    active_admission: Arc<Mutex<Option<ActiveEditAdmission>>>,
+}
+
+impl QwenEditGenerator {
+    fn generate_report_inner(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(request)?;
+        let references = extract_edit_references(request, self.descriptor.id)?;
+        let default_steps = if self.lightning {
+            LIGHTNING_DEFAULT_STEPS
+        } else {
+            crate::resolve_steps(None)
+        };
+        let default_guidance = if self.lightning {
+            LIGHTNING_DEFAULT_GUIDANCE
+        } else {
+            DEFAULT_GUIDANCE
+        };
+        let steps = request.steps.map(|s| s as usize).unwrap_or(default_steps);
+        let guidance = request
+            .true_cfg
+            .or(request.guidance)
+            .unwrap_or(default_guidance);
+        let base_seed = request.seed.unwrap_or(0);
+        let admitted_guard = candle_gen::lock_recover(&self.active_admission);
+        if let Some(admitted) = admitted_guard.as_ref() {
+            if request.count != 1 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: admitted memory context requires count=1 (got {})",
+                    self.descriptor.id, request.count
+                )));
+            }
+            let edit_req = build_edit_request(request, steps, guidance, base_seed, self.lightning);
+            return admitted.model.generate_with_memory_context_with_report(
+                &admitted.context,
+                &edit_req,
+                &references,
+                on_progress,
+            );
+        }
+        drop(admitted_guard);
+        let mut images = Vec::with_capacity(request.count as usize);
+        let mut pag = None;
+        for idx in 0..request.count {
+            let edit_req = build_edit_request(
+                request,
+                steps,
+                guidance,
+                base_seed.wrapping_add(idx as u64),
+                self.lightning,
+            );
+            let report = self
+                .model
+                .generate_with_report(&edit_req, &references, on_progress)?;
+            if pag.is_none() {
+                pag = report.pag;
+            }
+            if let Some(GenerationOutput::Images(mut imgs)) = report.output {
+                images.append(&mut imgs);
+            }
+        }
+        Ok(gen_core::GenerationReport {
+            pag,
+            ..gen_core::GenerationReport::from_output(GenerationOutput::Images(images))
+        })
+    }
 }
 
 impl Generator for QwenEditGenerator {
@@ -93,6 +230,63 @@ impl Generator for QwenEditGenerator {
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return MemorySafetyDecision::Accept;
+        };
+        let validated = crate::edit::validate_memory_load_spec(&self.loaded_spec)
+            .and_then(|()| {
+                let recipe = crate::edit::validate_memory_artifact_recipe(&self.loaded_spec)?;
+                crate::edit::validate_memory_recipe_context(recipe, context)?;
+                Ok(())
+            })
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))
+            .and_then(|()| {
+                crate::memory_strategy::validate_edit_context(
+                    contract,
+                    context,
+                    self.loaded_quant,
+                    !self.loaded_spec.adapters.is_empty(),
+                )
+            });
+        MemorySafetyDecision::from_validation(validated)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        let mut slot = candle_gen::lock_recover(&self.active_admission);
+        if slot.is_some() {
+            return Err(gen_core::Error::Msg(format!(
+                "{}: an admitted memory request scope is already active on this generator",
+                self.descriptor.id
+            )));
+        }
+        let admitted_model =
+            QwenEdit::load_with_memory_context(&self.paths, &self.loaded_spec, context)
+                .map_err(gen_core::Error::from)?;
+        let device = admitted_model.device().clone();
+        *slot = Some(ActiveEditAdmission {
+            context: context.clone(),
+            model: admitted_model,
+        });
+        drop(slot);
+        let inner = crate::memory_strategy::QwenMemoryScope::new(
+            self.descriptor.id,
+            device,
+            contract,
+            context,
+        );
+        Ok(Some(Box::new(QwenEditMemoryScope {
+            inner,
+            active_admission: Arc::clone(&self.active_admission),
+        })))
     }
 
     fn generate_with_execution_report(
@@ -117,8 +311,7 @@ impl Generator for QwenEditGenerator {
         plan.check_request(&self.descriptor, req)?;
         plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let _run = gen_core::RenderRun::new(plan, &req.cancel, scope);
-        self.generate(req, on_progress)
-            .map(gen_core::GenerationReport::from_output)
+        self.generate_report_inner(req, on_progress)
     }
 
     fn generate_planned_with_execution_report(
@@ -161,40 +354,10 @@ impl Generator for QwenEditGenerator {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(request)?;
-        let references = extract_edit_references(request, self.descriptor.id)?;
-        let default_steps = if self.lightning {
-            LIGHTNING_DEFAULT_STEPS
-        } else {
-            crate::resolve_steps(None)
-        };
-        let default_guidance = if self.lightning {
-            LIGHTNING_DEFAULT_GUIDANCE
-        } else {
-            DEFAULT_GUIDANCE
-        };
-        let steps = request.steps.map(|s| s as usize).unwrap_or(default_steps);
-        let guidance = request
-            .true_cfg
-            .or(request.guidance)
-            .unwrap_or(default_guidance);
-        let base_seed = request.seed.unwrap_or(0);
-        let mut images = Vec::with_capacity(request.count as usize);
-        for idx in 0..request.count {
-            let edit_req = build_edit_request(
-                request,
-                steps,
-                guidance,
-                base_seed.wrapping_add(idx as u64),
-                self.lightning,
-            );
-            images.push(
-                self.model
-                    .generate(&edit_req, &references, on_progress)
-                    .map_err(gen_core::Error::from)?,
-            );
-        }
-        Ok(GenerationOutput::Images(images))
+        let report = self.generate_report_inner(request, on_progress)?;
+        report.output.ok_or_else(|| {
+            gen_core::Error::Msg(format!("{}: produced no output", self.descriptor.id))
+        })
     }
 }
 
@@ -232,13 +395,19 @@ fn load_edit_with(
         offload_policy: spec.offload_policy,
     };
     let memory_contract = crate::memory_strategy::provider_contract("qwen_image_edit", spec).ok();
+    let loaded_quant = crate::memory_strategy::snapshot_quant_tier(spec, "qwen_image_edit")
+        .ok()
+        .flatten();
     let model = QwenEdit::load_with_spec(&paths, spec).map_err(gen_core::Error::from)?;
     Ok(Box::new(QwenEditGenerator {
         descriptor,
+        paths,
         loaded_spec: spec.clone(),
         model,
         lightning,
+        loaded_quant,
         memory_contract,
+        active_admission: Arc::new(Mutex::new(None)),
     }))
 }
 
@@ -553,7 +722,7 @@ mod tests {
             let desc = registry
                 .generator_descriptor(route_id)
                 .expect("descriptor registered");
-            plan.check_request(&desc, &edit_req)
+            plan.check_request(desc, &edit_req)
                 .unwrap_or_else(|e| panic!("{route_id} plan check_request failed: {e}"));
             plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
                 .unwrap_or_else(|e| panic!("{route_id} plan check_load failed: {e}"));
@@ -585,10 +754,147 @@ mod tests {
             .generator_descriptor("qwen_image_control")
             .expect("control descriptor registered");
         control_plan
-            .check_request(&control_desc, &control_req)
+            .check_request(control_desc, &control_req)
             .expect("control plan check_request succeeds");
         control_plan
             .check_load(&gen_core::RenderLoadBinding::from_spec(&control_spec))
             .expect("control plan check_load succeeds");
+    }
+
+    #[test]
+    fn registry_loaded_qwen_edit_executes_staged_residency_admission_lifecycle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp
+            .path()
+            .join(crate::edit::EDIT_2511_REPO_DIR)
+            .join("snapshots")
+            .join(crate::edit::EDIT_2511_REVISION)
+            .join("bf16");
+        std::fs::create_dir_all(&base).expect("create snapshot base");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .expect("write multimodal encoder fixture");
+
+        let spec = LoadSpec::new(WeightsSource::Dir(base))
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization)
+            .with_resolved_route(crate::edit::EDIT_2511_BASE_ROUTE);
+        let registry = crate::provider_registry().expect("qwen registry builds");
+        let generator = registry
+            .load("qwen_image_edit_2511", &spec)
+            .expect("registry loads qwen_image_edit_2511 trait object");
+        let contract = generator
+            .memory_strategy_contract()
+            .expect("resolved snapshot publishes edit memory strategy contract")
+            .clone();
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::StagedResidency,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::Edit,
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("build staged-residency edit memory context");
+
+        assert_eq!(
+            generator.memory_strategy_safety_check(&context),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("begin_memory_strategy_request succeeds")
+            .expect("staged-residency edit contract opens a request scope");
+
+        let ref_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        let mut req = GenerationRequest {
+            prompt: "relight portrait".into(),
+            width: context.geometry.width,
+            height: context.geometry.height,
+            count: context.geometry.batch,
+            conditioning: vec![Conditioning::Reference {
+                image: ref_img,
+                strength: None,
+            }],
+            cancel,
+            ..Default::default()
+        };
+        scope
+            .configure_request(&mut req)
+            .expect("scope configures staged-residency request");
+        let staged_memory = req
+            .memory
+            .expect("scope attaches staged-residency GenerationMemory");
+        assert!(staged_memory.stage_residency);
+
+        // Both direct generate() and generate_planned() execute through the admitted
+        // QwenEdit::generate_with_memory_context_with_report path, passing memory-authority
+        // validation and hitting the early cancel fence inside generate_inner.
+        let direct_err = generator
+            .generate(&req, &mut |_| {})
+            .expect_err("pre-cancelled request should stop at generate_inner cancel fence");
+        assert!(
+            matches!(direct_err, gen_core::Error::Canceled),
+            "expected Canceled after passing admitted memory authority, got: {direct_err}"
+        );
+
+        let plan = registry
+            .compile_render_plan("qwen_image_edit_2511", &spec, &req)
+            .expect("plan compiles")
+            .expect("plan returned");
+        let planned_err = generator
+            .generate_planned(&req, &plan, Some(&mut *scope), &mut |_| {})
+            .expect_err("pre-cancelled planned request should stop at generate_inner cancel fence");
+        assert!(
+            matches!(planned_err, gen_core::Error::Canceled),
+            "expected Canceled from planned admitted path, got: {planned_err}"
+        );
+
+        // Tampering with memory controls inside an active scope is still rejected by
+        // QwenEdit's concrete validate_memory_request check.
+        req.memory = None;
+        let drifted_err = generator
+            .generate(&req, &mut |_| {})
+            .expect_err("memory control drift inside active scope must fail closed");
+        assert!(
+            drifted_err
+                .to_string()
+                .contains("request memory controls changed after admission"),
+            "unexpected drift error: {drifted_err}"
+        );
+
+        // Finishing the scope releases the admitted context; constrained memory without a
+        // scope is once again rejected by validate_memory_authority.
+        scope
+            .finish(gen_core::MemoryRunOutcome::Canceled)
+            .expect("finish scope succeeds");
+        drop(scope);
+        req.memory = Some(staged_memory);
+        let unadmitted_err = generator
+            .generate(&req, &mut |_| {})
+            .expect_err("constrained memory outside a scope must be rejected");
+        assert!(
+            unadmitted_err
+                .to_string()
+                .contains("constrained memory requires an exact admitted context"),
+            "unexpected unadmitted error: {unadmitted_err}"
+        );
     }
 }

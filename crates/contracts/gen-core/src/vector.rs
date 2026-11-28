@@ -2401,8 +2401,19 @@ pub fn render_svg_preview(canonical: &CanonicalSvg, max_dimension: u32) -> Resul
             scale_y: f64::from(out_h) / viewbox[3].max(1e-6),
             pixels: &mut pixels,
         };
+        let mut stylesheet = Vec::new();
+        collect_stylesheets(root, &mut stylesheet);
         let default_style = PaintStyle::default();
-        rasterize_node(root, default_style, Transform2D::identity(), &mut canvas);
+        let mut ancestors = Vec::new();
+        rasterize_node(
+            root,
+            &mut ancestors,
+            &[],
+            &stylesheet,
+            default_style,
+            Transform2D::identity(),
+            &mut canvas,
+        );
     }
 
     Ok(Image {
@@ -2416,6 +2427,8 @@ pub fn render_svg_preview(canonical: &CanonicalSvg, max_dimension: u32) -> Resul
 struct PaintStyle {
     fill: Option<[u8; 3]>,
     stroke: Option<[u8; 3]>,
+    display_none: bool,
+    visible: bool,
 }
 
 impl Default for PaintStyle {
@@ -2423,6 +2436,8 @@ impl Default for PaintStyle {
         Self {
             fill: Some([0, 0, 0]),
             stroke: None,
+            display_none: false,
+            visible: true,
         }
     }
 }
@@ -2562,9 +2577,353 @@ fn parse_color(raw: &str) -> Option<Option<[u8; 3]>> {
     Some(Some(named))
 }
 
-fn resolve_style(attrs: &[(String, String)], inherited: PaintStyle) -> PaintStyle {
-    let mut style = inherited;
-    let mut apply = |key: &str, value: &str| match key {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CssCombinator {
+    Descendant,
+    Child,
+    AdjacentSibling,
+    GeneralSibling,
+}
+
+#[derive(Clone, Debug)]
+struct CssCompoundSelector {
+    tag: Option<String>,
+    ids: Vec<String>,
+    classes: Vec<String>,
+}
+
+impl CssCompoundSelector {
+    fn matches(&self, node: &SvgNode) -> bool {
+        if let Some(tag) = &self.tag {
+            if node.name != *tag {
+                return false;
+            }
+        }
+        if !self.ids.is_empty() {
+            let node_id = node
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "id")
+                .map(|(_, v)| v.trim());
+            if !self.ids.iter().all(|id| node_id == Some(id.as_str())) {
+                return false;
+            }
+        }
+        if !self.classes.is_empty() {
+            let node_classes = node
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "class")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            if !self
+                .classes
+                .iter()
+                .all(|cls| node_classes.split_ascii_whitespace().any(|c| c == cls))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CssSelector {
+    /// Compound selectors from left to right.
+    compounds: Vec<CssCompoundSelector>,
+    /// Combinators between `compounds[i]` and `compounds[i + 1]` (`len == compounds.len() - 1`).
+    combinators: Vec<CssCombinator>,
+    specificity: (usize, usize, usize),
+}
+
+#[derive(Clone, Debug)]
+struct CssDeclaration {
+    property: String,
+    value: String,
+    important: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CssRule {
+    selector: CssSelector,
+    order: usize,
+    declarations: Vec<CssDeclaration>,
+}
+
+fn parse_compound_selector(raw: &str) -> Option<(CssCompoundSelector, (usize, usize, usize))> {
+    if raw.is_empty() || raw.contains(':') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let mut tag = None;
+    let mut ids = Vec::new();
+    let mut classes = Vec::new();
+    let mut tag_spec = 0usize;
+
+    if bytes[0] == b'*' {
+        i = 1;
+    } else if bytes[0] != b'.' && bytes[0] != b'#' {
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+            i += 1;
+        }
+        let name = &raw[start..i];
+        if name.is_empty() {
+            return None;
+        }
+        tag = Some(name.to_owned());
+        tag_spec = 1;
+    }
+
+    while i < bytes.len() {
+        let marker = bytes[i];
+        if marker != b'.' && marker != b'#' {
+            return None;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+            i += 1;
+        }
+        let ident = &raw[start..i];
+        if ident.is_empty() {
+            return None;
+        }
+        if marker == b'#' {
+            ids.push(ident.to_owned());
+        } else {
+            classes.push(ident.to_owned());
+        }
+    }
+
+    let spec = (ids.len(), classes.len(), tag_spec);
+    Some((CssCompoundSelector { tag, ids, classes }, spec))
+}
+
+fn parse_css_selector(raw: &str) -> Option<CssSelector> {
+    let mut compounds = Vec::new();
+    let mut combinators = Vec::new();
+    let mut spec = (0usize, 0usize, 0usize);
+    let mut chars = raw.trim().char_indices().peekable();
+    let mut pending_combinator: Option<CssCombinator> = None;
+
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_ascii_whitespace() {
+            chars.next();
+            if !compounds.is_empty() && pending_combinator.is_none() {
+                pending_combinator = Some(CssCombinator::Descendant);
+            }
+            continue;
+        }
+        if matches!(ch, '>' | '+' | '~') {
+            if compounds.is_empty() {
+                return None;
+            }
+            chars.next();
+            pending_combinator = Some(match ch {
+                '>' => CssCombinator::Child,
+                '+' => CssCombinator::AdjacentSibling,
+                _ => CssCombinator::GeneralSibling,
+            });
+            continue;
+        }
+        let mut end = start;
+        while let Some(&(idx, c)) = chars.peek() {
+            if c.is_ascii_whitespace() || matches!(c, '>' | '+' | '~') {
+                break;
+            }
+            end = idx + c.len_utf8();
+            chars.next();
+        }
+        let token = &raw.trim()[start..end];
+        let (compound, (ids, classes, tags)) = parse_compound_selector(token)?;
+        if !compounds.is_empty() {
+            combinators.push(pending_combinator.take()?);
+        }
+        compounds.push(compound);
+        spec.0 += ids;
+        spec.1 += classes;
+        spec.2 += tags;
+    }
+
+    if compounds.is_empty() || pending_combinator.is_some() {
+        return None;
+    }
+    Some(CssSelector {
+        compounds,
+        combinators,
+        specificity: spec,
+    })
+}
+
+fn match_selector_at(
+    selector: &CssSelector,
+    idx: usize,
+    node: &SvgNode,
+    ancestors: &[&SvgNode],
+    prev_siblings: &[&SvgNode],
+) -> bool {
+    if !selector.compounds[idx].matches(node) {
+        return false;
+    }
+    if idx == 0 {
+        return true;
+    }
+    match selector.combinators[idx - 1] {
+        CssCombinator::Child => {
+            let Some((&parent, rest_ancestors)) = ancestors.split_last() else {
+                return false;
+            };
+            let parent_prev = parent_prev_siblings(parent, rest_ancestors);
+            match_selector_at(selector, idx - 1, parent, rest_ancestors, &parent_prev)
+        }
+        CssCombinator::Descendant => {
+            for pos in (0..ancestors.len()).rev() {
+                let candidate = ancestors[pos];
+                let rest_ancestors = &ancestors[..pos];
+                let candidate_prev = parent_prev_siblings(candidate, rest_ancestors);
+                if match_selector_at(
+                    selector,
+                    idx - 1,
+                    candidate,
+                    rest_ancestors,
+                    &candidate_prev,
+                ) {
+                    return true;
+                }
+            }
+            false
+        }
+        CssCombinator::AdjacentSibling => {
+            let Some((&prev, earlier)) = prev_siblings.split_last() else {
+                return false;
+            };
+            match_selector_at(selector, idx - 1, prev, ancestors, earlier)
+        }
+        CssCombinator::GeneralSibling => {
+            for pos in (0..prev_siblings.len()).rev() {
+                if match_selector_at(
+                    selector,
+                    idx - 1,
+                    prev_siblings[pos],
+                    ancestors,
+                    &prev_siblings[..pos],
+                ) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn parent_prev_siblings<'a>(node: &'a SvgNode, ancestors: &[&'a SvgNode]) -> Vec<&'a SvgNode> {
+    let Some(&parent) = ancestors.last() else {
+        return Vec::new();
+    };
+    let mut siblings = Vec::new();
+    for child in &parent.children {
+        if let SvgChild::Element(el) = child {
+            if std::ptr::eq(el, node) {
+                break;
+            }
+            siblings.push(el);
+        }
+    }
+    siblings
+}
+
+impl CssSelector {
+    fn matches(&self, node: &SvgNode, ancestors: &[&SvgNode], prev_siblings: &[&SvgNode]) -> bool {
+        match_selector_at(
+            self,
+            self.compounds.len() - 1,
+            node,
+            ancestors,
+            prev_siblings,
+        )
+    }
+}
+
+fn parse_css_declarations(raw: &str) -> Vec<CssDeclaration> {
+    let mut out = Vec::new();
+    for decl in raw.split(';') {
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
+        let prop = prop.trim().to_ascii_lowercase();
+        if prop.is_empty() {
+            continue;
+        }
+        let trimmed = val.trim();
+        let (value, important) = if let Some(prefix) = trimmed
+            .rsplit_once('!')
+            .filter(|(_, flag)| flag.trim().eq_ignore_ascii_case("important"))
+            .map(|(head, _)| head.trim())
+        {
+            (prefix.to_owned(), true)
+        } else {
+            (trimmed.to_owned(), false)
+        };
+        if !value.is_empty() {
+            out.push(CssDeclaration {
+                property: prop,
+                value,
+                important,
+            });
+        }
+    }
+    out
+}
+
+fn parse_stylesheet_rules(css: &str, rules: &mut Vec<CssRule>) {
+    let mut rest = css.trim();
+    while !rest.is_empty() {
+        let Some(open) = rest.find('{') else {
+            break;
+        };
+        let selector_list = rest[..open].trim();
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        let declarations = parse_css_declarations(&after_open[..close]);
+        if !declarations.is_empty() {
+            for sel in selector_list.split(',') {
+                if let Some(selector) = parse_css_selector(sel) {
+                    let order = rules.len();
+                    rules.push(CssRule {
+                        selector,
+                        order,
+                        declarations: declarations.clone(),
+                    });
+                }
+            }
+        }
+        rest = after_open[close + 1..].trim();
+    }
+}
+
+fn collect_stylesheets(node: &SvgNode, rules: &mut Vec<CssRule>) {
+    if node.name == "style" {
+        for child in &node.children {
+            if let SvgChild::Text(css) = child {
+                parse_stylesheet_rules(css, rules);
+            }
+        }
+        return;
+    }
+    for child in &node.children {
+        if let SvgChild::Element(el) = child {
+            collect_stylesheets(el, rules);
+        }
+    }
+}
+
+fn apply_style_declaration(style: &mut PaintStyle, key: &str, value: &str) {
+    match key {
         "fill" => {
             if let Some(c) = parse_color(value) {
                 style.fill = c;
@@ -2575,19 +2934,82 @@ fn resolve_style(attrs: &[(String, String)], inherited: PaintStyle) -> PaintStyl
                 style.stroke = c;
             }
         }
-        _ => {}
-    };
-    for (k, v) in attrs {
-        if k == "style" {
-            for decl in v.split(';') {
-                if let Some((prop, val)) = decl.split_once(':') {
-                    apply(prop.trim(), val.trim());
-                }
+        "display" => {
+            style.display_none = value.trim().eq_ignore_ascii_case("none");
+        }
+        "visibility" => {
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("hidden") || trimmed.eq_ignore_ascii_case("collapse") {
+                style.visible = false;
+            } else if trimmed.eq_ignore_ascii_case("visible") {
+                style.visible = true;
             }
-        } else {
-            apply(k.as_str(), v.as_str());
+        }
+        _ => {}
+    }
+}
+
+fn resolve_style(
+    node: &SvgNode,
+    ancestors: &[&SvgNode],
+    prev_siblings: &[&SvgNode],
+    stylesheet: &[CssRule],
+    inherited: PaintStyle,
+) -> PaintStyle {
+    let mut style = PaintStyle {
+        display_none: false,
+        ..inherited
+    };
+
+    // 1. Presentation attributes (lowest author precedence).
+    for (k, v) in &node.attrs {
+        if k != "style" {
+            apply_style_declaration(&mut style, &k.to_ascii_lowercase(), v);
         }
     }
+
+    // 2. Collect matching stylesheet rules sorted by (specificity, source order).
+    let mut matching: Vec<&CssRule> = stylesheet
+        .iter()
+        .filter(|rule| rule.selector.matches(node, ancestors, prev_siblings))
+        .collect();
+    matching.sort_by_key(|rule| (rule.selector.specificity, rule.order));
+
+    for rule in &matching {
+        for decl in &rule.declarations {
+            if !decl.important {
+                apply_style_declaration(&mut style, &decl.property, &decl.value);
+            }
+        }
+    }
+
+    // 3. Inline style declarations (non-important).
+    let inline_decls: Vec<CssDeclaration> = node
+        .attrs
+        .iter()
+        .filter(|(k, _)| k == "style")
+        .flat_map(|(_, v)| parse_css_declarations(v))
+        .collect();
+    for decl in &inline_decls {
+        if !decl.important {
+            apply_style_declaration(&mut style, &decl.property, &decl.value);
+        }
+    }
+
+    // 4. Important stylesheet declarations, then important inline declarations.
+    for rule in &matching {
+        for decl in &rule.declarations {
+            if decl.important {
+                apply_style_declaration(&mut style, &decl.property, &decl.value);
+            }
+        }
+    }
+    for decl in &inline_decls {
+        if decl.important {
+            apply_style_declaration(&mut style, &decl.property, &decl.value);
+        }
+    }
+
     style
 }
 
@@ -3028,134 +3450,115 @@ fn parse_transform_attr(raw: &str) -> Transform2D {
     xform
 }
 
-fn rasterize_node(
-    node: &SvgNode,
+fn rasterize_node<'a>(
+    node: &'a SvgNode,
+    ancestors: &mut Vec<&'a SvgNode>,
+    prev_siblings: &[&'a SvgNode],
+    stylesheet: &[CssRule],
     inherited: PaintStyle,
     inherited_xform: Transform2D,
     canvas: &mut PreviewCanvas<'_>,
 ) {
-    if matches!(node.name.as_str(), "defs" | "clipPath" | "filter" | "style") {
+    if matches!(
+        node.name.as_str(),
+        "defs" | "clipPath" | "filter" | "style" | "title" | "desc" | "metadata" | "symbol"
+    ) {
         return;
     }
-    if node
-        .attrs
-        .iter()
-        .any(|(k, v)| k == "display" && v.trim() == "none")
-    {
+    let style = resolve_style(node, ancestors, prev_siblings, stylesheet, inherited);
+    if style.display_none {
         return;
     }
-    let style = resolve_style(&node.attrs, inherited);
     let xform = node
         .attrs
         .iter()
         .find(|(k, _)| k == "transform")
         .map(|(_, v)| inherited_xform.then(parse_transform_attr(v)))
         .unwrap_or(inherited_xform);
-    match node.name.as_str() {
-        "rect" => {
-            let x = attr_f64(&node.attrs, "x", 0.0);
-            let y = attr_f64(&node.attrs, "y", 0.0);
-            let w = attr_f64(&node.attrs, "width", 0.0);
-            let h = attr_f64(&node.attrs, "height", 0.0);
-            if w > 0.0 && h > 0.0 {
-                let pts = [
-                    xform.apply((x, y)),
-                    xform.apply((x + w, y)),
-                    xform.apply((x + w, y + h)),
-                    xform.apply((x, y + h)),
-                ];
-                if let Some(fill) = style.fill {
-                    canvas.fill_polygon(&pts, fill);
-                }
-                if let Some(stroke) = style.stroke {
-                    for i in 0..4 {
-                        let (x0, y0) = pts[i];
-                        let (x1, y1) = pts[(i + 1) % 4];
-                        canvas.draw_line(x0, y0, x1, y1, stroke);
-                    }
-                }
-            }
-        }
-        "circle" | "ellipse" => {
-            let cx = attr_f64(&node.attrs, "cx", 0.0);
-            let cy = attr_f64(&node.attrs, "cy", 0.0);
-            let (rx, ry) = if node.name == "circle" {
-                let r = attr_f64(&node.attrs, "r", 0.0);
-                (r, r)
-            } else {
-                (
-                    attr_f64(&node.attrs, "rx", 0.0),
-                    attr_f64(&node.attrs, "ry", 0.0),
-                )
-            };
-            if rx > 0.0 && ry > 0.0 {
-                let segments = 32usize;
-                let pts: Vec<(f64, f64)> = (0..segments)
-                    .map(|i| {
-                        let a = std::f64::consts::TAU * (i as f64) / (segments as f64);
-                        xform.apply((cx + rx * a.cos(), cy + ry * a.sin()))
-                    })
-                    .collect();
-                if let Some(fill) = style.fill {
-                    canvas.fill_polygon(&pts, fill);
-                }
-                if let Some(stroke) = style.stroke {
-                    for i in 0..pts.len() {
-                        let (x0, y0) = pts[i];
-                        let (x1, y1) = pts[(i + 1) % pts.len()];
-                        canvas.draw_line(x0, y0, x1, y1, stroke);
-                    }
-                }
-            }
-        }
-        "line" => {
-            if let Some(stroke) = style.stroke.or(style.fill) {
-                let (x1, y1) = xform.apply((
-                    attr_f64(&node.attrs, "x1", 0.0),
-                    attr_f64(&node.attrs, "y1", 0.0),
-                ));
-                let (x2, y2) = xform.apply((
-                    attr_f64(&node.attrs, "x2", 0.0),
-                    attr_f64(&node.attrs, "y2", 0.0),
-                ));
-                canvas.draw_line(x1, y1, x2, y2, stroke);
-            }
-        }
-        "polygon" | "polyline" => {
-            if let Some((_, raw)) = node.attrs.iter().find(|(k, _)| k == "points") {
-                let pts: Vec<(f64, f64)> = parse_points(raw)
-                    .into_iter()
-                    .map(|pt| xform.apply(pt))
-                    .collect();
-                if node.name == "polygon" {
-                    if let Some(fill) = style.fill {
-                        canvas.fill_polygon(&pts, fill);
-                    }
-                }
-                if let Some(stroke) = style.stroke {
-                    let count = if node.name == "polygon" {
-                        pts.len()
-                    } else {
-                        pts.len().saturating_sub(1)
-                    };
-                    for i in 0..count {
-                        let (x0, y0) = pts[i];
-                        let (x1, y1) = pts[(i + 1) % pts.len()];
-                        canvas.draw_line(x0, y0, x1, y1, stroke);
-                    }
-                }
-            }
-        }
-        "path" => {
-            if let Some((_, d)) = node.attrs.iter().find(|(k, _)| k == "d") {
-                for (raw_pts, closed) in parse_path_subpaths(d) {
-                    let pts: Vec<(f64, f64)> =
-                        raw_pts.into_iter().map(|pt| xform.apply(pt)).collect();
+    if style.visible {
+        match node.name.as_str() {
+            "rect" => {
+                let x = attr_f64(&node.attrs, "x", 0.0);
+                let y = attr_f64(&node.attrs, "y", 0.0);
+                let w = attr_f64(&node.attrs, "width", 0.0);
+                let h = attr_f64(&node.attrs, "height", 0.0);
+                if w > 0.0 && h > 0.0 {
+                    let pts = [
+                        xform.apply((x, y)),
+                        xform.apply((x + w, y)),
+                        xform.apply((x + w, y + h)),
+                        xform.apply((x, y + h)),
+                    ];
                     if let Some(fill) = style.fill {
                         canvas.fill_polygon(&pts, fill);
                     }
                     if let Some(stroke) = style.stroke {
-                        let count = if closed {
+                        for i in 0..4 {
+                            let (x0, y0) = pts[i];
+                            let (x1, y1) = pts[(i + 1) % 4];
+                            canvas.draw_line(x0, y0, x1, y1, stroke);
+                        }
+                    }
+                }
+            }
+            "circle" | "ellipse" => {
+                let cx = attr_f64(&node.attrs, "cx", 0.0);
+                let cy = attr_f64(&node.attrs, "cy", 0.0);
+                let (rx, ry) = if node.name == "circle" {
+                    let r = attr_f64(&node.attrs, "r", 0.0);
+                    (r, r)
+                } else {
+                    (
+                        attr_f64(&node.attrs, "rx", 0.0),
+                        attr_f64(&node.attrs, "ry", 0.0),
+                    )
+                };
+                if rx > 0.0 && ry > 0.0 {
+                    let segments = 32usize;
+                    let pts: Vec<(f64, f64)> = (0..segments)
+                        .map(|i| {
+                            let a = std::f64::consts::TAU * (i as f64) / (segments as f64);
+                            xform.apply((cx + rx * a.cos(), cy + ry * a.sin()))
+                        })
+                        .collect();
+                    if let Some(fill) = style.fill {
+                        canvas.fill_polygon(&pts, fill);
+                    }
+                    if let Some(stroke) = style.stroke {
+                        for i in 0..pts.len() {
+                            let (x0, y0) = pts[i];
+                            let (x1, y1) = pts[(i + 1) % pts.len()];
+                            canvas.draw_line(x0, y0, x1, y1, stroke);
+                        }
+                    }
+                }
+            }
+            "line" => {
+                if let Some(stroke) = style.stroke.or(style.fill) {
+                    let (x1, y1) = xform.apply((
+                        attr_f64(&node.attrs, "x1", 0.0),
+                        attr_f64(&node.attrs, "y1", 0.0),
+                    ));
+                    let (x2, y2) = xform.apply((
+                        attr_f64(&node.attrs, "x2", 0.0),
+                        attr_f64(&node.attrs, "y2", 0.0),
+                    ));
+                    canvas.draw_line(x1, y1, x2, y2, stroke);
+                }
+            }
+            "polygon" | "polyline" => {
+                if let Some((_, raw)) = node.attrs.iter().find(|(k, _)| k == "points") {
+                    let pts: Vec<(f64, f64)> = parse_points(raw)
+                        .into_iter()
+                        .map(|pt| xform.apply(pt))
+                        .collect();
+                    if node.name == "polygon" {
+                        if let Some(fill) = style.fill {
+                            canvas.fill_polygon(&pts, fill);
+                        }
+                    }
+                    if let Some(stroke) = style.stroke {
+                        let count = if node.name == "polygon" {
                             pts.len()
                         } else {
                             pts.len().saturating_sub(1)
@@ -3168,14 +3571,49 @@ fn rasterize_node(
                     }
                 }
             }
+            "path" => {
+                if let Some((_, d)) = node.attrs.iter().find(|(k, _)| k == "d") {
+                    for (raw_pts, closed) in parse_path_subpaths(d) {
+                        let pts: Vec<(f64, f64)> =
+                            raw_pts.into_iter().map(|pt| xform.apply(pt)).collect();
+                        if let Some(fill) = style.fill {
+                            canvas.fill_polygon(&pts, fill);
+                        }
+                        if let Some(stroke) = style.stroke {
+                            let count = if closed {
+                                pts.len()
+                            } else {
+                                pts.len().saturating_sub(1)
+                            };
+                            for i in 0..count {
+                                let (x0, y0) = pts[i];
+                                let (x1, y1) = pts[(i + 1) % pts.len()];
+                                canvas.draw_line(x0, y0, x1, y1, stroke);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+    ancestors.push(node);
+    let mut child_siblings: Vec<&'a SvgNode> = Vec::new();
     for child in &node.children {
         if let SvgChild::Element(el) = child {
-            rasterize_node(el, style, xform, canvas);
+            rasterize_node(
+                el,
+                ancestors,
+                &child_siblings,
+                stylesheet,
+                style,
+                xform,
+                canvas,
+            );
+            child_siblings.push(el);
         }
     }
+    ancestors.pop();
 }
 
 #[cfg(test)]
@@ -3587,6 +4025,94 @@ mod tests {
             &preview.pixels[translated_idx..translated_idx + 3],
             &[255, 0, 0],
             "translated rectangle must appear at x=10..15"
+        );
+    }
+
+    #[test]
+    fn preview_rasterizer_applies_stylesheet_class_visibility_and_colors() {
+        // 1. display:none via class rule suppresses rendering completely.
+        let hidden_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><style>.hidden{display:none}</style><rect class="hidden" width="20" height="20"/></svg>"##;
+        let hidden_out = build_vector_output(
+            Some(hidden_svg),
+            StarVectorFinishReason::CompleteRoot,
+            6,
+            None,
+            64,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 20,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("hidden SVG must sanitize and rasterize");
+        let hidden_preview = hidden_out.preview.expect("hidden preview must render");
+        assert!(
+            hidden_preview.pixels.iter().all(|&b| b == 255),
+            "display:none class rule must leave canvas completely white"
+        );
+
+        // 2. Class fill, child combinator, ID specificity, inline override, and visibility.
+        let styled_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="10">
+            <style>
+                .accent { fill: #ff0000; }
+                g.layer > rect.card { fill: #00ff00; }
+                #hero { fill: #0000ff; }
+                .ghost { visibility: hidden; }
+                .reveal { visibility: visible; fill: #ffff00; }
+            </style>
+            <rect class="accent" x="0" y="0" width="10" height="10"/>
+            <g class="layer"><rect class="accent card" x="10" y="0" width="10" height="10"/></g>
+            <rect id="hero" class="accent" x="20" y="0" width="10" height="10"/>
+            <g class="ghost">
+                <rect x="30" y="0" width="5" height="10" fill="black"/>
+                <rect class="reveal" x="35" y="0" width="5" height="10"/>
+            </g>
+        </svg>"##;
+        let styled_out = build_vector_output(
+            Some(styled_svg),
+            StarVectorFinishReason::CompleteRoot,
+            10,
+            None,
+            64,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 40,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("styled SVG must sanitize and rasterize");
+        let preview = styled_out.preview.expect("styled preview must render");
+        assert_eq!((preview.width, preview.height), (40, 10));
+        let px = |x: usize, y: usize| -> [u8; 3] {
+            let idx = (y * 40 + x) * 3;
+            [
+                preview.pixels[idx],
+                preview.pixels[idx + 1],
+                preview.pixels[idx + 2],
+            ]
+        };
+        assert_eq!(px(5, 5), [255, 0, 0], ".accent class must paint red");
+        assert_eq!(
+            px(15, 5),
+            [0, 255, 0],
+            "g.layer > rect.card higher specificity must paint green"
+        );
+        assert_eq!(
+            px(25, 5),
+            [0, 0, 255],
+            "#hero ID selector must override .accent"
+        );
+        assert_eq!(
+            px(32, 5),
+            [255, 255, 255],
+            "inherited visibility:hidden must not paint"
+        );
+        assert_eq!(
+            px(37, 5),
+            [255, 255, 0],
+            "child .reveal visibility:visible must paint yellow"
         );
     }
 }
