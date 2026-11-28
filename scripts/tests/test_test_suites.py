@@ -333,6 +333,64 @@ class TestSuites(unittest.TestCase):
             self.assertIn(Path(path), [Path(value) for value in paths])
         self.assertNotIn(Path("/outside/not-cargo-runtime"), [Path(value) for value in paths])
 
+    def compile_timeouts(self, mode, deadline, **compile_seconds):
+        calls, seen = [], []
+        run = self.fake_run(calls)
+
+        def recording(command, timeout, **context):
+            if "--no-run" in command:
+                seen.append(timeout)
+            return run(command, timeout, **context)
+
+        command = ["cargo", "test", "--lib", "--tests", "-p", "fixture"]
+        with patch.object(suites, "run", recording), patch.object(suites, "require_windows_gpu1_before_model_case"):
+            if mode == "audited-safe":
+                suites.execute_safe(command, [self.case(test="contract::shape")], deadline, **compile_seconds)
+            else:
+                suites.execute(mode, command, [self.case()], deadline, **compile_seconds)
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_compile_phase_bound_defaults_is_overridable_and_never_extends_the_deadline(self):
+        for mode in ("audited-safe", "routine", "exhaustive"):
+            self.assertAlmostEqual(self.compile_timeouts(mode, 7200), suites.COMPILE_SECONDS, delta=5)
+            self.assertAlmostEqual(self.compile_timeouts(mode, 7200, compile_seconds=4200), 4200, delta=5)
+            # The suite deadline still caps the compile child.
+            self.assertLessEqual(self.compile_timeouts(mode, 60, compile_seconds=4200), 60)
+
+    def test_cli_rejects_a_non_positive_compile_bound(self):
+        for value in ("0", "-1"):
+            with patch.object(sys, "argv", ["test_suites.py", "--compile-seconds", value, "check"]), \
+                    patch.object(suites, "execute") as execute, self.assertRaises(SystemExit):
+                suites.main()
+            execute.assert_not_called()
+
+    def test_windows_cuda_exhaustive_lane_reuses_runner_flash_cache_and_bounds_measured_compile(self):
+        import re
+        import yaml
+        job = yaml.safe_load((suites.ROOT / ".github/workflows/model-test-suites.yml").read_text(encoding="utf-8"))["jobs"]["candle-cuda"]
+        names = [step.get("name") or step.get("uses") for step in job["steps"]]
+        run = next(step["run"] for step in job["steps"] if step.get("name") == "Run only registered exhaustive CUDA cases")
+        # The cold vendored FlashAttention fatbin is ~25 min of nvcc on this host: reuse the same
+        # per-runner object directory and verified archive as ci.yml's CUDA compile lanes.
+        for step in ("Wait for Windows CUDA build space", "Persistent FlashAttention object cache (per runner)",
+                     "Fetch verified FlashAttention archive when published"):
+            self.assertLess(names.index(step), names.index("Run only registered exhaustive CUDA cases"), step)
+        cache = next(step["run"] for step in job["steps"] if step.get("name") == "Persistent FlashAttention object cache (per runner)")
+        self.assertIn('candle-flash-attn-objects\\$env:RUNNER_NAME', cache)
+        self.assertIn("CANDLE_FLASH_ATTN_BUILD_DIR=", cache)
+        self.assertIn("./.github/actions/cleanup-runner-storage", names)
+        # Compile under the host's per-listener budget, not -j 1; tests still run one at a time.
+        self.assertEqual(job["env"]["CARGO_BUILD_JOBS"], "12")
+        self.assertNotIn("-j 1", run)
+        bound = int(re.search(r"--compile-seconds (\d+)", run).group(1))
+        deadline = int(re.search(r"--deadline-seconds (\d+)", run).group(1))
+        self.assertGreater(bound, suites.COMPILE_SECONDS)
+        self.assertLess(bound, deadline)
+        self.assertLess(deadline, job["timeout-minutes"] * 60)
+        self.assertIn("--features cuda --no-fail-fast", run)
+        self.assertIn('-p "candle-gen*"', run)
+
     def test_no_fail_fast_collects_failure_without_masking_suite_status(self):
         calls = []
         run = self.fake_run(calls)

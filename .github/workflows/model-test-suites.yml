@@ -184,7 +184,10 @@ jobs:
     runs-on: [self-hosted, windows, cuda]
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: '4'
+      # The same per-listener compile budget as ci.yml's windows-cuda-check and windows-cuda
+      # lanes on this shared host. Only the compile phase is parallel: test_suites.py runs every
+      # registered case alone (`--exact`, `--test-threads=1`).
+      CARGO_BUILD_JOBS: '12'
       RUST_TEST_THREADS: '1'
       CUDA_COMPUTE_CAP: '80'
       CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
@@ -194,6 +197,36 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      # All CUDA listeners share one Windows build volume: remove this job's cold target afterwards
+      # and wait for room before building it, exactly like ci.yml's CUDA compile lanes.
+      - uses: ./.github/actions/cleanup-runner-storage
+      - name: Wait for Windows CUDA build space
+        shell: powershell
+        timeout-minutes: 11
+        run: ./scripts/ci/windows-cuda-build-space.ps1 -WaitForSpace
+      # runtime-cuda's default `media-flash-attn` unifies the vendored FlashAttention fatbin
+      # (37 CUTLASS kernels x sm_80/90/120 + compute_120) into this graph. Built into OUT_DIR it
+      # is 22-32 min of nvcc on this host every run, which alone exhausted the compile bound
+      # (run 46076493234). Reuse the per-runner object directory ci.yml keeps warm (cudaforge
+      # rebuilds only objects whose source/args hash changed) and the verified archive when one is
+      # published for this source.
+      - name: Persistent FlashAttention object cache (per runner)
+        shell: powershell
+        run: |
+          $dir = Join-Path $env:RUNNER_TOOL_CACHE "candle-flash-attn-objects\$env:RUNNER_NAME"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          "CANDLE_FLASH_ATTN_BUILD_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+      - name: Fetch verified FlashAttention archive when published
+        shell: powershell
+        run: |
+          $cache = Join-Path $env:RUNNER_TOOL_CACHE "candle-flash-attn-prebuilt\$env:RUNNER_NAME"
+          python3 scripts/ci/fetch_flash_attn_prebuilt.py --target x86_64-pc-windows-msvc --cache "$cache" --github-env
+          if ($LASTEXITCODE -eq 1) {
+            Write-Warning 'No published archive for this FlashAttention source; compiling from source'
+          } elseif ($LASTEXITCODE -ne 0) {
+            throw 'FlashAttention archive verification failed'
+          }
+          exit 0
       - name: Bind physical GPU1 before any exhaustive model case
         shell: powershell
         run: |
@@ -204,8 +237,16 @@ jobs:
           if (-not $match.Success -or [int]$match.Groups[2].Value -le 0) { throw 'GPU1 identity or free memory unavailable' }
           $encoding = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CUDA_VISIBLE_DEVICES=$($match.Groups[1].Value)`nCUDA_DEVICE_ORDER=PCI_BUS_ID`nSCENEWORKS_GPU_ID=1`n", $encoding)
+      # Compile bound measured on this host (SW-6138, `--no-run` of exactly this graph, cap 80,
+      # sccache off, shared with other builds): a cold target with a cold FlashAttention object
+      # directory took 2216 s at -j 12 (the flash nvcc build script alone 1911 s, on the critical
+      # path), the worst case after a kernel-tree change or on a new listener; with the warm
+      # per-runner flash objects a cold target took 755 s. Summed unit time is 8587 s cold and
+      # 5862 s warm, so the former -j 1 could never finish inside 2400 s. 3600 s covers the
+      # cold case under contention from the other listeners and still stops a wedged
+      # compiler/nvcc/build script long before the 7200 s suite deadline.
       - name: Run only registered exhaustive CUDA cases
         shell: cmd
         run: |
           call "%VCVARS%"
-          python scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python scripts/ci/test_suites.py --deadline-seconds 7200 --compile-seconds 3600 exhaustive -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast

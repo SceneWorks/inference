@@ -16,6 +16,11 @@ use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::Result;
 
 use crate::config::NeoChatConfig;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// The vision patch embedder's 1-D RoPE: complex-interleaved pairs, half tables `[n, part/2]` (f32,
+/// the embedder's dtype), rotated in the activation dtype.
+const VISION_ROPE: RopeSpec = RopeSpec::interleaved(RopeLayout::Bshd).with_math(RopeMath::Native);
 
 /// A NEO vision embedder (Conv patch-embed → 2D RoPE → Conv patch-merge).
 pub struct NeoVisionEmbedder {
@@ -134,13 +139,97 @@ fn rope_1d_interleaved(x: &Tensor, positions: &[i32], theta: f32) -> CResult<Ten
         }
     }
     let freqs = Tensor::from_vec(freqs, (n, half), x.device())?;
-    let cos = freqs.cos()?.reshape((n, half, 1))?;
-    let sin = freqs.sin()?.reshape((n, half, 1))?;
-    let xr = x.reshape((n, half, 2))?;
-    let x1 = xr.narrow(2, 0, 1)?; // even lane [n, half, 1]
-    let x2 = xr.narrow(2, 1, 1)?; // odd lane
-    let rot1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
-    let rot2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
-    let out = Tensor::cat(&[&rot1, &rot2], 2)?; // [n, half, 2] interleaved
-    out.reshape((n, part))
+    // SW-6129: the rotation is the shared `candle_gen::rope::apply_rope` with `VISION_ROPE` over a
+    // `[1, n, 1, part]` view (fused on CUDA; elsewhere the shared reference chain, op for op the former
+    // `[n, half, 2]` chain — `rope_route_tests` pins the bit identity).
+    let rotated = candle_gen::rope::apply_rope(
+        &x.reshape((1, n, 1, part))?,
+        &freqs.cos()?,
+        &freqs.sin()?,
+        &VISION_ROPE,
+    )?;
+    rotated.reshape((n, part))
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::{DType, Device};
+
+    /// The pre-SW-6129 `rope_1d_interleaved`, verbatim (the oracle).
+    fn former(x: &Tensor, positions: &[i32], theta: f32) -> CResult<Tensor> {
+        let (n, part) = x.dims2()?;
+        let half = part / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|j| 1.0f32 / theta.powf((2 * j) as f32 / part as f32))
+            .collect();
+        let mut freqs = Vec::with_capacity(n * half);
+        for &p in positions {
+            for &f in &inv_freq {
+                freqs.push(p as f32 * f);
+            }
+        }
+        let freqs = Tensor::from_vec(freqs, (n, half), x.device())?;
+        let cos = freqs.cos()?.reshape((n, half, 1))?;
+        let sin = freqs.sin()?.reshape((n, half, 1))?;
+        let xr = x.reshape((n, half, 2))?;
+        let x1 = xr.narrow(2, 0, 1)?; // even lane [n, half, 1]
+        let x2 = xr.narrow(2, 1, 1)?; // odd lane
+        let rot1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+        let rot2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
+        let out = Tensor::cat(&[&rot1, &rot2], 2)?; // [n, half, 2] interleaved
+        out.reshape((n, part))
+    }
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU (f32, the
+    /// embedder's dtype) at the real abs-position layout of a 2-image grid.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let (xs, ys) = abs_positions(&[(4, 6), (3, 5)]);
+        for (pos, part) in [(&xs, 64usize), (&ys, 32)] {
+            let x = Tensor::randn(0f32, 1.0, (pos.len(), part), &dev).unwrap();
+            let got = rope_1d_interleaved(&x, pos, 10000.0).unwrap();
+            assert_eq!(
+                bits(&got),
+                bits(&former(&x, pos, 10000.0).unwrap()),
+                "part {part}"
+            );
+        }
+    }
+
+    /// CUDA smoke (f32, the embedder's dtype; the bf16 cast is exercised by the kernel suite): the
+    /// vision RoPE route takes the fused kernel, bit-identical to the shared reference (switch
+    /// off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        const CALLS: u64 = 1;
+        let (xs, _) = abs_positions(&[(64, 64)]);
+        let x = Tensor::randn(0f32, 1.0, (xs.len(), 64), &dev).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = rope_1d_interleaved(&x, &xs, 10000.0).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (CALLS, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = rope_1d_interleaved(&x, &xs, 10000.0).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &xs, 10000.0).unwrap()));
+    }
 }

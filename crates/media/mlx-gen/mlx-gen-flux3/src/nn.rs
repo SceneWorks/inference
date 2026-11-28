@@ -17,7 +17,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{concatenate_axis, stack_axis};
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 /// LayerNorm eps of every `layernorm_modulation` (`F.layer_norm(..., eps=1e-6)`).
@@ -188,10 +188,12 @@ pub fn layer_norm_f32(x: &Array) -> Result<Array> {
 /// `layernorm_modulation(x, scale, shift) = (1 + scale) · layer_norm(x) + shift`. The `1` is
 /// created in `scale`'s dtype (torch's weak Python scalar): `1 + scale` rounds in the compute
 /// dtype, and the product with the f32 norm promotes to f32, exactly as upstream.
+///
+/// The affine is the shared eager [`mlx_gen::nn::modulate_eager`] with `one_matches_scale = true`
+/// (SW-6140), the same three-op chain as this crate's private copy.
 pub fn layernorm_modulation(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
     let norm = layer_norm_f32(x)?;
-    Ok(norm.multiply(&scale.add(&one)?)?.add(shift)?)
+    mlx_gen::nn::modulate_eager(&norm, scale, shift, true)
 }
 
 /// `rmsnorm_rope(x, scale, freqs)`: per-head RMSNorm in f32 with an f32 gain, then the adjacent-pair
@@ -199,20 +201,22 @@ pub fn layernorm_modulation(x: &Array, scale: &Array, shift: &Array) -> Result<A
 /// `[L, D/2]` (the [`gen_core_flux3::rope_cos_sin`] tables of the tokens, in token order).
 ///
 /// [`gen_core_flux3::rope_cos_sin`]: gen_core_flux3::rope_cos_sin
+///
+/// The rotation is the shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`]
+/// (`RopeStyle::AdjacentPair`, head-major, no casts on the already-f32 normed stream; SW-6140) —
+/// the same `x0·cos − x1·sin`, `x1·cos + x0·sin` chain (IEEE products and sums commute) over the
+/// same `[1, 1, L, D/2]` broadcast as this crate's private copy — then cast back to `x`'s dtype.
+/// FLUX.3's positions are 4-axis ids, so there is no fused `fast::rope` route.
 pub fn rmsnorm_rope(x: &Array, scale: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let (b, h, l, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let pairs = d / 2;
     let normed = rms_norm(&x.as_dtype(Dtype::Float32)?, scale, RMS_EPS)?;
-    let xf = normed.reshape(&[b, h, l, pairs, 2])?;
-    let parts = xf.split(2, 4)?;
-    let (re, im) = (parts[0].squeeze_axes(&[4])?, parts[1].squeeze_axes(&[4])?);
-    let cos = cos.reshape(&[1, 1, l, pairs])?;
-    let sin = sin.reshape(&[1, 1, l, pairs])?;
-    // freqs = [[cos, −sin], [sin, cos]]: out0 = cos·x0 − sin·x1, out1 = sin·x0 + cos·x1.
-    let out_re = re.multiply(&cos)?.subtract(&im.multiply(&sin)?)?;
-    let out_im = re.multiply(&sin)?.add(&im.multiply(&cos)?)?;
-    let out = stack_axis(&[out_re, out_im], 4)?.reshape(&[b, h, l, d])?;
+    let out = mlx_gen::qkv::apply_rope_eager(
+        &normed,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )?;
     Ok(out.as_dtype(x.dtype())?)
 }
 

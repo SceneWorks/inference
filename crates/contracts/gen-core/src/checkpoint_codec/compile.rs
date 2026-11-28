@@ -46,6 +46,54 @@ pub fn plan_safetensors(
     })
 }
 
+/// [`plan_safetensors`] for a native single file that may carry **W4A8** projections (SW-6135).
+///
+/// The W4A8 projections are split out first ([`crate::w4a8_int8::delegate_projections`], header and
+/// descriptor validation only) and the plan is compiled over the remaining tensors, so every other
+/// tensor — dense, fp8, int8 or NVFP4 — plans exactly as it would in a file with no W4A8 rows. The
+/// caller serves the returned delegated bases through its packed W4A8 layer and must account for the
+/// delegated keys wherever it compares the file's tensor surface with the plan. A file-level
+/// `_quantization_metadata` table that names a delegated layer is not stripped: the plan compiler
+/// then finds that layer's tensors missing and refuses, which is the fail-closed answer to a file
+/// declaring one layer two ways.
+pub fn plan_safetensors_delegating_w4a8(
+    path: &std::path::Path,
+    mapping: &dyn LogicalKeyMapping,
+    codecs: &CheckpointCodecRegistry,
+    residency: &dyn CodecResidencyPolicy,
+) -> crate::Result<(LogicalWeightPlan, crate::w4a8_int8::W4A8Delegation)> {
+    let headers = crate::safetensors_path_tensor_headers(path)?;
+    let mut descriptors = crate::read_safetensors_tensor_payloads(
+        path,
+        |h| h.name.ends_with(DESCRIPTOR_SUFFIX),
+        65_536,
+    )?;
+    let delegation = crate::w4a8_int8::delegate_projections(&headers, &descriptors)
+        .map_err(|e| crate::Error::Msg(format!("{}: {e}", path.display())))?;
+    let headers: Vec<_> = headers
+        .into_iter()
+        .filter(|h| !delegation.owns(&h.name))
+        .collect();
+    descriptors.retain(|name, _| !delegation.owns(name));
+    let metadata = crate::safetensors_path_quantization_metadata(path)?;
+    let plan = compile_logical_weight_plan_with_metadata(
+        &headers,
+        &descriptors,
+        metadata.as_deref(),
+        mapping,
+        codecs,
+        residency,
+    )
+    .map_err(|e| {
+        crate::Error::Msg(format!(
+            "logical weight plan for {} ({}): {e}",
+            path.display(),
+            mapping.mapping_id()
+        ))
+    })?;
+    Ok((plan, delegation))
+}
+
 /// Compile a header into a [`LogicalWeightPlan`]. Pure and deterministic: the same header,
 /// descriptor payloads, mapping, codec registry, and residency policy always produce the same plan,
 /// in logical-key order. Fails on the first tensor (in header order, sorted by physical key) that

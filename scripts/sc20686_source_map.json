@@ -26,29 +26,29 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_k.forward",
-              "line": 398
+              "line": 408
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_v.forward",
-              "line": 399
-            },
-            {
-              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
-              "symbol": "add_k.forward",
               "line": 409
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "add_k.forward",
+              "line": 419
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "add_v.forward",
-              "line": 414
+              "line": 424
             }
           ],
           "reference_slice": [
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "record_flux_kv_created",
-              "line": 400
+              "line": 410
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
@@ -65,7 +65,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "attention",
-              "line": 430
+              "line": 440
             }
           ],
           "release": [
@@ -105,21 +105,21 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 339
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 405
+              "line": 462
             }
           ],
           "release": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "drop",
-              "line": 168
+              "line": 183
             }
           ],
           "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
@@ -141,28 +141,28 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1246
+              "line": 1290
             }
           ],
           "creation": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 339
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 405
+              "line": 462
             }
           ],
           "release": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "drop",
-              "line": 168
+              "line": 183
             }
           ],
           "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
@@ -184,28 +184,28 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1246
+              "line": 1290
             }
           ],
           "creation": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 339
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 405
+              "line": 462
             }
           ],
           "release": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "drop",
-              "line": 168
+              "line": 183
             }
           ],
           "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
@@ -234,21 +234,21 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 339
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 405
+              "line": 462
             }
           ],
           "release": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "drop",
-              "line": 168
+              "line": 183
             }
           ],
           "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
@@ -277,21 +277,21 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "register_cache",
-              "line": 339
+              "line": 396
             }
           ],
           "reads": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "record_cache_read",
-              "line": 405
+              "line": 462
             }
           ],
           "release": [
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
               "symbol": "drop",
-              "line": 168
+              "line": 183
             }
           ],
           "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
@@ -325,14 +325,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 169
+              "line": 158
             }
           ],
           "reference_slice": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686::bound_skv",
-              "line": 172
+              "line": 161
             },
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
@@ -344,7 +344,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686_joint_read",
-              "line": 448
+              "line": 437
             }
           ],
           "release": [
@@ -441,7 +441,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [
@@ -490,7 +490,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [
@@ -548,7 +548,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 736
+              "line": 733
             }
           ],
           "release": [

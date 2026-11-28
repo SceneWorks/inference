@@ -27,7 +27,7 @@ pub mod rope;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 
 use crate::config::BooguConfig;
-use crate::loader::{layernorm_noaffine, linear_detect, rmsnorm, Weights};
+use crate::loader::{linear_detect, rmsnorm, Weights};
 use crate::quant::QLinear;
 use block::{DoubleBlock, ModBlock, PlainBlock};
 use rope::RopeTables;
@@ -298,8 +298,7 @@ impl BooguTransformer {
 
         // Continuous-AdaLN output projection (LuminaLayerNormContinuous, eps 1e-6, no affine).
         let scale = self.norm_out_lin1.forward(&temb.silu()?)?; // [1, 1, 3360]
-        let normed = layernorm_noaffine(&joint, 1e-6)?;
-        let normed = normed.broadcast_mul(&(scale + 1.0)?)?;
+        let normed = norm_out_scale(&joint, &scale)?;
         let out = self.norm_out_lin2.forward(&normed)?; // [1, cap+ref+img, 64]
 
         // Unpatchify the trailing target-image tokens into the velocity (reference tokens, when
@@ -386,5 +385,48 @@ mod tests {
             builds, 2,
             "each CFG geometry built exactly once across all steps"
         );
+    }
+}
+
+/// The continuous-AdaLN output norm, `LN(x) · (1 + scale)` over the affine-free f32 LayerNorm
+/// (`layernorm_noaffine`, eps 1e-6, cast back) — the shared fused scale-only AdaLN over that
+/// composable chain (SW-6129, `AdaLnChain::layer`), bit-identical to it + the multiply.
+pub(crate) fn norm_out_scale(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    candle_gen::modulate::adaln_chain_scale_only(
+        x,
+        &candle_gen::modulate::AdaLnChain::layer(1e-6),
+        scale,
+    )
+}
+
+#[cfg(test)]
+mod norm_out_adaln_tests {
+    use super::*;
+    use crate::loader::layernorm_noaffine;
+
+    /// `norm_out_scale` equals the former `layernorm_noaffine(x, 1e-6) · (scale + 1)`.
+    #[test]
+    fn fused_norm_out_matches_the_former_chain() {
+        let dev = Device::Cpu;
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = (Tensor::randn(0f32, 2.0, (1, 40, 3360), &dev).unwrap() + 0.3)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let scale = Tensor::randn(0f32, 0.4, (1, 1, 3360), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let got = norm_out_scale(&x, &scale).unwrap();
+            let want = layernorm_noaffine(&x, 1e-6)
+                .unwrap()
+                .broadcast_mul(&(&scale + 1.0).unwrap())
+                .unwrap();
+            assert_eq!(
+                super::block::adaln_route_tests::bits(&got),
+                super::block::adaln_route_tests::bits(&want),
+                "{dtype:?}"
+            );
+        }
     }
 }

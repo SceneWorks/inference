@@ -1,0 +1,24 @@
+sceneworks-gen-core
+Copyright 2026 Michael Trefry and the SceneWorks contributors
+
+This product is licensed under the Apache License, Version 2.0. A copy of the
+license is provided in the repository LICENSE file.
+
+Ported third-party sources (IN the shipped Rust crate)
+------------------------------------------------------
+
+  * comfy-kitchen                               (Apache License 2.0)
+    Copyright (c) 2025 Comfy Org (https://github.com/Comfy-Org/comfy-kitchen)
+
+      - src/w4a8_int8.rs       — the `asym_w4a8_int8` descriptor contract and
+        the host int4->int8 decode, after comfy-kitchen PR#90
+        (`backends/cuda/ops/w4a8_gemm.cu`, `cutlass_gemm_int8.cu`,
+        `int8_linear.cu`).
+      - src/w4a8_int8/pack.rs  — the offline W4A8 packer and CPU dequant
+        reference (SW-6134), ported from `backends/eager/w4a8_int8.py`
+        (`_quantize_rotated_w4a8_int8_weight`, `_assign_codes`, `_assign_grid`,
+        `_grid_levels`, `_dequant_int4_grouped_to_int8`) and
+        `tensor/w4a8_packed.py` (`_FIXED_LUT`, `_pack_codes`).
+
+    Modified: reimplemented in Rust for the frozen 4-bit / group-16 / ConvRot-256
+    / fixed-codebook dialect only; no upstream source file is copied verbatim.

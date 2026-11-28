@@ -28,7 +28,7 @@
 
 use candle_core::{DType, Result, Tensor, D};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
-use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 
 use crate::transformer::{
     apply_rope, control_residual_interval, scaled_dot_product_attention,
@@ -130,10 +130,12 @@ impl AdaLayerNormZero {
         debug_assert_eq!(self.chunks, 6);
         let p = __model_proof_output!(emb.silu()?.apply(&self.linear))?.chunk(6, D::Minus1)?;
         // shift = p[0], scale = p[1]; normed = norm(hidden) * (1 + scale) + shift.
-        let normed = __model_proof_output!(self.norm.forward(hidden))?;
-        let normed = normed
-            .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
-            .broadcast_add(&p[0].unsqueeze(1)?)?;
+        let normed = crate::transformer::ln_modulate(
+            &self.norm,
+            hidden,
+            &p[1].unsqueeze(1)?,
+            &p[0].unsqueeze(1)?,
+        )?;
         Ok((
             normed,
             p[2].clone(),
@@ -424,9 +426,12 @@ fn apply_norm_ff(
     let hidden = (hidden + attn.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
     // The diffusers `norm2` (parameter-free, elementwise-affine = False), built once at load and
     // reused here rather than re-allocated each call (sc-9039).
-    let normed = __model_proof_output!(norm.forward(&hidden))?
-        .broadcast_mul(&(scale_mlp.unsqueeze(1)? + 1.0)?)?
-        .broadcast_add(&shift_mlp.unsqueeze(1)?)?;
+    let normed = crate::transformer::ln_modulate(
+        norm,
+        &hidden,
+        &scale_mlp.unsqueeze(1)?,
+        &shift_mlp.unsqueeze(1)?,
+    )?;
     let ff_out = ff.forward(&normed)?;
     hidden.broadcast_add(&ff_out.broadcast_mul(&gate_mlp.unsqueeze(1)?)?)
 }
@@ -875,6 +880,7 @@ pub fn accepts_control_kind(kind: &str) -> bool {
 mod tests {
     use super::*;
     use candle_core::Device;
+    use candle_nn::Module;
 
     /// A tiny base FLUX [`Config`] for the GPU-free control tests: inner 16 (heads 2 · head_dim 8),
     /// `axes_dim` summing to 8, with the real fixed input widths (in 64 / context 4096 / vec 768) the

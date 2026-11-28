@@ -2,6 +2,7 @@
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self, Module};
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use candle_gen::train::projection::FrozenProjectionPack;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
@@ -295,6 +296,63 @@ impl Norm {
             .to_dtype(dtype)?
             .broadcast_mul(&self.0.to_dtype(dtype)?)?)
     }
+
+    /// The dtype [`Norm::forward`] returns for an `x` of `x_dtype` (f32 when `x` or the weight is).
+    fn out_dtype(&self, x_dtype: DType) -> DType {
+        if x_dtype == DType::F32 || self.0.dtype() == DType::F32 {
+            DType::F32
+        } else {
+            x_dtype
+        }
+    }
+
+    /// `modulate(forward(x).to_dtype(m), scale.to_dtype(m), shift.to_dtype(m)).to_dtype(out)` —
+    /// this RMSNorm then the AdaLN modulation in the promoted dtype `m` — through the shared fused
+    /// AdaLN (SW-6129). The untracked inference norm is `normalize_composable` (f32
+    /// `sum_keepdim / width`, `+ eps`, `sqrt`, then `/ rms` under `reference_math()` else
+    /// `* recip(rms)`), cast to `x`'s dtype, cast to the weight-promoted dtype, `· weight` there:
+    /// `AdaLnChain::rms` / `rms_recip(1e-6).cast_through(x).with_post_weight(w)` op for op, then
+    /// modulated in `m` and cast to `out`. The comparison / legacy-E1 arms, a graph-retaining
+    /// backward, or any gradient-tracked operand keep [`Norm::forward`] and the composable modulate.
+    fn norm_modulate(
+        &self,
+        x: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        m: DType,
+        out: DType,
+    ) -> Result<Tensor> {
+        let composable = candle_gen::train::policy::legacy_e1()
+            || candle_gen::train::comparison::active_stage().is_some()
+            || candle_gen::candle_core::backprop::grad_do_not_detach()
+            || [x, &self.0, scale, shift].iter().any(|t| t.track_op());
+        if composable {
+            return Ok(candle_gen::modulate::modulate(
+                &self.forward(x)?.to_dtype(m)?,
+                &scale.to_dtype(m)?,
+                &shift.to_dtype(m)?,
+            )?
+            .to_dtype(out)?);
+        }
+        use candle_gen::modulate::{adaln_chain, AdaLnChain};
+        let weight = self.0.to_dtype(self.out_dtype(x.dtype()))?;
+        let norm = if candle_gen::train::profile::reference_math() {
+            AdaLnChain::rms(1e-6)
+        } else {
+            AdaLnChain::rms_recip(1e-6)
+        };
+        let spec = norm
+            .cast_through(x.dtype())
+            .with_post_weight(&weight)
+            .modulate_in(m)
+            .output(out);
+        Ok(adaln_chain(
+            x,
+            &spec,
+            &scale.to_dtype(m)?,
+            &shift.to_dtype(m)?,
+        )?)
+    }
 }
 pub(crate) fn situ(hidden: &Tensor, gate: &Tensor) -> Result<Tensor> {
     let a = ((gate / 4.0)?.tanh()? * 4.0)?;
@@ -338,20 +396,19 @@ pub(crate) fn rope(
     }
     Ok(Tensor::from_vec(values, (1, height * width + text, head_dim), device)?.to_dtype(dtype)?)
 }
+/// MOSS-Image's RoPE convention: rotate-half pairs on `[B, S, H, D]`, products and sums in the
+/// activation dtype (the source multiplication promotes a BF16 rope when a widened DMD Q/K enters).
+const MOSS_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bshd).with_math(RopeMath::Native);
+
+/// `x·cos + rotate_half(x)·sin` with the `[1, S, D]` `[sin | cos]` table (each half duplicated across
+/// both lane halves): the shared [`candle_gen::rope::apply_rope`] (SW-6129) on the two half-width
+/// views — the fused strided kernel on CUDA, and everywhere else the shared reference chain,
+/// bit-identical to the duplicate / cast / rotate-half chain this used to carry.
 fn rotate(x: &Tensor, rope: &Tensor) -> Result<Tensor> {
     let half = x.dim(3)? / 2;
-    let sin = rope.narrow(2, 0, half)?.unsqueeze(2)?;
-    let cos = rope.narrow(2, half, half)?.unsqueeze(2)?;
-    let sin = Tensor::cat(&[&sin, &sin], 3)?;
-    let cos = Tensor::cat(&[&cos, &cos], 3)?;
-    let paired = Tensor::cat(
-        &[&x.narrow(3, half, half)?.neg()?, &x.narrow(3, 0, half)?],
-        3,
-    )?;
-    // Source multiplication promotes BF16 rope when a widened DMD Q/K enters.
-    let dtype = x.dtype();
-    Ok(x.broadcast_mul(&cos.to_dtype(dtype)?)?
-        .add(&paired.broadcast_mul(&sin.to_dtype(dtype)?)?)?)
+    let sin = rope.narrow(2, 0, half)?;
+    let cos = rope.narrow(2, half, half)?;
+    Ok(candle_gen::rope::apply_rope(x, &cos, &sin, &MOSS_ROPE)?)
 }
 fn attention_qk_operands(
     q: &Tensor,
@@ -594,11 +651,7 @@ impl Block {
         };
         let y = self
             .n1
-            .forward(x)?
-            .to_dtype(dtype)?
-            .broadcast_mul(&(part(1)?.to_dtype(dtype)? + 1.0)?)?
-            .broadcast_add(&part(0)?.to_dtype(dtype)?)?
-            .to_dtype(self.q.dtype())?;
+            .norm_modulate(x, &part(1)?, &part(0)?, dtype, self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
         let (q, k, v) = if let Some(pack) = &self.projection_pack {
             candle_gen::train::profile::cohort_reuse("moss:frozen-projection-pack");
@@ -643,13 +696,10 @@ impl Block {
             .broadcast_mul(&part(2)?.to_dtype(dtype)?)?;
         let dtype = promoted(x.dtype(), residual.dtype());
         let x = x.to_dtype(dtype)?.add(&residual.to_dtype(dtype)?)?;
-        let normalized = self.n2.forward(&x)?;
-        let dtype = promoted(normalized.dtype(), m.dtype());
-        let y = normalized
-            .to_dtype(dtype)?
-            .broadcast_mul(&(part(4)?.to_dtype(dtype)? + 1.0)?)?
-            .broadcast_add(&part(3)?.to_dtype(dtype)?)?
-            .to_dtype(self.q.dtype())?;
+        let dtype = promoted(self.n2.out_dtype(x.dtype()), m.dtype());
+        let y = self
+            .n2
+            .norm_modulate(&x, &part(4)?, &part(3)?, dtype, self.q.dtype())?;
         let hg = self.up_gate.forward(&y)?;
         let f = hg.dim(2)? / 2;
         let residual = self
@@ -1177,10 +1227,11 @@ impl Transformer {
             } else {
                 y.dtype()
             };
-            let y = y
-                .to_dtype(dtype)?
-                .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)? + 1.)?)?
-                .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?)?;
+            let y = candle_gen::modulate::modulate(
+                &y.to_dtype(dtype)?,
+                &head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)?,
+                &head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?,
+            )?;
             let pred = __model_proof_output!(self
                 .final_linear
                 .forward(&y.to_dtype(self.final_linear.dtype())?))?
@@ -1343,18 +1394,20 @@ impl Transformer {
                     check_cancel(cancel)?;
                 }
             }
-            let y = self
-                .norm
-                .forward(&y.narrow(1, 0, video_len)?.to_dtype(self.norm.0.dtype())?)?;
-            let dtype = if y.dtype() == DType::F32 || head.dtype() == DType::F32 {
+            let y = y.narrow(1, 0, video_len)?.to_dtype(self.norm.0.dtype())?;
+            let normed = self.norm.out_dtype(y.dtype());
+            let dtype = if normed == DType::F32 || head.dtype() == DType::F32 {
                 DType::F32
             } else {
-                y.dtype()
+                normed
             };
-            let y = y
-                .to_dtype(dtype)?
-                .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)? + 1.0)?)?
-                .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?)?;
+            let y = self.norm.norm_modulate(
+                &y,
+                &head.i((.., 1, ..))?.unsqueeze(1)?,
+                &head.i((.., 0, ..))?.unsqueeze(1)?,
+                dtype,
+                dtype,
+            )?;
             result.push(
                 self.final_linear
                     .forward(&y.to_dtype(self.final_linear.dtype())?)?
@@ -1602,3 +1655,269 @@ mod attention_layout_tests {
 
 mod edit;
 pub(crate) use edit::EditConditioning;
+
+/// SW-6129: the DiT `rotate` is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private rotate, verbatim.
+    fn former_rotate(x: &Tensor, rope: &Tensor) -> Tensor {
+        let half = x.dim(3).unwrap() / 2;
+        let sin = rope.narrow(2, 0, half).unwrap().unsqueeze(2).unwrap();
+        let cos = rope.narrow(2, half, half).unwrap().unsqueeze(2).unwrap();
+        let sin = Tensor::cat(&[&sin, &sin], 3).unwrap();
+        let cos = Tensor::cat(&[&cos, &cos], 3).unwrap();
+        let paired = Tensor::cat(
+            &[
+                &x.narrow(3, half, half).unwrap().neg().unwrap(),
+                &x.narrow(3, 0, half).unwrap(),
+            ],
+            3,
+        )
+        .unwrap();
+        let dtype = x.dtype();
+        x.broadcast_mul(&cos.to_dtype(dtype).unwrap())
+            .unwrap()
+            .add(&paired.broadcast_mul(&sin.to_dtype(dtype).unwrap()).unwrap())
+            .unwrap()
+    }
+
+    /// The shared route equals the former rotate bit for bit on CPU for f32 / bf16 / f16 q/k and
+    /// f32 / bf16 rope tables (incl. the widened-DMD f32 q against a bf16 rope).
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let (h, w, text, hd) = (3usize, 4usize, 5usize, 64usize);
+        let x32 = values(&[2, h * w + text, 3, hd], 7, &Device::Cpu);
+        for rope_dtype in [DType::F32, DType::BF16] {
+            let r = rope(h, w, text, hd, rope_dtype, &Device::Cpu).unwrap();
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let x = x32.to_dtype(dtype).unwrap();
+                let got = rotate(&x, &r).unwrap();
+                assert_eq!(got.dtype(), dtype);
+                assert_eq!(
+                    bits(&got),
+                    bits(&former_rotate(&x, &r)),
+                    "{dtype:?} / {rope_dtype:?}"
+                );
+            }
+        }
+    }
+
+    /// SW-6129 CUDA smoke: moss-image rotate (bf16, [sin|cos] table) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // 1024^2 (64x64 latent tokens) plus 256 text tokens, 24 heads x 128, bf16.
+        let r = rope(64, 64, 256, 128, DType::BF16, &dev).unwrap();
+        let q = values(&[1, 4096 + 256, 24, 128], 3, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = values(&[1, 4096 + 256, 24, 128], 4, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || Tensor::cat(&[rotate(&q, &r).unwrap(), rotate(&k, &r).unwrap()], 0).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("moss-image rotate (bf16, [sin|cos] table): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
+    }
+}
+
+/// SW-6129: the MOSS-Image RMSNorm + AdaLN sites are the shared fused composable-chain AdaLN
+/// ([`Norm::norm_modulate`]).
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// The former site, verbatim: `Norm::forward`, the promotion casts, the composable modulate.
+    fn former(
+        n: &Norm,
+        x: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        m: DType,
+        out: DType,
+    ) -> Tensor {
+        candle_gen::modulate::modulate(
+            &n.forward(x).unwrap().to_dtype(m).unwrap(),
+            &scale.to_dtype(m).unwrap(),
+            &shift.to_dtype(m).unwrap(),
+        )
+        .unwrap()
+        .to_dtype(out)
+        .unwrap()
+    }
+
+    /// CPU: bit-identical to the former norm + modulate for f32 / bf16 / f16 streams, bf16 and f32
+    /// ("FP32 island") norm weights, f32 / activation-dtype modulation and an output cast, D 3072.
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn norm_modulate_matches_the_former_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 3072;
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        let w32 = values(&[d], 4, 0.5, 1.0, &dev);
+        for xd in [DType::F32, DType::BF16, DType::F16] {
+            for wd in [DType::F32, xd] {
+                let n = Norm(w32.to_dtype(wd).unwrap());
+                let x = x32.to_dtype(xd).unwrap();
+                for md in [n.out_dtype(xd), DType::F32] {
+                    let scale = values(&[2, 1, d], 5, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
+                    let shift = values(&[2, 1, d], 7, 0.5, 0.0, &dev).to_dtype(xd).unwrap();
+                    for out in [md, xd] {
+                        let got =
+                            __model_proof_output!(n.norm_modulate(&x, &scale, &shift, md, out))
+                                .unwrap();
+                        let want = former(&n, &x, &scale, &shift, md, out);
+                        assert_eq!(got.dtype(), want.dtype());
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "x {xd:?} w {wd:?} m {md:?} o {out:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate");
+    }
+
+    /// SW-6129 CUDA smoke: MOSS-Image `norm_modulate` (bf16 `[1, 4352, 3072]`, a bf16 norm weight
+    /// and an f32 "FP32 island" weight, bf16 modulation rows, bf16 output) is fused (2 calls) and
+    /// bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 3072;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let x = bf(values(&[1, 4352, d], 11, 3.0, 0.3, &dev));
+        let w = values(&[d], 12, 0.5, 1.0, &dev);
+        let (n_bf, n_f32) = (Norm(bf(w.clone())), Norm(w));
+        let scale = bf(values(&[1, 1, d], 13, 0.5, 0.0, &dev));
+        let shift = bf(values(&[1, 1, d], 14, 0.5, 0.0, &dev));
+        assert_fused_and_bit_identical(
+            "moss norm_modulate (bf16 [1,4352,3072], bf16 + f32 weight)",
+            2,
+            &|| {
+                let a = __model_proof_output!(n_bf.norm_modulate(
+                    &x,
+                    &scale,
+                    &shift,
+                    DType::BF16,
+                    DType::BF16
+                ));
+                let b = n_f32.norm_modulate(&x, &scale, &shift, DType::F32, DType::BF16);
+                Tensor::cat(&[&a.unwrap(), &b.unwrap()], 1).unwrap()
+            },
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
+    }
+}

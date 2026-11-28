@@ -21,6 +21,11 @@ use candle_gen::{CandleError, Result as CResult};
 
 use crate::nn::rms_norm;
 use candle_gen::attention::repeat_kv_bshd;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// Qwen2.5-VL's M-RoPE apply: HF half-split pairs on `[B, L, H, head_dim]` with the assembled
+/// full-width `[1, L, head_dim]` tables, in the activation dtype.
+const MROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bshd).with_math(RopeMath::Native);
 
 /// Text-decoder config for the Qwen2.5-VL-7B planner backbone (the LLM half of `mllm/config.json`).
 #[derive(Clone, Debug)]
@@ -166,15 +171,6 @@ impl Layer {
     }
 }
 
-/// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
-fn rotate_half(x: &Tensor) -> CResult<Tensor> {
-    let d = x.dim(D::Minus1)?;
-    let half = d / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, d - half)?;
-    Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
-}
-
 /// The native Qwen2.5-VL-7B text decoder, run as a stateless penultimate-hidden-state extractor.
 pub struct Qwen25VlText {
     embed_tokens: Tensor,
@@ -283,11 +279,11 @@ impl Qwen25VlText {
     }
 
     /// Apply MRoPE to a `[B, L, H, head_dim]` projection given assembled `cos`/`sin` `[1, L, head_dim]`
-    /// (broadcast over the head axis): `x*cos + rotate_half(x)*sin`.
+    /// (broadcast over the head axis): `x*cos + rotate_half(x)*sin`. SW-6129: the shared
+    /// [`candle_gen::rope::apply_rope`] with [`MROPE`] (fused on CUDA; elsewhere the shared reference
+    /// chain, op for op this function's former body — pinned by `mrope_shared_route_matches_former`).
     fn apply_mrope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CResult<Tensor> {
-        let cos = cos.unsqueeze(2)?; // [1, L, 1, head_dim]
-        let sin = sin.unsqueeze(2)?;
-        Ok((x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?)?)
+        Ok(candle_gen::rope::apply_rope(x, cos, sin, &MROPE)?)
     }
 
     /// Eager attention with an external additive 4D `mask` (`[1,1,L,L]` broadcast): q/k/v project →
@@ -439,6 +435,84 @@ impl Qwen25VlText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis (the former
+    /// private helper of `apply_mrope`, kept as the test oracle).
+    fn rotate_half(x: &Tensor) -> CResult<Tensor> {
+        let d = x.dim(D::Minus1)?;
+        let half = d / 2;
+        let x1 = x.narrow(D::Minus1, 0, half)?;
+        let x2 = x.narrow(D::Minus1, half, d - half)?;
+        Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
+    }
+
+    /// The pre-SW-6129 `apply_mrope`, verbatim.
+    fn former_mrope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let cos = cos.unsqueeze(2).unwrap();
+        let sin = sin.unsqueeze(2).unwrap();
+        (x.broadcast_mul(&cos).unwrap() + rotate_half(x).unwrap().broadcast_mul(&sin).unwrap())
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    fn mrope_tables(l: usize, hd: usize, dt: DType, dev: &Device) -> (Tensor, Tensor) {
+        let a = (Tensor::randn(0f32, 1.0, (1, l, hd / 2), dev).unwrap() * 30.0).unwrap();
+        let emb = Tensor::cat(&[&a, &a], 2).unwrap();
+        (
+            emb.cos().unwrap().to_dtype(dt).unwrap(),
+            emb.sin().unwrap().to_dtype(dt).unwrap(),
+        )
+    }
+
+    /// SW-6129: the shared M-RoPE route is bit-identical to the former private chain on CPU.
+    #[test]
+    fn mrope_shared_route_matches_former() {
+        let dev = Device::Cpu;
+        let (l, h, hd) = (11, 4, 128);
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let (cos, sin) = mrope_tables(l, hd, dt, &dev);
+            let x = Tensor::randn(0f32, 1.0, (2, l, h, hd), &dev).unwrap();
+            let x = x.to_dtype(dt).unwrap();
+            let got = Qwen25VlText::apply_mrope(&x, &cos, &sin).unwrap();
+            assert_eq!(bits(&got), bits(&former_mrope(&x, &cos, &sin)), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: the M-RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // Qwen2.5-VL-7B: 28 q heads x 128 over a 1024-token prompt.
+        let (l, h, hd) = (1024, 28, 128);
+        let (cos, sin) = mrope_tables(l, hd, DType::BF16, &dev);
+        let x = Tensor::randn(0f32, 1.0, (1, l, h, hd), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = Qwen25VlText::apply_mrope(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = Qwen25VlText::apply_mrope(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former_mrope(&x, &cos, &sin)));
+    }
     use candle_gen::candle_core::Device;
     use candle_gen::testkit::{tensor_cosine, tensor_max_abs_diff};
     use std::collections::HashMap;

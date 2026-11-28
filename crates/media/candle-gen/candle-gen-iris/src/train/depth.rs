@@ -296,16 +296,7 @@ fn depth_training_policy(
 }
 
 fn checked_depth_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
-    let expected = candle_gen::train::policy::bind_state_identity(
-        expected_private_state,
-        candle_gen::train::policy::active_profile(),
-    );
-    if saved != expected {
-        return Err(Error::Msg(
-            "iris depth resume: private execution-profile/state identity differs".into(),
-        ));
-    }
-    Ok(expected_private_state.into())
+    super::checked_bound_state_identity("iris depth resume", "", saved, expected_private_state)
 }
 
 // =============================================================================================

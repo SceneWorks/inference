@@ -441,52 +441,30 @@ fn txt_freq_block(freqs: &Array, txt_len: i32) -> Result<Array> {
     Ok(concatenate_axis(&[&a, &a, &a], -1)?)
 }
 
-/// rotate_half on `(..., 2k)`: pairs `(x0,x1) -> (-x1, x0)`.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let last = *sh.last().unwrap();
-    let mut head: Vec<i32> = sh[..sh.len() - 1].to_vec();
-    head.push(last / 2);
-    head.push(2);
-    let xr = x.reshape(&head)?; // (..., k, 2)
-    let nd = xr.ndim() as i32;
-    let x1 = xr.take_axis(Array::from_int(0), nd - 1)?; // (..., k)
-    let x2 = xr.take_axis(Array::from_int(1), nd - 1)?;
-    let neg = multiply(&x2, Array::from_f32(-1.0))?;
-    let mut tshape: Vec<i32> = sh[..sh.len() - 1].to_vec();
-    tshape.push(last / 2);
-    tshape.push(1);
-    let a = neg.reshape(&tshape)?;
-    let b = x1.reshape(&tshape)?;
-    Ok(concatenate_axis(&[&a, &b], -1)?.reshape(sh)?)
-}
-
-/// apply RoPE to `t` `(N, heads, head_dim)` with `freqs` `(N, rot)` (rot ≤ head_dim).
+/// apply RoPE to `t` `(N, heads, head_dim)` with `freqs` `(N, rot)` (rot ≤ head_dim): the leading
+/// `rot` channels rotate as adjacent pairs against the full-width `repeat_interleave(2)` angle table,
+/// in f32, cast back to `t`'s dtype; the tail passes through.
+///
+/// The rotation is the shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] with
+/// `RopeStyle::InterleavedFull`, `rot_dims = rot` and `RopeDtype::RestoreInput` (SW-6140) — the
+/// same `x·cos + rotate_pairwise(x)·sin` per-element chain (the private copy's `x1·(−1)` lane is the
+/// same bits as `−x1`) as this crate's private copy. `t` is viewed as token-major `[1, N, heads,
+/// head_dim]` for the call. SeedVR2's angles are 3-axis (`f/h/w`), so there is no fused route.
 fn apply_rope(t: &Array, freqs: &Array) -> Result<Array> {
     let sh = t.shape();
-    let (n, _heads, hd) = (sh[0], sh[1], sh[2]);
+    let (n, heads, hd) = (sh[0], sh[1], sh[2]);
     let rot = freqs.shape()[1];
-    let t_mid = t.take_axis(
-        Array::from_slice(&(0..rot).collect::<Vec<i32>>(), &[rot]),
-        2,
-    )?; // (N,heads,rot)
-    let cosf = cos(&freqs.as_dtype(Dtype::Float32)?)?.reshape(&[n, 1, rot])?;
-    let sinf = sin(&freqs.as_dtype(Dtype::Float32)?)?.reshape(&[n, 1, rot])?;
-    let mid_f = t_mid.as_dtype(Dtype::Float32)?;
-    let rotated = add(
-        &multiply(&mid_f, &cosf)?,
-        &multiply(&rotate_half(&mid_f)?, &sinf)?,
-    )?
-    .as_dtype(t.dtype())?;
-    if rot < hd {
-        let right = t.take_axis(
-            Array::from_slice(&(rot..hd).collect::<Vec<i32>>(), &[hd - rot]),
-            2,
-        )?;
-        Ok(concatenate_axis(&[&rotated, &right], -1)?)
-    } else {
-        Ok(rotated)
-    }
+    let freqs = freqs.as_dtype(Dtype::Float32)?;
+    let (cosf, sinf) = (cos(&freqs)?, sin(&freqs)?);
+    let rotated = mlx_gen::qkv::apply_rope_eager(
+        &t.reshape(&[1, n, heads, hd])?,
+        mlx_gen::qkv::RopeTables::new(&cosf, &sinf),
+        mlx_gen::qkv::RopeStyle::InterleavedFull,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        Some(rot),
+        mlx_gen::qkv::RopeDtype::RestoreInput,
+    )?;
+    Ok(rotated.reshape(&[n, heads, hd])?)
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +500,15 @@ fn emb_param(emb: &Array, layer_idx: i32, comp: i32) -> Result<Array> {
     Ok(c.expand_dims(1)?) // (B,1,vid_dim)
 }
 
+/// One adaLN-single parameter: the timestep row `emb_param(emb, layer_idx, comp)` plus the block's
+/// learned offset `p` (`shift`/`scale`/`gate`).
+fn ada_param(emb: &Array, layer_idx: i32, comp: i32, p: &Array) -> Result<Array> {
+    Ok(add(&emb_param(emb, layer_idx, comp)?, p)?)
+}
+
+/// adaLN-single input modulation `x·scale + shift` with `scale`/`shift` the full table rows (no
+/// `1 +`): the shared eager [`mlx_gen::nn::scale_shift`] (SW-6140), the same two-op chain as this
+/// crate's private copy.
 fn modulate_in(
     hidden: &Array,
     emb: &Array,
@@ -529,12 +516,15 @@ fn modulate_in(
     p_shift: &Array,
     p_scale: &Array,
 ) -> Result<Array> {
-    let shift = add(&emb_param(emb, layer_idx, 0)?, p_shift)?;
-    let scale = add(&emb_param(emb, layer_idx, 1)?, p_scale)?;
-    Ok(add(&multiply(hidden, &scale)?, &shift)?)
+    let shift = ada_param(emb, layer_idx, 0, p_shift)?;
+    let scale = ada_param(emb, layer_idx, 1, p_scale)?;
+    mlx_gen::nn::scale_shift(hidden, &scale, &shift)
 }
+
+/// adaLN-single output **gate** `x·(emb_gate + p_gate)` — a single multiply, not a modulation
+/// affine, so it stays local (SW-6140 route table: kept).
 fn modulate_out(hidden: &Array, emb: &Array, layer_idx: i32, p_gate: &Array) -> Result<Array> {
-    let gate = add(&emb_param(emb, layer_idx, 2)?, p_gate)?;
+    let gate = ada_param(emb, layer_idx, 2, p_gate)?;
     Ok(multiply(hidden, &gate)?)
 }
 
@@ -1179,7 +1169,7 @@ impl Seedvr2Transformer {
             let scale_a = emb_param(&emb, 0, 1)?;
             let scale = add(&scale_a, self.out_scale.as_ref().unwrap())?;
             let shift = add(&shift_a, self.out_shift.as_ref().unwrap())?;
-            vid = add(&multiply(&vid, &scale)?, &shift)?;
+            vid = mlx_gen::nn::scale_shift(&vid, &scale, &shift)?;
         }
         self.vid_out.forward(&vid, vid_shape)
     }

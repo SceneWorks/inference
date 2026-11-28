@@ -908,7 +908,10 @@ class RunGraph:
         # which this graph cannot resolve statically; bind the entire source body and CLI
         # mode instead of blessing arbitrary dynamic subprocess calls.
         if relative == 'scripts/ci/test_suites.py':
-            reviewed_sha = '253d75e21e94b6f9c8326f5a7cd38a4d3fbf077b5ef0ab6eb7a9e4f49127e729'
+            # SW-6138 only makes the `--no-run` compile-phase bound (default 2400 s) an explicit,
+            # positive `--compile-seconds` option, still capped by the suite deadline; no mode,
+            # selection or execution path changes.
+            reviewed_sha = '77813412530de049af7b8b14e5b592473f49ae06338f9a6de65a8c98e7c527dc'
             # SW-6775: append the 26 migrated numeric CV/fake-session controls.
             # Their bodies use buffers/tokens only; no ORT session or learned call.
             # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership

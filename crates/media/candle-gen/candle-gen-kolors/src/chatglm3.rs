@@ -36,6 +36,7 @@ use candle_gen::candle_core::Result as CandleResult;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::{self as nn, Module, RmsNorm, VarBuilder};
 use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 
 use crate::config::ChatGlmConfig;
 use crate::tokenizer::KolorsTokens;
@@ -263,39 +264,19 @@ impl ChatGlmModel {
     /// Rotary `(cos, sin)`, each `[1, seq, 1, rotary_dim/2]`, for the given absolute `positions` (one
     /// per sequence slot — Kolors' left-padded `position_ids`). θ = 10000, computed once.
     fn rope_tables(&self, positions: &[i64], dtype: DType) -> CandleResult<(Tensor, Tensor)> {
-        let half = self.cfg.rotary_dim / 2; // 32
-        let rot = self.cfg.rotary_dim as f64; // 64
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|j| (1.0 / self.cfg.rope_base.powf((2 * j) as f64 / rot)) as f32)
-            .collect();
-        let seq = positions.len();
-        let mut freqs = Vec::with_capacity(seq * half);
-        for &p in positions {
-            for &f in &inv_freq {
-                freqs.push(p as f32 * f);
-            }
-        }
-        let freqs = Tensor::from_vec(freqs, (1, seq, 1, half), &self.device)?.to_dtype(dtype)?;
-        Ok((freqs.cos()?, freqs.sin()?))
+        glm_rope_tables(&self.cfg, positions, dtype, &self.device)
     }
 
     /// GLM interleaved half-dim RoPE on `x` `[b, s, heads, d]`: rotate the first `rotary_dim` dims as
     /// adjacent pairs `(x[2i], x[2i+1])` against `(cos, sin)` `[1, s, 1, rotary_dim/2]`; pass the
     /// trailing `d - rotary_dim` dims through.
+    ///
+    /// The shared [`candle_gen::rope::apply_rope`] (SW-6129) with [`glm_rope_spec`]: the fused
+    /// strided kernel on CUDA (q/k stay views of the fused QKV projection), and everywhere else the
+    /// shared reference chain — bit-identical to the even/odd narrow, `x0·cos − x1·sin`,
+    /// `x0·sin + x1·cos`, stack and pass-through cat this used to carry, in the activation dtype.
     fn apply_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
-        let (b, s, h, d) = x.dims4()?;
-        let rot = self.cfg.rotary_dim;
-        let half = rot / 2;
-        let x_rot = x.narrow(3, 0, rot)?; // [b, s, h, rot]
-        let x_pass = x.narrow(3, rot, d - rot)?; // [b, s, h, d-rot]
-        let xr = x_rot.reshape((b, s, h, half, 2))?;
-        let x0 = xr.narrow(4, 0, 1)?.squeeze(4)?; // even lane [b, s, h, half]
-        let x1 = xr.narrow(4, 1, 1)?.squeeze(4)?; // odd lane
-        let out0 = (x0.broadcast_mul(cos)? - x1.broadcast_mul(sin)?)?;
-        let out1 = (x1.broadcast_mul(cos)? + x0.broadcast_mul(sin)?)?;
-        // Re-interleave: stack on a new trailing axis then fold back to `rot`.
-        let rotated = Tensor::stack(&[&out0, &out1], 4)?.reshape((b, s, h, rot))?;
-        Tensor::cat(&[&rotated, &x_pass], 3)
+        candle_gen::rope::apply_rope(x, cos, sin, &glm_rope_spec(self.cfg.rotary_dim))
     }
 
     /// Additive `[1, 1, s, s]` mask in `dtype` (B==1), mirroring the reference `get_masks`: a real query row
@@ -331,6 +312,38 @@ fn causal_padding_data(m: &[u32], b: usize, s: usize) -> Vec<f32> {
         }
     }
     data
+}
+
+/// GLM's RoPE convention: interleaved pairs on `[b, s, heads, d]`, the first `rotary_dim` lanes,
+/// products and sums in the activation dtype.
+fn glm_rope_spec(rotary_dim: usize) -> RopeSpec {
+    RopeSpec::interleaved(RopeLayout::Bshd)
+        .with_math(RopeMath::Native)
+        .with_rotary_dim(rotary_dim)
+}
+
+/// GLM RoPE `(cos, sin)` `[1, s, 1, rotary_dim/2]` for explicit `positions` (left-pad aware), in
+/// `dtype` on `device`.
+fn glm_rope_tables(
+    cfg: &ChatGlmConfig,
+    positions: &[i64],
+    dtype: DType,
+    device: &Device,
+) -> CandleResult<(Tensor, Tensor)> {
+    let half = cfg.rotary_dim / 2; // 32
+    let rot = cfg.rotary_dim as f64; // 64
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| (1.0 / cfg.rope_base.powf((2 * j) as f64 / rot)) as f32)
+        .collect();
+    let seq = positions.len();
+    let mut freqs = Vec::with_capacity(seq * half);
+    for &p in positions {
+        for &f in &inv_freq {
+            freqs.push(p as f32 * f);
+        }
+    }
+    let freqs = Tensor::from_vec(freqs, (1, seq, 1, half), device)?.to_dtype(dtype)?;
+    Ok((freqs.cos()?, freqs.sin()?))
 }
 
 #[cfg(test)]
@@ -643,5 +656,125 @@ mod tests {
         assert_eq!(at(1, 0, 0), 0.0);
         assert_eq!(at(1, 0, 2), 0.0);
         assert_ne!(at(0, 0, 2), at(1, 0, 2));
+    }
+}
+
+/// SW-6129: GLM's partial interleaved RoPE is the shared `candle_gen::rope::apply_rope`.
+#[cfg(test)]
+mod sw6129_rope_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in [-2, 2) (no device RNG).
+    fn values(dims: &[usize], seed: u64, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 4.0 - 2.0) as f32
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former private apply, verbatim (`rot` = `rotary_dim`).
+    fn former_apply(rot: usize, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let (b, s, h, d) = x.dims4().unwrap();
+        let half = rot / 2;
+        let x_rot = x.narrow(3, 0, rot).unwrap();
+        let x_pass = x.narrow(3, rot, d - rot).unwrap();
+        let xr = x_rot.reshape((b, s, h, half, 2)).unwrap();
+        let x0 = xr.narrow(4, 0, 1).unwrap().squeeze(4).unwrap();
+        let x1 = xr.narrow(4, 1, 1).unwrap().squeeze(4).unwrap();
+        let out0 = (x0.broadcast_mul(cos).unwrap() - x1.broadcast_mul(sin).unwrap()).unwrap();
+        let out1 = (x1.broadcast_mul(cos).unwrap() + x0.broadcast_mul(sin).unwrap()).unwrap();
+        let rotated = Tensor::stack(&[&out0, &out1], 4)
+            .unwrap()
+            .reshape((b, s, h, rot))
+            .unwrap();
+        Tensor::cat(&[&rotated, &x_pass], 3).unwrap()
+    }
+
+    /// The shared route equals the former apply bit for bit on CPU in f32 / bf16 / f16 at the
+    /// ChatGLM3-6B geometry (head_dim 128, rotary 64, left-padded positions), on a q view of a
+    /// fused QKV projection like the real call site.
+    #[test]
+    fn shared_rope_route_matches_the_former_private_chain() {
+        let cfg = ChatGlmConfig::chatglm3_6b();
+        let positions: Vec<i64> = vec![0, 0, 0, 1, 2, 3, 4, 5, 6];
+        let s = positions.len();
+        let qkv32 = values(&[2, s, 6, cfg.head_dim], 7, &Device::Cpu);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (cos, sin) = glm_rope_tables(&cfg, &positions, dtype, &Device::Cpu).unwrap();
+            let qkv = qkv32.to_dtype(dtype).unwrap();
+            let q = qkv.narrow(2, 0, 4).unwrap();
+            let spec = glm_rope_spec(cfg.rotary_dim);
+            let got = candle_gen::rope::apply_rope(&q, &cos, &sin, &spec).unwrap();
+            let want = former_apply(cfg.rotary_dim, &q, &cos, &sin);
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: kolors chatglm3 apply_rope (f32, fused-QKV views, rotary 64/128) on CUDA device 0 takes the fused strided RoPE (every call counted
+    /// `fused`) and is bit-identical to the same call with the kernel switch off (the shared
+    /// reference chain) — the bf16 / production-dtype run the CPU goldens cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        // ChatGLM3-6B: 32 q / 2 kv heads x 128 viewed out of the fused QKV, 256 tokens, f32 (the
+        // Kolors encoder's compute dtype).
+        let cfg = ChatGlmConfig::chatglm3_6b();
+        let positions: Vec<i64> = (0..256).collect();
+        let (cos, sin) = glm_rope_tables(&cfg, &positions, DType::F32, &dev).unwrap();
+        let qkv = values(&[1, 256, 36, cfg.head_dim], 3, &dev);
+        let (q, k) = (qkv.narrow(2, 0, 32).unwrap(), qkv.narrow(2, 32, 2).unwrap());
+        let spec = glm_rope_spec(cfg.rotary_dim);
+        let rot = |x: &Tensor| candle_gen::rope::apply_rope(x, &cos, &sin, &spec).unwrap();
+        let run = || {
+            Tensor::cat(
+                &[
+                    rot(&q).flatten_all().unwrap(),
+                    rot(&k).flatten_all().unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "{on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), 2, "{off}");
+        ROPE_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!("kolors chatglm3 apply_rope (f32, fused-QKV views, rotary 64/128): {mismatches} of {} elements differ; on {on}, off {off}", f.len());
+        assert_eq!(mismatches, 0);
     }
 }

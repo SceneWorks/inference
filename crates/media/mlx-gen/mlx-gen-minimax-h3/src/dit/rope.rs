@@ -67,12 +67,10 @@
 //! by this module's tests, and **both lanes move together** — that is why the candle twin carries
 //! the identical convention.
 
-use mlx_rs::ops::{concatenate_axis, cos, multiply, negative, sin};
+use mlx_rs::ops::{concatenate_axis, cos, multiply, sin};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{Error, Result};
-
-use crate::tensor::slice_axis;
 
 /// Precomputed `(cos, sin)` for one packed sequence, `[seq_len, rotary_dim]` each.
 ///
@@ -187,31 +185,28 @@ impl MmRope {
         }
 
         // `[seq, rotary]` -> `[1, seq, 1, rotary]`, broadcasting over batch and heads. The tables
-        // are f32; they are narrowed to the ACTIVATION's dtype here, before the multiply-add —
+        // are f32; they are narrowed to the ACTIVATION's dtype before the multiply-add —
         // reference-faithful (`cos.to(hidden_states.dtype)`, `transformer_minimax_h3.py:66-67`),
-        // NOT a missed upcast.
-        let stream = x.dtype();
-        let cos_t = tables.cos.as_dtype(stream)?.reshape(&[1, seq, 1, rotary])?;
-        let sin_t = tables.sin.as_dtype(stream)?.reshape(&[1, seq, 1, rotary])?;
-
-        let head = slice_axis(x, 3, 0, rotary)?;
-        let half = rotary / 2;
-        let x1 = slice_axis(&head, 3, 0, half)?;
-        let x2 = slice_axis(&head, 3, half, rotary)?;
-        let rotated = concatenate_axis(&[negative(&x2)?, x1], -1)?;
-        let out = mlx_rs::ops::add(&multiply(&head, &cos_t)?, &multiply(&rotated, &sin_t)?)?;
-
-        if rotary == d {
-            return Ok(out);
-        }
-        let tail = slice_axis(x, 3, rotary, d)?;
-        Ok(concatenate_axis(&[out, tail], -1)?)
+        // NOT a missed upcast. That is the shared cos/sin route's `RopeDtype::Stream`: the rotation
+        // is `mlx_gen::qkv::apply_rope_eager` (SW-6140) with `RopeStyle::RotateHalf` over the
+        // leading `rotary` channels, the same `x·cos + cat(−x2, x1)·sin` chain and untouched tail
+        // as this module's private copy. The packed sequence's positions are 3-axis, so there is no
+        // fused `fast::rope` route.
+        mlx_gen::qkv::apply_rope_eager(
+            x,
+            mlx_gen::qkv::RopeTables::new(&tables.cos, &tables.sin),
+            mlx_gen::qkv::RopeStyle::RotateHalf,
+            mlx_gen::qkv::RotationAxes::TokenMajor,
+            Some(rotary),
+            mlx_gen::qkv::RopeDtype::Stream,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::slice_axis;
     use mlx_gen::testing::peak_rel_or_abs;
 
     fn spread(shape: &[i32]) -> Array {

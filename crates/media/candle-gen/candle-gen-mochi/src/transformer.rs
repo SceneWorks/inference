@@ -30,9 +30,7 @@ use candle_gen::gen_core::safetensors_shards::{
 use candle_gen::quant::QLinear;
 use candle_gen::{CandleError, Result};
 
-use crate::nn::{
-    layer_norm_no_affine, linear_b, rms_weighted, rms_weightless, silu, timestep_sincos,
-};
+use crate::nn::{linear_b, rms_weighted, silu, timestep_sincos};
 use crate::rope::MochiRope;
 
 /// AsymmDiT geometry (`transformer/config.json`). `inner_dim = num_heads · head_dim = 3072`.
@@ -95,7 +93,9 @@ fn chunk_last(x: &Tensor, n: usize) -> Result<Vec<Tensor>> {
     Ok(x.chunk(n, D::Minus1)?)
 }
 
-/// `(1 + scale)` broadcast over a length-1 sequence axis: `[B, d]` → `[B, 1, d]`.
+/// `(1 + scale)` broadcast over a length-1 sequence axis: `[B, d]` → `[B, 1, d]` (the pre-SW-6129
+/// sites' factor; the tests' oracle).
+#[cfg(test)]
 fn scale_plus_one_seq(scale: &Tensor) -> Result<Tensor> {
     Ok(scale.affine(1.0, 1.0)?.unsqueeze(1)?)
 }
@@ -103,6 +103,44 @@ fn scale_plus_one_seq(scale: &Tensor) -> Result<Tensor> {
 /// `tanh(gate)` with a length-1 sequence axis inserted: `[B, d]` → `[B, 1, d]`.
 fn tanh_gate_seq(gate: &Tensor) -> Result<Tensor> {
     Ok(gate.tanh()?.unsqueeze(1)?)
+}
+
+/// The f32 weightless RMS chain of [`crate::nn::rms_weightless`] (`x / sqrt(mean(x²) + eps)`, kept in f32).
+fn rms_f32_chain(eps: f64) -> candle_gen::modulate::AdaLnChain<'static> {
+    candle_gen::modulate::AdaLnChain::rms(eps).modulate_in(DType::F32)
+}
+
+/// `rms_weightless(x, eps) · (1 + scale)` (`scale` `[B, d]`) — the Mochi `MochiRMSNormZero` /
+/// `MochiLayerNormContinuous` scale-only modulation — as the shared fused scale-only AdaLN over that
+/// exact f32 chain (SW-6129): one launch on CUDA, the chain itself elsewhere.
+fn rms_scale(x: &Tensor, eps: f64, scale: &Tensor) -> Result<Tensor> {
+    Ok(candle_gen::modulate::adaln_chain_scale_only(
+        x,
+        &rms_f32_chain(eps),
+        &scale.unsqueeze(1)?,
+    )?)
+}
+
+/// `rms_weightless(x, eps) · tanh(gate)` (`gate` `[B, d]`) — the sandwich-norm gated residual — as
+/// the shared fused scale-only AdaLN, direct-scale form, over the same exact f32 chain (SW-6129).
+fn rms_gate(x: &Tensor, eps: f64, gate: &Tensor) -> Result<Tensor> {
+    Ok(candle_gen::modulate::adaln_chain_scale_only(
+        x,
+        &rms_f32_chain(eps).direct_scale(),
+        &tanh_gate_seq(gate)?,
+    )?)
+}
+
+/// `layer_norm_no_affine(x, eps) · (1 + scale) + shift` (`[B, d]` rows) — the final
+/// `AdaLayerNormContinuous` — as the shared fused AdaLN over that exact f32 chain (SW-6129).
+fn layer_modulate(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let spec = candle_gen::modulate::AdaLnChain::layer(eps).modulate_in(DType::F32);
+    Ok(candle_gen::modulate::adaln_chain(
+        x,
+        &spec,
+        &scale.unsqueeze(1)?,
+        &shift.unsqueeze(1)?,
+    )?)
 }
 
 // ---------------------------------------------------------------------------- SwiGLU FFN
@@ -355,21 +393,19 @@ impl MochiTransformerBlock {
         let emb = linear_b(&silu_temb, &self.norm1_w, &self.norm1_b)?;
         let c = chunk_last(&emb, 4)?;
         let (scale_msa, gate_msa, scale_mlp, gate_mlp) = (&c[0], &c[1], &c[2], &c[3]);
-        let norm_h = rms_weightless(hidden, eps)?.broadcast_mul(&scale_plus_one_seq(scale_msa)?)?;
+        let norm_h = rms_scale(hidden, eps, scale_msa)?;
 
         // norm1_context (text).
         let (norm_e, ctx_gates) = match &self.norm1_context {
             NormContext::Zero { lin_w, lin_b } => {
                 let emb_c = linear_b(&silu_temb, lin_w, lin_b)?;
                 let cc = chunk_last(&emb_c, 4)?;
-                let norm_e =
-                    rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&cc[0])?)?;
+                let norm_e = rms_scale(enc, eps, &cc[0])?;
                 (norm_e, Some((cc[1].clone(), cc[2].clone(), cc[3].clone())))
             }
             NormContext::Continuous { lin_w, lin_b } => {
                 let scale_c = linear_b(&silu_temb, lin_w, lin_b)?;
-                let norm_e =
-                    rms_weightless(enc, eps)?.broadcast_mul(&scale_plus_one_seq(&scale_c)?)?;
+                let norm_e = rms_scale(enc, eps, &scale_c)?;
                 (norm_e, None)
             }
         };
@@ -378,24 +414,18 @@ impl MochiTransformerBlock {
         let (attn_h, attn_e) = self.attn.forward(&norm_h, &norm_e, rope, joint_mask)?;
 
         // Visual residuals: tanh-gated attn, SwiGLU FFN with (1+scale_mlp) mod, tanh-gated ff.
-        let hidden =
-            (hidden + rms_weightless(&attn_h, eps)?.broadcast_mul(&tanh_gate_seq(gate_msa)?)?)?;
-        let norm_h2 =
-            rms_weightless(&hidden, eps)?.broadcast_mul(&scale_plus_one_seq(scale_mlp)?)?;
+        let hidden = (hidden + rms_gate(&attn_h, eps, gate_msa)?)?;
+        let norm_h2 = rms_scale(&hidden, eps, scale_mlp)?;
         let ff_out = self.ff.forward(&norm_h2)?;
-        let hidden =
-            (&hidden + rms_weightless(&ff_out, eps)?.broadcast_mul(&tanh_gate_seq(gate_mlp)?)?)?;
+        let hidden = (&hidden + rms_gate(&ff_out, eps, gate_mlp)?)?;
 
         // Text residuals (skipped on the final context_pre_only block).
         let enc = match (ctx_gates, attn_e, &self.ff_context) {
             (Some((e_gate_msa, e_scale_mlp, e_gate_mlp)), Some(attn_e), Some(ff_ctx)) => {
-                let enc = (enc
-                    + rms_weightless(&attn_e, eps)?
-                        .broadcast_mul(&tanh_gate_seq(&e_gate_msa)?)?)?;
-                let norm_e2 =
-                    rms_weightless(&enc, eps)?.broadcast_mul(&scale_plus_one_seq(&e_scale_mlp)?)?;
+                let enc = (enc + rms_gate(&attn_e, eps, &e_gate_msa)?)?;
+                let norm_e2 = rms_scale(&enc, eps, &e_scale_mlp)?;
                 let ff_e = ff_ctx.forward(&norm_e2)?;
-                (&enc + rms_weightless(&ff_e, eps)?.broadcast_mul(&tanh_gate_seq(&e_gate_mlp)?)?)?
+                (&enc + rms_gate(&ff_e, eps, &e_gate_mlp)?)?
             }
             _ => enc.clone(),
         };
@@ -633,10 +663,7 @@ impl MochiTransformer3DModel {
         let emb = linear_b(&silu(&temb)?, &self.norm_out_w, &self.norm_out_b)?;
         let so = chunk_last(&emb, 2)?;
         let (scale, shift) = (&so[0], &so[1]);
-        let normed = layer_norm_no_affine(&hs, 1e-6)?;
-        let hs = normed
-            .broadcast_mul(&scale_plus_one_seq(scale)?)?
-            .broadcast_add(&shift.unsqueeze(1)?)?;
+        let hs = layer_modulate(&hs, 1e-6, scale, shift)?;
         let hs = linear_b(&hs, &self.proj_out_w, &self.proj_out_b)?; // [B, seq, p²·out_ch]
 
         // Unpatchify: [B, F, ph, pw, p, p, out_ch] → [B, out_ch, F, H, W].
@@ -1135,5 +1162,131 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::context_pre_only_block_returns_enc_unchanged");
+    }
+}
+
+/// SW-6129: the Mochi AdaLN sites (RMSNormZero / LayerNormContinuous scale-only modulations, the
+/// tanh-gated sandwich norms, the final AdaLayerNormContinuous) are the shared fused AdaLN over the
+/// exact former chains.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use crate::nn::{layer_norm_no_affine, rms_weightless};
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// `x` `[2, 70, d]` and two `[2, d]` rows chunked out of a `[2, 4·d]` modulation (f32, the
+    /// all-f32 DiT).
+    fn operands(d: usize, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let x = values(&[2, 70, d], 1, 3.0, 0.2, dev);
+        let c = values(&[2, 4 * d], 2, 0.6, 0.0, dev)
+            .chunk(4, D::Minus1)
+            .unwrap();
+        (x, c[0].clone(), c[1].clone())
+    }
+
+    /// CPU: every fused form is bit-identical to its former site (visual 3072, text 1536).
+    #[test]
+    fn adaln_sites_match_the_former_chains() {
+        for d in [1536usize, 3072] {
+            let (x, a, b) = operands(d, &Device::Cpu);
+            let eps = 1e-6;
+            let former_scale = rms_weightless(&x, eps)
+                .unwrap()
+                .broadcast_mul(&scale_plus_one_seq(&a).unwrap())
+                .unwrap();
+            assert_eq!(
+                bits(&rms_scale(&x, eps, &a).unwrap()),
+                bits(&former_scale),
+                "{d}"
+            );
+            let former_gate = rms_weightless(&x, eps)
+                .unwrap()
+                .broadcast_mul(&tanh_gate_seq(&a).unwrap())
+                .unwrap();
+            assert_eq!(
+                bits(&rms_gate(&x, eps, &a).unwrap()),
+                bits(&former_gate),
+                "{d}"
+            );
+            let former_out = layer_norm_no_affine(&x, eps)
+                .unwrap()
+                .broadcast_mul(&scale_plus_one_seq(&a).unwrap())
+                .unwrap()
+                .broadcast_add(&b.unsqueeze(1).unwrap())
+                .unwrap();
+            assert_eq!(
+                bits(&layer_modulate(&x, eps, &a, &b).unwrap()),
+                bits(&former_out),
+                "{d}"
+            );
+        }
+    }
+
+    /// CUDA (the all-f32 DiT; the name follows the epic's smoke convention): the three forms take
+    /// the fused kernel, bit-identical to the switch-off reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 3;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, a, b) = operands(3072, &dev);
+        let run = || {
+            Tensor::cat(
+                &[
+                    rms_scale(&x, 1e-6, &a).unwrap(),
+                    rms_gate(&x, 1e-6, &b).unwrap(),
+                    layer_modulate(&x, 1e-6, &a, &b).unwrap(),
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        ADALN_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "mochi adaln (f32, d 3072, scale / gate / out): {mismatches} of {} differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

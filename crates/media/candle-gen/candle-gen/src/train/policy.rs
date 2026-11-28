@@ -309,12 +309,15 @@ pub(super) fn resume_profile(meta: &HashMap<String, String>) -> Result<TrainingP
     }
 }
 
+/// Separates a bound identity's private part from its execution-profile tag.
+const PROFILE_TAG_SEPARATOR: &str = ";execution_profile=";
+
 /// Current retains the historical fingerprint byte-for-byte. Profile binding in
 /// the existing config fingerprint makes old loaders reject non-Current bundles.
 pub(super) fn bind_resume_fingerprint(base: &str, profile: TrainingProfile) -> String {
     match private_execution_tag(profile) {
         None => base.into(),
-        Some(tag) => format!("{base};execution_profile={tag}"),
+        Some(tag) => format!("{base}{PROFILE_TAG_SEPARATOR}{tag}"),
     }
 }
 
@@ -338,10 +341,19 @@ pub fn bind_state_identity(base: &str, profile: TrainingProfile) -> String {
 /// Decode the finite suffix in a native private checkpoint's state identity.
 /// Untagged historical state means Current; malformed/future tags fail closed.
 pub fn profile_from_state_identity(identity: &str) -> Result<TrainingProfile> {
-    let Some((_, tag)) = identity.rsplit_once(";execution_profile=") else {
+    let Some((_, tag)) = identity.rsplit_once(PROFILE_TAG_SEPARATOR) else {
         return Ok(TrainingProfile::Current);
     };
     resume_profile(&HashMap::from([(RESUME_KEY.into(), tag.into())]))
+}
+
+/// The private training-state part of a native checkpoint's state identity, without the
+/// execution-profile tag [`bind_state_identity`] appends. An untagged (historical or Current)
+/// identity is returned unchanged.
+pub fn private_state_of(identity: &str) -> &str {
+    identity
+        .rsplit_once(PROFILE_TAG_SEPARATOR)
+        .map_or(identity, |(state, _)| state)
 }
 
 pub(super) fn record_resume_profile(meta: &mut HashMap<String, String>) {
@@ -670,6 +682,8 @@ mod selector_metadata_tests {
                 profile_from_state_identity(&bound).unwrap(),
                 TrainingProfile::WithoutE3
             );
+            assert_eq!(private_state_of(&bound), "native-private-config");
+            assert_eq!(private_state_of("historical"), "historical");
             assert_eq!(
                 bind_state_identity("historical", TrainingProfile::Current),
                 "historical"

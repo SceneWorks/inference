@@ -5,7 +5,7 @@ use crate::eight_bit_linear;
 use crate::{adapt, convrot, convrot_int8, nvfp4_kitchen, repack, w4a8_int8};
 pub use adapt::{AdaptLinear, Adapter, Base, Linear, LokrFactors, ScaleContext};
 pub use candle_quant_kernels::{
-    cublaslt, nvfp4, nvfp4_linear, nvfp4_outlier, veda_int8, veda_score,
+    act_quant, cublaslt, nvfp4, nvfp4_linear, nvfp4_outlier, veda_int8, veda_score,
 };
 pub use convrot::{convrot_fht_f32, convrot_rotate, is_power_of_four, regular_hadamard};
 pub use convrot_int8::ConvRotLinear;

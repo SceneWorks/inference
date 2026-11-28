@@ -9,7 +9,10 @@
 //! codec; only the weight half — packed codes, codebook, `s_rel`/`s_channel` — is new.
 //!
 //! This module owns the **contract** ([`W4A8Int8`] descriptor/geometry/value validation and
-//! residency) and the **host packed→int8 decode** ([`dequant_packed_to_int8`]) that the Candle
+//! residency, with the typed [`W4A8DescriptorError`]), the offline **packer** and dense **CPU
+//! dequant reference** ([`pack`]: [`quantize_weight`], [`decode_dense`], the checkpoint tensor set
+//! [`W4A8Packed::checkpoint_tensors`] and its reader [`W4A8Packed::from_safetensors`], SW-6134),
+//! and the **host packed→int8 decode** ([`dequant_packed_to_int8`]) that the Candle
 //! CPU/Metal dequant-dense fallback consumes — the same production-decoder role
 //! `decode_int8_per_row` / `decode_nvfp4` / `decode_mxfp8` play in [`crate::comfy_quant`]. The
 //! bit-accurate *forward* reference (activation FHT + quantizer + int32 GEMM + epilogue) is
@@ -45,6 +48,15 @@
 //! **activation** quantizer clamps `[-128, 127]` — matching the two kernels verbatim.
 
 use serde::Deserialize;
+
+pub mod delegation;
+pub use delegation::{delegate_projections, W4A8Delegation, DELEGATED_SUFFIXES};
+
+pub mod pack;
+pub use pack::{
+    decode_dense, quantize_weight, quantize_weight_with_codebook, serialize_checkpoint,
+    write_checkpoint, W4A8CheckpointTensor, W4A8PackError, W4A8Packed, DEFAULT_CODEBOOK,
+};
 
 /// Stable source/storage and native execution identity of this validated operand format.
 ///
@@ -119,6 +131,73 @@ struct Descriptor {
     convrot_groupsize: usize,
 }
 
+/// Why a W4A8 `.comfy_quant` descriptor (or its operand shapes) is refused — the typed form of
+/// [`W4A8Int8::parse`]'s message. `Display` is that exact message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum W4A8DescriptorError {
+    /// Empty, or longer than [`MAX_DESCRIPTOR_BYTES`].
+    Length,
+    /// Not a JSON object of exactly `format`, `group_size`, `convrot_groupsize`.
+    Json { detail: String },
+    /// `format` is not [`FORMAT`].
+    Format,
+    /// `group_size` is not the frozen dialect's [`GROUP_SIZE`].
+    GroupSize { declared: usize },
+    /// `convrot_groupsize` is not the frozen dialect's [`CONVROT_GROUP`].
+    RotationGroup { declared: usize },
+    /// The packed weight is not a nonempty `[out, in/2]` with an even byte width.
+    WeightShape,
+    /// The logical input width is not a multiple of the rotation group.
+    InputNotRotationMultiple,
+    /// The logical input width is not a multiple of the group size.
+    InputNotGroupMultiple,
+    /// `weight_s_rel` is not `[out, in/group]`.
+    SRelShape,
+    /// `weight_s_channel` is not `[out]`.
+    SChannelShape,
+    /// `weight_codebook` is not `[16]`.
+    CodebookShape,
+    /// The integer GEMM geometry overflows.
+    Overflow,
+}
+
+impl std::fmt::Display for W4A8DescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Length => write!(f, "W4A8 descriptor length is invalid"),
+            Self::Json { detail } => write!(f, "W4A8 descriptor: {detail}"),
+            Self::Format => write!(f, "expected format asym_w4a8_int8"),
+            Self::GroupSize { declared } => {
+                write!(f, "W4A8 group_size must be {GROUP_SIZE}, got {declared}")
+            }
+            Self::RotationGroup { declared } => write!(
+                f,
+                "W4A8 convrot_groupsize must be {CONVROT_GROUP}, got {declared}"
+            ),
+            Self::WeightShape => write!(
+                f,
+                "W4A8 weight must be nonempty [out, in/2] with an even byte width"
+            ),
+            Self::InputNotRotationMultiple => write!(
+                f,
+                "W4A8 logical input must be a multiple of the rotation group"
+            ),
+            Self::InputNotGroupMultiple => {
+                write!(f, "W4A8 logical input must be a multiple of the group size")
+            }
+            Self::SRelShape => write!(f, "W4A8 weight_s_rel must be F8_E4M3 [out, in/group]"),
+            Self::SChannelShape => write!(f, "W4A8 weight_s_channel must be F32 [out]"),
+            Self::CodebookShape => write!(
+                f,
+                "W4A8 codebook must be F32 [16] (the symmetric codebook dialect)"
+            ),
+            Self::Overflow => write!(f, "W4A8 integer GEMM geometry overflow"),
+        }
+    }
+}
+
+impl std::error::Error for W4A8DescriptorError {}
+
 impl W4A8Int8 {
     /// Parse the authoritative U8 `.comfy_quant` payload and validate its operand shapes.
     ///
@@ -131,7 +210,8 @@ impl W4A8Int8 {
     ///
     /// Only the actual frozen dialect is admitted: `{"format":"asym_w4a8_int8","group_size":16,
     /// "convrot_groupsize":256}`. Any other group/rotation size, a `convrot` bool, an absent
-    /// codebook, or an unknown field refuses through `serde(deny_unknown_fields)`.
+    /// codebook, or an unknown field refuses through `serde(deny_unknown_fields)`. The message is
+    /// [`W4A8DescriptorError`]'s `Display`; [`Self::parse_typed`] returns the typed refusal.
     pub fn parse(
         payload: &[u8],
         weight: &[usize],
@@ -139,48 +219,59 @@ impl W4A8Int8 {
         s_channel: &[usize],
         codebook: &[usize],
     ) -> Result<Self, String> {
+        Self::parse_typed(payload, weight, s_rel, s_channel, codebook).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::parse`] with the typed refusal.
+    pub fn parse_typed(
+        payload: &[u8],
+        weight: &[usize],
+        s_rel: &[usize],
+        s_channel: &[usize],
+        codebook: &[usize],
+    ) -> Result<Self, W4A8DescriptorError> {
+        use W4A8DescriptorError as E;
         if payload.is_empty() || payload.len() > MAX_DESCRIPTOR_BYTES {
-            return Err("W4A8 descriptor length is invalid".into());
+            return Err(E::Length);
         }
-        let d: Descriptor =
-            serde_json::from_slice(payload).map_err(|e| format!("W4A8 descriptor: {e}"))?;
+        let d: Descriptor = serde_json::from_slice(payload).map_err(|e| E::Json {
+            detail: e.to_string(),
+        })?;
         if d.format != FORMAT {
-            return Err("expected format asym_w4a8_int8".into());
+            return Err(E::Format);
         }
         if d.group_size != GROUP_SIZE {
-            return Err(format!(
-                "W4A8 group_size must be {GROUP_SIZE}, got {}",
-                d.group_size
-            ));
+            return Err(E::GroupSize {
+                declared: d.group_size,
+            });
         }
         if d.convrot_groupsize != CONVROT_GROUP {
-            return Err(format!(
-                "W4A8 convrot_groupsize must be {CONVROT_GROUP}, got {}",
-                d.convrot_groupsize
-            ));
+            return Err(E::RotationGroup {
+                declared: d.convrot_groupsize,
+            });
         }
         if weight.len() != 2 || weight.contains(&0) || !weight[1].is_multiple_of(2) {
-            return Err("W4A8 weight must be nonempty [out, in/2] with an even byte width".into());
+            return Err(E::WeightShape);
         }
         let (n, k_half) = (weight[0], weight[1]);
-        let k = k_half * 2;
+        let k = k_half.checked_mul(2).ok_or(E::Overflow)?;
         if !k.is_multiple_of(CONVROT_GROUP) {
-            return Err("W4A8 logical input must be a multiple of the rotation group".into());
+            return Err(E::InputNotRotationMultiple);
         }
         if k % GROUP_SIZE != 0 {
-            return Err("W4A8 logical input must be a multiple of the group size".into());
+            return Err(E::InputNotGroupMultiple);
         }
         if s_rel != [n, k / GROUP_SIZE] {
-            return Err("W4A8 weight_s_rel must be F8_E4M3 [out, in/group]".into());
+            return Err(E::SRelShape);
         }
         if s_channel != [n] {
-            return Err("W4A8 weight_s_channel must be F32 [out]".into());
+            return Err(E::SChannelShape);
         }
         if codebook != [16] {
-            return Err("W4A8 codebook must be F32 [16] (the symmetric codebook dialect)".into());
+            return Err(E::CodebookShape);
         }
         if n.checked_mul(k_half).is_none() || n > i32::MAX as usize || k > i32::MAX as usize {
-            return Err("W4A8 integer GEMM geometry overflow".into());
+            return Err(E::Overflow);
         }
         Ok(Self {
             out_features: n,

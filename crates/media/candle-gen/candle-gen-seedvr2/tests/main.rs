@@ -34,3 +34,6 @@ mod cuda_smoke;
 
 #[path = "cuda_video_smoke.rs"]
 mod cuda_video_smoke;
+
+#[path = "lossy_attention_job_real_weights.rs"]
+mod lossy_attention_job_real_weights;

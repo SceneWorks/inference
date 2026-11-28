@@ -45,11 +45,32 @@ pub fn conservative_video_decode_memory_profile(
 /// ([`attention::AttentionPathCounts`]: fused calls, and materialized calls by refusal reason).
 /// [`attention::FLASH_ATTN_COMPILED`] says whether this build carries the kernel at all (the
 /// default `media-flash-attn` feature).
+///
+/// The job-level **lossy-attention opt-ins** (SW-6132), off by default, for every Candle media
+/// provider whose attention routes through the shared helpers: the INT8 QK kernel and the Sol-Attn
+/// sparse kernel ([`attention::LossyAttentionOptIns`]). Per job, a product worker calls
+/// [`attention::admit_lossy_attention`]`(provider_id, &opt_ins)`, which returns a typed
+/// `Unsupported` for a provider with its own attention ([`attention::shared_attention_routing`] is
+/// [`attention::SharedAttentionRouting::Bespoke`]), a requested kernel the provider's attention can
+/// never take ([`attention::LossyServe::Never`]: a mask on every call, a head dim above 128, no
+/// self-attention for Sol-Attn; f32 attention and narrower heads are adapted, never refused), an
+/// unknown id, an invalid Sol-Attn configuration or a kernel this build lacks. It then calls
+/// [`attention::set_lossy_attention`] at job start and
+/// `set_lossy_attention(LossyAttentionOptIns::OFF)` at job end. Calls the kernel cannot serve keep
+/// FlashAttention / the budgeted path, counted in [`attention::AttentionPathCounts`]'s `int8` /
+/// `sol`, `int8_refusals` / `sol_refusals` and `lossy_adapted`.
 #[cfg(feature = "media")]
 pub mod attention {
     pub use candle_gen_catalog::media::fused_attention::{
-        attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
-        take_attention_path_counts, AttentionPathCounts, FLASH_ATTN_COMPILED,
+        attention_path_counts, flash_attention_enabled, lossy_attention,
+        set_flash_attention_enabled, set_lossy_attention, take_attention_path_counts,
+        AttentionPathCounts, Int8AttentionConfig, Int8RefusalCounts, KCentering, LossyAdaptCounts,
+        LossyAttentionOptIns, LossyAttentionRefusal, LossyOperandAdapt, PvPrecision, SolConfig,
+        SolRefusalCounts, SolSelection, FLASH_ATTN_COMPILED, INT8_ATTN_COMPILED, SOL_ATTN_COMPILED,
+    };
+    pub use candle_gen_catalog::{
+        admit_lossy_attention, shared_attention_routing, LossyServe, SharedAttentionRouting,
+        SHARED_ATTENTION_ROUTING,
     };
 }
 

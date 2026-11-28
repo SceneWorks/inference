@@ -293,16 +293,49 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// `IRIS_DIST_SHARE_DEVICE=1` (the CUDA lane, whose runner exposes one card): the multi-rank
-/// scenarios opt into `dist.world.share_device` — explicitly several ranks on one card.
+/// `IRIS_DIST_SHARE_DEVICE=1` forces the multi-rank scenarios into `dist.world.share_device`
+/// (several ranks on one card) whatever the box holds.
 const SHARE_DEVICE_ENV: &str = "IRIS_DIST_SHARE_DEVICE";
+
+/// Whether this scenario's ranks share a card. The protocol scenarios (rendezvous, cancel, stall,
+/// resharding, DDP/FSDP equivalence) need `local_ranks` rank processes, not `local_ranks` GPUs:
+/// when this process sees fewer CUDA devices than local ranks (the single-GPU exhaustive runner),
+/// they opt into `dist.world.share_device` explicitly. With enough cards nothing is shared and
+/// every rank keeps its own `cuda:<local_rank>` (the trainer only shares when that ordinal is
+/// absent anyway). Sharing changes placement only: each rank is still its own process with its
+/// own shard, collective and optimizer state, so the bit-for-bit DDP/FSDP comparisons hold the
+/// same arithmetic on one device. The missing-device refusal itself stays covered by
+/// `a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in`, which sets the flag
+/// both ways. CPU builds never consult it (every rank trains on the CPU).
+fn share_device(local_ranks: usize) -> bool {
+    if std::env::var(SHARE_DEVICE_ENV).as_deref() == Ok("1") {
+        return true;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen::candle_core::cuda_backend::cudarc::driver::CudaContext;
+        // Rank children inherit this process's CUDA_VISIBLE_DEVICES, so they see the same count.
+        let visible = CudaContext::device_count().map_or(0, |n| usize::try_from(n).unwrap_or(0));
+        let share = visible < local_ranks;
+        eprintln!(
+            "train_distributed: {visible} visible CUDA device(s) for {local_ranks} local rank(s): \
+             share_device={share}"
+        );
+        share
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = local_ranks;
+        false
+    }
+}
 
 fn tcp_world(n: usize, nodes: usize) -> Json {
     json!({
         "world_size": n, "local_world_size": n / nodes, "num_nodes": nodes,
         "master_addr": "127.0.0.1", "master_port": free_port(), "transport": "tcp",
         "timeout_secs": 20,
-        "share_device": std::env::var(SHARE_DEVICE_ENV).as_deref() == Ok("1"),
+        "share_device": share_device(n / nodes),
     })
 }
 

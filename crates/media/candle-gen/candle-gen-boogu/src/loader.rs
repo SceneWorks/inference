@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, Var, D};
+use candle_gen::candle_core::{DType, Device, Result, Tensor, Var};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::loader::MappedWeights;
 use candle_gen::quant::PackedConfig;
@@ -372,12 +372,18 @@ pub(crate) fn rmsnorm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 
 /// Plain LayerNorm over the last dim with **no affine** (LuminaLayerNormContinuous's inner norm,
 /// eps 1e-6): `(x − mean) / sqrt(var + eps)`. Computed in f32 then cast back to `x`'s dtype.
+///
+/// SW-6129: the output norm runs this chain through the shared fused AdaLN
+/// (`transformer::norm_out_scale`); this copy stays as its test oracle.
+#[cfg(test)]
 pub(crate) fn layernorm_noaffine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let x = x.to_dtype(DType::F32)?;
-    let mean = x.mean_keepdim(D::Minus1)?;
+    let mean = x.mean_keepdim(candle_gen::candle_core::D::Minus1)?;
     let centered = x.broadcast_sub(&mean)?;
-    let var = centered.sqr()?.mean_keepdim(D::Minus1)?;
+    let var = centered
+        .sqr()?
+        .mean_keepdim(candle_gen::candle_core::D::Minus1)?;
     let normed = centered.broadcast_div(&(var + eps)?.sqrt()?)?;
     normed.to_dtype(dt)
 }

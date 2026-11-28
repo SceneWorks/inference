@@ -8,6 +8,7 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
+use candle_gen::modulate::{adaln_scale_only, modulate, AdaLn};
 
 use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, rmsnorm, Weights};
@@ -253,6 +254,13 @@ impl SwiGlu {
     }
 }
 
+/// `RMSNorm(x; weight) · (1 + scale)` — [`rmsnorm`] (candle's fused `ops::rms_norm`) then the
+/// scale-only modulation, as the shared fused AdaLN (SW-6129, [`adaln_scale_only`] over
+/// [`AdaLn::rms`]): one launch on CUDA, bit-identical to that chain, which it runs everywhere else.
+pub(crate) fn rms_scale(x: &Tensor, weight: &Tensor, eps: f64, scale: &Tensor) -> Result<Tensor> {
+    adaln_scale_only(x, &AdaLn::rms(eps).with_weight(weight), scale)
+}
+
 // ── LuminaRMSNormZero modulation ────────────────────────────────────────────────────────────
 /// `emb = linear(silu(temb))` (`1024 → 4·D`), chunked into 4; the returned hidden is
 /// `RMSNorm(x)·(1 + scale_msa)`. The caller reuses the other three chunks per its pattern.
@@ -276,8 +284,7 @@ impl ModNorm {
     pub fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let emb = self.linear.forward(&temb.silu()?)?; // [b, 1, 4D]
         let chunks = emb.chunk(4, D::Minus1)?;
-        let scale_msa = (chunks[0].contiguous()? + 1.0)?;
-        let normed = rmsnorm(x, &self.norm, self.eps)?.broadcast_mul(&scale_msa)?;
+        let normed = rms_scale(x, &self.norm, self.eps, &chunks[0])?;
         Ok((
             normed,
             chunks[1].contiguous()?,
@@ -366,7 +373,7 @@ impl ModBlock {
         let x = (x + gate_msa
             .tanh()?
             .broadcast_mul(&rmsnorm(&attn, &self.norm2, self.eps)?)?)?;
-        let mlp_in = rmsnorm(&x, &self.ffn_norm1, self.eps)?.broadcast_mul(&(scale_mlp + 1.0)?)?;
+        let mlp_in = rms_scale(&x, &self.ffn_norm1, self.eps, &scale_mlp)?;
         let mlp = self.ff.forward(&mlp_in)?;
         &x + gate_mlp
             .tanh()?
@@ -483,9 +490,7 @@ impl DoubleBlock {
                 &self.img_self_attn_norm,
                 self.eps,
             )?)?)?;
-        let img_mlp_in = img_n2
-            .broadcast_mul(&(img_scale_mlp + 1.0)?)?
-            .broadcast_add(&img_shift_mlp)?;
+        let img_mlp_in = modulate(&img_n2, &img_scale_mlp, &img_shift_mlp)?;
         let img_mlp = self
             .img_ff
             .forward(&rmsnorm(&img_mlp_in, &self.img_ffn_norm1, self.eps)?)?;
@@ -503,9 +508,7 @@ impl DoubleBlock {
                 &self.instruct_attn_norm,
                 self.eps,
             )?)?)?;
-        let ins_mlp_in = ins_n2
-            .broadcast_mul(&(ins_scale_mlp + 1.0)?)?
-            .broadcast_add(&ins_shift_mlp)?;
+        let ins_mlp_in = modulate(&ins_n2, &ins_scale_mlp, &ins_shift_mlp)?;
         let ins_mlp =
             self.instruct_ff
                 .forward(&rmsnorm(&ins_mlp_in, &self.instruct_ffn_norm1, self.eps)?)?;
@@ -558,5 +561,104 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// SW-6129: the LuminaRMSNormZero / FFN scale-only sites are the shared fused AdaLN.
+#[cfg(test)]
+pub(crate) mod adaln_route_tests {
+    use super::*;
+    use candle_gen::candle_core::{DType, Device};
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    pub(crate) fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Boogu width (3360): `x [1, 40, D]`, a `[1, 1, 4·D]` ModNorm table (chunk views), a weight.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let d = 3360;
+        let x = values(&[1, 40, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let emb = values(&[1, 1, 4 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let w = values(&[d], 3, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        (x, emb, w)
+    }
+
+    /// `rms_scale` equals both former forms: ModNorm's `rmsnorm · (chunk.contiguous() + 1)` and
+    /// the FFN's `rmsnorm · (scale + 1)`.
+    #[test]
+    fn fused_scale_only_site_matches_the_former_chain() {
+        let eps = 1e-5;
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, emb, w) = operands(dtype, &Device::Cpu);
+            let chunks = emb.chunk(4, D::Minus1).unwrap();
+            let got = rms_scale(&x, &w, eps, &chunks[0]).unwrap();
+            let scale = (chunks[0].contiguous().unwrap() + 1.0).unwrap();
+            let want = rmsnorm(&x, &w, eps).unwrap().broadcast_mul(&scale).unwrap();
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// CUDA bf16: the scale-only site takes the fused AdaLN and is bit-identical to the same call
+    /// with the kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, emb, w) = operands(DType::BF16, &dev);
+        let chunks = emb.chunk(4, D::Minus1).unwrap();
+        let run = || {
+            let a = rms_scale(&x, &w, 1e-5, &chunks[0]).unwrap();
+            let b = crate::transformer::norm_out_scale(&x, &chunks[1]).unwrap();
+            Tensor::cat(&[a, b], 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "boogu adaln (bf16, D=3360): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

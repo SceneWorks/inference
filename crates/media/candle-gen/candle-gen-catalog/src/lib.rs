@@ -75,6 +75,288 @@ pub struct BespokeMemoryRouteWaiver {
 /// Empty after `SW-6982` registered `pulid_flux` and `instantid` as full `RouteRecord` generators.
 pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] = &[];
 
+/// Whether a registered provider's model attention runs through `candle-gen`'s shared SDPA helpers
+/// (`sdpa_budgeted_*` / `sdpa_planned_*` / the `training_sdpa_*` inference entry points) — the one
+/// dispatch the job-level attention switches act on (SW-6130 flash toggle, SW-6132 lossy opt-ins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedAttentionRouting {
+    /// The provider's transformer / UNet attention goes through the shared helpers: the flash
+    /// toggle reaches it, and so does each lossy kernel the provider can take
+    /// ([`LossyServe::Served`]) when opted in. Each call is still eligibility-checked; a call a
+    /// lossy kernel cannot serve keeps FlashAttention / the budgeted path, counted in
+    /// `AttentionPathCounts::{int8_refusals, sol_refusals}`. Operand layout is never a reason to
+    /// refuse (the shared dispatch runs f32 at bf16 and zero-pads a head dim below 128); a kernel
+    /// gap the provider's attention always hits (a mask, a head dim above 128, no self-attention
+    /// for Sol-Attn) is [`LossyServe::Never`], refused upfront by [`admit_lossy_attention`].
+    SharedHelpers {
+        /// Whether the provider's attention can take the INT8 QK kernel (SW-6131).
+        int8: LossyServe,
+        /// Whether the provider's attention can take the Sol-Attn kernel (SW-6137).
+        sol: LossyServe,
+    },
+    /// The provider's model attention is its own code (outside the shared helpers): no job-level
+    /// attention switch reaches it, so a product must refuse a lossy-attention opt-in for it with a
+    /// typed error rather than silently render the exact path ([`admit_lossy_attention`]).
+    Bespoke,
+}
+
+/// Whether a [`SharedAttentionRouting::SharedHelpers`] provider's attention can take one lossy
+/// kernel at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossyServe {
+    /// Its attention calls can take the kernel (unmasked, a head dim of at most 128, and for
+    /// Sol-Attn a sequence attending to itself; f32 runs at bf16 and a narrower head is
+    /// zero-padded by the shared dispatch); each call is still eligibility-checked.
+    Served,
+    /// Its attention can never take the kernel, and why (the typed refusal's text): opting in
+    /// would only render the exact path.
+    Never(&'static str),
+}
+
+impl SharedAttentionRouting {
+    /// Shared helpers, both lossy kernels served.
+    pub const ALL: Self = Self::SharedHelpers {
+        int8: LossyServe::Served,
+        sol: LossyServe::Served,
+    };
+
+    /// Shared helpers, the INT8 kernel served and Sol-Attn never (`why`).
+    pub const fn int8_only(why: &'static str) -> Self {
+        Self::SharedHelpers {
+            int8: LossyServe::Served,
+            sol: LossyServe::Never(why),
+        }
+    }
+
+    /// Shared helpers (the flash toggle reaches it) but neither lossy kernel can serve (`why`).
+    pub const fn exact_only(why: &'static str) -> Self {
+        Self::SharedHelpers {
+            int8: LossyServe::Never(why),
+            sol: LossyServe::Never(why),
+        }
+    }
+}
+
+/// Every provider this catalog registers (generators, transforms, captioners, embedders) and how
+/// its model attention routes. Trainers are not listed: training attention always runs the
+/// materialized path (epic E9), whatever the job switches say. `catalog_attention_routing_covers_every_provider`
+/// (tests) pins this table to the registry, so a new provider must state its routing here.
+pub const SHARED_ATTENTION_ROUTING: &[(&str, SharedAttentionRouting)] = {
+    use SharedAttentionRouting as R;
+    const ALL: R = R::ALL;
+    const BESPOKE: R = R::Bespoke;
+    // The only `Never`s are kernel gaps. Operand layout is never one: the shared dispatch runs f32
+    // attention at bf16 and zero-pads a head dim below 128 (`candle_gen::fused_attention::
+    // LossyOperandAdapt`), so an f32 model or a 64 / 120-wide head takes both kernels.
+    const HD256: &str =
+        "has 256-wide attention heads: the INT8 kernel is compiled for head dim 64 \
+                         / 128 and Sol-Attn for 128, and a wider head cannot be zero-padded down";
+    const BLOCK_CAUSAL: &str = "attends block-causally: every unmasked call attends a query slice \
+                                to a longer key prefix (Sq != Sk), and Sol-Attn routes only a token \
+                                sequence attending to itself";
+    &[
+        ("anima_base", ALL),
+        ("anima_aesthetic", ALL),
+        ("anima_turbo", ALL),
+        // Bernini renders with Wan's `WanTransformer`.
+        ("bernini_renderer", ALL),
+        ("bernini", ALL),
+        // 120-wide heads: zero-padded to 128 for both kernels.
+        ("boogu_image", ALL),
+        ("boogu_image_turbo", ALL),
+        ("boogu_image_edit", ALL),
+        // Chroma, FLUX.2, FLUX.3, LTX, SCAIL2 and SVD attend at f32: run at bf16 by the dispatch.
+        ("chroma1_hd", ALL),
+        ("chroma1_base", ALL),
+        ("chroma1_flash", ALL),
+        ("flux1_schnell", ALL),
+        ("flux1_dev", ALL),
+        // FLUX.1 ControlNet: the control blocks' joint attention is the DiT's `sdpa_planned_flat`.
+        ("flux1_dev_control", ALL),
+        // XLabs IP-Adapter: the DiT attention is shared; the small decoupled image-token
+        // cross-attention residual runs materialized beside it (as PuLID's identity CA does).
+        ("flux1_dev_ip_adapter", ALL),
+        ("flux1_schnell_ip_adapter", ALL),
+        ("flux2_klein_9b", ALL),
+        ("flux2_dev", ALL),
+        // FLUX.2 edit / control: reference or control tokens join the one unmasked joint sequence
+        // through the DiT's `sdpa_planned_bhsd`.
+        ("flux2_dev_control", ALL),
+        ("flux2_dev_edit", ALL),
+        ("flux2_klein_9b_edit", ALL),
+        ("flux3_klein", ALL),
+        ("flux3_klein_base", ALL),
+        ("ideogram_4", R::exact_only(HD256)),
+        ("ideogram_4_turbo", R::exact_only(HD256)),
+        ("iris_3b", ALL),
+        // Kolors: a lossy opt-in loads its dense snapshot through the vendored SDXL UNet (shared
+        // helpers, f32 at bf16, 64-wide heads padded for Sol-Attn); the default keeps the stock UNet.
+        ("kolors", ALL),
+        // Kolors IP-Adapter / ControlNet Pose always load the vendored SDXL UNet (f32 at bf16).
+        ("kolors_ip_adapter", ALL),
+        ("kolors_control", ALL),
+        ("krea_2_turbo", ALL),
+        ("krea_2_raw", ALL),
+        ("krea_2_edit", ALL),
+        ("krea_2_turbo_edit", ALL),
+        ("krea_2_turbo_control", ALL),
+        // 64-wide heads: zero-padded to 128 for Sol-Attn (INT8 has a 64 template).
+        ("lens_turbo", ALL),
+        ("lens", ALL),
+        ("ltx_2_3_distilled", ALL),
+        ("ltx_2_5_distilled", ALL),
+        // Mage's DiT attention goes through `training_sdpa_bhsd` (the shared planned helper).
+        ("mage_flow", ALL),
+        ("mage_flow_base", ALL),
+        ("mage_flow_turbo", ALL),
+        ("mage_flow_edit", ALL),
+        ("mage_flow_edit_base", ALL),
+        ("mage_flow_edit_turbo", ALL),
+        ("minimax_h3", ALL),
+        ("minimax_h3_image", ALL),
+        (
+            "mochi_1",
+            R::exact_only(
+                "attends under its text padding mask on every call (joint and pooled attention), \
+                 and neither the INT8 nor the Sol-Attn kernel takes an attention mask",
+            ),
+        ),
+        // MOSS-Image's DiT attention is its own explicit-f32 materialized path.
+        ("moss_image_base", BESPOKE),
+        ("moss_image_sft", BESPOKE),
+        ("qwen_image", ALL),
+        // Qwen-Image edit (reference tokens in the joint sequence) and Fun control (the control
+        // branch reuses the base dual-stream `Block`): the DiT's `sdpa_planned_bhsd`.
+        ("qwen_image_edit", ALL),
+        ("qwen_image_edit_2509", ALL),
+        ("qwen_image_edit_2511", ALL),
+        ("qwen_image_edit_2511_lightning", ALL),
+        ("qwen_image_control", ALL),
+        ("qwen_image_2_1", R::int8_only(BLOCK_CAUSAL)),
+        ("qwen_image_2_1_turbo", R::int8_only(BLOCK_CAUSAL)),
+        // Sana: ReLU linear self-attention plus its own masked cross-attention.
+        ("sana_1600m", BESPOKE),
+        ("sana_sprint_1600m", BESPOKE),
+        ("scail2_14b", ALL),
+        ("sd3_5_large", ALL),
+        ("sd3_5_large_turbo", ALL),
+        ("sd3_5_medium", ALL),
+        ("sdxl", ALL),
+        // The edit / detail / control / IP-Adapter routes run the vendored SDXL UNet (and its
+        // ControlNet), whose `CrossAttention` is the shared `sdpa_budgeted_bhsd`.
+        ("sdxl_edit", ALL),
+        ("sdxl_detail", ALL),
+        ("sdxl_control", ALL),
+        ("sdxl_ip_adapter", ALL),
+        ("seedvr2", ALL),
+        ("seedvr2_3b", ALL),
+        ("seedvr2_7b", ALL),
+        (
+            "sensenova_u1_8b",
+            R::exact_only(
+                "attends under its block-causal mask on every call, and neither the INT8 nor the \
+                 Sol-Attn kernel takes an attention mask",
+            ),
+        ),
+        (
+            "sensenova_u1_8b_fast",
+            R::exact_only(
+                "attends under its block-causal mask on every call, and neither the INT8 nor the \
+                 Sol-Attn kernel takes an attention mask",
+            ),
+        ),
+        // Supra-2's DiT has its own materialized `sdpa`.
+        ("supra2_img", BESPOKE),
+        ("svd_xt", ALL),
+        ("wan2_2_ti2v_5b", ALL),
+        ("wan2_2_t2v_14b", ALL),
+        ("wan2_2_i2v_14b", ALL),
+        ("wan_vace", ALL),
+        ("wan2_2_vace_fun_14b", ALL),
+        ("z_image_turbo", ALL),
+        ("z_image", ALL),
+        // Z-Image control: the base DiT's blocks and caption-padding trim (unmasked when trimmed).
+        ("z_image_control", ALL),
+        ("z_image_turbo_control", ALL),
+        ("iris_3b_restore", ALL),
+        // The identity routes denoise with FLUX.1 / the vendored SDXL UNet.
+        (candle_gen_pulid::memory_strategy::PROVIDER_ID, ALL),
+        (candle_gen_instantid::memory_strategy::PROVIDER_ID, ALL),
+        // The captioner and the CLIP embedders run their own attention.
+        ("fancyfeast/llama-joycaption-beta-one-hf-llava", BESPOKE),
+        ("clip_vit_l14", BESPOKE),
+        ("clip_vit_l14_text", BESPOKE),
+    ]
+};
+
+/// How `provider_id`'s model attention routes ([`SharedAttentionRouting`]); `None` for an id this
+/// catalog does not register.
+pub fn shared_attention_routing(provider_id: &str) -> Option<SharedAttentionRouting> {
+    SHARED_ATTENTION_ROUTING
+        .iter()
+        .find_map(|(id, routing)| (*id == provider_id).then_some(*routing))
+}
+
+/// The one upfront check a product runs before setting a job's lossy-attention opt-ins
+/// (`candle_gen::fused_attention::set_lossy_attention`) for `provider_id` (SW-6132): `Ok` when
+/// nothing is requested, or when the provider's attention routes through the shared helpers, can
+/// take every requested kernel ([`LossyServe::Served`]) and this build compiles it; otherwise a
+/// typed [`media::gen_core::Error::Unsupported`] naming the provider and the reason — never a
+/// silently exact render. Per-call constraints (mask, head dim, dtype, the device's compute
+/// capability, cross-attention for Sol-Attn) are checked at each attention call and counted in
+/// `AttentionPathCounts::{int8_refusals, sol_refusals}`.
+pub fn admit_lossy_attention(
+    provider_id: &str,
+    opt_ins: &media::fused_attention::LossyAttentionOptIns,
+) -> media::gen_core::Result<()> {
+    use media::fused_attention::{INT8_ATTN_COMPILED, SOL_ATTN_COMPILED};
+    use media::gen_core::Error;
+    if !opt_ins.any() {
+        return Ok(());
+    }
+    let requested = match (opt_ins.int8.is_some(), opt_ins.sol.is_some()) {
+        (true, true) => "int8_attention + sol_attention",
+        (true, false) => "int8_attention",
+        _ => "sol_attention",
+    };
+    opt_ins
+        .validate()
+        .map_err(|refusal| Error::Unsupported(format!("{provider_id}: {refusal}")))?;
+    let (int8, sol) = match shared_attention_routing(provider_id) {
+        None => {
+            return Err(Error::Unsupported(format!(
+                "{requested}: `{provider_id}` is not a Candle provider this runtime registers"
+            )))
+        }
+        Some(SharedAttentionRouting::Bespoke) => {
+            return Err(Error::Unsupported(format!(
+                "{requested}: `{provider_id}` runs its own attention, outside the shared Candle \
+                 attention helpers the option acts on"
+            )))
+        }
+        Some(SharedAttentionRouting::SharedHelpers { int8, sol }) => (int8, sol),
+    };
+    for (asked, serve, name) in [
+        (opt_ins.int8.is_some(), int8, "int8_attention"),
+        (opt_ins.sol.is_some(), sol, "sol_attention"),
+    ] {
+        if let (true, LossyServe::Never(why)) = (asked, serve) {
+            return Err(Error::Unsupported(format!("{name}: `{provider_id}` {why}")));
+        }
+    }
+    if opt_ins.int8.is_some() && !INT8_ATTN_COMPILED {
+        return Err(Error::Unsupported(format!(
+            "int8_attention: this build does not compile the INT8 attention kernel (`{provider_id}`)"
+        )));
+    }
+    if opt_ins.sol.is_some() && !SOL_ATTN_COMPILED {
+        return Err(Error::Unsupported(format!(
+            "sol_attention: this build does not compile the Sol-Attn kernel (`{provider_id}`)"
+        )));
+    }
+    Ok(())
+}
+
 fn register_providers_with_flux3_mode(
     registry: ProviderRegistryBuilder,
     cuda_flux3_target: bool,

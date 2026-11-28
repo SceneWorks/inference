@@ -135,8 +135,54 @@ fn render(width: u32, height: u32) {
     };
 
     let t_gen = Instant::now();
-    let out = gen.generate(&req, &mut |_| {}).expect("generate");
+    // Step timestamps (s/step = the mean interval between consecutive denoise steps).
+    // The denoise peak: the device pool's high-water reset at the first step, read at decode.
+    let mut steps: Vec<Instant> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let pool = candle_gen::cuda_mempool::MemPool::device_current(0);
+    #[cfg(feature = "cuda")]
+    let mut denoise_peak: Option<(u64, u64)> = None;
+    let out = gen
+        .generate(&req, &mut |p| match p {
+            candle_gen::gen_core::Progress::Step { .. } => {
+                #[cfg(feature = "cuda")]
+                if steps.is_empty() {
+                    if let Some(pool) = &pool {
+                        pool.reset_used_high_water();
+                    }
+                }
+                steps.push(Instant::now());
+            }
+            candle_gen::gen_core::Progress::Decoding =>
+            {
+                #[cfg(feature = "cuda")]
+                if let Some(pool) = &pool {
+                    denoise_peak = pool.used_high().zip(pool.used());
+                }
+            }
+            _ => {}
+        })
+        .expect("generate");
+    #[cfg(feature = "cuda")]
+    if let Some((high, live)) = denoise_peak {
+        eprintln!(
+            "[krea_2_turbo {width}x{height}] denoise pool high-water {:.2} GiB (live at decode {:.2} GiB)",
+            high as f64 / (1u64 << 30) as f64,
+            live as f64 / (1u64 << 30) as f64
+        );
+    }
     let gen_s = t_gen.elapsed().as_secs_f32();
+    if let [first, .., last] = steps.as_slice() {
+        let per_step = last.duration_since(*first).as_secs_f32() / (steps.len() - 1) as f32;
+        eprintln!(
+            "[krea_2_turbo {width}x{height}] {per_step:.3} s/step over {} steps",
+            steps.len()
+        );
+    }
+    // Which fused media kernels served the render, and which fell back (SW-F287 E1).
+    for (kernel, counts) in candle_gen::fused_path::fused_path_counts() {
+        eprintln!("[krea_2_turbo {width}x{height}] fused path {kernel}: {counts}");
+    }
 
     let GenerationOutput::Images(imgs) = out else {
         panic!("expected GenerationOutput::Images");
@@ -332,8 +378,54 @@ fn render_raw(width: u32, height: u32, guidance: f32, negative: &str) -> Option<
     };
 
     let t_gen = Instant::now();
-    let out = gen.generate(&req, &mut |_| {}).expect("generate");
+    // Step timestamps (s/step = the mean interval between consecutive denoise steps).
+    // The denoise peak: the device pool's high-water reset at the first step, read at decode.
+    let mut steps: Vec<Instant> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let pool = candle_gen::cuda_mempool::MemPool::device_current(0);
+    #[cfg(feature = "cuda")]
+    let mut denoise_peak: Option<(u64, u64)> = None;
+    let out = gen
+        .generate(&req, &mut |p| match p {
+            candle_gen::gen_core::Progress::Step { .. } => {
+                #[cfg(feature = "cuda")]
+                if steps.is_empty() {
+                    if let Some(pool) = &pool {
+                        pool.reset_used_high_water();
+                    }
+                }
+                steps.push(Instant::now());
+            }
+            candle_gen::gen_core::Progress::Decoding =>
+            {
+                #[cfg(feature = "cuda")]
+                if let Some(pool) = &pool {
+                    denoise_peak = pool.used_high().zip(pool.used());
+                }
+            }
+            _ => {}
+        })
+        .expect("generate");
+    #[cfg(feature = "cuda")]
+    if let Some((high, live)) = denoise_peak {
+        eprintln!(
+            "[krea_2_turbo {width}x{height}] denoise pool high-water {:.2} GiB (live at decode {:.2} GiB)",
+            high as f64 / (1u64 << 30) as f64,
+            live as f64 / (1u64 << 30) as f64
+        );
+    }
     let gen_s = t_gen.elapsed().as_secs_f32();
+    if let [first, .., last] = steps.as_slice() {
+        let per_step = last.duration_since(*first).as_secs_f32() / (steps.len() - 1) as f32;
+        eprintln!(
+            "[krea_2_turbo {width}x{height}] {per_step:.3} s/step over {} steps",
+            steps.len()
+        );
+    }
+    // Which fused media kernels served the render, and which fell back (SW-F287 E1).
+    for (kernel, counts) in candle_gen::fused_path::fused_path_counts() {
+        eprintln!("[krea_2_turbo {width}x{height}] fused path {kernel}: {counts}");
+    }
 
     let GenerationOutput::Images(mut imgs) = out else {
         panic!("expected GenerationOutput::Images");

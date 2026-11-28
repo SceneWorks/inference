@@ -6,18 +6,34 @@
 //! scores, so it works at any `head_dim` — the pixel stream's `head_dim = 72` needs no flash-pad hack
 //! (the MLX port padded to 80 for MLX's fused kernel). Runs f32 throughout.
 
-use candle_gen::candle_core::{Tensor, D};
+use candle_gen::candle_core::{DType, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{Linear, Module};
+use candle_gen::modulate::{adaln, AdaLn};
 use candle_gen::{Result, Weights};
 
 use super::layers::{FeedForward, Mlp, RMS_EPS};
 use super::rope::apply_rope;
 use crate::nn::{linear, rms};
 
-/// `norm · (scale + 1) + shift` (the DiT AdaLN modulation; mirrors `mlx_gen::nn::modulate`).
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    Ok(norm.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)?)
+/// `rms(x, weight) · (scale + 1) + shift` — [`crate::nn::rms`] (candle `ops::rms_norm` on an f32
+/// copy with the f32 weight, cast back) then `norm · (scale + 1) + shift` (mirrors
+/// `mlx_gen::nn::modulate`), as the shared fused AdaLN (SW-6129,
+/// [`AdaLn::rms`] `.norm_in_f32()`): one launch on CUDA, bit-identical to that chain, which it runs
+/// everywhere else. A rank-2 `[B, D]` modulation is the right-aligned `[1, B, D]` broadcast it was.
+fn rms_modulate(x: &Tensor, weight: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let w = weight.to_dtype(DType::F32)?;
+    let spec = AdaLn::rms(f64::from(RMS_EPS)).with_weight(&w).norm_in_f32();
+    Ok(adaln(x, &spec, &rank3(scale)?, &rank3(shift)?)?)
+}
+
+/// `t` with leading unit axes up to rank 3 — the same right-aligned broadcast candle applies.
+fn rank3(t: &Tensor) -> Result<Tensor> {
+    let mut t = t.clone();
+    while t.rank() < 3 {
+        t = t.unsqueeze(0)?;
+    }
+    Ok(t)
 }
 
 /// `x + gate · y` (mirrors `mlx_gen::nn::gated`). `gate` broadcasts over the token axis.
@@ -223,25 +239,21 @@ impl MMDiTBlockT2I {
         let mx = __model_proof_output!(self.adaln_img.forward(c))?.chunk(6, D::Minus1)?;
         let my = __model_proof_output!(self.adaln_txt.forward(c))?.chunk(6, D::Minus1)?;
 
-        let x_norm = modulate(&rms(x, &self.norm_x1, RMS_EPS)?, &mx[1], &mx[0])?;
-        let y_norm = modulate(&rms(y, &self.norm_y1, RMS_EPS)?, &my[1], &my[0])?;
+        let x_norm = rms_modulate(x, &self.norm_x1, &mx[1], &mx[0])?;
+        let y_norm = rms_modulate(y, &self.norm_y1, &my[1], &my[0])?;
         let (attn_x, attn_y) = self
             .attn
             .forward(&x_norm, &y_norm, cos_img, sin_img, cos_txt, sin_txt)?;
         let x = gated(x, &mx[2], &attn_x)?;
         let y = gated(y, &my[2], &attn_y)?;
 
-        let x_mlp = self.mlp_x.forward(&modulate(
-            &rms(&x, &self.norm_x2, RMS_EPS)?,
-            &mx[4],
-            &mx[3],
-        )?)?;
+        let x_mlp = self
+            .mlp_x
+            .forward(&rms_modulate(&x, &self.norm_x2, &mx[4], &mx[3])?)?;
         let x = gated(&x, &mx[5], &x_mlp)?;
-        let y_mlp = self.mlp_y.forward(&modulate(
-            &rms(&y, &self.norm_y2, RMS_EPS)?,
-            &my[4],
-            &my[3],
-        )?)?;
+        let y_mlp = self
+            .mlp_y
+            .forward(&rms_modulate(&y, &self.norm_y2, &my[4], &my[3])?)?;
         let y = gated(&y, &my[5], &y_mlp)?;
         Ok((x, y))
     }
@@ -307,7 +319,7 @@ impl PiTBlock {
         ))?;
         let m = cond.chunk(6, D::Minus1)?; // shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
-        let x_norm = modulate(&rms(x, &self.norm1, RMS_EPS)?, &m[1], &m[0])?;
+        let x_norm = rms_modulate(x, &self.norm1, &m[1], &m[0])?;
         let x_flat = x_norm.reshape((bl, p2 * self.pixel_dim))?;
         let x_comp = __model_proof_output!(self.compress_to_attn.forward(&x_flat))?.reshape((
             b,
@@ -321,9 +333,128 @@ impl PiTBlock {
         .reshape((bl, p2, self.pixel_dim))?;
         let x = gated(x, &m[2], &attn_exp)?;
 
-        let mlp_out =
-            self.mlp
-                .forward(&modulate(&rms(&x, &self.norm2, RMS_EPS)?, &m[4], &m[3])?)?;
+        let mlp_out = self
+            .mlp
+            .forward(&rms_modulate(&x, &self.norm2, &m[4], &m[3])?)?;
         gated(&x, &m[5], &mlp_out)
+    }
+}
+
+/// SW-6129: the backbone AdaLN sites are the shared fused AdaLN, bit-identical to
+/// `rms` + `modulate`.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The former site: `rms` then the composable modulate.
+    fn former(x: &Tensor, w: &Tensor, scale: &Tensor, shift: &Tensor) -> Tensor {
+        candle_gen::modulate::modulate(&rms(x, w, RMS_EPS).unwrap(), scale, shift).unwrap()
+    }
+
+    /// `(x, weight, scale, shift)` sites at the real widths: the MMDiT patch stream (hidden 1536,
+    /// `[1, D]` and `[1, 1, D]` modulation) and the PiT pixel stream (pixel dim 16, per-pixel
+    /// `[B·L, P², 16]` modulation chunks of a `[B·L, P², 96]` table).
+    fn sites(dtype: DType, dev: &Device) -> Vec<(Tensor, Tensor, Tensor, Tensor)> {
+        let x = values(&[1, 40, 1536], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let w = values(&[1536], 2, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        let m = values(&[1, 6 * 1536], 3, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let c = m.chunk(6, D::Minus1).unwrap();
+        let px = values(&[12, 16, 16], 4, 3.0, 0.2, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let pw = values(&[16], 5, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        let pm = values(&[12, 16, 96], 6, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let pc = pm.chunk(6, D::Minus1).unwrap();
+        vec![
+            (x.clone(), w.clone(), c[1].clone(), c[0].clone()),
+            (x, w, c[4].unsqueeze(1).unwrap(), c[3].unsqueeze(1).unwrap()),
+            (px, pw, pc[1].clone(), pc[0].clone()),
+        ]
+    }
+
+    #[test]
+    fn fused_adaln_sites_match_the_former_chain() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for (i, (x, w, scale, shift)) in sites(dtype, &Device::Cpu).iter().enumerate() {
+                let got = rms_modulate(x, w, scale, shift).unwrap();
+                assert_eq!(
+                    bits(&got),
+                    bits(&former(x, w, scale, shift)),
+                    "site {i} {dtype:?}"
+                );
+            }
+        }
+    }
+
+    /// CUDA bf16: the three site shapes take the fused AdaLN and are bit-identical to the same
+    /// calls with the kernel switch off (and to the former chain).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 3;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let sites = sites(DType::BF16, &dev);
+        let run = || {
+            let outs: Vec<Tensor> = sites
+                .iter()
+                .map(|(x, w, sc, sh)| rms_modulate(x, w, sc, sh).unwrap().flatten_all().unwrap())
+                .collect();
+            Tensor::cat(&outs, 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "pid adaln (bf16, D=1536 / 16): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
     }
 }

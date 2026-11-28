@@ -26,7 +26,7 @@ use crate::common::{
     Weights,
 };
 use crate::config::Sam3VisionConfig;
-use crate::vision::{Backbone, FpnLayer};
+use crate::vision::{Backbone, FpnLayer, SAM3_ROPE};
 
 // --- fixed facebook/sam3 tracker hyperparameters (Sam3TrackerVideoMaskDecoderConfig) -------------
 const HIDDEN: usize = 256;
@@ -901,6 +901,7 @@ fn build_rope_tables(grid: usize, device: &Device) -> Result<(Tensor, Tensor)> {
 }
 
 /// `rotate_pairwise`: pairs `(a, b)` → `(−b, a)` along the last (head_dim) axis.
+#[cfg(test)]
 fn rotate_pairwise(x: &Tensor) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     let d = *dims.last().unwrap();
@@ -927,9 +928,10 @@ fn apply_rope_2d(
     num_k_exclude: usize,
     repeat_freqs_k: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let q_embed = q
-        .broadcast_mul(cos)?
-        .add(&rotate_pairwise(q)?.broadcast_mul(sin)?)?;
+    // Both rotations are the shared `candle_gen::rope::apply_rope` with the vision tower's SAM3
+    // convention (SW-6129): bit-identical to the `x·cos + rotate_pairwise(x)·sin` chain this
+    // function carried (`tests::apply_rope_2d_matches_the_former_private_chain` pins it).
+    let q_embed = candle_gen::rope::apply_rope(q, cos, sin, &SAM3_ROPE)?;
     let seq_k = k.dim(2)?;
     let n_rot = seq_k - num_k_exclude;
     let k_rot = slice_axis(k, 2, 0, n_rot)?;
@@ -947,9 +949,7 @@ fn apply_rope_2d(
     } else {
         (cos.clone(), sin.clone())
     };
-    let k_embed = k_rot
-        .broadcast_mul(&cos_k)?
-        .add(&rotate_pairwise(&k_rot)?.broadcast_mul(&sin_k)?)?;
+    let k_embed = candle_gen::rope::apply_rope(&k_rot, &cos_k, &sin_k, &SAM3_ROPE)?;
     let k_out = if num_k_exclude > 0 {
         let k_pass = slice_axis(k, 2, n_rot, seq_k)?;
         Tensor::cat(&[&k_embed, &k_pass], 2)?
@@ -1782,5 +1782,133 @@ mod tests {
             .unwrap();
         assert_eq!(bytes(&fresh), bytes(&a), "cached frame_pos != fresh");
         assert_eq!(bytes(&a), bytes(&b), "frame_pos cache hit drifted");
+    }
+}
+
+/// SW-6129 route: `apply_rope_2d` rotates through the shared `candle_gen::rope::apply_rope`; the
+/// former private chain is the oracle.
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+
+    fn spread(shape: &[usize], seed: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.9)
+            .collect();
+        Tensor::from_vec(vals, shape, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 `apply_rope_2d`, verbatim.
+    fn former(
+        q: &Tensor,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        num_k_exclude: usize,
+        repeat_freqs_k: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let q_embed = q
+            .broadcast_mul(cos)?
+            .add(&rotate_pairwise(q)?.broadcast_mul(sin)?)?;
+        let seq_k = k.dim(2)?;
+        let n_rot = seq_k - num_k_exclude;
+        let k_rot = slice_axis(k, 2, 0, n_rot)?;
+        let q_seq = q.dim(2)?;
+        let (cos_k, sin_k) = if repeat_freqs_k && n_rot != q_seq {
+            let rf = n_rot / q_seq;
+            let cos_rep: Vec<&Tensor> = (0..rf).map(|_| cos).collect();
+            let sin_rep: Vec<&Tensor> = (0..rf).map(|_| sin).collect();
+            (Tensor::cat(&cos_rep, 0)?, Tensor::cat(&sin_rep, 0)?)
+        } else {
+            (cos.clone(), sin.clone())
+        };
+        let k_embed = k_rot
+            .broadcast_mul(&cos_k)?
+            .add(&rotate_pairwise(&k_rot)?.broadcast_mul(&sin_k)?)?;
+        let k_out = if num_k_exclude > 0 {
+            let k_pass = slice_axis(k, 2, n_rot, seq_k)?;
+            Tensor::cat(&[&k_embed, &k_pass], 2)?
+        } else {
+            k_embed
+        };
+        Ok((q_embed, k_out))
+    }
+
+    /// Bit-identical to the former chain on the real memory-attention tables: plain self-attention
+    /// keys, and memory keys with repeated frequencies plus excluded object-pointer tokens.
+    #[test]
+    fn apply_rope_2d_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let (cos, sin) = build_rope_tables(4, &dev).unwrap(); // [16, 256]
+        let q = spread(&[1, 1, 16, 256], 0.8, &dev);
+        for (seq_k, exclude, repeat) in [(16usize, 0usize, false), (16 * 3 + 4, 4, true)] {
+            let k = spread(&[1, 1, seq_k, 256], 1.7, &dev);
+            let (gq, gk) = apply_rope_2d(&q, &k, &cos, &sin, exclude, repeat).unwrap();
+            let (wq, wk) = former(&q, &k, &cos, &sin, exclude, repeat).unwrap();
+            assert_eq!(bits(&gq), bits(&wq), "q (seq_k {seq_k})");
+            assert_eq!(gk.dims(), wk.dims());
+            assert_eq!(bits(&gk), bits(&wk), "k (seq_k {seq_k}, exclude {exclude})");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: the memory attention's 2-D RoPE (q, and memory keys with repeated tables + excluded tokens; bf16) on `Device::new_cuda(0)` with the fused RoPE switch on (every call
+    /// served by the fused kernel) and off (the shared reference chain), bit-identical outputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).expect("CUDA device 0");
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ROPE_PATH.guard(Some(true));
+        let (cos, sin) = build_rope_tables(72, &dev).unwrap();
+        let q = spread(&[1, 1, 72 * 72, 256], 0.8, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k = spread(&[1, 1, 72 * 72 * 2 + 16, 256], 1.7, &dev)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let run = || -> Vec<Tensor> {
+            let (q, k) = apply_rope_2d(&q, &k, &cos, &sin, 16, true).unwrap();
+            vec![q, k]
+        };
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let fused = run();
+        let on = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (2, 0), "switch on: {on}");
+        ROPE_PATH.set_enabled(Some(false));
+        let start = ROPE_PATH.thread_counts();
+        let reference = run();
+        let off = ROPE_PATH.thread_counts().since(&start);
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(off.reference_for("disabled"), 2, "switch off: {off}");
+        assert_eq!(fused.len(), reference.len());
+        for (i, (f, r)) in fused.iter().zip(&reference).enumerate() {
+            assert_eq!(f.dims(), r.dims());
+            assert_eq!(f.dtype(), r.dtype());
+            let (fb, rb) = (bits(f), bits(r));
+            let mismatches = fb.iter().zip(&rb).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches,
+                0,
+                "output {i}: fused differs from the reference in {mismatches} of {}",
+                fb.len()
+            );
+        }
     }
 }
