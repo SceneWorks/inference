@@ -484,7 +484,7 @@ mod removed {
         let f = t.as_dtype(mlx_rs::Dtype::Float32).unwrap();
         let r = add(
             multiply(&f, cos).unwrap(),
-            multiply(&crate::nn::rotate_half(&f).unwrap(), sin).unwrap(),
+            multiply(crate::nn::rotate_half(&f).unwrap(), sin).unwrap(),
         )
         .unwrap();
         r.as_dtype(dtype).unwrap()
