@@ -236,7 +236,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// Chatterbox clone-TTS identity + capabilities — computed from [`route`] without loading weights.
+/// Chatterbox clone-TTS identity + capabilities — computed from `route` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

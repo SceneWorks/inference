@@ -637,7 +637,7 @@ pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
     }
 }
 
-/// SD3.5 descriptor for `variant` — computed from [`route_for`].
+/// SD3.5 descriptor for `variant` — computed from `route_for`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     route_for(variant).compute_descriptor()
 }

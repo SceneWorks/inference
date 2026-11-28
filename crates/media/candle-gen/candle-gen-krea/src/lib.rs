@@ -1713,22 +1713,22 @@ pub(crate) fn route_turbo_edit() -> gen_core::RouteRecord {
     route
 }
 
-/// Krea 2 Turbo identity + capabilities, computed from [`route_turbo`].
+/// Krea 2 Turbo identity + capabilities, computed from `route_turbo`.
 pub fn descriptor() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }
 
-/// Krea 2 **Raw** identity + capabilities, computed from [`route_raw`].
+/// Krea 2 **Raw** identity + capabilities, computed from `route_raw`.
 pub fn raw_descriptor() -> ModelDescriptor {
     route_raw().compute_descriptor()
 }
 
-/// Krea 2 **Edit** identity + capabilities, computed from [`route_edit`].
+/// Krea 2 **Edit** identity + capabilities, computed from `route_edit`.
 pub fn edit_descriptor() -> ModelDescriptor {
     route_edit().compute_descriptor()
 }
 
-/// Krea 2 **Turbo Edit** identity + capabilities, computed from [`route_turbo_edit`].
+/// Krea 2 **Turbo Edit** identity + capabilities, computed from `route_turbo_edit`.
 pub fn turbo_edit_descriptor() -> ModelDescriptor {
     route_turbo_edit().compute_descriptor()
 }

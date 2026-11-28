@@ -236,7 +236,7 @@ pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
     }
 }
 
-/// SenseNova-U1's registered Candle descriptor — computed from [`route_for`].
+/// SenseNova-U1's registered Candle descriptor — computed from `route_for`.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     route_for(id).compute_descriptor()
 }

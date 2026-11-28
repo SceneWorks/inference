@@ -225,12 +225,12 @@ pub fn route_base() -> RouteRecord {
     r
 }
 
-/// Identity + capabilities, constructible without weights, computed from [`route`].
+/// Identity + capabilities, constructible without weights, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }
 
-/// Base checkpoint public surface, computed from [`route_base`].
+/// Base checkpoint public surface, computed from `route_base`.
 pub fn descriptor_base() -> ModelDescriptor {
     route_base().compute_descriptor()
 }

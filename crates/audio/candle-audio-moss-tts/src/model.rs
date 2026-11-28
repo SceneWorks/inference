@@ -180,7 +180,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// MOSS-TTSD's identity + capabilities — computed from [`route`] without loading weights.
+/// MOSS-TTSD's identity + capabilities — computed from `route` without loading weights.
 /// `supports_multi_speaker` is `true` (the model honors `[S1]`/`[S2]` turn labels; the AR brain
 /// models them and this is verified at the token level), with `max_speakers = 2`.
 pub fn descriptor() -> ModelDescriptor {

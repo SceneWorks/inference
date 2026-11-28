@@ -178,7 +178,7 @@ pub struct Capabilities {
     /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
     /// is `false`; the shared floor refuses a `Some` policy otherwise.
     pub supports_caption_overflow_policy: bool,
-    /// Whether this model honours [`GenerationRequest::h3_image_sampler`] (SW-7106). `Default` is
+    /// Whether this model honours [`crate::H3Extension::image_sampler`] (SW-7106). `Default` is
     /// `false`; the shared floor refuses a `Some` sampler block otherwise.
     pub supports_h3_image_sampler: bool,
     /// The longest prompt, in the model's own text-encoder tokens, that this model conditions on
@@ -301,7 +301,7 @@ pub struct Capabilities {
     // `Default`, so every pre-2.5 provider keeps refusing these requests without editing its
     // descriptor — declaration and enforcement move together.
     /// Whether this model predicts clip length from a **duration head** when the request opts in
-    /// via [`GenerationRequest::auto_duration`] (reference `--auto-duration`).
+    /// via [`crate::LtxExtension::auto_duration`] (reference `--auto-duration`).
     ///
     /// `Default` is `false`, and the shared floor then rejects an `auto_duration` request as the
     /// typed [`Error::Unsupported`] rather than silently rendering the model's default length — an
@@ -311,7 +311,7 @@ pub struct Capabilities {
     /// `gen_core_ltx::duration_head::resolve_request_num_frames`.
     pub supports_auto_duration: bool,
     /// Whether this model places **generated keyframe slots** at interior positions when the
-    /// request sets [`GenerationRequest::num_generated_keyframes`] (reference
+    /// request sets [`crate::LtxExtension::num_generated_keyframes`] (reference
     /// `--num-generated-keyframes`).
     ///
     /// Requires a transformer with the learned `use_keyframes_abs_pos_embedding` slot marker
@@ -319,7 +319,7 @@ pub struct Capabilities {
     /// as unmarked tokens — wasted compute carrying no conditioning — so the floor refuses a
     /// positive count as the typed [`Error::Unsupported`].
     pub supports_generated_keyframes: bool,
-    /// The largest [`GenerationRequest::temporal_upsample_rounds`] this model honours (reference
+    /// The largest [`crate::LtxExtension::temporal_upsample_rounds`] this model honours (reference
     /// `--temporal-upsample-rounds`). `0` (the `Default`) means the DFR temporal path is not
     /// implemented and the floor refuses any positive round count as the typed
     /// [`Error::Unsupported`].
@@ -451,9 +451,9 @@ pub struct Capabilities {
     pub approximation: ApproximationSurface,
     /// Perturbed-Attention Guidance (PAG) capability descriptor (SW-7173). `None` (the `Default`)
     /// means this model/backend does not support PAG, and the shared request floor rejects any
-    /// `Some` [`GenerationRequest::pag`] as [`Error::Unsupported`].
+    /// `Some` [`crate::FeatureParams::pag`] as [`Error::Unsupported`].
     pub pag: Option<crate::PagCapability>,
-    /// Whether this model route honours [`GenerationRequest::phases`] multi-phase denoise
+    /// Whether this model route honours [`crate::FeatureParams::phases`] multi-phase denoise
     /// (SW-6938). `Default` is `false`, and the shared floor refuses any `Some` `phases` on a
     /// non-supporting route with [`Error::Unsupported`] rather than letting a provider silently
     /// ignore it and render a single-phase trajectory.
@@ -698,8 +698,8 @@ impl Capabilities {
         self.approximation.resolve(id, req.approximation.as_ref())
     }
 
-    /// Resolve [`GenerationRequest::effective_pag`] (covering both top-level
-    /// [`GenerationRequest::pag`] and [`crate::moss_image::MossImageOptions::pag`]) against
+    /// Resolve [`GenerationRequest::effective_pag`] (covering both
+    /// [`crate::FeatureParams::pag`] and [`crate::moss_image::MossImageOptions::pag`]) against
     /// [`Capabilities::pag`] (SW-7173).
     ///
     /// Returns `Ok(None)` when neither PAG field is set or the effective config resolves to

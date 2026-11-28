@@ -689,11 +689,36 @@ impl PulidFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_planned_with_scope_and_execution_report(
+            req,
+            reference,
+            plan,
+            None,
+            on_progress,
+        )
+    }
+
+    /// Bind a completed planned image with an optional admitted [`MemoryRequestScope`] to
+    /// observations from this same PuLID attempt.
+    pub(crate) fn generate_planned_with_scope_and_execution_report(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let pag = resolve_pulid_pag_report(req, plan)?;
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         complete_pulid_image_with_pag(&req.cancel, "pulid/pulid_flux/generate", || {
-            let image = self.generate_planned(req, reference, plan, &mut report_progress)?;
+            let image = self.generate_planned_with_scope(
+                req,
+                reference,
+                plan,
+                scope,
+                &mut report_progress,
+            )?;
             Ok((image, pag))
         })
     }
@@ -708,13 +733,24 @@ impl PulidFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if self.admitted_context.is_some() {
+        self.generate_planned_with_scope(req, reference, plan, None, on_progress)
+    }
+
+    fn generate_planned_with_scope(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if self.admitted_context.is_some() && scope.is_none() {
             return Err(CandleError::Msg(
                 "pulid_flux: admitted model requires generate_with_memory_context_planned".into(),
             ));
         }
         self.check_plan(req, reference, plan)?;
-        let run = RenderRun::new(plan, &req.cancel, None);
+        let run = RenderRun::new(plan, &req.cancel, scope);
         self.generate_inner(req, reference, plan, &run, on_progress)
     }
 

@@ -89,11 +89,11 @@ mod explicit_registry_tests {
         assert!(registry.route_conformance_errors().is_empty());
         assert!(registry.descriptor_conformance_errors().is_empty());
 
-        let surface_registry = super::register_memory_contract_surfaces(super::register_providers(
-            candle_gen::gen_core::ProviderRegistryBuilder::new(),
-        ))
-        .build()
-        .unwrap();
+        let builder =
+            super::register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new());
+        #[cfg(not(feature = "cuda"))]
+        let builder = super::register_memory_contract_surfaces(builder);
+        let surface_registry = builder.build().unwrap();
         assert!(surface_registry
             .memory_strategy_registrations()
             .any(|r| r.provider_id == "pulid_flux"));

@@ -351,7 +351,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// SVD-XT img2vid descriptor — computed from [`route`].
+/// SVD-XT img2vid descriptor — computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

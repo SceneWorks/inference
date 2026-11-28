@@ -2124,7 +2124,7 @@ pub(crate) fn route_base(variant: Flux2Variant) -> gen_core::RouteRecord {
     }
 }
 
-/// The txt2img descriptor for `variant`, computed from [`route_base`].
+/// The txt2img descriptor for `variant`, computed from `route_base`.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     route_base(variant).compute_descriptor()
 }

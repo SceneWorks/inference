@@ -1137,17 +1137,17 @@ pub(crate) fn route_edit() -> gen_core::RouteRecord {
     route
 }
 
-/// Boogu Base descriptor, computed from [`route_base`].
+/// Boogu Base descriptor, computed from `route_base`.
 pub fn descriptor() -> ModelDescriptor {
     route_base().compute_descriptor()
 }
 
-/// Boogu Turbo descriptor, computed from [`route_turbo`].
+/// Boogu Turbo descriptor, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }
 
-/// Boogu Edit descriptor, computed from [`route_edit`].
+/// Boogu Edit descriptor, computed from `route_edit`.
 pub fn descriptor_edit() -> ModelDescriptor {
     route_edit().compute_descriptor()
 }

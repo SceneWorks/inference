@@ -88,7 +88,7 @@ impl ChromaVariant {
         matches!(self, Self::Base)
     }
 
-    /// The candle descriptor for this variant, computed from [`crate::route_for`].
+    /// The candle descriptor for this variant, computed from `crate::route_for`.
     pub fn descriptor(self) -> ModelDescriptor {
         crate::route_for(self).compute_descriptor()
     }

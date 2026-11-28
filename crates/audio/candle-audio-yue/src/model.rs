@@ -166,7 +166,7 @@ pub fn route_for(variant: Variant) -> gen_core::RouteRecord {
     }
 }
 
-/// The weights-free descriptor for `variant` — computed from [`route_for`].
+/// The weights-free descriptor for `variant` — computed from `route_for`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     route_for(variant).compute_descriptor()
 }

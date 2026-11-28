@@ -2272,7 +2272,7 @@ pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
     }
 }
 
-/// Lens' identity + capabilities for `id`, computed from [`route_for`].
+/// Lens' identity + capabilities for `id`, computed from `route_for`.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     route_for(id).compute_descriptor()
 }

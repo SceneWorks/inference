@@ -200,7 +200,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// Stable identity + advertised capabilities for Mochi 1, computed from [`route`].
+/// Stable identity + advertised capabilities for Mochi 1, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

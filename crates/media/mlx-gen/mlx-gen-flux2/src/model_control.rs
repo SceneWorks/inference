@@ -78,7 +78,7 @@ pub fn route_dev_control() -> gen_core::RouteRecord {
     route
 }
 
-/// The control variant's identity + capabilities, computed from [`route_dev_control`].
+/// The control variant's identity + capabilities, computed from `route_dev_control`.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     route_dev_control().compute_descriptor()
 }

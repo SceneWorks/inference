@@ -2217,13 +2217,13 @@ pub(crate) fn route_ltx_2_5() -> gen_core::RouteRecord {
     route_ltx_2_5_for_variant(TransformerVariant::Distilled)
 }
 
-/// Stable identity + advertised capabilities for LTX-2.3, computed from [`route_ltx_2_3`].
+/// Stable identity + advertised capabilities for LTX-2.3, computed from `route_ltx_2_3`.
 pub fn descriptor() -> ModelDescriptor {
     route_ltx_2_3().compute_descriptor()
 }
 
 /// The ordinary Candle provider descriptor for LTX-2.5's split Gemma-4 bundle, computed from
-/// [`route_ltx_2_5`].
+/// `route_ltx_2_5`.
 pub fn descriptor_25() -> ModelDescriptor {
     route_ltx_2_5().compute_descriptor()
 }

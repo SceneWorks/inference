@@ -210,7 +210,7 @@ pub fn route_renderer() -> RouteRecord {
 }
 
 /// Stable identity + advertised capabilities for the Bernini renderer, computed from
-/// [`route_renderer`].
+/// `route_renderer`.
 pub fn descriptor() -> ModelDescriptor {
     route_renderer().compute_descriptor()
 }

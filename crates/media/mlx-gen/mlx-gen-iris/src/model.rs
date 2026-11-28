@@ -263,7 +263,7 @@ pub fn route_restore() -> RouteRecord {
     }
 }
 
-/// Identity + capabilities, constructible without weights, computed from [`route`].
+/// Identity + capabilities, constructible without weights, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

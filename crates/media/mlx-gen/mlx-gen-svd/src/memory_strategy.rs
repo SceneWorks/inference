@@ -1230,7 +1230,6 @@ mod tests {
                     noise_aug_strength: Some(0.02),
                     decode_chunk_size: Some(8),
                     conditioning_fps: Some(7),
-                    ..Default::default()
                 }),
                 ..Default::default()
             },

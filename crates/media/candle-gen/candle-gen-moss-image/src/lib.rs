@@ -232,7 +232,7 @@ impl MossImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
         self.run_with_execution(request, inputs, edit, on_progress)
-            .map(|(output, _, _)| output)
+            .map(|(output, _, _, _, _)| output)
     }
     #[allow(clippy::type_complexity)]
     fn run_with_execution(
@@ -245,6 +245,8 @@ impl MossImageGenerator {
         MossImageAdvancedOutput,
         Option<PagExecutionReport>,
         ExecutionIdentity,
+        Option<gen_core::FamilyExecutionReport>,
+        Vec<AdapterApplyReport>,
     )> {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
@@ -275,7 +277,19 @@ impl MossImageGenerator {
                 &self.sources.spec.adapters,
                 &state.apply_reports,
             )?;
-            Ok((output, pag, execution))
+            let family_report = if edit.is_some() {
+                state
+                    .edit_report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
+            } else {
+                state
+                    .report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
+            };
+            let apply_reports = state.apply_reports.clone();
+            Ok((output, pag, execution, family_report, apply_reports))
         });
         // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
         // synchronize after release so the next admission sees the recovered driver budget.
@@ -624,7 +638,8 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedMossImageAdvanced> {
-        let (output, _, execution) = self.run_with_execution(request, inputs, None, on_progress)?;
+        let (output, _, execution, _, _) =
+            self.run_with_execution(request, inputs, None, on_progress)?;
         CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
@@ -665,34 +680,13 @@ impl Generator for MossImageGenerator {
             .moss_image
             .as_ref()
             .and_then(|ext| ext.edit.as_ref());
-        let (output, pag, execution, is_edit) = if let Some(edit_req) = edit_req {
+        let (output, pag, execution, family_report, apply_reports) = if let Some(edit_req) =
+            edit_req
+        {
             let inputs = edit_req.as_inputs();
-            let (output, pag, execution) =
-                self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
-            (output, pag, execution, true)
+            self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?
         } else {
-            let (output, pag, execution) = self.run_with_execution(
-                request,
-                MossImageAdvancedInputs::default(),
-                None,
-                progress,
-            )?;
-            (output, pag, execution, false)
-        };
-        let (family_report, apply_reports) = {
-            let state = candle_gen::lock_recover(&self.state);
-            let family_report = if is_edit {
-                state
-                    .edit_report
-                    .clone()
-                    .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
-            } else {
-                state
-                    .report
-                    .clone()
-                    .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
-            };
-            (family_report, state.apply_reports.clone())
+            self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?
         };
         let mut report = GenerationReport::from_output(GenerationOutput::from(output));
         report.pag = pag;

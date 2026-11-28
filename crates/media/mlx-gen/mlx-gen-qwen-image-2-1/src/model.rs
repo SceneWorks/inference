@@ -395,7 +395,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
 }
 
 /// The distilled Turbo checkpoint's identity + capabilities (sc-25900), computed from
-/// [`route_turbo`].
+/// `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }

@@ -386,12 +386,12 @@ pub(crate) fn route_sprint() -> gen_core::RouteRecord {
     }
 }
 
-/// SANA-1.6B's identity + capabilities — computed from [`route_base`] without loading weights.
+/// SANA-1.6B's identity + capabilities — computed from `route_base` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route_base().compute_descriptor()
 }
 
-/// **SANA-Sprint** identity + capabilities — computed from [`route_sprint`] without loading weights.
+/// **SANA-Sprint** identity + capabilities — computed from `route_sprint` without loading weights.
 pub fn sprint_descriptor() -> ModelDescriptor {
     route_sprint().compute_descriptor()
 }

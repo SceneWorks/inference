@@ -177,7 +177,7 @@ pub fn route_base() -> RouteRecord {
     }
 }
 
-/// Boogu Base's identity + capabilities, computed from [`route_base`].
+/// Boogu Base's identity + capabilities, computed from `route_base`.
 pub fn descriptor() -> ModelDescriptor {
     route_base().compute_descriptor()
 }
@@ -220,7 +220,7 @@ pub fn route_turbo() -> RouteRecord {
     route
 }
 
-/// Boogu **Turbo** identity + capabilities, computed from [`route_turbo`].
+/// Boogu **Turbo** identity + capabilities, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }
@@ -243,7 +243,7 @@ pub fn route_edit() -> RouteRecord {
     route
 }
 
-/// Boogu **Edit** identity + capabilities, computed from [`route_edit`].
+/// Boogu **Edit** identity + capabilities, computed from `route_edit`.
 pub fn descriptor_edit() -> ModelDescriptor {
     route_edit().compute_descriptor()
 }

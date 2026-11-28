@@ -18,6 +18,16 @@ use crate::memory_strategy::SdxlArtifactSeal;
 use crate::pipeline::{SdxlComponents, REQUIRED_COMPONENTS};
 use crate::{MODEL_ID, SIZE_MULTIPLE};
 
+fn resolve_strength(
+    conditioning_strength: Option<f32>,
+    request_strength: Option<f32>,
+    default_strength: f32,
+) -> f32 {
+    conditioning_strength
+        .or(request_strength)
+        .unwrap_or(default_strength)
+}
+
 fn require_vae(components: &SdxlComponents, route_id: &str) -> gen_core::Result<WeightsSource> {
     components.vae_fp16_fix.clone().ok_or_else(|| {
         gen_core::Error::Msg(format!("{route_id} requires the `vae_fp16_fix` component"))
@@ -44,8 +54,19 @@ pub(crate) fn route_sdxl_edit() -> gen_core::RouteRecord {
     route.structure.conditioning.control_kinds = None;
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresEdit;
+    route.structure.sampling = gen_core::SamplingSurface {
+        samplers: vec!["euler_ancestral"],
+        schedulers: vec!["discrete"],
+        guidance_methods: vec!["cfg"],
+        supports_guidance: true,
+        ..Default::default()
+    };
     route.structure.denoiser =
         gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("sdxl_unet"));
+    route.defaults.steps = Some(30);
+    route.defaults.guidance = Some(5.0);
+    route.defaults.sampler = Some("euler_ancestral");
+    route.defaults.schedule = Some("discrete");
     route.defaults.strength = Some(DEFAULT_EDIT_STRENGTH);
     route.bindings = gen_core::RouteBindings::generator(edit_descriptor, load_edit)
         .with_feature_route(Some(MODEL_ID), edit_descriptor);
@@ -142,7 +163,7 @@ impl Generator for SdxlEditGenerator {
         let defaults = SdxlEditRequest::default();
         let steps = request.steps.map(|s| s as usize).unwrap_or(defaults.steps);
         let guidance = request.guidance.unwrap_or(defaults.guidance);
-        let strength = strength.unwrap_or(defaults.strength);
+        let strength = resolve_strength(strength, request.strength, defaults.strength);
         let base_seed = request.seed.unwrap_or(0);
         let mut images = Vec::with_capacity(request.count as usize);
         for idx in 0..request.count {
@@ -215,9 +236,20 @@ pub(crate) fn route_sdxl_detail() -> gen_core::RouteRecord {
     route.structure.conditioning.control_kinds = Some(gen_core::AcceptedControlKinds::Any);
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.sampling = gen_core::SamplingSurface {
+        samplers: vec!["euler_ancestral"],
+        schedulers: vec!["discrete"],
+        guidance_methods: vec!["cfg"],
+        supports_guidance: true,
+        ..Default::default()
+    };
     route.structure.weight_plan.requires_control_overlay = true;
     route.structure.denoiser =
         gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("sdxl_unet"));
+    route.defaults.steps = Some(24);
+    route.defaults.guidance = Some(5.0);
+    route.defaults.sampler = Some("euler_ancestral");
+    route.defaults.schedule = Some("discrete");
     route.defaults.strength = Some(0.55);
     route.bindings = gen_core::RouteBindings::generator(detail_descriptor, load_detail)
         .with_feature_route(Some(MODEL_ID), detail_descriptor);
@@ -321,7 +353,7 @@ impl Generator for SdxlDetailGenerator {
             .unwrap_or_else(|| defaults.negative.clone());
         let steps = request.steps.map(|s| s as usize).unwrap_or(defaults.steps);
         let guidance = request.guidance.unwrap_or(defaults.guidance);
-        let strength = strength.unwrap_or(defaults.strength);
+        let strength = resolve_strength(strength, request.strength, defaults.strength);
         let control_scale = cond_scale
             .or(request.control_scale)
             .unwrap_or(defaults.control_scale);
@@ -441,9 +473,13 @@ pub(crate) fn route_sdxl_ip_adapter() -> gen_core::RouteRecord {
     route.structure.conditioning.pass0_requirement =
         gen_core::Pass0ConditioningRequirement::RequiresReference;
     route.structure.conditioning.modules = vec!["sdxl_ip_adapter_plus"];
+    route.structure.sampling.guidance_methods = vec!["cfg"];
     route.structure.weight_plan.requires_ip_adapter_overlay = true;
     route.structure.denoiser =
         gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("sdxl_unet"));
+    route.defaults.guidance = Some(5.0);
+    route.defaults.sampler = Some("euler_ancestral");
+    route.defaults.schedule = Some("discrete");
     route.defaults.strength = Some(DEFAULT_IP_ADAPTER_SCALE);
     route.bindings = gen_core::RouteBindings::generator(ip_adapter_descriptor, load_ip_adapter)
         .with_feature_route(Some(MODEL_ID), ip_adapter_descriptor);
@@ -511,7 +547,8 @@ impl Generator for SdxlIpAdapterGenerator {
         let defaults = IpAdapterSdxlRequest::default();
         let steps = request.steps.map(|s| s as usize).unwrap_or(defaults.steps);
         let guidance = request.guidance.unwrap_or(defaults.guidance);
-        let ip_adapter_scale = strength.unwrap_or(defaults.ip_adapter_scale);
+        let ip_adapter_scale =
+            resolve_strength(strength, request.strength, defaults.ip_adapter_scale);
         let base_seed = request.seed.unwrap_or(0);
         let mut model = self.model.borrow_mut();
         let mut images = Vec::with_capacity(request.count as usize);
@@ -598,4 +635,85 @@ pub(crate) fn load_ip_adapter(spec: &LoadSpec) -> gen_core::Result<Box<dyn Gener
         descriptor: ip_adapter_descriptor(),
         model: RefCell::new(model),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_image() -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        }
+    }
+
+    #[test]
+    fn sdxl_edit_and_detail_restrict_sampling_capabilities_to_implemented_controls() {
+        for (id, desc) in [
+            ("sdxl_edit", edit_descriptor()),
+            ("sdxl_detail", detail_descriptor()),
+        ] {
+            assert_eq!(desc.capabilities.samplers, vec!["euler_ancestral"], "{id}");
+            assert_eq!(desc.capabilities.schedulers, vec!["discrete"], "{id}");
+            assert_eq!(
+                desc.capabilities.supported_guidance_methods,
+                vec!["cfg"],
+                "{id}"
+            );
+
+            let valid = GenerationRequest {
+                prompt: "studio portrait".into(),
+                width: 1024,
+                height: 1024,
+                sampler: Some("euler_ancestral".into()),
+                scheduler: Some("discrete".into()),
+                guidance_method: Some("cfg".into()),
+                conditioning: vec![Conditioning::Reference {
+                    image: dummy_image(),
+                    strength: None,
+                }],
+                ..Default::default()
+            };
+            assert!(
+                desc.capabilities.validate_request(id, &valid).is_ok(),
+                "{id} must accept its implemented euler_ancestral/discrete/cfg controls"
+            );
+
+            let mut bad_sampler = valid.clone();
+            bad_sampler.sampler = Some("heun".into());
+            assert!(
+                desc.capabilities
+                    .validate_request(id, &bad_sampler)
+                    .is_err(),
+                "{id} must refuse unimplemented sampler heun"
+            );
+
+            let mut bad_scheduler = valid.clone();
+            bad_scheduler.scheduler = Some("karras".into());
+            assert!(
+                desc.capabilities
+                    .validate_request(id, &bad_scheduler)
+                    .is_err(),
+                "{id} must refuse unimplemented scheduler karras"
+            );
+
+            let mut bad_guidance = valid;
+            bad_guidance.guidance_method = Some("cfg_pp".into());
+            assert!(
+                desc.capabilities
+                    .validate_request(id, &bad_guidance)
+                    .is_err(),
+                "{id} must refuse unimplemented guidance method cfg_pp"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_strength_prefers_conditioning_then_request_then_default() {
+        assert_eq!(resolve_strength(Some(0.35), Some(0.65), 0.8), 0.35);
+        assert_eq!(resolve_strength(None, Some(0.65), 0.8), 0.65);
+        assert_eq!(resolve_strength(None, None, 0.8), 0.8);
+    }
 }

@@ -95,7 +95,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 motion_bucket_id: Some(127.0),
                 noise_aug_strength: Some(0.02),
                 decode_chunk_size: Some(chunk),
-                ..Default::default()
             }),
             ..Default::default()
         },

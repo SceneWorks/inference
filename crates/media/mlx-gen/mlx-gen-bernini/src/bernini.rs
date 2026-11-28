@@ -580,7 +580,7 @@ pub fn route_full() -> RouteRecord {
 }
 
 /// Stable identity + advertised capabilities for the full Bernini pipeline, computed from
-/// [`route_full`].
+/// `route_full`.
 pub fn descriptor() -> ModelDescriptor {
     route_full().compute_descriptor()
 }

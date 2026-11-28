@@ -1096,7 +1096,7 @@ pub fn route_edit_turbo() -> RouteRecord {
     route_for(MageVariant::EditTurbo)
 }
 
-/// Weights-free descriptor for a Mage-Flow variant, computed from [`route_for`].
+/// Weights-free descriptor for a Mage-Flow variant, computed from `route_for`.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     route_for(variant).compute_descriptor()
 }

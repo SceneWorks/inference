@@ -1173,7 +1173,7 @@ pub fn medium_base_route() -> gen_core::RouteRecord {
     route_for(Variant::MediumBase)
 }
 
-/// Stable Audio 3 descriptor for `variant` — computed from [`route_for`] without loading weights.
+/// Stable Audio 3 descriptor for `variant` — computed from `route_for` without loading weights.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     route_for(variant).compute_descriptor()
 }

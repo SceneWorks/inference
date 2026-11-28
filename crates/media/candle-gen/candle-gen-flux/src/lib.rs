@@ -762,7 +762,7 @@ pub(crate) fn route_base(variant: Variant) -> gen_core::RouteRecord {
     }
 }
 
-/// The descriptor for a FLUX.1 `variant`, computed from [`route_base`].
+/// The descriptor for a FLUX.1 `variant`, computed from `route_base`.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     route_base(variant).compute_descriptor()
 }

@@ -145,7 +145,7 @@ pub fn route() -> RouteRecord {
     }
 }
 
-/// Stable identity + advertised capabilities for Krea Realtime 14B, computed from [`route`].
+/// Stable identity + advertised capabilities for Krea Realtime 14B, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

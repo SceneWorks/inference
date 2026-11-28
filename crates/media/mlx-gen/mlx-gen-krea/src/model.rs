@@ -582,22 +582,22 @@ pub fn route_turbo_edit() -> RouteRecord {
     route
 }
 
-/// Krea 2 Turbo identity + capabilities, computed from [`route_turbo`].
+/// Krea 2 Turbo identity + capabilities, computed from `route_turbo`.
 pub fn descriptor() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }
 
-/// Krea 2 **Raw** identity + capabilities, computed from [`route_raw`].
+/// Krea 2 **Raw** identity + capabilities, computed from `route_raw`.
 pub fn raw_descriptor() -> ModelDescriptor {
     route_raw().compute_descriptor()
 }
 
-/// Krea 2 **image-edit** identity + capabilities, computed from [`route_edit`].
+/// Krea 2 **image-edit** identity + capabilities, computed from `route_edit`.
 pub fn edit_descriptor() -> ModelDescriptor {
     route_edit().compute_descriptor()
 }
 
-/// Krea 2 **CFG-free Turbo image-edit** identity + capabilities, computed from [`route_turbo_edit`].
+/// Krea 2 **CFG-free Turbo image-edit** identity + capabilities, computed from `route_turbo_edit`.
 pub fn turbo_edit_descriptor() -> ModelDescriptor {
     route_turbo_edit().compute_descriptor()
 }
@@ -2045,7 +2045,7 @@ fn render_one(
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded weights.
 /// Layers Krea's model-specific constraints (non-empty prompt, size multiple-of-16, steps ≥ 1) on top
-/// of the shared [`Capabilities::validate_request`] floor (count/size range, negative/guidance/true_cfg
+/// of the shared [`mlx_gen::Capabilities::validate_request`] floor (count/size range, negative/guidance/true_cfg
 /// flags, conditioning kinds).
 /// # Callable without weights, and deliberately `pub`
 ///
@@ -2057,7 +2057,7 @@ fn render_one(
 ///
 /// That is not hypothetical: SceneWorks' Aether Studio mirrors this function by
 /// hand for exactly that reason, and keeps a test that runs the engine's own
-/// [`Capabilities::validate_request`] over the same corpus to detect the drift it
+/// [`mlx_gen::Capabilities::validate_request`] over the same corpus to detect the drift it
 /// cannot prevent. Making this `pub` lets that mirror be deleted rather than
 /// maintained.
 pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {

@@ -177,7 +177,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// MOSS-SoundEffect's identity + capabilities — computed from [`route`] without loading weights.
+/// MOSS-SoundEffect's identity + capabilities — computed from `route` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

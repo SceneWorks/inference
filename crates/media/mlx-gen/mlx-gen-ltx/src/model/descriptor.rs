@@ -178,12 +178,12 @@ pub fn route_25() -> RouteRecord {
 }
 
 /// Stable identity + advertised capabilities for the LTX-2.3 AudioVideo model, computed from
-/// [`route`].
+/// `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }
 
-/// Stable identity and capability surface of the LTX-2.5 MLX route, computed from [`route_25`].
+/// Stable identity and capability surface of the LTX-2.5 MLX route, computed from `route_25`.
 pub fn descriptor_25() -> ModelDescriptor {
     route_25().compute_descriptor()
 }

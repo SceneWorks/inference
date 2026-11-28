@@ -209,7 +209,7 @@ pub fn route() -> RouteRecord {
     }
 }
 
-/// Kolors' identity + capabilities, computed from [`route`].
+/// Kolors' identity + capabilities, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

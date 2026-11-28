@@ -1728,7 +1728,7 @@ pub(crate) fn route_base() -> gen_core::RouteRecord {
     }
 }
 
-/// Qwen-Image txt2img descriptor — computed from [`route_base`].
+/// Qwen-Image txt2img descriptor — computed from `route_base`.
 pub fn descriptor() -> ModelDescriptor {
     route_base().compute_descriptor()
 }

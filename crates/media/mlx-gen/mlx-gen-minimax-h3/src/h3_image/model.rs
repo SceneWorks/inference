@@ -225,7 +225,7 @@ pub fn route() -> RouteRecord {
     }
 }
 
-/// The identity, modality and capability surface, computed from [`route`].
+/// The identity, modality and capability surface, computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

@@ -167,7 +167,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// The 44k provider's identity + capabilities — computed from [`route`] without loading weights.
+/// The 44k provider's identity + capabilities — computed from `route` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

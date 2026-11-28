@@ -1170,7 +1170,7 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
     }
 }
 
-/// Z-Image-Turbo's identity + the wired surface — computed from [`route_turbo`].
+/// Z-Image-Turbo's identity + the wired surface — computed from `route_turbo`.
 pub fn descriptor() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }

@@ -1862,7 +1862,7 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
 }
 
 /// The Candle Bernini memory profile (sc-27307): the requested tier, the route gate
-/// ([`route_ok`]) inside the shared pipeline, the snapshot-gated preset geometry and the
+/// (`route_ok`) inside the shared pipeline, the snapshot-gated preset geometry and the
 /// fingerprint spelling. Its behavior fixtures are provider-owned (multi-request assembly).
 const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
     gates: gen_core::MemoryProfileGates::within(profile_route_gate),

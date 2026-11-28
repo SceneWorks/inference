@@ -220,7 +220,7 @@ fn pulid_req_and_ref(
         height: req.height,
         steps: req.steps.map(|s| s as usize).unwrap_or(25),
         guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
-        id_weight: strength.unwrap_or(DEFAULT_ID_WEIGHT),
+        id_weight: strength.or(req.strength).unwrap_or(DEFAULT_ID_WEIGHT),
         sampler: req.sampler.as_deref().map(str::to_owned),
         scheduler: req.scheduler.as_deref().map(str::to_owned),
         scheduler_shift: req.scheduler_shift,
@@ -266,8 +266,38 @@ impl Generator for PulidFluxGenerator {
             .validate_request(self.descriptor.id, req)?;
         let (pulid_req, reference) = pulid_req_and_ref(req)?;
         let plan = compile_pulid_plan(&self.paths, &self.spec, &pulid_req, reference)?;
-        self.model
-            .generate_with_execution_report(&pulid_req, reference, &plan, on_progress)
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_planned_with_execution_report(req, plan, scope, on_progress)
+            .map(|completed| completed.generation)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
+        let (pulid_req, reference) = pulid_req_and_ref(req)?;
+        self.model.generate_planned_with_scope_and_execution_report(
+            &pulid_req,
+            reference,
+            plan,
+            scope,
+            on_progress,
+        )
     }
 
     fn validate(&self, request: &GenerationRequest) -> gen_core::Result<()> {

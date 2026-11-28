@@ -189,12 +189,12 @@ pub fn route_turbo() -> RouteRecord {
     route
 }
 
-/// Ideogram 4's identity + capabilities, computed from [`route_quality`].
+/// Ideogram 4's identity + capabilities, computed from `route_quality`.
 pub fn descriptor() -> ModelDescriptor {
     route_quality().compute_descriptor()
 }
 
-/// Ideogram 4 **turbo** identity + capabilities, computed from [`route_turbo`].
+/// Ideogram 4 **turbo** identity + capabilities, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }

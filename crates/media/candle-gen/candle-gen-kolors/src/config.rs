@@ -36,7 +36,7 @@ pub const DEFAULT_SAMPLER: &str = "euler_discrete";
 /// Kolors works in the SDXL VAE's /8 latent — both image dims must be multiples of 8.
 pub const SIZE_MULTIPLE: u32 = 8;
 
-/// Kolors' identity + capabilities, computed from [`crate::route_base`].
+/// Kolors' identity + capabilities, computed from `crate::route_base`.
 pub fn descriptor() -> ModelDescriptor {
     crate::route_base().compute_descriptor()
 }

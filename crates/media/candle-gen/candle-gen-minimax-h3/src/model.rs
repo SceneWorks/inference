@@ -646,7 +646,7 @@ pub(crate) fn route_video() -> gen_core::RouteRecord {
     }
 }
 
-/// The identity, modality and capability surface, computed from [`route_video`].
+/// The identity, modality and capability surface, computed from `route_video`.
 pub fn descriptor() -> ModelDescriptor {
     route_video().compute_descriptor()
 }

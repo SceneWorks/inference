@@ -440,12 +440,12 @@ pub(crate) fn route_turbo() -> gen_core::RouteRecord {
     route
 }
 
-/// Ideogram 4 (quality) descriptor, computed from [`route_quality`].
+/// Ideogram 4 (quality) descriptor, computed from `route_quality`.
 pub fn descriptor() -> ModelDescriptor {
     route_quality().compute_descriptor()
 }
 
-/// Ideogram 4 Turbo descriptor, computed from [`route_turbo`].
+/// Ideogram 4 Turbo descriptor, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }

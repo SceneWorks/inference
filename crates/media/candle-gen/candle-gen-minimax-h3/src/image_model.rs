@@ -240,7 +240,7 @@ pub(crate) fn route_image() -> gen_core::RouteRecord {
     }
 }
 
-/// The identity, modality and capability surface, computed from [`route_image`].
+/// The identity, modality and capability surface, computed from `route_image`.
 pub fn image_descriptor() -> ModelDescriptor {
     route_image().compute_descriptor()
 }

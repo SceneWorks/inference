@@ -122,7 +122,7 @@ pub(crate) fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// The weights-free descriptor — computed from [`route`].
+/// The weights-free descriptor — computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

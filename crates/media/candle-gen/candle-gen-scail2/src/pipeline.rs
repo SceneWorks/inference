@@ -224,7 +224,7 @@ pub(crate) fn route() -> candle_gen::gen_core::RouteRecord {
     }
 }
 
-/// Stable identity + advertised capabilities for SCAIL-2 — computed from [`route`].
+/// Stable identity + advertised capabilities for SCAIL-2 — computed from `route`.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

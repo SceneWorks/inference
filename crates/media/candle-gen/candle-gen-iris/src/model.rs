@@ -160,7 +160,7 @@ pub(crate) fn route_generation() -> gen_core::RouteRecord {
     }
 }
 
-/// Identity + capabilities, constructible without weights, computed from [`route_generation`].
+/// Identity + capabilities, constructible without weights, computed from `route_generation`.
 pub fn descriptor() -> ModelDescriptor {
     route_generation().compute_descriptor()
 }

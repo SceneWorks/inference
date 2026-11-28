@@ -1238,7 +1238,6 @@ mod tests {
                     motion_bucket_id: Some(127.0),
                     noise_aug_strength: Some(0.02),
                     decode_chunk_size: Some(8),
-                    ..Default::default()
                 }),
                 ..Default::default()
             },

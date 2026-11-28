@@ -560,7 +560,7 @@ impl MossImage {
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
         self.execute_with_execution(request, inputs, progress, edit)
-            .map(|(output, _, _)| output)
+            .map(|(output, _, _, _, _)| output)
     }
     #[allow(clippy::type_complexity)]
     fn execute_with_execution(
@@ -573,6 +573,8 @@ impl MossImage {
         MossImageAdvancedOutput,
         Option<gen_core::PagExecutionReport>,
         gen_core::generator::ExecutionIdentity,
+        Option<gen_core::FamilyExecutionReport>,
+        Vec<gen_core::AdapterApplyReport>,
     )> {
         let mut state = self
             .state
@@ -603,7 +605,18 @@ impl MossImage {
                 &self.spec.adapters,
                 &state.apply_reports,
             )?;
-            Ok((output, pag, execution))
+            let family_report = if edit.is_some() {
+                edit_report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
+            } else {
+                state
+                    .report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
+            };
+            let apply_reports = state.apply_reports.clone();
+            Ok((output, pag, execution, family_report, apply_reports))
         });
         if result.is_err() {
             *edit_report = None;
@@ -1168,7 +1181,7 @@ impl MossImageAdvancedGenerator for MossImage {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedMossImageAdvanced> {
-        let (output, _, execution) =
+        let (output, _, execution, _, _) =
             self.execute_with_execution(request, inputs, on_progress, None)?;
         gen_core::generator::CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
@@ -1181,6 +1194,7 @@ impl MossImage {
     }
 
     /// Last-run adapter apply reports for concrete advanced-generator test harnesses.
+    #[cfg(feature = "test-support")]
     pub(crate) fn last_adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
         self.state
             .lock()
@@ -1221,23 +1235,8 @@ impl Generator for MossImage {
                 .map_err(gen_core::Error::from)?;
         }
         let (request, advanced, edit_inputs) = Self::prepare_generator_request(request)?;
-        let is_edit = edit_inputs.is_some();
-        let (output, pag, execution) =
+        let (output, pag, execution, family_report, apply_reports) =
             self.execute_with_execution(&request, advanced, progress, edit_inputs)?;
-        let apply_reports = self.last_adapter_apply_reports();
-        let family_report = if is_edit {
-            self.edit_report
-                .lock()
-                .ok()
-                .and_then(|report| report.clone())
-                .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
-        } else {
-            self.state
-                .lock()
-                .ok()
-                .and_then(|s| s.report.clone())
-                .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
-        };
         let mut report = gen_core::GenerationReport::from_output(GenerationOutput::from(output));
         report.pag = pag;
         report.adapter_apply_reports = apply_reports;

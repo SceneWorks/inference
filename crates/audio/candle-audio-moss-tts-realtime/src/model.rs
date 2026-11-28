@@ -175,7 +175,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// MOSS-TTS-Realtime's identity + capabilities — computed from [`route`] without loading weights.
+/// MOSS-TTS-Realtime's identity + capabilities — computed from `route` without loading weights.
 /// `supports_streaming` is `true`: this is the family's realtime/streaming model, and the AR loop
 /// emits one RVQ frame at a time (the codec decodes a block of frames into a streamed PCM chunk).
 pub fn descriptor() -> ModelDescriptor {

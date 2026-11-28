@@ -253,7 +253,7 @@ pub fn descriptor() -> ModelDescriptor {
     route_base().compute_descriptor()
 }
 
-/// **SANA-Sprint** identity + capabilities (sc-8490), computed from [`route_sprint`].
+/// **SANA-Sprint** identity + capabilities (sc-8490), computed from `route_sprint`.
 pub fn sprint_descriptor() -> ModelDescriptor {
     route_sprint().compute_descriptor()
 }

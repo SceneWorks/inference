@@ -279,7 +279,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
     }
 }
 
-/// Public descriptor accessors, computed from [`route_turbo`] / [`route_base`].
+/// Public descriptor accessors, computed from `route_turbo` / `route_base`.
 pub fn descriptor_turbo() -> ModelDescriptor {
     route_turbo().compute_descriptor()
 }

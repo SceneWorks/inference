@@ -187,7 +187,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// MMAudio's identity + capabilities — computed from [`route`] without loading weights.
+/// MMAudio's identity + capabilities — computed from `route` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

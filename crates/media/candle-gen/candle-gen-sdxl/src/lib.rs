@@ -1277,7 +1277,7 @@ pub(crate) fn route_sdxl() -> gen_core::RouteRecord {
     }
 }
 
-/// SDXL's identity + the surface candle wires — computed from [`route_sdxl`].
+/// SDXL's identity + the surface candle wires — computed from `route_sdxl`.
 pub fn descriptor() -> ModelDescriptor {
     route_sdxl().compute_descriptor()
 }

@@ -194,7 +194,7 @@ pub(crate) fn route_renderer() -> gen_core::RouteRecord {
 /// Stable identity + advertised capabilities for the Bernini renderer (Wan2.2-A14B dual-expert with
 /// APG guidance; caption→video/image). `backend = "candle"`, `mac_only = false`.
 ///
-/// Computed from [`route_renderer`].
+/// Computed from `route_renderer`.
 pub fn descriptor() -> ModelDescriptor {
     route_renderer().compute_descriptor()
 }

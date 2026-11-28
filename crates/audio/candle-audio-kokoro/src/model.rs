@@ -177,7 +177,7 @@ pub fn route() -> gen_core::RouteRecord {
     }
 }
 
-/// Kokoro's identity + capabilities — computed from [`route`] without loading weights.
+/// Kokoro's identity + capabilities — computed from `route` without loading weights.
 pub fn descriptor() -> ModelDescriptor {
     route().compute_descriptor()
 }

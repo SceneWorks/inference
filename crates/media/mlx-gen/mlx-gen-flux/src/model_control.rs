@@ -89,7 +89,7 @@ pub fn route_dev_control() -> gen_core::RouteRecord {
 }
 
 /// The control variant's identity + capabilities (E2 sc-8239, finalized), computed from
-/// [`route_dev_control`].
+/// `route_dev_control`.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     route_dev_control().compute_descriptor()
 }

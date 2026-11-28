@@ -2650,16 +2650,67 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
         }
     }
 
+    const CURVE_SEGMENTS: usize = 16;
+    const MAX_PATH_POINTS: usize = 16_384;
+
     let mut subpaths = Vec::new();
     let mut current = Vec::new();
     let mut cur = (0.0f64, 0.0f64);
     let mut start_pt = (0.0f64, 0.0f64);
+    let mut last_cubic_ctrl: Option<(f64, f64)> = None;
+    let mut last_quad_ctrl: Option<(f64, f64)> = None;
+    let mut total_points = 0usize;
     let mut cmd = 'M';
     let mut idx = 0;
     let next_num = |idx: &mut usize| -> Option<f64> {
         let val = tokens.get(*idx)?.parse::<f64>().ok()?;
         *idx += 1;
         val.is_finite().then_some(val)
+    };
+    let push_pt = |current: &mut Vec<(f64, f64)>, total_points: &mut usize, pt: (f64, f64)| {
+        if *total_points < MAX_PATH_POINTS {
+            current.push(pt);
+            *total_points += 1;
+        }
+    };
+    let flatten_cubic = |current: &mut Vec<(f64, f64)>,
+                         total_points: &mut usize,
+                         p0: (f64, f64),
+                         p1: (f64, f64),
+                         p2: (f64, f64),
+                         p3: (f64, f64)| {
+        for step in 1..=CURVE_SEGMENTS {
+            let t = step as f64 / CURVE_SEGMENTS as f64;
+            let u = 1.0 - t;
+            let x = u * u * u * p0.0
+                + 3.0 * u * u * t * p1.0
+                + 3.0 * u * t * t * p2.0
+                + t * t * t * p3.0;
+            let y = u * u * u * p0.1
+                + 3.0 * u * u * t * p1.1
+                + 3.0 * u * t * t * p2.1
+                + t * t * t * p3.1;
+            if *total_points < MAX_PATH_POINTS {
+                current.push((x, y));
+                *total_points += 1;
+            }
+        }
+    };
+    let flatten_quad = |current: &mut Vec<(f64, f64)>,
+                        total_points: &mut usize,
+                        p0: (f64, f64),
+                        p1: (f64, f64),
+                        p2: (f64, f64)| {
+        for step in 1..=CURVE_SEGMENTS {
+            let t = step as f64 / CURVE_SEGMENTS as f64;
+            let u = 1.0 - t;
+            let x = u * u * p0.0 + 2.0 * u * t * p1.0 + t * t * p2.0;
+            let y = u * u * p0.1 + 2.0 * u * t * p1.1 + t * t * p2.1;
+            if *total_points < MAX_PATH_POINTS {
+                current.push((x, y));
+                *total_points += 1;
+            }
+        }
     };
     while idx < tokens.len() {
         let tok = tokens[idx];
@@ -2671,6 +2722,8 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
                     subpaths.push((std::mem::take(&mut current), true));
                 }
                 cur = start_pt;
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
             }
             continue;
         }
@@ -2688,7 +2741,9 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
                     (x, y)
                 };
                 start_pt = cur;
-                current.push(cur);
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
+                push_pt(&mut current, &mut total_points, cur);
                 cmd = if cmd == 'm' { 'l' } else { 'L' };
             }
             'L' | 'l' => {
@@ -2700,20 +2755,26 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
                 } else {
                     (x, y)
                 };
-                current.push(cur);
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
+                push_pt(&mut current, &mut total_points, cur);
             }
             'H' | 'h' => {
                 let Some(x) = next_num(&mut idx) else { break };
                 cur.0 = if cmd == 'h' { cur.0 + x } else { x };
-                current.push(cur);
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
+                push_pt(&mut current, &mut total_points, cur);
             }
             'V' | 'v' => {
                 let Some(y) = next_num(&mut idx) else { break };
                 cur.1 = if cmd == 'v' { cur.1 + y } else { y };
-                current.push(cur);
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
+                push_pt(&mut current, &mut total_points, cur);
             }
             'C' | 'c' => {
-                let (Some(_), Some(_), Some(_), Some(_), Some(x), Some(y)) = (
+                let (Some(x1), Some(y1), Some(x2), Some(y2), Some(x), Some(y)) = (
                     next_num(&mut idx),
                     next_num(&mut idx),
                     next_num(&mut idx),
@@ -2723,15 +2784,22 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
                 ) else {
                     break;
                 };
-                cur = if cmd == 'c' {
-                    (cur.0 + x, cur.1 + y)
+                let (p1, p2, p3) = if cmd == 'c' {
+                    (
+                        (cur.0 + x1, cur.1 + y1),
+                        (cur.0 + x2, cur.1 + y2),
+                        (cur.0 + x, cur.1 + y),
+                    )
                 } else {
-                    (x, y)
+                    ((x1, y1), (x2, y2), (x, y))
                 };
-                current.push(cur);
+                flatten_cubic(&mut current, &mut total_points, cur, p1, p2, p3);
+                last_cubic_ctrl = Some(p2);
+                last_quad_ctrl = None;
+                cur = p3;
             }
-            'Q' | 'q' | 'S' | 's' => {
-                let (Some(_), Some(_), Some(x), Some(y)) = (
+            'S' | 's' => {
+                let (Some(x2), Some(y2), Some(x), Some(y)) = (
                     next_num(&mut idx),
                     next_num(&mut idx),
                     next_num(&mut idx),
@@ -2739,14 +2807,60 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
                 ) else {
                     break;
                 };
-                cur = if cmd.is_ascii_lowercase() {
+                let p1 = match last_cubic_ctrl {
+                    Some(prev) => (2.0 * cur.0 - prev.0, 2.0 * cur.1 - prev.1),
+                    None => cur,
+                };
+                let (p2, p3) = if cmd == 's' {
+                    ((cur.0 + x2, cur.1 + y2), (cur.0 + x, cur.1 + y))
+                } else {
+                    ((x2, y2), (x, y))
+                };
+                flatten_cubic(&mut current, &mut total_points, cur, p1, p2, p3);
+                last_cubic_ctrl = Some(p2);
+                last_quad_ctrl = None;
+                cur = p3;
+            }
+            'Q' | 'q' => {
+                let (Some(x1), Some(y1), Some(x), Some(y)) = (
+                    next_num(&mut idx),
+                    next_num(&mut idx),
+                    next_num(&mut idx),
+                    next_num(&mut idx),
+                ) else {
+                    break;
+                };
+                let (p1, p2) = if cmd == 'q' {
+                    ((cur.0 + x1, cur.1 + y1), (cur.0 + x, cur.1 + y))
+                } else {
+                    ((x1, y1), (x, y))
+                };
+                flatten_quad(&mut current, &mut total_points, cur, p1, p2);
+                last_quad_ctrl = Some(p1);
+                last_cubic_ctrl = None;
+                cur = p2;
+            }
+            'T' | 't' => {
+                let (Some(x), Some(y)) = (next_num(&mut idx), next_num(&mut idx)) else {
+                    break;
+                };
+                let p1 = match last_quad_ctrl {
+                    Some(prev) => (2.0 * cur.0 - prev.0, 2.0 * cur.1 - prev.1),
+                    None => cur,
+                };
+                let p2 = if cmd == 't' {
                     (cur.0 + x, cur.1 + y)
                 } else {
                     (x, y)
                 };
-                current.push(cur);
+                flatten_quad(&mut current, &mut total_points, cur, p1, p2);
+                last_quad_ctrl = Some(p1);
+                last_cubic_ctrl = None;
+                cur = p2;
             }
             _ => {
+                last_cubic_ctrl = None;
+                last_quad_ctrl = None;
                 idx += 1;
             }
         }
@@ -3181,5 +3295,63 @@ mod tests {
             ),
             Err(Error::Canceled)
         ));
+    }
+
+    #[test]
+    fn preview_rasterizer_flattens_cubic_quadratic_and_smooth_bezier_curves() {
+        // Cubic dome `M0 10 C0 0 10 0 10 10 Z` encloses a filled interior that disappears if
+        // control points are discarded.
+        let cubic_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 10 10"><path d="M0 10 C0 0 10 0 10 10 Z" fill="#000000"/></svg>"##;
+        let cubic_out = build_vector_output(
+            Some(cubic_svg),
+            StarVectorFinishReason::CompleteRoot,
+            10,
+            None,
+            100,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 64,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("cubic curve SVG must sanitize and rasterize");
+        let cubic_preview = cubic_out.preview.expect("cubic preview must render");
+        let dark_pixels = cubic_preview
+            .pixels
+            .chunks_exact(3)
+            .filter(|rgb| rgb[0] < 64 && rgb[1] < 64 && rgb[2] < 64)
+            .count();
+        assert!(
+            dark_pixels > 1000,
+            "cubic Bezier filled interior must be visible in preview (got {dark_pixels} dark pixels)"
+        );
+
+        // Quadratic + smooth quadratic (`Q` / `T`) and smooth cubic (`S`) also render filled regions.
+        let quad_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32" viewBox="0 0 20 10"><path d="M0 10 Q5 0 10 10 T20 10 Z" fill="#000000"/></svg>"##;
+        let quad_out = build_vector_output(
+            Some(quad_svg),
+            StarVectorFinishReason::CompleteRoot,
+            10,
+            None,
+            100,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 64,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("quadratic curve SVG must sanitize and rasterize");
+        let quad_preview = quad_out.preview.expect("quad preview must render");
+        let quad_dark = quad_preview
+            .pixels
+            .chunks_exact(3)
+            .filter(|rgb| rgb[0] < 64 && rgb[1] < 64 && rgb[2] < 64)
+            .count();
+        assert!(
+            quad_dark > 50,
+            "quadratic/smooth Bezier interior must be visible in preview (got {quad_dark} dark pixels)"
+        );
     }
 }

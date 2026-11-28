@@ -176,7 +176,7 @@ impl Sd3Variant {
     /// Large / Medium run a negative prompt + a guidance scale >1. Turbo is distilled to a single
     /// (cond-only) forward — guidance 1.0, no negative prompt.
     ///
-    /// This is deliberately distinct from [`Capabilities::supports_true_cfg`], which describes the
+    /// This is deliberately distinct from [`mlx_gen::Capabilities::supports_true_cfg`], which describes the
     /// separate [`mlx_gen::GenerationRequest::true_cfg`] request field. SD3.5's MLX render path
     /// consumes `guidance` and `negative_prompt`, but never consumes `true_cfg`.
     pub fn uses_classifier_free_guidance(self) -> bool {

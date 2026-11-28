@@ -70,7 +70,7 @@ pub fn route_control() -> gen_core::RouteRecord {
     route
 }
 
-/// Krea 2 Turbo pose-control identity + capabilities, computed from [`route_control`].
+/// Krea 2 Turbo pose-control identity + capabilities, computed from `route_control`.
 pub fn descriptor() -> ModelDescriptor {
     route_control().compute_descriptor()
 }
