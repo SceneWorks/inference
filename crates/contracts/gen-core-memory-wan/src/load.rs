@@ -412,9 +412,8 @@ pub fn prepare_load_spec(
         )));
     }
     let root = validate_load_spec(spec, provider_id)?.to_path_buf();
-    let (repository, revision) = repository_policy(backend, route, tier);
     if !matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
-        repository_revision(&root, repository, revision, tier, backend)?;
+        bind_repository_revision(&root, backend, route, tier)?;
     } else if route == WanI2vRoute::VaceFun {
         vace_fun_source_receipt_revision(&root, backend)?;
     } else {

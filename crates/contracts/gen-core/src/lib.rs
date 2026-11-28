@@ -420,6 +420,9 @@ pub use source_inventory::SourceInventory;
 // One snapshot-inventory walker + receipt hashing helpers shared by the Candle providers (sc-27253).
 pub mod snapshot_inventory;
 
+// Exact primary (MLX) + Candle-twin snapshot identities a provider binds a tier root to (SW-7285).
+pub mod snapshot_source;
+
 mod ios_build_identity;
 #[doc(hidden)]
 pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;
