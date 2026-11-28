@@ -20,6 +20,9 @@
 //!
 //! * `--tier NAME=from-mlx` -- Q4: lossless Q4_1 from the MLX triple (group size read from the
 //!   component `config.json`, any multiple of 32). A q8 tier via from-mlx is the legacy lossy requant.
+//!   Each triple converts at the width its own shapes imply: a q4 component's 8-bit precision-floor
+//!   triples (Mage's `norm_out.linear`) become Q8_0 exactly as the load-time repack builds them,
+//!   each recorded as an anchored `overrides` entry; any other width is refused.
 //! * `--tier NAME=from-bf16@ROOT` -- Q8_0 quantized from the dense bf16/f16/f32 source at
 //!   `ROOT/<component>`; the MLX q8 component at `<src-root>/NAME/<component>` is only the structural
 //!   template and may be header-only (see dump-headers / fetch-headers). With a header-only template
@@ -284,11 +287,19 @@ fn build(args: Vec<String>) {
             report.tensor_bytes,
             started.elapsed().as_secs_f64()
         );
+        if report.precision_floors > 0 {
+            println!(
+                "  [floor] {}: {} projections packed wider than the tier in the MLX source, kept \
+                 at their own width (Q8_0, as the load-time repack builds them) and recorded in \
+                 `overrides`",
+                job.label, report.precision_floors
+            );
+        }
         if job.options.keep_q8.is_some() {
             println!(
                 "  [recipe] {}: {} Q4_1 (lossless from MLX q4) + {} Q8_0 --keep-q8 overrides (from {})",
                 job.label,
-                report.converted - report.keep_q8,
+                report.converted - report.keep_q8 - report.precision_floors,
                 report.keep_q8,
                 job.options
                     .keep_q8
