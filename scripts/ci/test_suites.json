@@ -1142,7 +1142,7 @@
       "target": "mlx_gen",
       "test": "qkv::rope_route_tests::the_shared_cos_sin_route_reproduces_every_removed_private_rope_bitwise",
       "source": "crates/media/mlx-gen/src/qkv/rope_route_tests.rs",
-      "reason": "SW-6140 MLX RoPE bit-exactness: qkv::apply_rope_eager / apply_rope vs verbatim copies of the removed private rotations (qwen/sam2/minimax/sam3/seedvr2/lens forms), f32 and bf16, array_eq.",
+      "reason": "SW-6140 MLX RoPE bit-exactness: qkv::apply_rope_eager / apply_rope vs verbatim copies of the removed private rotations (qwen/sam2/minimax/sam3 vision + tracker/seedvr2 full + partial/lens/pulid/boogu forms), f32 and bf16 (sam3 tracker f32 only), array_eq.",
       "platforms": [
         "darwin"
       ]

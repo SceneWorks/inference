@@ -142829,7 +142829,16 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "required_environment": [
+      "BOOGU_EDIT_DIR"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "BOOGU_EDIT_DIR",
+        "pin": "SceneWorks/boogu-image-mlx@a459e614d408bfdf57089c32cc3da706f5a017de/edit-q4"
+      }
+    ]
   },
   {
     "package": "mlx-gen-boogu",
@@ -231864,7 +231873,16 @@
         }
       ],
       "source_identity": "crates/media/mlx-gen/mlx-gen-scail2/tests/sequential_residency_real_weights.rs::sequential_residency_real_weights::scail2_staged_peak_stays_below_umt5_plus_dit_coresidence@11a39bb7dec55e0c063401dea24781684bcfe803155d71e4bf58376e0e53585c"
-    }
+    },
+    "required_environment": [
+      "SCAIL2_MODEL_DIR"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "SCAIL2_MODEL_DIR",
+        "pin": "SceneWorks/scail2-mlx@ce88cfdb1008f395e9c820e525e6db7b6695f7b3/q4"
+      }
+    ]
   },
   {
     "package": "mlx-gen-scail2",
