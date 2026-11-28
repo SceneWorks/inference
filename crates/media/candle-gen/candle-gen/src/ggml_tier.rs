@@ -819,12 +819,10 @@ fn split_lead(tensor: &str, dims: &[usize]) -> Result<(Option<usize>, usize, usi
 /// ([`repack_packed_weight_uncached`], behind the cached `repack_packed_weight`) reads every
 /// triple's width from its own shapes, so such a component loads today; the stored tier converts
 /// each triple at that same width. Any other width is a mislabelled or misread pack.
+/// The table is the shared contract's ([`gen_core::stored_ggml::admitted_widths`]), the one every
+/// reader admits the marker's `overrides` against.
 pub fn admitted_widths(tier_bits: u64) -> &'static [usize] {
-    match tier_bits {
-        4 => &[4, 8],
-        8 => &[8],
-        _ => &[],
-    }
+    usize::try_from(tier_bits).map_or(&[], gen_core::stored_ggml::admitted_widths)
 }
 
 /// The widths one conversion admits for its packed triples, and the tier they are judged against.
@@ -1361,16 +1359,19 @@ fn floor_overrides(
             }
         }
     }
-    Ok(floors
+    // One record per projection in the shape `--keep-q8` writes, through the shared record type.
+    floors
         .into_iter()
         .map(|(base, bits)| {
-            serde_json::json!({
-                "pattern": format!("^{}$", regex::escape(&base)),
-                "bits": bits,
-                "count": 1,
-            })
+            gen_core::stored_ggml::StoredGgmlOverride::parse(
+                &format!("^{}$", regex::escape(&base)),
+                bits,
+                1,
+            )
+            .map(|record| record.to_json())
+            .map_err(|e| GgmlTierError::Spec(e.to_string()))
         })
-        .collect())
+        .collect()
 }
 
 /// The `Q8_0` blocks of projection `base` (`expected` = its dense shape) from the dense source
@@ -1702,6 +1703,16 @@ pub fn convert_component_with(
         SourceMode::FromBf16(_) => Widths::uniform(cfg_bits),
     };
     let overrides = (!overrides.is_empty()).then_some(overrides);
+    // The declaration this run writes must be one every reader admits: parse it back through the
+    // shared marker parser before anything is written.
+    if let Some(records) = &overrides {
+        let marker = serde_json::Map::from_iter([(
+            gen_core::stored_ggml::OVERRIDES_KEY.to_owned(),
+            Value::Array(records.clone()),
+        )]);
+        gen_core::stored_ggml::StoredGgmlWidths::from_marker(cfg_bits as usize, &marker)
+            .map_err(|e| GgmlTierError::Spec(e.to_string()))?;
+    }
     let ctx = Ctx {
         mode,
         dense: match mode {
@@ -1863,7 +1874,7 @@ impl KeepQ8 {
             .patterns
             .iter()
             .zip(counts)
-            .map(|(p, n)| serde_json::json!({ "pattern": p.as_str(), "bits": 8, "count": n }))
+            .map(|(p, n)| gen_core::stored_ggml::StoredGgmlOverride::new(p.clone(), 8, n).to_json())
             .collect())
     }
 }
@@ -3865,6 +3876,209 @@ mod tests {
             cfg["quantization"],
             serde_json::json!({"bits": 4, "storage": "ggml"})
         );
+    }
+
+    /// A tiny Qwen3 text-encoder contract (hidden 64, two layers, group-64 packing) for the
+    /// builder → encoder-contract round trip. The tokenizer and prompt policies are only bound by a
+    /// production load; header validation never reads them.
+    const TE_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+        architecture: "qwen3",
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 2,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        vocab_size: 16,
+        output_width: 64,
+        loaded_hidden_layers: 2,
+        requires_final_norm: true,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+        rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
+        max_position_embeddings: 4_096,
+        attention_bias: gen_core::EncoderConfigBool::Required(false),
+        tie_word_embeddings: gen_core::EncoderConfigBool::Required(true),
+        tokenizer: gen_core::EncoderTokenizerContract {
+            family: "test-qwen3",
+            binding: gen_core::EncoderTokenizerBinding::RetainBase,
+            artifact_candidates: &["tokenizer/tokenizer.json"],
+            required_tokens: &[gen_core::EncoderRequiredToken {
+                role: "test_special",
+                literal: "<test>",
+                id: 1,
+                config_field: None,
+            }],
+        },
+        prompt_executions: &[gen_core::EncoderPromptExecutionContract {
+            purpose: "test_prompt",
+            template: gen_core::EncoderPromptTemplate::QwenInstruct,
+            add_special_tokens: true,
+            length: gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 8 },
+            padding: gen_core::EncoderPromptPadding::None,
+            prefix_trim: 0,
+        }],
+        bos_token_id: None,
+        eos_token_id: None,
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[2],
+        packing: Some(gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: false,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
+    /// [`TE_CONTRACT`] as an MLX q4 component (every layer projection a group-64 triple, the
+    /// embedding and norms dense F16) plus a bf16 dense source of `model.layers.0.mlp.down_proj`.
+    fn te_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let (src, dense) = (root.join("q4/text_encoder"), root.join("bf16/text_encoder"));
+        let f16 = |shape: &[usize]| Tensor::ones(shape, DType::F16, &Device::Cpu).unwrap();
+        let mut s = HashMap::new();
+        s.insert("model.embed_tokens.weight".to_string(), f16(&[16, 64]));
+        s.insert("model.norm.weight".to_string(), f16(&[64]));
+        for layer in 0..2 {
+            let base = format!("model.layers.{layer}");
+            for (i, (name, out, inp)) in [
+                ("self_attn.q_proj", 64, 64),
+                ("self_attn.k_proj", 32, 64),
+                ("self_attn.v_proj", 32, 64),
+                ("self_attn.o_proj", 64, 64),
+                ("mlp.gate_proj", 128, 64),
+                ("mlp.up_proj", 128, 64),
+                ("mlp.down_proj", 64, 128),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                put_triple(&mut s, &format!("{base}.{name}"), q4_pack(out, inp, 64, i));
+            }
+            for (name, width) in [
+                ("self_attn.q_norm", 32),
+                ("self_attn.k_norm", 32),
+                ("input_layernorm", 64),
+                ("post_attention_layernorm", 64),
+            ] {
+                s.insert(format!("{base}.{name}.weight"), f16(&[width]));
+            }
+        }
+        write_component(&src, 4, 64, &[s]);
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::json!({
+                "model_type": "qwen3", "hidden_size": 64, "intermediate_size": 128,
+                "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 32, "vocab_size": 16, "hidden_act": "silu",
+                "attention_dropout": 0.0, "rms_norm_eps": 0.000001, "rope_theta": 1000000,
+                "max_position_embeddings": 4096, "attention_bias": false,
+                "tie_word_embeddings": true,
+                "quantization": {"bits": 4, "group_size": 64}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&dense).unwrap();
+        save(
+            &HashMap::from([(
+                "model.layers.0.mlp.down_proj.weight".to_string(),
+                dense_bf16(64, 128, 0.3),
+            )]),
+            dense.join("model.safetensors"),
+        );
+        (src, dense)
+    }
+
+    /// The finding SW-7285's review raised: a q4 text encoder converted with `--keep-q8` writes
+    /// mixed Q4_1 / Q8_0 blocks and declares the Q8_0 projections in `quantization.overrides`, and
+    /// the encoder contract must admit exactly that tier — every width check reads the same
+    /// declaration the builder wrote. Header and conversion only; no forward runs.
+    #[test]
+    fn keep_q8_text_encoder_round_trips_through_the_encoder_contract() {
+        let root = tmp();
+        let (src, dense) = te_fixture(root.path());
+        let dst = root.path().join("ggml/text_encoder");
+        let opts = keep(&[r"^model\.layers\.0\.mlp\.down_proj$"], dense, vec![]);
+        let report =
+            convert_component_with(&src, &dst, &SourceMode::FromMlx, &opts, &mut noop).unwrap();
+        assert_eq!((report.converted, report.keep_q8), (14, 1));
+        let got = load(dst.join("model-00001-of-00001.safetensors"));
+        assert_eq!(
+            got["model.layers.0.mlp.down_proj.weight"].dims(),
+            [64, 4, 34]
+        );
+        assert_eq!(
+            got["model.layers.1.mlp.down_proj.weight"].dims(),
+            [64, 4, 20]
+        );
+
+        let validate =
+            || TE_CONTRACT.validate_source(&gen_core::WeightsSource::Dir(dst.to_path_buf()));
+        let validated = validate().unwrap();
+        assert_eq!(validated.packed_quant_bits(), Some(4));
+        assert!(validated.packed_quant_is_stored_ggml());
+
+        // Each refusal edits only the declaration the builder wrote.
+        let config_path = dst.join("config.json");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let refused = |overrides: Option<Value>| {
+            let mut cfg = written.clone();
+            match overrides {
+                Some(o) => cfg["quantization"]["overrides"] = o,
+                None => {
+                    cfg["quantization"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("overrides");
+                }
+            }
+            std::fs::write(&config_path, cfg.to_string()).unwrap();
+            validate().unwrap_err().to_string()
+        };
+        // The undeclared wider block.
+        let error = refused(None);
+        assert!(
+            error
+                .contains("model.layers.0.mlp.down_proj stores Q8_0 blocks (Q8) under a Q4 marker"),
+            "{error}"
+        );
+        // A recorded count that disagrees with the component.
+        let error = refused(Some(serde_json::json!([
+            {"pattern": r"^model\.layers\.0\.mlp\.down_proj$", "bits": 8, "count": 2}
+        ])));
+        assert!(
+            error.contains("records count 2, but 1 stored block"),
+            "{error}"
+        );
+        // An override naming other projections: the Q8_0 block is undeclared and the named
+        // projection's Q4_1 blocks contradict the override.
+        let error = refused(Some(serde_json::json!([
+            {"pattern": r"\.mlp\.up_proj$", "bits": 8, "count": 2}
+        ])));
+        assert!(
+            error.contains("under a Q4 marker") || error.contains("but override"),
+            "{error}"
+        );
+        // A width the tier does not admit.
+        let error = refused(Some(serde_json::json!([
+            {"pattern": r"^model\.layers\.0\.mlp\.down_proj$", "bits": 16, "count": 1}
+        ])));
+        assert!(
+            error.contains("declares Q16, which a Q4 tier does not admit"),
+            "{error}"
+        );
+        // The builder's own declaration is admitted again.
+        std::fs::write(&config_path, written.to_string()).unwrap();
+        validate().unwrap();
     }
 
     #[test]

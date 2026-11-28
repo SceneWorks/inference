@@ -43,10 +43,17 @@ pub(super) fn parse_packed_quantization(
                     crate::stored_ggml::GGML_STORAGE
                 )));
             }
-            return Ok(Some(PackedQuantization {
-                bits,
-                storage: PackedStorage::Ggml,
-            }));
+            // The width `overrides` (`--keep-q8`, MLX precision floors) through the one shared
+            // parser the tier builder writes for.
+            let widths = crate::stored_ggml::StoredGgmlWidths::from_marker(bits, marker).map_err(
+                |error| {
+                    Error::Unsupported(format!(
+                        "text encoder quantization: {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
+            return Ok(Some(PackedQuantization::ggml(widths)));
         }
         Some(other) => {
             return Err(Error::Unsupported(format!(
@@ -553,8 +560,8 @@ pub(super) fn validate_quantization_evidence(
             || names.contains(format!("{base}.scales").as_str())
             || names.contains(format!("{base}.biases").as_str())
     });
-    // Stored GGML blocks (SW-7285) are classified by the one shared header rule. The first one
-    // whose block type contradicts the declared bits is kept for the refusal.
+    // Stored GGML blocks (SW-7285) are classified by the one shared header rule; each one's width
+    // is admitted against the marker's declaration below.
     let stored = headers
         .iter()
         .filter(|header| header.name.ends_with(".weight"))
@@ -582,22 +589,27 @@ pub(super) fn validate_quantization_evidence(
                         crate::stored_ggml::GGML_STORAGE
                     )));
                 }
-                PackedStorage::Ggml if has_affine_evidence => {
+                PackedStorage::Ggml(_) if has_affine_evidence => {
                     return Err(Error::Unsupported(format!(
                         "text encoder quantization mismatch at {}: config declares {quant} but the exact direct-shard surface stores MLX affine triples",
                         path.display()
                     )));
                 }
-                PackedStorage::MlxAffine { .. } | PackedStorage::Ggml => {}
+                PackedStorage::MlxAffine { .. } | PackedStorage::Ggml(_) => {}
             }
-            if let Some((header, g)) = stored.iter().find(|(_, g)| g.block.bits() != quant.bits) {
-                return Err(Error::Unsupported(format!(
-                    "text encoder quantization mismatch at {}: config declares {quant} but {} stores {:?} blocks (Q{})",
-                    path.display(),
-                    header.name,
-                    g.block,
-                    g.block.bits()
-                )));
+            // A block at another width than `bits` must be a declared override of exactly that
+            // width. `headers` may be a bounded evidence window, so the override counts are
+            // checked over the whole component by `validate_headers`.
+            if let Some(widths) = quant.ggml_widths() {
+                for (header, g) in &stored {
+                    let base = header.name.strip_suffix(".weight").expect("filtered on .weight");
+                    widths.admit(base, g.block).map_err(|error| {
+                        Error::Unsupported(format!(
+                            "text encoder quantization mismatch at {}: config declares {quant} but {error}",
+                            path.display()
+                        ))
+                    })?;
+                }
             }
             Ok(Some(quant))
         }

@@ -8,11 +8,12 @@ impl EncoderContract {
         &self,
         headers: &[SafetensorsTensorHeader],
         path: &Path,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         dtype_policy: EncoderDtypePolicy,
     ) -> Result<()> {
         let prefix = self.expected_header_prefix()?;
         self.validate_architecture_signature(headers, path, prefix)?;
+        let component = headers;
         let lm_head_prefix = self
             .requires_lm_head
             .then(|| self.expected_lm_head_prefix())
@@ -260,6 +261,20 @@ impl EncoderContract {
         }
         self.validate_all_packed_triples(headers, path, packed_quant, &allowed_packed_bases)?;
         self.validate_dense_storage_probe(headers, path)?;
+        // A stored-GGML tier's width declaration over the WHOLE component (SW-7285), after the
+        // per-matrix checks have named any loaded projection: every block's width admitted, and
+        // each `overrides` record's `count` equal to the blocks it matches — exactly what the tier
+        // builder counted when it wrote the marker.
+        if let Some(widths) = packed_quant.and_then(PackedQuantization::ggml_widths) {
+            widths.admit_headers(component).map_err(|error| {
+                self.mismatch(
+                    path,
+                    "quantization.overrides",
+                    format!("the declared Q{} width contract", widths.bits()),
+                    error,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -382,7 +397,7 @@ impl EncoderContract {
     pub(super) fn validate_packing_config(
         &self,
         path: &Path,
-        packed: Option<PackedQuantization>,
+        packed: Option<&PackedQuantization>,
         is_file: bool,
     ) -> Result<()> {
         match (packed, self.packing) {
@@ -448,7 +463,7 @@ impl EncoderContract {
         &self,
         headers: &[SafetensorsTensorHeader],
         path: &Path,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         allowed_packed_bases: &BTreeSet<String>,
     ) -> Result<()> {
         let find = |name: &str| headers.iter().find(|header| header.name == name);
@@ -716,7 +731,7 @@ impl EncoderContract {
         headers: &[SafetensorsTensorHeader],
         path: &Path,
         expectation: MatrixExpectation<'_>,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         dtype_policy: EncoderDtypePolicy,
     ) -> Result<()> {
         let MatrixExpectation {
@@ -765,17 +780,22 @@ impl EncoderContract {
                         "stored GGML blocks",
                     ));
                 }
-                let bits = weight.stored_ggml_block_bits();
-                if bits != Some(quant.bits) {
+                // The block width: the marker's `bits`, or a declared override of exactly this
+                // width (a q4 `--keep-q8` projection) — the one shared admission rule.
+                let geometry = crate::stored_ggml::stored_ggml_header_geometry(weight)
+                    .expect("is_stored_ggml_block classified this header");
+                let widths = quant
+                    .ggml_widths()
+                    .expect("is_ggml checked the storage above");
+                if let Err(error) = widths.admit(base, geometry.block) {
                     return Err(self.mismatch(
                         path,
                         "packed_dtype",
-                        format!("Q{} GGML blocks", quant.bits),
-                        format!("{:?} with {bits:?}-bit blocks", weight.shape),
+                        format!("Q{} GGML blocks or a declared override", quant.bits),
+                        error,
                     ));
                 }
-                let cols = crate::stored_ggml::stored_ggml_header_geometry(weight)
-                    .map(|geometry| geometry.cols);
+                let cols = Some(geometry.cols);
                 if weight.shape[0] != expected_output {
                     return Err(self.mismatch(path, field, expected_output, weight.shape[0]));
                 }

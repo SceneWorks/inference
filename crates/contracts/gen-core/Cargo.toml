@@ -29,6 +29,9 @@ safetensors = { workspace = true }
 # JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
 serde_json = { workspace = true }
 serde = { workspace = true }
+# The stored-GGML marker's `quantization.overrides` patterns (SW-7285, `stored_ggml`): the one
+# parser the Candle tier builder writes for and every header validator reads with.
+regex = { workspace = true }
 sceneworks-gen-core-moss-image-policy = { workspace = true }
 sceneworks-gen-core-pag-policy = { workspace = true }
 # Canonical production-latent tiled-decode quality receipts (SC-18325). This hashes semantic
