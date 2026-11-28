@@ -99,15 +99,15 @@ impl Sd35Route {
         match self {
             Self::Large => Some(SceneWorksSnapshot::new(
                 "sd3.5-large-candle",
-                "dcd575d1e360cba23a41d097297d287192476edc",
+                "4924caaf5648ea61562a6e9bdd780d7b4bfc1426",
             )),
             Self::LargeTurbo => Some(SceneWorksSnapshot::new(
                 "sd3.5-large-turbo-candle",
-                "7aedbd5e4f9b4f81e0aacb533b201c9c5c767d66",
+                "478ff0921a9170e8d9ced8d53023ad9fba97530c",
             )),
             Self::Medium => Some(SceneWorksSnapshot::new(
                 "sd3.5-medium-candle",
-                "098bb70d214dc5060d4180e46a8308db2c55463a",
+                "546b11d6e36a74caa8bf0add74fa2e31af861406",
             )),
         }
     }

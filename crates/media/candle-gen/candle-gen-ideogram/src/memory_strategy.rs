@@ -37,7 +37,7 @@ pub const BF16_REVISION: &str = "2e8fb610109bf0db195344cc424df98b301d3cad";
 /// the exact `SceneWorksSnapshot::new("ideogram-4-candle", "<rev>")` here.
 pub const PACKED_CANDLE_TWIN: Option<SceneWorksSnapshot> = Some(SceneWorksSnapshot::new(
     "ideogram-4-candle",
-    "7debcb619eb9a12d20bcba6fdb62c604664f0d98",
+    "67ac436b1e5d9f59ce75921e3d7f4dced8d02473",
 ));
 pub const PID_FLUX2_REVISION: &str = "6d5c1f1049e863f1757f68fd81c6bc850a95609d";
 pub const PID_GEMMA_REVISION: &str = "684c553b5b41a1c835989d89f62f585e6269a7de";

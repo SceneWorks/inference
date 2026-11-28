@@ -26,7 +26,7 @@ pub const CANONICAL_REVISION: &str = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3";
 /// on Windows/Linux. Exact repository + revision; nothing else is admitted.
 pub const CANONICAL_SOURCES: TierSources = TierSources::with_candle_twin(
     SceneWorksSnapshot::new("scail2-mlx", CANONICAL_REVISION),
-    SceneWorksSnapshot::new("scail2-candle", "b813a5922619c768fd84226143d481ea20657ce2"),
+    SceneWorksSnapshot::new("scail2-candle", "b091ec1e6b8e528b55707d4dc88c4f49a4c1ae6e"),
 );
 pub const PUBLIC_BUCKETS: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 704), (704, 1280)];
 pub const PUBLIC_FRAMES: &[u32] = &[45, 61, 77];

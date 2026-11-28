@@ -62,7 +62,7 @@ const EDIT_2511_SOURCES: TierSources = TierSources::with_candle_twin(
     SceneWorksSnapshot::new("qwen-image-edit-2511-mlx", EDIT_2511_REVISION),
     SceneWorksSnapshot::new(
         "qwen-image-edit-2511-candle",
-        "decd173ca654ae367231e3f08cadcad62a0d0d7f",
+        "c8cb2566415852b1f3c9929b3462b3e828e49b5f",
     ),
 );
 const EDIT_2511_LIGHTNING_REPO_DIR: &str = "models--lightx2v--Qwen-Image-Edit-2511-Lightning";
