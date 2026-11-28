@@ -305,6 +305,38 @@ impl candle_gen::gen_core::Generator for FluxIpAdapterGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         self.validate(req)?;
+        let plan = compile_ip_feature_route(self.variant, &self.spec, req)?.ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(format!(
+                "{}: failed to compile IP render plan",
+                self.descriptor.id
+            ))
+        })?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        self.generate_planned_with_execution_report(req, plan, scope, on_progress)
+            .map(|completed| completed.generation)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&candle_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.spec,
+        ))?;
         let (reference, strength) = match req.conditioning.as_slice() {
             [Conditioning::Reference { image, strength }] => (image, *strength),
             _ => {
@@ -314,12 +346,6 @@ impl candle_gen::gen_core::Generator for FluxIpAdapterGenerator {
                 )));
             }
         };
-        let plan = compile_ip_feature_route(self.variant, &self.spec, req)?.ok_or_else(|| {
-            candle_gen::gen_core::Error::Msg(format!(
-                "{}: failed to compile IP render plan",
-                self.descriptor.id
-            ))
-        })?;
         let default_steps = if self.variant.is_dev() { 25 } else { 4 };
         let ip_req = IpAdapterFluxRequest {
             prompt: req.prompt.clone(),
@@ -330,15 +356,16 @@ impl candle_gen::gen_core::Generator for FluxIpAdapterGenerator {
             scheduler: req.scheduler.as_deref().map(str::to_owned),
             scheduler_shift: req.scheduler_shift,
             guidance: req.guidance.unwrap_or(3.5),
-            ip_adapter_scale: strength.unwrap_or(DEFAULT_IP_SCALE),
+            ip_adapter_scale: strength.or(req.strength).unwrap_or(DEFAULT_IP_SCALE),
             seed: req.seed.unwrap_or(0),
             memory: req.memory.unwrap_or_default(),
             preview: req.preview.clone(),
             pag: req.features.pag.clone(),
             cancel: req.cancel.clone(),
         };
+        let _run = candle_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.model
-            .generate_with_execution_report(&ip_req, reference, &plan, on_progress)
+            .generate_with_execution_report(&ip_req, reference, plan, on_progress)
     }
 
     fn validate(&self, request: &GenerationRequest) -> candle_gen::gen_core::Result<()> {

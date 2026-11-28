@@ -1411,21 +1411,30 @@ pub fn compile_edit_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_edit_render_plan_for(edit_descriptor(), false, spec, req)
+}
+
+pub(crate) fn compile_edit_render_plan_for(
+    desc: ModelDescriptor,
+    lightning: bool,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let route_id = desc.id;
     if matches!(spec.weights, WeightsSource::File(_)) {
-        return Err(gen_core::Error::Msg(
-            "qwen_image_edit expects a snapshot directory".into(),
-        ));
+        return Err(gen_core::Error::Msg(format!(
+            "{route_id} expects a snapshot directory"
+        )));
     }
-    let desc = edit_descriptor();
-    desc.capabilities.validate_request(desc.id, req)?;
+    desc.capabilities.validate_request(route_id, req)?;
     if req.prompt.is_empty() {
-        return Err(gen_core::Error::Msg(
-            "qwen_image_edit: prompt must not be empty".into(),
-        ));
+        return Err(gen_core::Error::Msg(format!(
+            "{route_id}: prompt must not be empty"
+        )));
     }
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(gen_core::Error::Msg(format!(
-            "qwen_image_edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            "{route_id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
             req.width, req.height
         )));
     }
@@ -1437,11 +1446,17 @@ pub fn compile_edit_render_plan(
         )
     });
     if !has_ref {
-        return Err(gen_core::Error::Msg(
-            "qwen_image_edit requires a Reference or MultiReference conditioning image".into(),
-        ));
+        return Err(gen_core::Error::Msg(format!(
+            "{route_id} requires a Reference or MultiReference conditioning image"
+        )));
     }
-    let steps = resolve_steps(req.steps);
+    let steps = req.steps.map(|s| s as usize).unwrap_or_else(|| {
+        if lightning {
+            4
+        } else {
+            resolve_steps(None)
+        }
+    });
     let native = pipeline::qwen_sigmas(steps, req.width, req.height);
     let mu = pipeline::qwen_mu(req.width, req.height);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
@@ -1453,7 +1468,8 @@ pub fn compile_edit_render_plan(
     )?;
     let executed_steps = sigmas.len().saturating_sub(1);
     let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
-    let guidance = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE);
+    let default_guidance = if lightning { 1.0 } else { DEFAULT_GUIDANCE };
+    let guidance = req.true_cfg.or(req.guidance).unwrap_or(default_guidance);
     let pass = gen_core::render::PackedImagePass {
         pixel_stride: SIZE_MULTIPLE,
         token_width: 64,

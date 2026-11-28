@@ -79,15 +79,11 @@ pub fn edit_request(request: &GenerationRequest) -> Result<GenerationRequest> {
     let edited = gen_core_moss_image_policy::apply_edit_defaults(&policy_request)
         .map_err(|error| Error::Unsupported(error.message().into()))?;
     let mut request = request.clone();
-    let existing_edit = request
+    let ext = request
         .extensions
         .moss_image
-        .as_ref()
-        .and_then(|ext| ext.edit.clone());
-    request.extensions.moss_image = Some(gen_core::MossImageExtension {
-        options: edited.moss_image.map(Into::into),
-        edit: existing_edit,
-    });
+        .get_or_insert_with(gen_core::MossImageExtension::default);
+    ext.options = edited.moss_image.map(Into::into);
     request.steps = edited.steps;
     request.guidance = edited.guidance;
     request.scheduler_shift = edited.scheduler_shift;

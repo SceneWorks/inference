@@ -2402,7 +2402,7 @@ pub fn render_svg_preview(canonical: &CanonicalSvg, max_dimension: u32) -> Resul
             pixels: &mut pixels,
         };
         let default_style = PaintStyle::default();
-        rasterize_node(root, default_style, &mut canvas);
+        rasterize_node(root, default_style, Transform2D::identity(), &mut canvas);
     }
 
     Ok(Image {
@@ -2519,18 +2519,21 @@ fn parse_color(raw: &str) -> Option<Option<[u8; 3]>> {
         return Some(None);
     }
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Some([r, g, b]));
+        if hex.is_ascii() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if hex.len() == 6 {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                return Some(Some([r, g, b]));
+            }
+            if hex.len() == 3 {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                return Some(Some([r, g, b]));
+            }
         }
-        if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
-            return Some(Some([r, g, b]));
-        }
+        return None;
     }
     if let Some(inner) = s.strip_prefix("rgb(").and_then(|r| r.strip_suffix(')')) {
         let parts: Vec<u8> = inner
@@ -2871,7 +2874,166 @@ fn parse_path_subpaths(d: &str) -> Vec<(Vec<(f64, f64)>, bool)> {
     subpaths
 }
 
-fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCanvas<'_>) {
+#[derive(Clone, Copy)]
+struct Transform2D {
+    // 2x3 SVG affine matrix:
+    //   x' = a * x + c * y + e
+    //   y' = b * x + d * y + f
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+}
+
+impl Transform2D {
+    fn identity() -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    fn translate(tx: f64, ty: f64) -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: tx,
+            f: ty,
+        }
+    }
+
+    fn scale(sx: f64, sy: f64) -> Self {
+        Self {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    fn rotate(deg: f64) -> Self {
+        let rad = deg.to_radians();
+        let (sin, cos) = rad.sin_cos();
+        Self {
+            a: cos,
+            b: sin,
+            c: -sin,
+            d: cos,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    fn skew_x(deg: f64) -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: deg.to_radians().tan(),
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    fn skew_y(deg: f64) -> Self {
+        Self {
+            a: 1.0,
+            b: deg.to_radians().tan(),
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Compose `self * rhs` (applies `rhs` first in local coordinates, then `self`).
+    fn then(self, rhs: Self) -> Self {
+        Self {
+            a: self.a * rhs.a + self.c * rhs.b,
+            b: self.b * rhs.a + self.d * rhs.b,
+            c: self.a * rhs.c + self.c * rhs.d,
+            d: self.b * rhs.c + self.d * rhs.d,
+            e: self.a * rhs.e + self.c * rhs.f + self.e,
+            f: self.b * rhs.e + self.d * rhs.f + self.f,
+        }
+    }
+
+    fn apply(self, pt: (f64, f64)) -> (f64, f64) {
+        (
+            self.a * pt.0 + self.c * pt.1 + self.e,
+            self.b * pt.0 + self.d * pt.1 + self.f,
+        )
+    }
+}
+
+fn parse_transform_attr(raw: &str) -> Transform2D {
+    let mut xform = Transform2D::identity();
+    let mut rest = raw.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+        let Some(open) = rest.find('(') else { break };
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(')') else {
+            break;
+        };
+        let args_str = &after_open[..close];
+        let nums: Vec<f64> = args_str
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f64>().ok().filter(|v| v.is_finite()))
+            .collect();
+        let op = match name.as_str() {
+            "matrix" if nums.len() == 6 => Some(Transform2D {
+                a: nums[0],
+                b: nums[1],
+                c: nums[2],
+                d: nums[3],
+                e: nums[4],
+                f: nums[5],
+            }),
+            "translate" if !nums.is_empty() => Some(Transform2D::translate(
+                nums[0],
+                nums.get(1).copied().unwrap_or(0.0),
+            )),
+            "scale" if !nums.is_empty() => Some(Transform2D::scale(
+                nums[0],
+                nums.get(1).copied().unwrap_or(nums[0]),
+            )),
+            "rotate" if nums.len() == 1 => Some(Transform2D::rotate(nums[0])),
+            "rotate" if nums.len() == 3 => Some(
+                Transform2D::translate(nums[1], nums[2])
+                    .then(Transform2D::rotate(nums[0]))
+                    .then(Transform2D::translate(-nums[1], -nums[2])),
+            ),
+            "skewx" if nums.len() == 1 => Some(Transform2D::skew_x(nums[0])),
+            "skewy" if nums.len() == 1 => Some(Transform2D::skew_y(nums[0])),
+            _ => None,
+        };
+        if let Some(op) = op {
+            xform = xform.then(op);
+        }
+        rest = &after_open[close + 1..];
+    }
+    xform
+}
+
+fn rasterize_node(
+    node: &SvgNode,
+    inherited: PaintStyle,
+    inherited_xform: Transform2D,
+    canvas: &mut PreviewCanvas<'_>,
+) {
     if matches!(node.name.as_str(), "defs" | "clipPath" | "filter" | "style") {
         return;
     }
@@ -2883,6 +3045,12 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
         return;
     }
     let style = resolve_style(&node.attrs, inherited);
+    let xform = node
+        .attrs
+        .iter()
+        .find(|(k, _)| k == "transform")
+        .map(|(_, v)| inherited_xform.then(parse_transform_attr(v)))
+        .unwrap_or(inherited_xform);
     match node.name.as_str() {
         "rect" => {
             let x = attr_f64(&node.attrs, "x", 0.0);
@@ -2890,7 +3058,12 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
             let w = attr_f64(&node.attrs, "width", 0.0);
             let h = attr_f64(&node.attrs, "height", 0.0);
             if w > 0.0 && h > 0.0 {
-                let pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+                let pts = [
+                    xform.apply((x, y)),
+                    xform.apply((x + w, y)),
+                    xform.apply((x + w, y + h)),
+                    xform.apply((x, y + h)),
+                ];
                 if let Some(fill) = style.fill {
                     canvas.fill_polygon(&pts, fill);
                 }
@@ -2920,7 +3093,7 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
                 let pts: Vec<(f64, f64)> = (0..segments)
                     .map(|i| {
                         let a = std::f64::consts::TAU * (i as f64) / (segments as f64);
-                        (cx + rx * a.cos(), cy + ry * a.sin())
+                        xform.apply((cx + rx * a.cos(), cy + ry * a.sin()))
                     })
                     .collect();
                 if let Some(fill) = style.fill {
@@ -2937,18 +3110,23 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
         }
         "line" => {
             if let Some(stroke) = style.stroke.or(style.fill) {
-                canvas.draw_line(
+                let (x1, y1) = xform.apply((
                     attr_f64(&node.attrs, "x1", 0.0),
                     attr_f64(&node.attrs, "y1", 0.0),
+                ));
+                let (x2, y2) = xform.apply((
                     attr_f64(&node.attrs, "x2", 0.0),
                     attr_f64(&node.attrs, "y2", 0.0),
-                    stroke,
-                );
+                ));
+                canvas.draw_line(x1, y1, x2, y2, stroke);
             }
         }
         "polygon" | "polyline" => {
             if let Some((_, raw)) = node.attrs.iter().find(|(k, _)| k == "points") {
-                let pts = parse_points(raw);
+                let pts: Vec<(f64, f64)> = parse_points(raw)
+                    .into_iter()
+                    .map(|pt| xform.apply(pt))
+                    .collect();
                 if node.name == "polygon" {
                     if let Some(fill) = style.fill {
                         canvas.fill_polygon(&pts, fill);
@@ -2970,7 +3148,9 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
         }
         "path" => {
             if let Some((_, d)) = node.attrs.iter().find(|(k, _)| k == "d") {
-                for (pts, closed) in parse_path_subpaths(d) {
+                for (raw_pts, closed) in parse_path_subpaths(d) {
+                    let pts: Vec<(f64, f64)> =
+                        raw_pts.into_iter().map(|pt| xform.apply(pt)).collect();
                     if let Some(fill) = style.fill {
                         canvas.fill_polygon(&pts, fill);
                     }
@@ -2993,7 +3173,7 @@ fn rasterize_node(node: &SvgNode, inherited: PaintStyle, canvas: &mut PreviewCan
     }
     for child in &node.children {
         if let SvgChild::Element(el) = child {
-            rasterize_node(el, style, canvas);
+            rasterize_node(el, style, xform, canvas);
         }
     }
 }
@@ -3352,6 +3532,61 @@ mod tests {
         assert!(
             quad_dark > 50,
             "quadratic/smooth Bezier interior must be visible in preview (got {quad_dark} dark pixels)"
+        );
+    }
+
+    #[test]
+    fn malformed_unicode_hex_color_never_panics_during_preview() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="8" height="8" fill="#aé"/></svg>"##;
+        let out = build_vector_output(
+            Some(svg),
+            StarVectorFinishReason::CompleteRoot,
+            4,
+            None,
+            64,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 32,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("non-ASCII hex color must not panic during sanitize + preview");
+        assert!(out.preview.is_some());
+    }
+
+    #[test]
+    fn preview_rasterizer_applies_inherited_group_and_element_transforms() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><g transform="translate(10 0)"><rect width="5" height="5" fill="red"/></g></svg>"##;
+        let out = build_vector_output(
+            Some(svg),
+            StarVectorFinishReason::CompleteRoot,
+            6,
+            None,
+            64,
+            "test-vector",
+            VectorSanitizeOptions {
+                preview_max_dimension: 20,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("translated group SVG must sanitize and rasterize");
+        let preview = out.preview.expect("translated preview must render");
+        assert_eq!((preview.width, preview.height), (20, 10));
+        // Original untranslated left region (x=2, y=2) must remain white.
+        let left_idx = (2 * 20 + 2) * 3;
+        assert_eq!(
+            &preview.pixels[left_idx..left_idx + 3],
+            &[255, 255, 255],
+            "untranslated left edge must stay white"
+        );
+        // Translated region (x=12, y=2) must be painted red.
+        let translated_idx = (2 * 20 + 12) * 3;
+        assert_eq!(
+            &preview.pixels[translated_idx..translated_idx + 3],
+            &[255, 0, 0],
+            "translated rectangle must appear at x=10..15"
         );
     }
 }

@@ -80,6 +80,7 @@ fn build_edit_request(
 
 struct QwenEditGenerator {
     descriptor: ModelDescriptor,
+    loaded_spec: LoadSpec,
     model: QwenEdit,
     lightning: bool,
     memory_contract: Option<gen_core::MemoryProviderContract>,
@@ -100,6 +101,34 @@ impl Generator for QwenEditGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("qwen/edit_route", self.descriptor.id.into());
+            candle_gen::execution::policy("qwen/lightning", format!("{}", self.lightning).into());
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let _run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        self.generate(req, on_progress)
+            .map(gen_core::GenerationReport::from_output)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::policy("qwen/edit_route", self.descriptor.id.into());
             candle_gen::execution::policy("qwen/lightning", format!("{}", self.lightning).into());
         })
@@ -206,6 +235,7 @@ fn load_edit_with(
     let model = QwenEdit::load_with_spec(&paths, spec).map_err(gen_core::Error::from)?;
     Ok(Box::new(QwenEditGenerator {
         descriptor,
+        loaded_spec: spec.clone(),
         model,
         lightning,
         memory_contract,
@@ -228,10 +258,35 @@ pub(crate) fn load_edit_2511_lightning(spec: &LoadSpec) -> gen_core::Result<Box<
     load_edit_with(crate::edit_2511_lightning_descriptor(), true, spec)
 }
 
+fn compile_edit_2509_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    crate::compile_edit_render_plan_for(crate::edit_2509_descriptor(), false, spec, req)
+}
+
+fn compile_edit_2511_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    crate::compile_edit_render_plan_for(crate::edit_2511_descriptor(), false, spec, req)
+}
+
+fn compile_edit_2511_lightning_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    crate::compile_edit_render_plan_for(crate::edit_2511_lightning_descriptor(), true, spec, req)
+}
+
 fn route_edit_alias(
     route_id: &'static str,
     descriptor: fn() -> ModelDescriptor,
     load: fn(&LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
+    compile_plan: fn(
+        &LoadSpec,
+        &GenerationRequest,
+    ) -> gen_core::Result<Option<gen_core::RenderPlan>>,
     lightning: bool,
 ) -> gen_core::RouteRecord {
     let mut route = crate::route_base();
@@ -248,7 +303,7 @@ fn route_edit_alias(
     }
     route.bindings = gen_core::RouteBindings::generator(descriptor, load)
         .with_feature_route(Some(MODEL_ID), descriptor)
-        .with_render_plan(crate::compile_edit_render_plan);
+        .with_render_plan(compile_plan);
     route
 }
 
@@ -257,6 +312,7 @@ pub(crate) fn route_edit_2509() -> gen_core::RouteRecord {
         "qwen_image_edit_2509",
         crate::edit_2509_descriptor,
         load_edit_2509,
+        compile_edit_2509_render_plan,
         false,
     )
 }
@@ -266,6 +322,7 @@ pub(crate) fn route_edit_2511() -> gen_core::RouteRecord {
         "qwen_image_edit_2511",
         crate::edit_2511_descriptor,
         load_edit_2511,
+        compile_edit_2511_render_plan,
         false,
     )
 }
@@ -275,12 +332,14 @@ pub(crate) fn route_edit_2511_lightning() -> gen_core::RouteRecord {
         "qwen_image_edit_2511_lightning",
         crate::edit_2511_lightning_descriptor,
         load_edit_2511_lightning,
+        compile_edit_2511_lightning_render_plan,
         true,
     )
 }
 
 struct QwenFunControlGenerator {
     descriptor: ModelDescriptor,
+    loaded_spec: LoadSpec,
     model: QwenFunControl,
 }
 
@@ -295,6 +354,33 @@ impl Generator for QwenFunControlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("qwen/control_route", self.descriptor.id.into());
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let _run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        self.generate(req, on_progress)
+            .map(gen_core::GenerationReport::from_output)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::policy("qwen/control_route", self.descriptor.id.into());
         })
     }
@@ -403,6 +489,7 @@ pub(crate) fn load_control(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generato
     let model = QwenFunControl::load_with_spec(&paths, spec).map_err(gen_core::Error::from)?;
     Ok(Box::new(QwenFunControlGenerator {
         descriptor: crate::control_descriptor(),
+        loaded_spec: spec.clone(),
         model,
     }))
 }
@@ -429,5 +516,79 @@ mod tests {
         let edit_req = build_edit_request(&request, 4, 1.0, 42, true);
         assert!(edit_req.stage_residency);
         assert_eq!(edit_req.memory, Some(memory));
+    }
+
+    #[test]
+    fn all_qwen_edit_aliases_and_control_compile_route_specific_render_plans() {
+        let registry = crate::provider_registry().expect("qwen registry builds");
+        let spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
+            "/tmp/qwen-dir",
+        )));
+        let ref_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        let edit_req = GenerationRequest {
+            prompt: "relight portrait".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: ref_img.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let default_steps = crate::resolve_steps(None);
+        for (route_id, expected_steps) in [
+            ("qwen_image_edit", default_steps),
+            ("qwen_image_edit_2509", default_steps),
+            ("qwen_image_edit_2511", default_steps),
+            ("qwen_image_edit_2511_lightning", LIGHTNING_DEFAULT_STEPS),
+        ] {
+            let plan = registry
+                .compile_render_plan(route_id, &spec, &edit_req)
+                .unwrap_or_else(|e| panic!("{route_id} plan compile failed: {e}"))
+                .unwrap_or_else(|| panic!("{route_id} must return a RenderPlan"));
+            let desc = registry
+                .generator_descriptor(route_id)
+                .expect("descriptor registered");
+            plan.check_request(&desc, &edit_req)
+                .unwrap_or_else(|e| panic!("{route_id} plan check_request failed: {e}"));
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
+                .unwrap_or_else(|e| panic!("{route_id} plan check_load failed: {e}"));
+            assert_eq!(plan.executed_steps(), expected_steps, "{route_id}");
+        }
+
+        let control_spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
+            "/tmp/qwen-dir",
+        )))
+        .with_control(WeightsSource::File(std::path::PathBuf::from(
+            "/tmp/qwen-control.safetensors",
+        )));
+        let control_req = GenerationRequest {
+            prompt: "studio pose".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Control {
+                image: ref_img,
+                kind: gen_core::ControlKind::Pose,
+                scale: Some(0.8),
+            }],
+            ..Default::default()
+        };
+        let control_plan = registry
+            .compile_render_plan("qwen_image_control", &control_spec, &control_req)
+            .expect("qwen_image_control plan compiles")
+            .expect("qwen_image_control returns RenderPlan");
+        let control_desc = registry
+            .generator_descriptor("qwen_image_control")
+            .expect("control descriptor registered");
+        control_plan
+            .check_request(&control_desc, &control_req)
+            .expect("control plan check_request succeeds");
+        control_plan
+            .check_load(&gen_core::RenderLoadBinding::from_spec(&control_spec))
+            .expect("control plan check_load succeeds");
     }
 }

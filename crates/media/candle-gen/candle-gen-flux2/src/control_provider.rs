@@ -176,6 +176,35 @@ impl candle_gen::gen_core::Generator for Flux2ControlGenerator {
         })
     }
 
+    fn generate_planned(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&candle_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.spec,
+        ))?;
+        let _run = candle_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
+        self.generate(req, on_progress)
+            .map(candle_gen::gen_core::GenerationReport::from_output)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            candle_gen::execution::policy("flux2/control_route", self.descriptor.id.into());
+        })
+    }
+
     fn validate(
         &self,
         request: &candle_gen::gen_core::GenerationRequest,

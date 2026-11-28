@@ -30,6 +30,7 @@ fn extract_control<'a>(
 
 struct ZImageControlGenerator {
     descriptor: ModelDescriptor,
+    loaded_spec: LoadSpec,
     base: bool,
     model: ZImageControl,
 }
@@ -45,6 +46,33 @@ impl Generator for ZImageControlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("z_image/control_route", self.descriptor.id.into());
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let _run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        self.generate(req, on_progress)
+            .map(gen_core::GenerationReport::from_output)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::policy("z_image/control_route", self.descriptor.id.into());
         })
     }
@@ -154,6 +182,7 @@ fn load_control_variant(
     }
     Ok(Box::new(ZImageControlGenerator {
         descriptor,
+        loaded_spec: spec.clone(),
         base,
         model,
     }))

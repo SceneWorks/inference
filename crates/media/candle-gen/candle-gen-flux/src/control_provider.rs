@@ -390,6 +390,37 @@ impl candle_gen::gen_core::Generator for Flux1DevControlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         self.validate(req)?;
+        let plan = compile_control_feature_route(&self.spec, req)?.ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(
+                "flux1_dev_control: failed to compile control render plan".into(),
+            )
+        })?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        self.generate_planned_with_execution_report(req, plan, scope, on_progress)
+            .map(|completed| completed.generation)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&candle_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.spec,
+        ))?;
         let (control_image, kind, scale) = match req.conditioning.as_slice() {
             [Conditioning::Control { image, kind, scale }] => (image, kind, *scale),
             _ => {
@@ -398,11 +429,6 @@ impl candle_gen::gen_core::Generator for Flux1DevControlGenerator {
                 ));
             }
         };
-        let plan = compile_control_feature_route(&self.spec, req)?.ok_or_else(|| {
-            candle_gen::gen_core::Error::Msg(
-                "flux1_dev_control: failed to compile control render plan".into(),
-            )
-        })?;
         let control_kind = match kind {
             ControlKind::Pose => "pose".to_string(),
             ControlKind::Canny => "canny".to_string(),
@@ -426,8 +452,9 @@ impl candle_gen::gen_core::Generator for Flux1DevControlGenerator {
             pag: req.features.pag.clone(),
             cancel: req.cancel.clone(),
         };
+        let _run = candle_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.model
-            .generate_with_execution_report(&control_req, control_image, &plan, on_progress)
+            .generate_with_execution_report(&control_req, control_image, plan, on_progress)
     }
 
     fn validate(&self, request: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
