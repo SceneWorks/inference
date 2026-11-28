@@ -62,7 +62,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{LayerNorm, Linear, Module};
 
-use crate::loader::{stored_ggml, Weights};
+use crate::loader::{stored_ggml_checked, stored_ggml_geometry, Weights};
 use crate::quant::QLinear;
 
 /// Qwen3-VL vision-tower config (the `vision_config` block of `mllm/config.json`).
@@ -141,7 +141,7 @@ fn layer_norm(w: &Weights, prefix: &str, eps: f64) -> Result<LayerNorm> {
 /// merely happens to carry a similarly-named tensor is untouched — the marker is what makes the
 /// sibling mean "packed".
 fn require_dense(w: &Weights, base: &str, why: &str) -> Result<()> {
-    if w.packed().is_some() && stored_ggml(w, base)?.is_some() {
+    if w.packed().is_some() && stored_ggml_geometry(w, base).is_some() {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "boogu: `{base}.weight` is a stored GGML block tensor, but it is loaded by a \
              dense-only path ({why}). Reading GGML blocks as floats is silent garbage (sc-14980), \
@@ -193,13 +193,10 @@ fn vision_linear(
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
     if w.packed().is_some() {
-        if let Some(stored) = stored_ggml(w, base)? {
-            if w.contains(&scales_key) {
-                return Err(candle_gen::candle_core::Error::Msg(format!(
-                    "boogu vision `{base}`: `{weight_key}` is a stored GGML block tensor but \
-                     `{scales_key}` is also present — a tier stores a projection one way, never both"
-                )));
-            }
+        // Read on the host by the shared mapped-set helper, which also refuses a `.scales` sibling
+        // (a tier stores a projection one way, never both); the device receives only the final
+        // `QTensor`.
+        if let Some(stored) = stored_ggml_checked(w, "boogu vision", base)? {
             if let Some([out, inp]) = shape {
                 let decoded = candle_gen::candle_layers::llm_projection::ggml_block_storage(
                     true,
