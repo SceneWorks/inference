@@ -12,7 +12,9 @@
 //! * every other tensor is copied byte-for-byte at its stored dtype and shape;
 //! * shard file names are preserved; `*.index.json` is rewritten (`weight_map` from what was written,
 //!   `metadata.total_size` restated);
-//! * `config.json`'s `quantization` block becomes `{"bits": N, "storage": "ggml"}`;
+//! * `config.json`'s `quantization` block becomes `{"bits": N, "storage": "ggml"}`, plus an
+//!   `overrides` list when some projections are stored at another width (`--keep-q8`, precision
+//!   floors); the loaders classify each tensor by its own block size either way;
 //! * every other sidecar is copied verbatim;
 //! * the component is written to `<dst>.partial` and renamed into place at the end; an existing
 //!   `dst` is a hard error.
@@ -23,7 +25,11 @@
 //!   carries the MLX per-group `scale`/`bias` as its `d`/`m`, up to the f16 cast); the group size is
 //!   read from the component's `config.json` (`quantization.group_size`, default 64) and may be any
 //!   multiple of 32 — each MLX group splits into `group / 32` consecutive `Q4_1` blocks sharing the
-//!   scale/bias. Q8 through this mode is the legacy dequant-then-requant (lossy).
+//!   scale/bias. Q8 through this mode is the legacy dequant-then-requant (lossy). Each triple
+//!   converts at the width its **own shapes** imply, the load-time repack's dispatch: a q4
+//!   component may carry 8-bit **precision-floor** triples (Mage's `norm_out.linear`), stored
+//!   `Q8_0` and recorded in the marker's `overrides` ([`admitted_widths`]); any other width is
+//!   refused.
 //! * [`SourceMode::FromBf16`] — **Q8_0 straight from the dense source.** The MLX q8 component is
 //!   only a *structural template*: a tensor is quantized iff it has a `.scales` sibling there; its
 //!   dense `{base}.weight` is read from the bf16/f16/f32 source directory (any sharding — tensors
@@ -125,14 +131,17 @@ pub enum GgmlTierError {
         "ggml tier: --keep-q8 `{pattern}` matches no packed projection of {} (typo?)", .dir.display()
     )]
     KeepQ8NoMatch { dir: PathBuf, pattern: String },
+    /// A packed triple's shape-inferred width is not one its tier admits ([`admitted_widths`]): the
+    /// tier's own width, plus the 8-bit precision floor a q4 component may carry.
     #[error(
-        "ggml tier: `{tensor}` packs {inferred}-bit codes at group {group_size}, but the \
-         component config declares {expected} bits (wrong group_size?)"
+        "ggml tier: `{tensor}` packs {inferred}-bit codes at group {group_size}, but a \
+         {expected}-bit tier admits only {admitted:?}-bit triples (wrong group_size?)"
     )]
     BitsMismatch {
         tensor: String,
         inferred: usize,
         expected: usize,
+        admitted: Vec<usize>,
         group_size: usize,
     },
     #[error("ggml tier: from-bf16 needs a q8 template (bits 8); config declares bits {0}")]
@@ -209,6 +218,11 @@ pub struct ComponentReport {
     /// Projections of a q4 tier stored `Q8_0` from the dense source by a `--keep-q8` override
     /// (counted in [`converted`](Self::converted) too; the rest of `converted` is lossless `Q4_1`).
     pub keep_q8: usize,
+    /// From-MLX projections packed **wider than their tier** in the source — a q4 component's
+    /// 8-bit precision-floor triples ([`admitted_widths`]) — converted at their own width exactly as
+    /// the load-time repack does (`Q8_0` via the exact-grid dequant), and recorded in the marker's
+    /// `overrides` (counted in [`converted`](Self::converted) too).
+    pub precision_floors: usize,
 }
 
 /// An explicit tensor-name prefix rewrite between the MLX template and the dense source. Never
@@ -797,8 +811,94 @@ fn split_lead(tensor: &str, dims: &[usize]) -> Result<(Option<usize>, usize, usi
     }
 }
 
-/// Convert one MLX triple into stored GGML blocks. `cfg_bits` (from the component config), when
-/// given, must agree with the width the packed shapes imply at `group_size`.
+/// The MLX widths a `tier_bits` **component** admits for its packed triples: the tier's own width
+/// plus, for a q4 tier, the **8-bit precision floor**. A family's MLX converter keeps a projection
+/// that does not survive 4 bits at 8 under the q4 marker — `mlx-gen-mage`'s
+/// `quantize_mage_transformer` packs `norm_out.linear` at 8 and its text encoder's decoder layers
+/// likewise (sc-15071); the marker records the tier, not a per-tensor width. The load-time repack
+/// ([`repack_packed_weight_uncached`], behind the cached `repack_packed_weight`) reads every
+/// triple's width from its own shapes, so such a component loads today; the stored tier converts
+/// each triple at that same width. Any other width is a mislabelled or misread pack.
+pub fn admitted_widths(tier_bits: u64) -> &'static [usize] {
+    match tier_bits {
+        4 => &[4, 8],
+        8 => &[8],
+        _ => &[],
+    }
+}
+
+/// The widths one conversion admits for its packed triples, and the tier they are judged against.
+#[derive(Clone, Copy, Debug)]
+struct Widths {
+    tier: u64,
+    admitted: &'static [usize],
+}
+
+impl Widths {
+    /// A component tier: its width plus a q4 tier's 8-bit precision floor ([`admitted_widths`]).
+    fn component(tier: u64) -> Self {
+        Self {
+            tier,
+            admitted: admitted_widths(tier),
+        }
+    }
+
+    /// Exactly `tier`: a split tier (its manifest records no per-tensor width and the LTX
+    /// validators pin `bits * group` for every triple) and a from-bf16 q8 template.
+    fn uniform(tier: u64) -> Self {
+        Self {
+            tier,
+            admitted: match tier {
+                4 => &[4],
+                8 => &[8],
+                _ => &[],
+            },
+        }
+    }
+
+    /// Refuse a width this conversion does not admit ([`GgmlTierError::BitsMismatch`]).
+    fn check(self, base: &str, bits: usize, group_size: usize) -> Result<usize> {
+        if self.admitted.contains(&bits) {
+            return Ok(bits);
+        }
+        Err(GgmlTierError::BitsMismatch {
+            tensor: base.to_string(),
+            inferred: bits,
+            expected: self.tier as usize,
+            admitted: self.admitted.to_vec(),
+            group_size,
+        })
+    }
+}
+
+/// The bit width an MLX triple packs, read **exactly** from its own shapes: `wq_cols` u32 code
+/// words per row hold `in * bits / 32` codes over `in = s_cols * group_size` inputs. A row width
+/// that does not divide into whole bits is a malformed triple ([`GgmlTierError::TripleShape`]),
+/// never truncated to a neighbouring width.
+fn packed_width(base: &str, wq_cols: usize, s_cols: usize, group_size: usize) -> Result<usize> {
+    let bad = |detail: String| GgmlTierError::TripleShape {
+        tensor: base.to_string(),
+        detail,
+    };
+    let in_features = s_cols
+        .checked_mul(group_size)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| bad(format!("{s_cols} scale groups of {group_size} inputs")))?;
+    let encoded = wq_cols
+        .checked_mul(32)
+        .ok_or_else(|| bad(format!("{wq_cols} code words per row overflow")))?;
+    if !encoded.is_multiple_of(in_features) {
+        return Err(bad(format!(
+            "{wq_cols} u32 code words per row do not pack a whole bit width over {in_features} \
+             inputs ({s_cols} groups of {group_size})"
+        )));
+    }
+    Ok(encoded / in_features)
+}
+
+/// Convert one MLX triple into stored GGML blocks, at the width its own shapes imply at
+/// `group_size` — `Q4_1` for 4 bits, `Q8_0` for 8, the load-time repack's own dispatch. `widths`,
+/// when given, must admit that width.
 ///
 /// A rank-3 triple (`[E, out, in_packed]` codes + `[E, out, in / group]` scales/biases, the stacked
 /// MoE experts) becomes ONE rank-4 stored tensor `[E, out, in / 32, block_bytes]`: GGML quantizes
@@ -810,7 +910,7 @@ fn blocks_from_mlx(
     scales: &Tensor,
     biases: &Tensor,
     group_size: usize,
-    cfg_bits: Option<u64>,
+    widths: Option<Widths>,
 ) -> Result<Blocks> {
     if !group_size.is_multiple_of(GGML_BLOCK) {
         return Err(GgmlTierError::GroupSize { group_size });
@@ -844,16 +944,9 @@ fn blocks_from_mlx(
             detail: "scales have no groups".into(),
         });
     }
-    let inferred = mlx_packed_bits_gs(wq_cols, s_cols, group_size);
-    if let Some(expected) = cfg_bits {
-        if inferred as u64 != expected {
-            return Err(GgmlTierError::BitsMismatch {
-                tensor: base.to_string(),
-                inferred,
-                expected: expected as usize,
-                group_size,
-            });
-        }
+    let inferred = packed_width(base, wq_cols, s_cols, group_size)?;
+    if let Some(widths) = widths {
+        widths.check(base, inferred, group_size)?;
     }
     let flat_rows = lead.unwrap_or(1) * rows;
     // The repack receives scales/biases at f32; widening bf16/f16 is exact and the block fields are
@@ -1107,7 +1200,9 @@ struct Ctx<'a> {
     mode: &'a SourceMode,
     dense: Option<ShardSet>,
     group_size: usize,
-    cfg_bits: u64,
+    /// The tier width and the triple widths it admits ([`Widths::component`] for a component tier,
+    /// [`Widths::uniform`] for a split tier).
+    widths: Widths,
     /// Write each template shard's `__metadata__` into its output shard (split tiers: the
     /// LTX-2.5 per-component stamps). Component tiers keep the slice-B output (no metadata).
     keep_metadata: bool,
@@ -1201,16 +1296,17 @@ fn dense_passthrough(
 }
 
 /// Validate a template triple's shapes (`entry` is its `.weight`, `s_shape` its `.scales`) and the
-/// width they imply at `group_size` against `want_bits`; returns the dense `[out, in]` /
-/// `[E, out, in]` shape the triple stands for. Structure only: the template's data is never read.
+/// width they imply at `group_size` against `widths`; returns the dense `[out, in]` /
+/// `[E, out, in]` shape the triple stands for and that width. Structure only: the template's data
+/// is never read.
 fn triple_dense_shape(
     base: &str,
     name: &str,
     entry: &Entry,
     s_shape: &[usize],
     group_size: usize,
-    want_bits: usize,
-) -> Result<Vec<usize>> {
+    widths: Widths,
+) -> Result<(Vec<usize>, usize)> {
     if entry.dtype != "U32" {
         return Err(GgmlTierError::NotPackedCodes {
             tensor: name.to_string(),
@@ -1222,24 +1318,59 @@ fn triple_dense_shape(
         && s_shape[..s_shape.len() - 1] == entry.shape[..entry.shape.len() - 1]
         && s_shape[s_shape.len() - 1] > 0;
     if !shapes_agree {
-        return Err(GgmlTierError::OrphanTriple {
-            tensor: format!("{base}.scales"),
-            detail: format!("scales shape {s_shape:?} does not match `{name}`"),
+        return Err(GgmlTierError::TripleShape {
+            tensor: base.to_string(),
+            detail: format!("weight {:?}, scales {s_shape:?}", entry.shape),
         });
     }
     let s_cols = s_shape[s_shape.len() - 1];
-    let inferred = mlx_packed_bits_gs(wq_cols, s_cols, group_size);
-    if inferred != want_bits {
-        return Err(GgmlTierError::BitsMismatch {
-            tensor: base.to_string(),
-            inferred,
-            expected: want_bits,
-            group_size,
-        });
-    }
+    let bits = widths.check(
+        base,
+        packed_width(base, wq_cols, s_cols, group_size)?,
+        group_size,
+    )?;
     let mut expected = entry.shape.clone();
     *expected.last_mut().expect("rank checked") = s_cols * group_size;
-    Ok(expected)
+    Ok((expected, bits))
+}
+
+/// Validate every packed triple of a from-MLX component `template` against `widths` before
+/// anything is written, and return the marker `overrides` records of its **precision-floor**
+/// triples: those packed at a width other than the tier's that no `--keep-q8` pattern re-sources.
+/// One record per projection, `{"pattern": "^<escaped base>$", "bits": N, "count": 1}` — the
+/// shape `--keep-q8` writes — sorted by base.
+fn floor_overrides(
+    template: &[(std::ffi::OsString, ShardFile)],
+    group_size: usize,
+    widths: Widths,
+    keep: Option<&KeepQ8>,
+) -> Result<Vec<Value>> {
+    let mut floors = BTreeMap::new();
+    for (_, shard) in template {
+        for (name, entry) in &shard.entries {
+            let Some(base) = name.strip_suffix(".weight") else {
+                continue;
+            };
+            let Some(scales) = shard.entries.get(&format!("{base}.scales")) else {
+                continue;
+            };
+            let (_, bits) =
+                triple_dense_shape(base, name, entry, &scales.shape, group_size, widths)?;
+            if bits as u64 != widths.tier && !keep.is_some_and(|k| k.matches(base)) {
+                floors.insert(base.to_string(), bits);
+            }
+        }
+    }
+    Ok(floors
+        .into_iter()
+        .map(|(base, bits)| {
+            serde_json::json!({
+                "pattern": format!("^{}$", regex::escape(&base)),
+                "bits": bits,
+                "count": 1,
+            })
+        })
+        .collect())
 }
 
 /// The `Q8_0` blocks of projection `base` (`expected` = its dense shape) from the dense source
@@ -1343,42 +1474,57 @@ fn convert_shard(
             .filter(|(k, _)| matches!(ctx.mode, SourceMode::FromMlx) && k.matches(base));
         let blocks = match ctx.mode {
             SourceMode::FromMlx if keep.is_some() => {
-                // A `--keep-q8` override: Q8_0 from the dense source, never from the q4 codes.
+                // A `--keep-q8` override: Q8_0 from the dense source, never from the MLX codes.
+                // The triple's own width (q4, or an 8-bit precision floor) only sizes the source.
                 let (k, dense) = keep.expect("checked");
-                let expected = triple_dense_shape(
+                let (expected, _) = triple_dense_shape(
                     base,
                     name,
                     entry,
                     &shard.entries[&s_name].shape,
                     ctx.group_size,
-                    ctx.cfg_bits as usize,
+                    ctx.widths,
                 )?;
                 report.keep_q8 += 1;
                 q8_from_source(base, name, &expected, file, &k.source, dense, report)?
             }
             SourceMode::FromMlx => {
-                let wq = shard.read_tensor(name)?;
-                let scales = shard.read_tensor(&s_name)?;
-                let biases = shard.read_tensor(&b_name)?;
-                report.bytes_in +=
-                    entry.len() + shard.entries[&s_name].len() + shard.entries[&b_name].len();
-                blocks_from_mlx(
-                    base,
-                    &wq,
-                    &scales,
-                    &biases,
-                    ctx.group_size,
-                    Some(ctx.cfg_bits),
-                )?
-            }
-            SourceMode::FromBf16(src) => {
-                let expected = triple_dense_shape(
+                // Each triple converts at its own width (`Q4_1` / `Q8_0`), as the load-time
+                // repack does; a precision floor wider than the tier is counted and recorded.
+                let (_, bits) = triple_dense_shape(
                     base,
                     name,
                     entry,
                     &shard.entries[&s_name].shape,
                     ctx.group_size,
-                    8,
+                    ctx.widths,
+                )?;
+                let wq = shard.read_tensor(name)?;
+                let scales = shard.read_tensor(&s_name)?;
+                let biases = shard.read_tensor(&b_name)?;
+                report.bytes_in +=
+                    entry.len() + shard.entries[&s_name].len() + shard.entries[&b_name].len();
+                let blocks = blocks_from_mlx(
+                    base,
+                    &wq,
+                    &scales,
+                    &biases,
+                    ctx.group_size,
+                    Some(ctx.widths),
+                )?;
+                if bits as u64 != ctx.widths.tier {
+                    report.precision_floors += 1;
+                }
+                blocks
+            }
+            SourceMode::FromBf16(src) => {
+                let (expected, _) = triple_dense_shape(
+                    base,
+                    name,
+                    entry,
+                    &shard.entries[&s_name].shape,
+                    ctx.group_size,
+                    Widths::uniform(8),
                 )?;
                 let dense = ctx.dense.as_ref().expect("dense source opened");
                 q8_from_source(base, name, &expected, file, src, dense, report)?
@@ -1523,8 +1669,8 @@ pub fn convert_component_with(
     if matches!(mode, SourceMode::FromMlx) && !group_size.is_multiple_of(GGML_BLOCK) {
         return Err(GgmlTierError::GroupSize { group_size });
     }
-    let overrides = match &options.keep_q8 {
-        None => None,
+    let mut overrides = match &options.keep_q8 {
+        None => Vec::new(),
         Some(keep) => {
             if !matches!(mode, SourceMode::FromMlx) || cfg_bits != 4 {
                 return Err(GgmlTierError::Spec(format!(
@@ -1537,9 +1683,25 @@ pub fn convert_component_with(
                     }
                 )));
             }
-            Some(keep.counts(src, &template)?)
+            keep.counts(src, &template)?
         }
     };
+    // From-MLX: every triple keeps its own width (a q4 tier's 8-bit precision floors included),
+    // validated before anything is written; the floors join the marker's `overrides`.
+    let widths = match mode {
+        SourceMode::FromMlx => {
+            let widths = Widths::component(cfg_bits);
+            overrides.extend(floor_overrides(
+                &template,
+                group_size,
+                widths,
+                options.keep_q8.as_ref(),
+            )?);
+            widths
+        }
+        SourceMode::FromBf16(_) => Widths::uniform(cfg_bits),
+    };
+    let overrides = (!overrides.is_empty()).then_some(overrides);
     let ctx = Ctx {
         mode,
         dense: match mode {
@@ -1547,7 +1709,7 @@ pub fn convert_component_with(
             SourceMode::FromMlx => None,
         },
         group_size,
-        cfg_bits,
+        widths,
         keep_metadata: false,
         keep: match &options.keep_q8 {
             Some(k) => Some((k, ShardSet::open(&k.source.dir, false)?)),
@@ -1654,7 +1816,9 @@ fn write_shard(
 /// (the tensor name without `.weight`, e.g. `transformer_blocks.3.img_mod.1`) matches one of
 /// `patterns` (unanchored [`regex::Regex::is_match`]; anchor with `^...$` for an exact match) is
 /// stored `Q8_0`, quantized from the dense source's `{base}.weight` by the same quantizer as a
-/// from-bf16 tier; every other projection stays lossless `Q4_1` from the MLX triple. The loaders
+/// from-bf16 tier, whatever width its MLX triple packs (q4, or an 8-bit precision floor); every
+/// other projection converts from its MLX triple at its own width (lossless `Q4_1`, or a
+/// precision floor's `Q8_0`). The loaders
 /// classify each stored tensor by its own block size, so a mixed tier needs no reader change.
 #[derive(Clone, Debug)]
 pub struct KeepQ8 {
@@ -1734,7 +1898,9 @@ pub struct ConvertOptions {
 
 /// Record `overrides` in every GGML-marked `quantization` block of a rewritten config:
 /// `"overrides": [{"pattern": ..., "bits": 8, "count": N}]` beside the unchanged `"bits": 4,
-/// "storage": "ggml"`. `None` returns `text` untouched (no override, byte-identical output).
+/// "storage": "ggml"` — the `--keep-q8` patterns, then one anchored record per from-MLX
+/// precision-floor projection. `None` returns `text` untouched (no override, byte-identical
+/// output).
 fn with_overrides(text: String, overrides: Option<&[Value]>) -> Result<String> {
     let Some(overrides) = overrides else {
         return Ok(text);
@@ -1764,7 +1930,7 @@ fn with_overrides(text: String, overrides: Option<&[Value]>) -> Result<String> {
         serde_json::from_str(&text).map_err(|e| GgmlTierError::Config(e.to_string()))?;
     if add(&mut config, overrides) == 0 {
         return Err(GgmlTierError::Config(
-            "no GGML quantization block to record the --keep-q8 overrides in".into(),
+            "no GGML quantization block to record the width overrides in".into(),
         ));
     }
     serde_json::to_string_pretty(&config).map_err(|e| GgmlTierError::Config(e.to_string()))
@@ -1962,7 +2128,7 @@ pub fn convert_split_tier(
             SourceMode::FromMlx => None,
         },
         group_size,
-        cfg_bits: bits,
+        widths: Widths::uniform(bits),
         keep_metadata: true,
         keep: None,
     };
@@ -3769,6 +3935,215 @@ mod tests {
             Err(GgmlTierError::Spec(_))
         ));
         assert!(KeepQ8Spec::new(&["(".to_string()], PathBuf::new()).is_err());
+    }
+
+    /// A self-consistent MLX **8-bit** triple (bf16 scales/biases, as the MLX converters write).
+    fn q8_pack(out: usize, inp: usize, seed: f32) -> [Tensor; 3] {
+        let dense = dense_bf16(out, inp, seed).to_dtype(DType::F32).unwrap();
+        let (wq, s, b) = crate::quant::pack_mlx_affine(&dense, 8, 64).unwrap();
+        [
+            wq,
+            s.to_dtype(DType::BF16).unwrap(),
+            b.to_dtype(DType::BF16).unwrap(),
+        ]
+    }
+
+    /// The bytes the **load-time** repack (`repack_packed_weight`, the runtime entry point; no
+    /// quantization cache is installed in a unit test) builds for a triple.
+    fn runtime_repack(t: &[Tensor; 3]) -> Vec<u8> {
+        let [wq, s, b] = t;
+        crate::quant::repack_packed_weight(wq, s, b, 64, &Device::Cpu)
+            .unwrap()
+            .data()
+            .unwrap()
+            .into_owned()
+    }
+
+    /// A Mage-style q4 transformer: `proj_out` packed at 4 bits and the `norm_out.linear` head
+    /// modulation at its 8-bit precision floor, under a `bits: 4` marker
+    /// (`mlx_gen_mage::convert::quantize_mage_transformer`).
+    fn floor_fixture(root: &Path) -> (PathBuf, [Tensor; 3], [Tensor; 3]) {
+        let src = root.join("q4/transformer");
+        let (q4, q8) = (q4_pack(4, 128, 64, 2), q8_pack(6, 128, 0.3));
+        let mut s = HashMap::new();
+        put_triple(&mut s, "proj_out", q4.clone());
+        put_triple(&mut s, "norm_out.linear", q8.clone());
+        s.insert("norm_out.linear.bias".into(), norm());
+        write_component(&src, 4, 64, &[s]);
+        (src, q4, q8)
+    }
+
+    #[test]
+    fn q4_component_keeps_its_8_bit_precision_floor_as_the_runtime_repack_builds_it() {
+        let root = tmp();
+        let (src, q4, q8) = floor_fixture(root.path());
+        let dst = root.path().join("out");
+        let report = convert_component(&src, &dst, &SourceMode::FromMlx, &mut noop).unwrap();
+        assert_eq!(
+            (report.converted, report.precision_floors, report.keep_q8),
+            (2, 1, 0)
+        );
+        let got = load(dst.join("model-00001-of-00001.safetensors"));
+        // Each triple is stored at its own width: Q4_1 for the q4 body, Q8_0 for the floor...
+        let (body, head) = (&got["proj_out.weight"], &got["norm_out.linear.weight"]);
+        assert_eq!(body.dims(), [4, 128 / 32, 20]);
+        assert_eq!(head.dims(), [6, 128 / 32, 34]);
+        assert!(!got.contains_key("norm_out.linear.scales"));
+        assert_eq!(got["norm_out.linear.bias"].dtype(), DType::BF16);
+        // ...byte-for-byte what the load-time repack builds from the same triple (the Q8 floor
+        // through the exact-grid dequant + Q8_0 requant, the q4 body through lossless Q4_1).
+        assert_eq!(bytes(head), runtime_repack(&q8));
+        assert_eq!(bytes(body), runtime_repack(&q4));
+        // The loaders and every header-reading pricer classify each tensor by its own block size.
+        for (t, block, dtype, rows) in [
+            (
+                body,
+                gen_core::stored_ggml::StoredGgmlBlock::Q4_1,
+                GgmlDType::Q4_1,
+                4,
+            ),
+            (
+                head,
+                gen_core::stored_ggml::StoredGgmlBlock::Q8_0,
+                GgmlDType::Q8_0,
+                6,
+            ),
+        ] {
+            let g = gen_core::stored_ggml::stored_ggml_geometry(true, t.dims()).unwrap();
+            assert_eq!((g.block, g.rows, g.cols), (block, rows, 128));
+            assert_eq!(
+                candle_layers::stored_ggml::stored_block_tensor(t),
+                Some((dtype, rows, 128))
+            );
+        }
+        // The marker keeps the tier and records the floor, in `--keep-q8`'s record shape.
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["quantization"],
+            serde_json::json!({"bits": 4, "storage": "ggml", "overrides": [
+                {"pattern": r"^norm_out\.linear$", "bits": 8, "count": 1}
+            ]})
+        );
+        assert!(candle_layers::stored_ggml::config_declares_ggml_storage(
+            &cfg
+        ));
+        let pattern = regex::Regex::new(r"^norm_out\.linear$").unwrap();
+        assert!(pattern.is_match("norm_out.linear") && !pattern.is_match("norm_out.linear2"));
+    }
+
+    #[test]
+    fn keep_q8_judges_each_triple_at_its_own_width_beside_precision_floors() {
+        let root = tmp();
+        let (src, _, q8) = floor_fixture(root.path());
+        let dense = root.path().join("bf16/transformer");
+        std::fs::create_dir_all(&dense).unwrap();
+        let (w_body, w_head) = (dense_bf16(4, 128, 0.6), dense_bf16(6, 128, 0.9));
+        save(
+            &HashMap::from([
+                ("proj_out.weight".to_string(), w_body.clone()),
+                ("norm_out.linear.weight".to_string(), w_head.clone()),
+            ]),
+            dense.join("diffusion_pytorch_model.safetensors"),
+        );
+        let quant = |dst: &str, pattern: &str| {
+            let dst = root.path().join(dst);
+            let opts = keep(&[pattern], dense.clone(), vec![]);
+            let report =
+                convert_component_with(&src, &dst, &SourceMode::FromMlx, &opts, &mut noop).unwrap();
+            let got = load(dst.join("model-00001-of-00001.safetensors"));
+            let cfg: Value =
+                serde_json::from_str(&std::fs::read_to_string(dst.join("config.json")).unwrap())
+                    .unwrap();
+            (report, got, cfg["quantization"]["overrides"].clone())
+        };
+        // `--keep-q8` on the q4 body: Q8_0 from bf16; the untouched floor still converts from its
+        // own 8-bit triple, and both are recorded.
+        let (report, got, overrides) = quant("body", r"^proj_out$");
+        assert_eq!((report.keep_q8, report.precision_floors), (1, 1));
+        assert_eq!(
+            bytes(&got["proj_out.weight"]),
+            bytes(&dense_to_q8_0_blocks("proj_out", &w_body).unwrap())
+        );
+        assert_eq!(bytes(&got["norm_out.linear.weight"]), runtime_repack(&q8));
+        assert_eq!(
+            overrides,
+            serde_json::json!([
+                {"pattern": r"^proj_out$", "bits": 8, "count": 1},
+                {"pattern": r"^norm_out\.linear$", "bits": 8, "count": 1}
+            ])
+        );
+        // `--keep-q8` on the floor itself (an 8-bit triple under a 4-bit marker, which validating
+        // against the marker used to refuse): re-sourced from bf16, recorded once, not a floor.
+        let (report, got, overrides) = quant("head", r"^norm_out\.linear$");
+        assert_eq!((report.keep_q8, report.precision_floors), (1, 0));
+        let head = &got["norm_out.linear.weight"];
+        assert_eq!(head.dims(), [6, 4, 34]);
+        assert_eq!(
+            bytes(head),
+            bytes(&dense_to_q8_0_blocks("norm_out.linear", &w_head).unwrap())
+        );
+        assert_eq!(got["proj_out.weight"].dims(), [4, 4, 20]);
+        assert_eq!(
+            overrides,
+            serde_json::json!([{"pattern": r"^norm_out\.linear$", "bits": 8, "count": 1}])
+        );
+    }
+
+    #[test]
+    fn widths_outside_the_tier_and_its_precision_floor_are_refused_before_any_write() {
+        let root = tmp();
+        let refused = |src: &Path, out: &str| {
+            let dst = root.path().join(out);
+            let r = convert_component(src, &dst, &SourceMode::FromMlx, &mut noop);
+            assert!(!dst.exists() && !partial_path(&dst).exists(), "{out}");
+            r.unwrap_err()
+        };
+        // A q8 tier admits no 4-bit triple: the floor only ever widens a q4 tier.
+        let q8 = root.path().join("q8");
+        let mut s = HashMap::new();
+        put_triple(&mut s, "a", q8_pack(2, 64, 0.4));
+        put_triple(&mut s, "b", q4_pack(2, 64, 64, 0));
+        write_component(&q8, 8, 64, &[s]);
+        assert!(matches!(
+            refused(&q8, "o1"),
+            GgmlTierError::BitsMismatch { tensor, inferred: 4, expected: 8, admitted, .. }
+                if tensor == "b" && admitted == [8]
+        ));
+        // A q4 tier admits 4 and 8 only (here a g32 q4 pack read at the declared group 64
+        // implies 2 bits).
+        let q4 = root.path().join("q4");
+        let mut s = HashMap::new();
+        put_triple(&mut s, "p", q4_pack(2, 128, 32, 0));
+        write_component(&q4, 4, 64, &[s]);
+        assert!(matches!(
+            refused(&q4, "o2"),
+            GgmlTierError::BitsMismatch { inferred: 2, expected: 4, admitted, .. }
+                if admitted == [4, 8]
+        ));
+        // Code words that pack no whole width over the scales' inputs are a malformed triple, not
+        // truncated to a neighbouring width (17 words * 32 / 64 inputs = 8.5 bits).
+        let odd = root.path().join("odd");
+        let mut s = HashMap::new();
+        put_triple(
+            &mut s,
+            "p",
+            [
+                Tensor::zeros((2, 17), DType::U32, &Device::Cpu).unwrap(),
+                Tensor::ones((2, 1), DType::BF16, &Device::Cpu).unwrap(),
+                Tensor::zeros((2, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ],
+        );
+        write_component(&odd, 4, 64, &[s]);
+        assert!(matches!(
+            refused(&odd, "o3"),
+            GgmlTierError::TripleShape { tensor, .. } if tensor == "p"
+        ));
+        // Width checks are unit-level too: a split tier admits exactly its declared width.
+        assert!(Widths::uniform(4).check("x", 8, 64).is_err());
+        assert_eq!(Widths::component(4).check("x", 8, 64).unwrap(), 8);
+        assert!(admitted_widths(2).is_empty());
     }
 
     #[test]
