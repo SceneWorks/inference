@@ -40,6 +40,9 @@ mod qkv_family_fixtures;
 #[path = "quant_parity.rs"]
 mod quant_parity;
 
+#[path = "rope_modulate_block_bench_proof.rs"]
+mod rope_modulate_block_bench_proof;
+
 #[path = "rung4_block_residency_spike.rs"]
 mod rung4_block_residency_spike;
 
