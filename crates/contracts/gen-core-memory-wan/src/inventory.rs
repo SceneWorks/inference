@@ -543,13 +543,27 @@ pub(super) fn structural_files(
                     ))
                 })?;
                 let bits = value.get("bits").and_then(serde_json::Value::as_u64);
+                let declared = value
+                    .get("quantization")
+                    .and_then(|value| value.get("bits"))
+                    .and_then(serde_json::Value::as_u64);
                 let group = value
                     .get("quantization")
                     .and_then(|value| value.get("group_size"))
                     .and_then(serde_json::Value::as_u64);
-                if bits != Some(quant.bits() as u64) || group != Some(64) {
+                // An MLX-affine marker encodes the group-64 layout; a Candle-native GGML marker
+                // (SW-7285) declares `storage: "ggml"` and, by the stored-GGML rule, no
+                // `group_size` — its block type fixes the group. Its declared bits must still
+                // agree with the selected tier.
+                let layout_matches = if gen_core::stored_ggml::config_declares_ggml_storage(&value)
+                {
+                    group.is_none() && declared == Some(quant.bits() as u64)
+                } else {
+                    group == Some(64)
+                };
+                if bits != Some(quant.bits() as u64) || !layout_matches {
                     return Err(gen_core::Error::Unsupported(format!(
-                        "Wan packed marker {} does not match the selected Q{} group-64 tier",
+                        "Wan packed marker {} does not match the selected Q{} group-64 or GGML tier",
                         marker.display(),
                         quant.bits()
                     )));

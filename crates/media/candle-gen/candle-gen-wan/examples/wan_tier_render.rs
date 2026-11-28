@@ -184,6 +184,15 @@ fn main() {
         frames: Some(frames),
         seed: Some(seed),
         steps,
+        // The worker spells the mode the prepared memory receipt selects its row by.
+        video_mode: Some(
+            if reference.is_some() {
+                "image_to_video"
+            } else {
+                "text_to_video"
+            }
+            .to_owned(),
+        ),
         conditioning: reference
             .into_iter()
             .map(|image| Conditioning::Reference {
