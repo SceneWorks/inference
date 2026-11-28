@@ -97,9 +97,18 @@ impl Sd35Route {
     /// add the exact `SceneWorksSnapshot::new("sd3.5-…-candle", "<rev>")` row here.
     pub const fn candle_twin(self) -> Option<SceneWorksSnapshot> {
         match self {
-            Self::Large => None,
-            Self::LargeTurbo => None,
-            Self::Medium => None,
+            Self::Large => Some(SceneWorksSnapshot::new(
+                "sd3.5-large-candle",
+                "dcd575d1e360cba23a41d097297d287192476edc",
+            )),
+            Self::LargeTurbo => Some(SceneWorksSnapshot::new(
+                "sd3.5-large-turbo-candle",
+                "7aedbd5e4f9b4f81e0aacb533b201c9c5c767d66",
+            )),
+            Self::Medium => Some(SceneWorksSnapshot::new(
+                "sd3.5-medium-candle",
+                "098bb70d214dc5060d4180e46a8308db2c55463a",
+            )),
         }
     }
 
