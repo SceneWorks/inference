@@ -563,10 +563,15 @@ impl EncoderContract {
         )?;
         self.validate_packing_config(
             source_path(weights),
-            packed_quant,
+            packed_quant.as_ref(),
             matches!(weights, WeightsSource::File(_)),
         )?;
-        self.validate_headers(headers, source_path(weights), packed_quant, dtype_policy)?;
+        self.validate_headers(
+            headers,
+            source_path(weights),
+            packed_quant.as_ref(),
+            dtype_policy,
+        )?;
         Ok(packed_quant)
     }
 

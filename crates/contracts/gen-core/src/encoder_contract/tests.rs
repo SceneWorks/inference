@@ -1549,12 +1549,9 @@ fn stored_ggml_blocks_are_packed_quantization_evidence() {
     assert_eq!(stored(20).stored_ggml_block_bits(), Some(4));
     assert_eq!(stored(34).stored_ggml_block_bits(), Some(8));
     assert_eq!(stored(21).stored_ggml_block_bits(), None);
-    let declared = PackedQuantization {
-        bits: 8,
-        storage: PackedStorage::Ggml,
-    };
+    let declared = PackedQuantization::ggml(crate::stored_ggml::StoredGgmlWidths::uniform(8));
     assert_eq!(
-        validate_quantization_evidence(&[stored(34)], Path::new("fixture"), Some(declared))
+        validate_quantization_evidence(&[stored(34)], Path::new("fixture"), Some(declared.clone()))
             .unwrap(),
         Some(declared)
     );
@@ -2373,7 +2370,46 @@ fn stored_block_type_contradicting_the_declared_bits_is_refused() {
     });
     let error = ggml_error(temp.path());
     assert!(error.contains("field packed_dtype"), "{error}");
-    assert!(error.contains("Some(8)-bit blocks"), "{error}");
+    assert!(
+        error.contains("stores Q8_0 blocks (Q8) under a Q4 marker"),
+        "{error}"
+    );
+}
+
+/// A q4 tier built with `--keep-q8` keeps the projections its marker's `overrides` declare at
+/// Q8_0: admitted by discovery, the matrix checks and the whole-component count alike, while an
+/// override the surface contradicts (here, one miscounted) is refused.
+#[test]
+fn declared_q8_overrides_of_a_q4_stored_encoder_are_admitted() {
+    let marker = |count: usize| {
+        json!({"bits": 4, "storage": "ggml", "overrides": [
+            {"pattern": r"\.mlp\.down_proj$", "bits": 8, "count": count}
+        ]})
+    };
+    let widen = |entries: &mut Vec<FixtureTensor>| {
+        for layer in 0..2 {
+            find_tensor(
+                entries,
+                &format!("model.layers.{layer}.mlp.down_proj.weight"),
+            )
+            .2 = vec![64, 3, 34];
+        }
+    };
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), marker(2), 20, widen);
+    let validated = validate_ggml(temp.path()).unwrap();
+    assert_eq!(validated.packed_quant_bits(), Some(4));
+    let source = WeightsSource::Dir(temp.path().to_path_buf());
+    assert_eq!(text_encoder_packed_quant_bits(&source).unwrap(), Some(4));
+    PACKED_CONTRACT
+        .validate_source_for_discovery(&source, &authorized_test_roots(temp.path()))
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    write_ggml_fixture(temp.path(), marker(3), 20, widen);
+    let error = ggml_error(temp.path());
+    assert!(error.contains("field quantization.overrides"), "{error}");
+    assert!(error.contains("records count 3, but 2"), "{error}");
 }
 
 #[test]

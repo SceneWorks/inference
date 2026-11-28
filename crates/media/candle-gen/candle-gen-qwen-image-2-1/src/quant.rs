@@ -139,7 +139,27 @@ ArtifactInput,
         (Some(bits), Some(group)) if matches!(bits, 4 | 8) && group == GROUP_SIZE as i64 => {
             Ok(Some(bits))
         }
-        (Some(bits), None) if ggml && matches!(bits, 4 | 8) => Ok(Some(bits)),
+        // Its per-tensor widths are the marker's declaration (`bits` plus any `overrides`, e.g. the
+        // q4 tiers' Q8_0 `img_mod.1`), admitted over the component's stored blocks by the one
+        // shared rule the tier builder writes for: an undeclared wider block, a miscounted or an
+        // unsupported override is refused here.
+        (Some(bits), None) if ggml && matches!(bits, 4 | 8) => {
+            let widths = gen_core::stored_ggml::StoredGgmlWidths::from_config(&value)
+                .map_err(|err| Error::Msg(format!("qwen_image_2_1: {}: {err}", config.display())))?
+                .expect("the stored-GGML marker was recognised above");
+            // A component with no readable safetensors is the loaders' problem, not this check's.
+            if let Ok(headers) =
+                gen_core::weightsmeta::safetensors_path_tensor_headers(component_dir)
+            {
+                widths.admit_headers(&headers).map_err(|err| {
+                    Error::Msg(format!(
+                        "qwen_image_2_1: {}: {err}",
+                        component_dir.display()
+                    ))
+                })?;
+            }
+            Ok(Some(bits))
+        }
         _ => Err(Error::Msg(format!(
             "qwen_image_2_1: {} declares quantization {{bits: {bits:?}, group_size: {group:?}}}; \
              every installable tier of this model is Q4 or Q8 at group {GROUP_SIZE}",
@@ -188,8 +208,9 @@ fn derived_component_bits(component_dir: &Path) -> Result<Option<i64>> {
             )));
         }
         // The tier's width is the narrowest block present; wider blocks are precision overrides
-        // the converter keeps (the q4 tiers' Q8_0 `img_mod.1`, listed in the marker's
-        // `overrides`). A tier labelled at any other width is a mislabel.
+        // the converter keeps (the q4 tiers' Q8_0 `img_mod.1`), each one admitted against the
+        // marker's declared `overrides` by `packed_bits`. A tier labelled at any other width is a
+        // mislabel.
         return Ok(stored_counts.keys().next().copied());
     }
     let Some(base) = headers
@@ -484,6 +505,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installed_tier(&mixed).unwrap(), Tier::Q4);
+        // The same Q8_0 block without its declaration (or under a miscounted one) is refused by
+        // the shared admission rule rather than read as a precision floor.
+        for quantization in [
+            serde_json::json!({ "bits": 4, "storage": "ggml" }),
+            serde_json::json!({ "bits": 4, "storage": "ggml", "overrides": [
+                { "pattern": "img_mod\\.1", "bits": 8, "count": 2 }
+            ] }),
+        ] {
+            std::fs::write(
+                mixed.join("transformer").join("config.json"),
+                serde_json::json!({ "quantization": quantization }).to_string(),
+            )
+            .unwrap();
+            let err = installed_tier(&mixed).unwrap_err().to_string();
+            assert!(
+                err.contains("no `quantization.overrides` pattern declares it")
+                    || err.contains("records count 2, but 1"),
+                "{err}"
+            );
+        }
 
         std::fs::write(
             root.join("transformer").join("config.json"),

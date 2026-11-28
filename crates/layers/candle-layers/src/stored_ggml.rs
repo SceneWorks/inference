@@ -13,8 +13,10 @@
 //! This module is the one implementation of the second form's detect, validation and build, shared
 //! by the `VarBuilder`-fed loaders ([`crate::quant::lin_gs`], [`crate::quant::embedding_dtype_gs`],
 //! [`crate::AdaptLinear::linear_detect_gs`]), the [`crate::CandleWeightSource`]-fed
-//! [`crate::quant::linear_from_weights_gs`], and the `Weights`-fed helpers in `candle-gen`
-//! (`candle_gen::quant::stored_ggml`, which `candle-gen-minimax-h3` routes through).
+//! [`crate::quant::linear_from_weights_gs`], the `Weights`-fed helpers in `candle-gen`
+//! (`candle_gen::quant::stored_ggml`, which `candle-gen-minimax-h3` routes through), and the
+//! mapped-set family loaders (Ideogram, Boogu / Mage) through [`stored_ggml_mmap_host`]. Every one
+//! reads the blocks on the host and uploads only the final [`QTensor`].
 //!
 //! A stored block tensor is classified **from its header alone** — `U8`, rank 3, and a last axis
 //! equal to one of the persisted block sizes ([`crate::llm_projection::ggml_block_storage`]) — and is
@@ -26,6 +28,7 @@
 //! bytes as a float is silent garbage).
 
 use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -243,6 +246,40 @@ pub fn stored_ggml_qtensor_vb(
         .set_device(Device::Cpu)
         .get_unchecked_dtype(&format!("{base}.weight"), DType::U8)?;
     Ok(Some(qtensor_from_stored(&stored, device)?))
+}
+
+/// The stored-block geometry of `{base}.weight` in a mapped safetensors set, read from its
+/// **header** (no payload). `None` when the key is absent or is not a stored block tensor.
+pub fn stored_ggml_mmap_geometry(
+    st: &MmapedSafetensors,
+    base: &str,
+) -> Option<(GgmlDType, usize, usize)> {
+    let view = st.get(&format!("{base}.weight")).ok()?;
+    let dtype = DType::try_from(view.dtype()).ok()?;
+    stored_block_geometry(dtype, view.shape())
+}
+
+/// `{base}.weight` of a mapped safetensors set read **on the host** when its header marks it a
+/// stored GGML block tensor, after refusing a `.scales` sibling ([`validate_stored`]); `None`
+/// otherwise. The mapped twin of [`stored_ggml_qtensor_vb`]'s host read: the caller builds the
+/// resident [`QTensor`] with [`qtensor_from_stored`] on its destination, so the block bytes reach a
+/// device once, as that final buffer, and never as a device copy read straight back.
+pub fn stored_ggml_mmap_host(
+    st: &MmapedSafetensors,
+    context: &str,
+    base: &str,
+) -> Result<Option<Tensor>> {
+    let Some(geometry) = stored_ggml_mmap_geometry(st, base) else {
+        return Ok(None);
+    };
+    validate_stored(
+        context,
+        base,
+        geometry,
+        st.get(&format!("{base}.scales")).is_ok(),
+        None,
+    )?;
+    Ok(Some(st.load(&format!("{base}.weight"), &Device::Cpu)?))
 }
 
 /// Refuse a stored GGML block at a **dense-only** `VarBuilder` loader. `vb` is already prefixed to
@@ -609,7 +646,7 @@ mod tests {
         candle_core::safetensors::save(&map, &file).unwrap();
         // SAFETY: the file is private to this test and unmodified while mapped.
         let mapped = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[file], DType::BF16, &Device::Cpu).unwrap()
+            VarBuilder::from_mmaped_safetensors(&[&file], DType::BF16, &Device::Cpu).unwrap()
         };
         let cache = counting_cache();
         let _scope = gen_core::QuantizationCacheContext::new(cache.clone()).install();
@@ -621,5 +658,26 @@ mod tests {
         assert_eq!(q.quant_dtype(), Some(GgmlDType::Q4_1));
         assert_eq!(stored_ggml_vb(&mapped, "blocks.0.norm").unwrap(), None);
         assert_eq!(requests(&cache), 0);
+
+        // The mapped-set helper the `MappedWeights`-fed family loaders share: classified from the
+        // header, read on the host, and built once on the destination.
+        // SAFETY: as above.
+        let st = unsafe { MmapedSafetensors::new(&file).unwrap() };
+        assert_eq!(
+            stored_ggml_mmap_geometry(&st, "blocks.0.q"),
+            Some((GgmlDType::Q4_1, 8, 128))
+        );
+        assert_eq!(stored_ggml_mmap_geometry(&st, "blocks.0.norm"), None);
+        let host = stored_ggml_mmap_host(&st, "t", "blocks.0.q")
+            .unwrap()
+            .expect("a stored block tensor");
+        assert!(host.device().is_cpu());
+        assert_eq!(host.dims(), [8, 4, 20]);
+        let built = qtensor_from_stored(&host, &Device::Cpu).unwrap();
+        let want = qtensor_from_stored(&map["blocks.0.q.weight"], &Device::Cpu).unwrap();
+        assert_eq!(built.data().unwrap(), want.data().unwrap());
+        assert!(stored_ggml_mmap_host(&st, "t", "blocks.0.norm")
+            .unwrap()
+            .is_none());
     }
 }

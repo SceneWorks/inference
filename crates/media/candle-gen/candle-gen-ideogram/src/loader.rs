@@ -99,28 +99,11 @@ impl Weights {
     }
 
     /// `{base}.weight` read on the host when its safetensors header marks it a **stored GGML block
-    /// tensor** (a Candle-native tier, SW-7285), after refusing a `.scales` sibling beside it (the
-    /// shared [`candle_gen::quant::stored_ggml::validate_stored`] rule). `None` otherwise.
+    /// tensor** (a Candle-native tier, SW-7285), after refusing a `.scales` sibling beside it — the
+    /// shared mapped-set helper
+    /// ([`candle_gen::quant::stored_ggml::stored_ggml_mmap_host`]). `None` otherwise.
     pub fn stored_ggml(&self, base: &str) -> Result<Option<Tensor>> {
-        use candle_gen::quant::stored_ggml::{stored_block_geometry, validate_stored};
-        let key = format!("{base}.weight");
-        let Ok(view) = self.st.mmap().get(&key) else {
-            return Ok(None);
-        };
-        let Ok(dtype) = DType::try_from(view.dtype()) else {
-            return Ok(None);
-        };
-        let Some(geometry) = stored_block_geometry(dtype, view.shape()) else {
-            return Ok(None);
-        };
-        validate_stored(
-            "ideogram",
-            base,
-            geometry,
-            self.contains(&format!("{base}.scales")),
-            None,
-        )?;
-        Ok(Some(self.st.mmap().load(&key, &Device::Cpu)?))
+        candle_gen::quant::stored_ggml::stored_ggml_mmap_host(self.st.mmap(), "ideogram", base)
     }
 
     pub fn device(&self) -> &Device {
