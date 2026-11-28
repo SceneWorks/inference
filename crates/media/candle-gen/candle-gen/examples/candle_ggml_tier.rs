@@ -112,25 +112,14 @@ fn curl(url: &str, range: Option<&str>, token: Option<&str>, out: Option<&Path>)
     output.stdout
 }
 
+/// The bearer token for `--use-hf-token`, taken only from the explicit `HF_TOKEN` environment
+/// variable (the workspace never reads Hugging Face cache locations).
 fn hf_token() -> String {
-    std::env::var("HF_TOKEN").unwrap_or_else(|_| {
-        let home = std::env::var("HF_HOME").map_or_else(
-            |_| {
-                PathBuf::from(
-                    std::env::var("USERPROFILE")
-                        .or_else(|_| std::env::var("HOME"))
-                        .unwrap_or_default(),
-                )
-                .join(".cache")
-                .join("huggingface")
-            },
-            PathBuf::from,
-        );
-        std::fs::read_to_string(home.join("token"))
-            .unwrap_or_else(|e| panic!("no HF token: {e}"))
-            .trim()
-            .to_string()
-    })
+    std::env::var("HF_TOKEN")
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| panic!("--use-hf-token requires the HF_TOKEN environment variable"))
 }
 
 /// Download just the safetensors headers (HTTP Range) and the small non-weight files of one

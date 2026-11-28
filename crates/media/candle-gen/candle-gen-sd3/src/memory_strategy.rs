@@ -231,7 +231,7 @@ pub struct AdapterReceipt {
 #[derive(Clone, Debug)]
 pub struct Sd35LoadReceipt {
     pub route: Sd35Route,
-    /// The exact identity [`validate_snapshot_binding`] bound the root to: the route's MLX tree or
+    /// The exact identity `validate_snapshot_binding` bound the root to: the route's MLX tree or
     /// its Candle twin. Every receipt digest names this one, never the route's default.
     pub source: SceneWorksSnapshot,
     pub tier: Option<Quant>,
