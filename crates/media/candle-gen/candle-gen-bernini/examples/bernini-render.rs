@@ -121,7 +121,7 @@ fn main() -> Result<()> {
         steps,
         guidance,
         frames,
-        video_mode: mode,
+        video_mode: (mode).map(Into::into),
         conditioning,
         ..Default::default()
     };

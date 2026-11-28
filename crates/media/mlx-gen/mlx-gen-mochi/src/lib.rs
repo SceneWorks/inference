@@ -46,12 +46,7 @@ pub use vae::{load_vae_decoder, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::REGISTRATION)
-        .register_video_plan(mlx_gen::gen_core::VideoPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: model::compile_video_plan,
-        })
+    registry.register_route(model::route_mochi())
 }
 
 /// Build the complete explicit MLX Mochi 1 provider catalog.

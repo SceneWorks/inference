@@ -9,9 +9,17 @@ use gen_core_iris::{
     validate_generation_request, GenerationParams, GenerationResources, IrisConfig, IrisTask,
     FAMILY, GENERATION_MODEL_ID, SAMPLERS,
 };
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyDriverSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, StepSupport, TextEncoderDeclaration, TextEncoderSurface,
+    WeightPlanDeclaration, WeightSourceKind,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, AdapterApplyReport, AdapterSpec, Capabilities, Error, GenerationOutput,
+    default_seed, gen_core, AdapterApplyReport, AdapterSpec, Error, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
     Residency, Result, SizeFloor,
 };
@@ -35,59 +43,229 @@ pub const MAX_SIZE: u32 = 2048;
 /// Images per request.
 pub const MAX_COUNT: u32 = 8;
 
-/// Identity + capabilities, constructible without weights.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // Pixel space: there is no latent and no VAE.
-        denoiser_output_latent_space: None,
-        control_kinds: None,
-        // The Qwen3-VL text encoder is a load-time component (`components["text_encoder"]`);
-        // `load` refuses without it.
-        required_components: &[gen_core_iris::TEXT_ENCODER_COMPONENT],
-        id: MODEL_ID,
+/// Primary typed route declaration for Iris-3B generation (`REG-1`, `AP5`).
+pub fn route() -> RouteRecord {
+    RouteRecord {
+        route_id: MODEL_ID,
         family: FAMILY,
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // CFG against the negative prompt run through the same template (default "").
-            supports_negative_prompt: true,
-            // `guidance` is upstream's `cfg_scale` (default 3.0; 1.0 = CFG off).
-            supports_guidance: true,
-            supports_true_cfg: false,
-            // The FlowDPM-Solver++ in its two upstream orders: `dpmpp_2m` (order 2, the default)
-            // and `euler` (order 1 — the first-order DPM-Solver++ step IS the flow Euler step).
-            // There is one schedule (the shifted linear grid), so no scheduler name is advertised;
-            // `scheduler_shift` is upstream's `shift`.
-            samplers: SAMPLERS.to_vec(),
-            schedulers: Vec::new(),
-            // upstream `cfg_interval`, a prompt list, and `text_encoder.on_caption_overflow`.
-            supports_cfg_interval: true,
-            supports_prompt_batch: true,
-            supports_caption_overflow_policy: true,
-            // LoRA / LoKr (and LyCORIS-layout LoHa) residuals on the backbone projections; every
-            // file must carry the Iris `family` / `irisTask` stamps.
-            supports_lora: true,
-            supports_lokr: true,
-            // Pixel space: every step's predicted clean image is the preview, decoded exactly.
-            supports_preview: true,
-            min_size: MIN_SIZE,
-            max_size: MAX_SIZE,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // sc-26266: the affine tiers, quantized at load from the dense release — the backbone's
-            // projections (the SwiGLU down projections zero-padded to a group multiple) and the
-            // Qwen3-VL tower's attention/MLP projections. Embeddings, norms, the text position
-            // table and the few sub-group-wide pixel heads stay dense; see `crate::nn` and
-            // `crate::text_encoder`.
-            supported_quants: &[Quant::Q8, Quant::Q4],
-            supports_sequential_offload: true,
-            size_floor: SizeFloor::RangeCheckedOnGrid {
-                multiple: SIZE_MULTIPLE,
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new("qwen3_vl_4b", None)],
+                encoder_contract: None,
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: true,
+                supports_prompt_enhancement: false,
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: SamplingSurface {
+                samplers: SAMPLERS.to_vec(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: true,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_driver(FamilyDriverSpec::new(
+                crate::solver::iris_flow_dpm_driver_support(false),
+            )),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: None,
+                output_latent_space: None,
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_4b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Denoise, ["iris_3b_dit"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q8, Quant::Q4],
+                component_precision_floors: &[],
+                required_components: &[gen_core_iris::TEXT_ENCODER_COMPONENT],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::PixelSpace,
+                supports_hdr: false,
+                supports_alpha_output: false,
             },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: true,
+        },
+        defaults: RouteDefaults {
+            steps: Some(gen_core_iris::DEFAULT_STEPS),
+            guidance: Some(gen_core_iris::DEFAULT_CFG_SCALE),
+            sampler: Some(SAMPLERS[0]),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((gen_core_iris::DEFAULT_SIZE, gen_core_iris::DEFAULT_SIZE)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                crate::memory_strategy::MEMORY_BEHAVIOR_REGISTRATION,
+            ),
     }
+}
+
+/// Composed memory-route declaration for Iris-3B monocular depth (`iris_3b_depth`).
+pub fn route_depth() -> RouteRecord {
+    RouteRecord {
+        route_id: crate::depth::DEPTH_MODEL_ID,
+        family: FAMILY,
+        backend: "mlx",
+        modality: Modality::Image,
+        mac_only: true,
+        structure: RouteStructure {
+            denoiser: ModelBinding::non_diffusion("iris_3b_depth"),
+            adapters: AdapterSurface::unsupported(),
+            residency: ResidencySurface {
+                lifetime_graph: vec![ResidencyPhaseNode::new(
+                    ResidencyPhaseKind::Denoise,
+                    ["iris_3b_depth_dit"],
+                    false,
+                )],
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults::default(),
+        bindings: RouteBindings::default()
+            .with_composed_memory_registration(crate::memory_strategy::DEPTH_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(crate::memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
+            .with_memory_behavior_registration(
+                crate::memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION,
+            ),
+    }
+}
+
+/// Composed memory-route declaration for Iris-3B restoration (`iris_3b_restore`).
+pub fn route_restore() -> RouteRecord {
+    RouteRecord {
+        route_id: crate::restoration::MODEL_ID,
+        family: FAMILY,
+        backend: "mlx",
+        modality: Modality::Image,
+        mac_only: true,
+        structure: RouteStructure {
+            denoiser: ModelBinding::non_diffusion("iris_3b_restore"),
+            adapters: AdapterSurface::unsupported(),
+            residency: ResidencySurface {
+                lifetime_graph: vec![ResidencyPhaseNode::new(
+                    ResidencyPhaseKind::Upsample,
+                    ["iris_3b_restore_dit"],
+                    false,
+                )],
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: ProductLimits {
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
+            size_floor: SizeFloor::RangeCheckedOnGrid {
+                multiple: SIZE_MULTIPLE,
+            },
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::DeterministicSynthesis,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults::default(),
+        bindings: RouteBindings::default()
+            .with_composed_memory_registration(crate::memory_strategy::RESTORE_MEMORY_REGISTRATION)
+            .with_memory_fixture_registration(
+                crate::memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE,
+            )
+            .with_memory_behavior_registration(
+                crate::memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION,
+            ),
+    }
+}
+
+/// Identity + capabilities, constructible without weights, computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Label of the backbone's iOS pre-load check.
@@ -596,6 +774,8 @@ impl Iris3b {
             prefix_kv_cache: None,
             pag: None,
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
         })
     }
 
@@ -742,13 +922,6 @@ impl Generator for Iris3b {
         &self.descriptor
     }
 
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        self.adapter_reports
-            .lock()
-            .map(|reports| reports.clone())
-            .unwrap_or_default()
-    }
-
     /// The registered contract, priced from the loaded resources: the same one
     /// [`crate::memory_strategy::MEMORY_REGISTRATION`] builds for this spec.
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -844,12 +1017,14 @@ impl Iris3b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let mut report = self.generate_impl(req, on_progress)?;
+        report.adapter_apply_reports = self
+            .adapter_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default();
+        Ok(report)
     }
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

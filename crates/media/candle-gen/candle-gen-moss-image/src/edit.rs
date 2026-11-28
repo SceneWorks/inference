@@ -197,8 +197,10 @@ pub(crate) fn extra_peak(
     const TEXT: u64 = 4096;
     const LATENT: u64 = 128;
     let text_tokens = request
+        .extensions
         .moss_image
         .as_ref()
+        .and_then(|ext| ext.options.as_ref())
         .map_or(4096, |o| o.max_sequence_length) as u64;
     let image_tokens = (request.width as u64 * request.height as u64 / 256).max(reference_tokens);
     let precise_bytes = text_tokens

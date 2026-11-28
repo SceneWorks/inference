@@ -834,14 +834,6 @@ mod execution_tests {
             self.mark("descriptor");
             &self.desc
         }
-        fn veda_execution_report(&self) -> Option<VedaExecutionReport> {
-            self.mark("veda_report");
-            None
-        }
-        fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-            self.mark("adapters");
-            vec![]
-        }
         fn checkpoint_weight_facts(&self) -> Option<CheckpointWeightFacts> {
             self.mark("facts");
             None
@@ -858,10 +850,14 @@ mod execution_tests {
             self.mark("prediction");
             MemoryPeakBreakdown::from_unattributed(123)
         }
-        fn veda_workspace_bound(
+        fn request_memory_peak(&self, _: &GenerationRequest) -> Result<Option<u64>> {
+            self.mark("request_peak");
+            Ok(None)
+        }
+        fn request_workspace_bound(
             &self,
-            _: veda::workspace::Request<'_>,
-        ) -> Result<Option<veda::workspace::WorkspaceBound>> {
+            _: &GenerationRequest,
+        ) -> Result<Option<RequestWorkspaceBound>> {
             self.mark("workspace");
             Ok(None)
         }
@@ -1204,15 +1200,12 @@ mod execution_tests {
         let bound = bind(receipt, &registry, calls.clone(), consumed.clone());
         let req = &request(&candidate);
         let _ = bound.descriptor();
-        let _ = bound.veda_execution_report();
-        let _ = bound.adapter_apply_reports();
         let _ = bound.checkpoint_weight_facts();
         let _ = bound.memory_strategy_contract();
         let _ = bound.structural_resident_evidence();
         let _ = bound.predicted_memory_peak_from_base(1);
-        bound
-            .veda_workspace_bound(veda::workspace::Request::from(req))
-            .unwrap();
+        bound.request_memory_peak(req).unwrap();
+        bound.request_workspace_bound(req).unwrap();
         let context = bound.admitted_context().clone();
         assert_eq!(
             bound.memory_strategy_safety_check(&context),
@@ -1255,12 +1248,11 @@ mod execution_tests {
             .contains("probe conversation"));
         for expected in [
             "descriptor",
-            "veda_report",
-            "adapters",
             "facts",
             "contract",
             "structural",
             "prediction",
+            "request_peak",
             "workspace",
             "safety",
             "begin",

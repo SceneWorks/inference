@@ -9,9 +9,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{select_expert_adapters, ExpertAdapterOrder};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, PerComponentBytes, Progress, WeightsSource,
+    self, AdapterSpec, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
+    PerComponentBytes, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -781,35 +781,97 @@ impl Generator for WanVaceFunGenerator {
     }
 }
 
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        // VACE-Fun rides the same z16 Wan VAE as its VACE sibling (`ProviderVae = WanVae16`), so it
-        // declares the same denoiser latent space.
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID_VACE_FUN,
+/// Primary typed route declaration for Candle Wan2.2 VACE-Fun 14B (`REG-1`, `AP5`).
+pub(crate) fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID_VACE_FUN,
         family: "wan",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            // The public Candle route is the immutable dense bf16 VACE-Fun snapshot.
-            // Do not advertise dormant packed tiers: they have no provider receipt.
-            supported_quants: &[],
-            supports_sequential_offload: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["vace_fun_control"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("wan2_2_vace_fun_14b_moe").with_expert_switching(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["transformer", "transformer_2"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_video_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS_14B),
+            guidance: Some(T2V_14B_GUIDANCE_HIGH),
+            sampler: Some("uni_pc"),
+            shift: Some(T2V_14B_FLOW_SHIFT as f32),
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_footprint(component_footprint),
     }
+}
+
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Provider-owned inventory of the exact VACE-Fun component roots loaded by [`Pipeline`]. Both
@@ -874,11 +936,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         experts: Mutex::new(None),
         i2v_memory,
     }))
-}
-
-candle_gen::register_generators! {
-    pub(crate) const VACE_FUN_REGISTRATION = descriptor => load;
-    footprint = component_footprint
 }
 
 #[cfg(test)]

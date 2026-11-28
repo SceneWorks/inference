@@ -3001,13 +3001,16 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 count: 1,
-                use_pid: admitted_pid,
+                features: mlx_gen::gen_core::FeatureParams {
+                    pid: (admitted_pid).then(mlx_gen::gen_core::PidParams::enabled),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             // The admitted route configures fine...
             scope.configure_request(&mut request).unwrap();
             // ...and the other one is refused.
-            request.use_pid = !admitted_pid;
+            request.features.pid = (!admitted_pid).then(mlx_gen::gen_core::PidParams::enabled);
             let err = scope
                 .configure_request(&mut request)
                 .unwrap_err()

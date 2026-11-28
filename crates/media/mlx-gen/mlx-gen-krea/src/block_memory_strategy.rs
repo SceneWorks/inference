@@ -1088,7 +1088,7 @@ fn executable_memory_behavior_fixture(
         _ => unreachable!("provider-owned route validation constructs only executable fixtures"),
     };
     if fixture.context.has_phases {
-        fixture.request.phases = Some(vec![
+        fixture.request.features.phases = Some(vec![
             mlx_gen::GenerationPhase {
                 steps: 1,
                 ..Default::default()
@@ -1554,11 +1554,12 @@ mod tests {
                     |error| panic!("{provider_id} fixture is not executable: {error}"),
                 );
                 assert_eq!(
-                    fixture.request.use_pid, fixture.context.use_pid,
+                    fixture.request.use_pid(),
+                    fixture.context.use_pid,
                     "{provider_id}"
                 );
                 assert_eq!(
-                    fixture.request.phases.is_some(),
+                    fixture.request.features.phases.is_some(),
                     fixture.context.has_phases,
                     "{provider_id}"
                 );

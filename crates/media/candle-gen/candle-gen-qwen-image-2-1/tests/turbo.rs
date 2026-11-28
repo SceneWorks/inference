@@ -524,7 +524,7 @@ fn a_curated_scheduler_name_replaces_the_saved_list_with_its_unshifted_ramp() {
     let literal = render_over(root, &SAVED_PLUS_ZERO);
 
     let mut curated = request(None);
-    curated.scheduler = Some("karras".to_owned());
+    curated.scheduler = Some("karras".into());
     generator.validate(&curated).unwrap();
     let karras = candle_gen::resolve_flow_schedule(Some("karras"), 0.0, 8, &SAVED_PLUS_ZERO);
     assert_eq!(karras.len(), 9);
@@ -536,7 +536,7 @@ fn a_curated_scheduler_name_replaces_the_saved_list_with_its_unshifted_ramp() {
 
     // A curated SAMPLER rides the saved list: same sigmas, a different integrator.
     let mut sampler = request(None);
-    sampler.sampler = Some("heun".to_owned());
+    sampler.sampler = Some("heun".into());
     generator.validate(&sampler).unwrap();
     assert_ne!(pixels(generator.as_ref(), &sampler), literal);
 

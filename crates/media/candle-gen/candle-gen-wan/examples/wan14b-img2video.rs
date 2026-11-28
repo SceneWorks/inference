@@ -143,7 +143,7 @@ fn main() -> Result<()> {
         guidance,
         frames,
         fps,
-        sampler,
+        sampler: sampler.map(Into::into),
         conditioning: vec![Conditioning::Reference {
             image,
             strength: None,

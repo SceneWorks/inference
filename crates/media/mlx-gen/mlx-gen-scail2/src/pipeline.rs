@@ -44,62 +44,148 @@ pub const SHARED_TIER_FILES: &[&str] = &[
     "vae.safetensors",
 ];
 
+/// Primary typed route declaration for SCAIL-2 (`REG-1`, `AP5`).
+pub(crate) fn route_scail2() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
+        family: "scail2",
+        backend: "mlx",
+        modality: Modality::Video,
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Reference character image + its color-coded segmentation mask; driving video +
+                // per-frame color masks map to ControlClip.
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::Mask,
+                    ConditioningKind::ControlClip,
+                ],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: true,
+                modules: vec!["clip_vit_h14"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["unipc", "dpm++"],
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "scail2_wan_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(DIM_ALIGN),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["clip_vit_h14", "wan_z16_vae"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["scail2_wan_dit"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_vae"],
+                        true,
+                    ),
+                ],
+                // The root-only provider always stages UMT5 + CLIP ahead of the DiT and has no
+                // request-selectable Resident mode. This is physical staging, not a shared control.
+                supports_sequential_offload: false,
+                unconditionally_engages_staged_residency: true,
+                supports_kv_cache: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            // sc-18317: the graph-evaluation cadence + FFN chunk this provider's shared Wan
+            // `DitMemoryConfig` consumes.
+            execution: crate::generate::EXECUTION_SURFACE,
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 32,
+            max_size: 1280,
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
+                multiple: DIM_ALIGN,
+            },
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("unipc"),
+            schedule: None,
+            shift: Some(DEFAULT_SHIFT),
+            strength: None,
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        })
+        .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+        .with_resident_only_memory_registration(crate::memory_strategy::RESIDENT_ONLY_WITNESS),
+    }
+}
+
 /// Stable identity + advertised capabilities for SCAIL-2 (Wan2.1-14B I2V end-to-end character
 /// animation: reference image + driving video + color-coded masks → animated/identity-replaced video;
 /// plain single-scale CFG; packed-token conditioning + per-source RoPE + CLIP image cross-attn).
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "scail2",
-        backend: "mlx",
-        modality: Modality::Video,
-        capabilities: Capabilities {
-            // ADVERTISED, not merely implemented. `width`/`height == 0` means "size from the
-            // driving-video frames", so the shared floor exempts that sentinel while applying the
-            // provider's downstream envelope check. Explicit dimensions are different: the caller
-            // chose them, so the same descriptor advertises the exact 32-pixel grid and the shared
-            // floor rejects an off-grid request before a load (sc-16198).
-            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
-                multiple: DIM_ALIGN,
-            },
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
-            // characters (MultiReference, experimental); the driving video + its per-frame color masks
-            // map to ControlClip.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::Mask,
-                ConditioningKind::ControlClip,
-            ],
-            // Inference LoRA (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
-            // LoRA) installs as a forward-time residual over the (possibly Q4/Q8) base via the
-            // family-agnostic loader — SCAIL-2 is Wan2.1-14B I2V, so a Wan-I2V LoRA resolves directly
-            // (sc-5451). LoKr/LoHa ride the same residual path.
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: vec!["unipc", "dpm++"],
-            min_size: 32,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: true,
-            // The root-only provider always stages UMT5 + CLIP ahead of the DiT and has no
-            // request-selectable Resident mode. This is physical staging, not a shared control.
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: true,
-            // sc-18317: the graph-evaluation cadence + FFN chunk this provider's shared Wan
-            // `DitMemoryConfig` consumes. `generate` threads the request through
-            // `DitMemoryConfig::with_request` on top of `SCAIL2_MEM_DEFAULT`.
-            execution: crate::generate::EXECUTION_SURFACE,
-            ..Default::default()
-        },
-    }
+    route_scail2().compute_descriptor()
 }
 
 /// The loaded SCAIL-2 model: resolved config + snapshot dir + optional load-time quant. The heavy
@@ -155,10 +241,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
     }))
 }
-
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 impl Scail2 {
     fn generate_execution_attempt(
@@ -782,7 +864,7 @@ mod tests {
             );
             // ...and it fails closed: a request that asks for memory is refused, not admitted.
             let mut memory_request = GenerationRequest {
-                video_mode: Some("animation".to_owned()),
+                video_mode: Some("animation".into()),
                 ..Default::default()
             };
             memory_request.memory = Some(mlx_gen::gen_core::GenerationMemory::default());
@@ -798,7 +880,7 @@ mod tests {
             (None, false),
         ] {
             let request = GenerationRequest {
-                video_mode: mode.map(str::to_owned),
+                video_mode: mode.map(Into::into),
                 ..Default::default()
             };
             assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");

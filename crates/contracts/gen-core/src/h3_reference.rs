@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// | [`Diffusers`](Self::Diffusers) | `short_edge / min(w, h)` (upscales) |
 ///
 /// `short_edge` is the request's effective
-/// [`reference_image_short_edge`](crate::GenerationRequest::reference_image_short_edge) —
+/// [`reference_image_short_edge`](crate::H3Extension::reference_image_short_edge) —
 /// `gen_core_h3::h3_reference::REFERENCE_IMAGE_BASE_SHORT_EDGE` unless the caller lowered it. `Match` does not read it.
 ///
 /// Serde form: lowercase strings `"match"` / `"max"` / `"diffusers"`, upstream's own spelling.
@@ -74,5 +74,9 @@ impl std::str::FromStr for ReferenceImageResizeMode {
 pub fn effective_reference_image_resize_mode(
     req: &crate::GenerationRequest,
 ) -> ReferenceImageResizeMode {
-    req.reference_image_resize_mode.unwrap_or_default()
+    req.extensions
+        .h3
+        .as_ref()
+        .and_then(|h3| h3.reference_image_resize_mode)
+        .unwrap_or_default()
 }

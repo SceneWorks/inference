@@ -121,6 +121,13 @@ pub mod providers {
     pub use mlx_gen_catalog::providers::*;
 }
 
+#[cfg(feature = "media")]
+mod facades;
+#[cfg(all(feature = "media", feature = "test-support"))]
+pub use facades::test_support;
+#[cfg(feature = "media")]
+pub use facades::{calibration, converters, memory_helpers, utilities};
+
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "macos";
 /// The single tensor backend every media, LLM, and snapshot-preparer provider in this bundle uses.
@@ -138,10 +145,50 @@ pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &["aarch64-apple-darwin"];
 /// Native (non-Cargo) prerequisites required to build and run this bundle.
 pub const NATIVE_PREREQUISITES: &[&str] = &["macOS 26.2+", "Xcode Metal toolchain"];
 
+#[cfg(feature = "media")]
+fn load_starvector_1b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+    let text_registry = mlx_llm::catalog_text_registry()
+        .map_err(|err| gen_core::Error::Msg(format!("mlx text registry: {err}")))?;
+    runtime_catalog::starvector::load_from_text_registry(
+        runtime_catalog::starvector::descriptor_mlx_1b(),
+        &text_registry,
+        runtime_catalog::starvector::MLX_STARVECTOR_1B_LLM_ID,
+        spec,
+    )
+}
+
+#[cfg(feature = "media")]
+fn load_starvector_8b(spec: &gen_core::LoadSpec) -> gen_core::Result<Box<dyn gen_core::Generator>> {
+    let text_registry = mlx_llm::catalog_text_registry()
+        .map_err(|err| gen_core::Error::Msg(format!("mlx text registry: {err}")))?;
+    runtime_catalog::starvector::load_from_text_registry(
+        runtime_catalog::starvector::descriptor_mlx_8b(),
+        &text_registry,
+        runtime_catalog::starvector::MLX_STARVECTOR_8B_LLM_ID,
+        spec,
+    )
+}
+
+#[cfg(feature = "media")]
+fn build_macos_media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    mlx_gen_catalog::register_providers(gen_core::ProviderRegistryBuilder::new())
+        .register_route(runtime_catalog::starvector::route_mlx_1b(
+            load_starvector_1b,
+        ))
+        .register_route(runtime_catalog::starvector::route_mlx_8b(
+            load_starvector_8b,
+        ))
+        .reject_quant(
+            mlx_gen_catalog::media::Quant::Nvfp4,
+            mlx_gen_catalog::NVFP4_UNSUPPORTED_REASON,
+        )
+        .build()
+}
+
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
-        mlx_gen_catalog::provider_registry()
+        build_macos_media_registry()
     }
 
     #[cfg(not(feature = "media"))]
@@ -154,7 +201,7 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
-        mlx_gen_catalog::provider_registry()
+        build_macos_media_registry()
     }
 
     #[cfg(not(feature = "media"))]
@@ -218,6 +265,35 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             mlx_llm::snapshot_preparer_registry(),
         )
     }
+}
+
+/// Platform export options for the macOS MLX bundle (`SW-6980`, `REG-3`).
+pub fn export_assembly_options() -> runtime_catalog::ExportAssemblyOptions {
+    #[cfg_attr(not(any(feature = "media", feature = "audio")), allow(unused_mut))]
+    let mut options =
+        runtime_catalog::ExportAssemblyOptions::new(gen_core::export::FEATURE_SET_MACOS_MLX);
+    #[cfg(feature = "media")]
+    {
+        options.bespoke_utility_crates = mlx_gen_catalog::BESPOKE_UTILITY_CRATES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    #[cfg(feature = "audio")]
+    {
+        options.crate_api_providers = candle_audio_catalog::CRATE_API_PROVIDERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    options
+}
+
+/// Export the canonical `sga.capabilities/2` build product for the shipping `macos-mlx` feature
+/// set without loading weights or executing Metal GPU kernels (`SW-6980`, `REG-3`).
+pub fn capabilities_export() -> runtime_catalog::Result<gen_core::export::CapabilitiesExportV2> {
+    let catalog = catalog()?;
+    Ok(catalog.capabilities_export(&export_assembly_options()))
 }
 
 #[cfg(test)]
@@ -470,7 +546,7 @@ mod tests {
             assert!(snapshot.audio_embedder_ids.is_empty());
         }
         #[cfg(feature = "media")]
-        assert_eq!(mlx_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
+        assert_eq!(mlx_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 5);
         assert_eq!(snapshot.to_json()["platform"], "macos");
     }
 
@@ -588,5 +664,158 @@ mod tests {
             std::any::TypeId::of::<super::layers::Linear>(),
             std::any::TypeId::of::<super::media::Linear>()
         );
+    }
+
+    /// SW-6980 (`REG-3`, `HOOK-4`, `M8`, `AC1`): the shipping `macos-mlx` descriptor-only export
+    /// matches the linked macOS catalog 1-to-1 across all independent entrypoints, emits
+    /// deterministic canonical JSON without pin/host metadata, and refuses runtime disagreements.
+    #[cfg(all(feature = "media", feature = "audio"))]
+    #[test]
+    fn descriptor_only_export_matches_macos_mlx_shipping_registry() {
+        use super::gen_core::export::{
+            canonical_bytes_equal, semantic_equal, CapabilitiesExportV2, ExportDisagreementKind,
+            CAPABILITIES_EXPORT_SCHEMA_VERSION, FEATURE_SET_MACOS_MLX,
+        };
+
+        let catalog = super::catalog().expect("macos catalog");
+        let export = super::capabilities_export().expect("macos-mlx export");
+
+        assert_eq!(export.schema_version, CAPABILITIES_EXPORT_SCHEMA_VERSION);
+        assert_eq!(export.platform, "macos");
+        assert_eq!(export.backend, "mlx");
+        assert_eq!(export.feature_set, FEATURE_SET_MACOS_MLX);
+        assert_eq!(export.audio_backend.as_deref(), Some("candle"));
+        assert!(export.advanced_quant_tiers.is_empty());
+        assert!(
+            export.rejected_quants.contains_key("nvfp4"),
+            "macOS MLX export must advertise nvfp4 refusal"
+        );
+
+        let bytes_a = export.to_canonical_json_bytes().unwrap();
+        let bytes_b = super::capabilities_export()
+            .unwrap()
+            .to_canonical_json_bytes()
+            .unwrap();
+        assert_eq!(bytes_a, bytes_b);
+        assert!(canonical_bytes_equal(&bytes_a, &bytes_b).unwrap());
+        let parsed = CapabilitiesExportV2::from_json_bytes(&bytes_a).unwrap();
+        assert!(semantic_equal(&export, &parsed));
+
+        let snapshot = catalog.snapshot();
+        assert_eq!(
+            export
+                .routes
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            snapshot
+                .generator_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            export
+                .audio_routes
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            snapshot
+                .audio_generator_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            export.llm_models.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "mlx-joycaption",
+                "mlx-llama",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
+        assert_eq!(export.llm_models["mlx-llama"].entrypoint_kind, "text_llm");
+        assert_eq!(
+            export.llm_models["mlx-starvector-1b"].entrypoint_kind,
+            "vector"
+        );
+        assert_eq!(export.trainers.len(), snapshot.trainer_ids.len());
+        assert_eq!(export.captioners.len(), snapshot.captioner_ids.len());
+        assert_eq!(
+            export.transcribers.len(),
+            snapshot.audio_transcriber_ids.len()
+        );
+        assert_eq!(
+            export.embedders.image.len(),
+            snapshot.image_embedder_ids.len()
+        );
+        assert_eq!(
+            export.embedders.text.len(),
+            snapshot.text_embedder_ids.len()
+        );
+        assert_eq!(
+            export.embedders.voice.len(),
+            snapshot.audio_voice_embedder_ids.len()
+        );
+        assert_eq!(
+            export.embedders.audio.len(),
+            snapshot.audio_embedder_ids.len()
+        );
+        assert_eq!(export.transforms.image.len(), snapshot.transform_ids.len());
+        assert_eq!(
+            export.transforms.audio.len(),
+            snapshot.audio_transform_ids.len()
+        );
+        assert_eq!(export.bespoke_waivers.utility_crates.len(), 5);
+        assert_eq!(
+            export.bespoke_waivers.crate_api_providers,
+            vec!["sheetsage2"]
+        );
+
+        // PIPE-18 / B1 / E4: macOS MLX export reconciles StarVector 1B/8B (`image_to_svg`) +
+        // InstantID + PuLID independently of registration, and keeps XL-4 LLM IDs intact.
+        runtime_catalog::reconcile::reconcile_callable_routes(&[&export], false)
+            .expect("macos-mlx export must pass callable-route reconciliation");
+        assert_eq!(export.routes["starvector_1b"].modality, "vector");
+        assert_eq!(
+            export.routes["starvector_1b"].modes,
+            vec!["image_to_svg".to_string()]
+        );
+        assert_eq!(export.routes["starvector_8b"].modality, "vector");
+        assert_eq!(
+            export.routes["starvector_8b"].modes,
+            vec!["image_to_svg".to_string()]
+        );
+        let mut without_starvector = export.clone();
+        without_starvector.routes.remove("starvector_1b");
+        without_starvector.routes.remove("starvector_8b");
+        let sv_err =
+            runtime_catalog::reconcile::reconcile_callable_routes(&[&without_starvector], false)
+                .expect_err("deleting StarVector bindings must fail reconciliation");
+        assert_eq!(
+            sv_err.missing_cells(),
+            vec![
+                "macos/mlx/starvector_1b/operation/image_to_svg",
+                "macos/mlx/starvector_8b/operation/image_to_svg",
+            ]
+        );
+
+        // Every route exports computed HOOK-4 features.
+        assert!(export.routes.values().all(|r| !r.features.is_empty()));
+
+        catalog
+            .verify_against_export(&export, &super::export_assembly_options())
+            .expect("macos catalog verifies against its own export");
+
+        let mut tampered = export.clone();
+        tampered.routes.remove("flux1_dev");
+        let err = catalog
+            .verify_against_export(&tampered, &super::export_assembly_options())
+            .expect_err("linked runtime must refuse export missing a shipped route");
+        assert!(err
+            .disagreements
+            .iter()
+            .any(|d| d.kind == ExportDisagreementKind::ExtraRouteInRuntime));
     }
 }

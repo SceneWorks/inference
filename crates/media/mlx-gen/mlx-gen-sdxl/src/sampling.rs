@@ -188,8 +188,8 @@ impl ResolvedSampling {
             crate::model::resolve_cfg_batching(req),
             req.strength,
             reference_strength,
-            req.use_pid,
-            req.pid_capture_sigma,
+            req.use_pid(),
+            req.pid_capture_sigma(),
             work,
         )
     }
@@ -890,15 +890,20 @@ impl SamplingRecipe {
     }
 
     fn write_controls(&self, req: &mut GenerationRequest) {
-        req.sampler = Some(self.sampler.clone());
-        req.scheduler = Some(self.scheduler.clone());
+        req.sampler = Some(self.sampler.clone().into());
+        req.scheduler = Some(self.scheduler.clone().into());
         req.steps = Some(self.steps);
         req.guidance = Some(self.guidance);
-        req.guidance_method = Some(self.guidance_method.clone());
+        req.guidance_method = Some(self.guidance_method.clone().into());
         req.memory.get_or_insert_with(Default::default).cfg_batching = Some(self.cfg_batching);
         req.strength = self.strength;
-        req.use_pid = self.use_pid;
-        req.pid_capture_sigma = self.pid_capture_sigma;
+        req.features.pid = if self.use_pid || self.pid_capture_sigma.is_some() {
+            Some(mlx_gen::gen_core::PidParams {
+                capture_sigma: self.pid_capture_sigma,
+            })
+        } else {
+            None
+        };
         for c in &mut req.conditioning {
             if let Conditioning::Reference { strength, .. } = c {
                 *strength = self.reference_strength;

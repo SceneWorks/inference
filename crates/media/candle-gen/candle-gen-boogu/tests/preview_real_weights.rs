@@ -98,7 +98,7 @@ fn request(lane: Lane<'_>, size: u32, conditioning: Vec<Conditioning>) -> Genera
         count: 1,
         seed: Some(SEED),
         steps: Some(lane.steps),
-        sampler: lane.sampler.map(str::to_string),
+        sampler: (lane.sampler.map(str::to_string)).map(Into::into),
         conditioning,
         ..GenerationRequest::default()
     }

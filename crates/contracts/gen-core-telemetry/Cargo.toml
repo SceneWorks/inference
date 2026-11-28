@@ -13,8 +13,9 @@ categories = ["science"]
 name = "gen_core_telemetry"
 
 [dependencies]
-# The per-step JSON report the collector builds. Moved out of gen-core with the host-RSS FFI in
-# sc-27316; gen-core keeps only the `GenerateRequest::h3_terminal_telemetry` flag.
+# Typed stage/phase/lifecycle telemetry events (`PIPE-17`) plus the per-step JSON report
+# (`OPT-8` field-name stability).
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]

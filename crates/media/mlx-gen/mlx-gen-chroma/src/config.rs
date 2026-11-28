@@ -8,9 +8,16 @@
 //! and attention is **masked** by the T5 padding mask. Generation uses **true CFG** (real negative
 //! prompt), not FLUX's distilled guidance.
 
-use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, Modality, ModelDescriptor, Quant,
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
+    FLUX1_LATENT_SPACE,
 };
+use mlx_gen::{curated_sampler_names, curated_scheduler_names, Modality, ModelDescriptor, Quant};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
@@ -90,60 +97,122 @@ impl ChromaVariant {
         matches!(self, Self::Base)
     }
 
-    pub fn descriptor(self) -> ModelDescriptor {
-        ModelDescriptor {
-            encoder_contract: None,
-            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-            control_kinds: None,
-            required_components: &[],
-            id: self.id(),
+    /// Primary typed route declaration for this Chroma variant (`REG-1`, `AP5`).
+    pub fn route_record(self) -> RouteRecord {
+        let mut samplers = curated_sampler_names();
+        samplers.push("flow_match");
+        let mut schedulers = curated_scheduler_names();
+        schedulers.push("linear");
+
+        RouteRecord {
+            route_id: self.id(),
             family: "chroma",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities {
-                // Chroma uses real classifier-free guidance with a true negative prompt.
-                supports_negative_prompt: true,
-                // No distilled guidance-scalar embedding (`guidance_embeds=false`); CFG is `true_cfg`.
-                supports_guidance: false,
-                supports_true_cfg: true,
-                // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
-                conditioning: vec![],
-                supported_quants: &[Quant::Q4, Quant::Q8],
-                // LoRA/LoKr via the shared core adapter seam (sc-3842), over the diffusers/peft
-                // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
-                supports_lora: true,
-                supports_lokr: true,
-                // The curated unified-framework integrator menu (epic 7114 P3) + the legacy
-                // `flow_match` alias (== Euler). `euler`/`heun` (DEFAULT_SAMPLER/HEUN_SAMPLER) are in
-                // the curated set; Flash's unset sampler still resolves to Heun in the generate path.
-                samplers: {
-                    let mut s = curated_sampler_names();
-                    s.push("flow_match");
-                    s
+            mac_only: true,
+            structure: RouteStructure {
+                text_encoders: TextEncoderSurface {
+                    encoders: vec![TextEncoderDeclaration::new(
+                        "t5_xxl",
+                        Some(MAX_SEQUENCE_LENGTH as u32),
+                    )],
+                    ..Default::default()
                 },
-                // Scheduler axis (epic 7114): the native static-shift (HD/Flash) / beta (Base) schedule
-                // is the byte-exact default (`linear` alias / unset); a curated name re-shapes σ over the
-                // variant's static shift.
-                schedulers: {
-                    let mut s = curated_scheduler_names();
-                    s.push("linear");
-                    s
+                conditioning: ConditioningSurface {
+                    kinds: vec![],
+                    control_kinds: None,
+                    pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                    supports_negative_prompt: true,
+                    modules: vec![],
+                    ..Default::default()
                 },
-                min_size: 256,
-                max_size: 2048,
-                max_count: 8,
-                mac_only: true,
-                // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.
-                requires_sigma_shift: true,
-                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
-                // drops the T5-XXL encoder after the prompt encode so peak unified memory is bounded
-                // to `max(T5, DiT+VAE)` instead of their sum.
-                supports_sequential_offload: true,
-                supports_preview: true,
-                supports_low_res_start: true,
+                sampling: SamplingSurface {
+                    samplers,
+                    schedulers,
+                    guidance_methods: vec![],
+                    supports_guidance: false,
+                    supports_true_cfg: true,
+                    supports_cfg_interval: false,
+                    requires_sigma_shift: true,
+                    supports_h3_image_sampler: false,
+                },
+                denoiser: ModelBinding::family_model(
+                    FamilyModelSpec::new("chroma_mmdit").with_low_res_start(),
+                ),
+                latent_codec: LatentCodecDeclaration {
+                    codec_id: Some("flux1_ae"),
+                    output_latent_space: Some(&FLUX1_LATENT_SPACE),
+                    pixel_stride: Some(crate::SIZE_MULTIPLE),
+                    token_width: Some(64),
+                    supports_diffusion_decoder: false,
+                },
+                upsamplers: UpsamplerSurface {
+                    components: vec!["pid_decoder"],
+                    max_temporal_upsample_rounds: 0,
+                },
+                adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+                residency: ResidencySurface {
+                    lifetime_graph: vec![
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::PromptEncode, ["t5_xxl"], true),
+                        ResidencyPhaseNode::new(
+                            ResidencyPhaseKind::Denoise,
+                            ["chroma_mmdit"],
+                            false,
+                        ),
+                        ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux1_ae"], false),
+                    ],
+                    supports_sequential_offload: true,
+                    ..Default::default()
+                },
+                weight_plan: WeightPlanDeclaration {
+                    source_kind: WeightSourceKind::SnapshotDirectory,
+                    supported_quants: &[Quant::Q4, Quant::Q8],
+                    component_precision_floors: &[],
+                    required_components: &[],
+                    requires_control_overlay: false,
+                    requires_ip_adapter_overlay: false,
+                    requires_identity_overlay: false,
+                    ..Default::default()
+                },
+                output: OutputSurface {
+                    preview: PreviewSupport::LatentProjection,
+                    supports_hdr: false,
+                    supports_alpha_output: false,
+                },
                 ..Default::default()
             },
+            limits: ProductLimits {
+                min_size: 256,
+                max_size: 2048,
+                size_floor: SizeFloor::RangeChecked,
+                supported_steps: StepSupport::Unconstrained,
+                max_audio_duration_secs: None,
+            },
+            seed_and_batch: SeedAndBatchSemantics {
+                seed_scheme: SeedScheme::BackendGlobalSeeded,
+                max_count: 8,
+                supports_prompt_batch: false,
+            },
+            defaults: RouteDefaults {
+                steps: Some(self.default_steps()),
+                guidance: None,
+                sampler: Some(if matches!(self, Self::Flash) {
+                    HEUN_SAMPLER
+                } else {
+                    DEFAULT_SAMPLER
+                }),
+                schedule: Some("linear"),
+                shift: Some(self.sigma_shift()),
+                strength: None,
+                dimensions: Some((DEFAULT_WIDTH, DEFAULT_HEIGHT)),
+                ..Default::default()
+            },
+            bindings: RouteBindings::default(),
         }
+    }
+
+    pub fn descriptor(self) -> ModelDescriptor {
+        self.route_record().compute_descriptor()
     }
 }
 

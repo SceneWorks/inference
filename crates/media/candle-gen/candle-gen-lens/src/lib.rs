@@ -1571,7 +1571,6 @@ fn lens_memory_strategy_safety_decision(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct LensMemoryScope {
     provider_id: &'static str,
     device: Device,
@@ -1590,7 +1589,6 @@ fn lens_generation_memory(
     contract.generation_memory(&selection)
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl LensMemoryScope {
     fn new(
         provider_id: &'static str,
@@ -1643,13 +1641,12 @@ impl LensMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl gen_core::MemoryRequestScope for LensMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.use_pid
+        if request.use_pid() != self.use_pid
             || !request.conditioning.is_empty()
-            || request.phases.is_some()
+            || request.features.phases.is_some()
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: optimized memory strategies cover ordinary text-to-image only",
@@ -1759,7 +1756,6 @@ impl gen_core::MemoryRequestScope for LensMemoryScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl Drop for LensMemoryScope {
     fn drop(&mut self) {
         if !self.finished {
@@ -2122,56 +2118,163 @@ impl Generator for LensGenerator {
     }
 }
 
-/// Lens' identity + capabilities for `id` — constructible without loading weights. The norm-rescaled
-/// CFG path is always present; turbo simply defaults guidance to 1.0. **Standard guidance, not
-/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load); Q4/Q8 quant is wired for
-/// **both** the gpt-oss encoder experts (sc-5111) and the DiT (sc-5117, GGUF `QMatMul` folded in after
-/// the merge).
-fn descriptor_for(id: &'static str) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::LENS_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id,
+/// Primary typed route declaration for a Candle Lens variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_for(id: &'static str) -> gen_core::RouteRecord {
+    let defaults = defaults_for(id);
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = if id == MODEL_ID_BASE {
+        gen_core::RouteBindings::generator(descriptor_base, load_base)
+            .with_render_plan(compile_lens_base)
+    } else {
+        gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+            .with_render_plan(compile_lens_turbo)
+    };
+    #[cfg(feature = "cuda")]
+    {
+        bindings = if id == MODEL_ID_BASE {
+            bindings
+                .with_memory_registration(BASE_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    weights_free_lens_base_memory_strategy_contract,
+                )
+                .with_memory_surface_resolver(weights_free_lens_base_surface_contract)
+                .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR)
+        } else {
+            bindings
+                .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    weights_free_lens_turbo_memory_strategy_contract,
+                )
+                .with_memory_surface_resolver(weights_free_lens_turbo_surface_contract)
+                .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR)
+        };
+    }
+
+    gen_core::RouteRecord {
+        route_id: id,
         family: "lens",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // `conditioning` is deferred to its empty default: pure T2I — no img2img / control /
-            // IP in the Lens port.
-            supports_lora: true,
-            supports_lokr: true,
-            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy aliases
-            // (`flow_match_euler`/`flow_match`), which fall back to euler / the native schedule (N3).
-            samplers: candle_gen::menu_with_aliases(
-                candle_gen::curated_sampler_names(),
-                &["flow_match_euler"],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("gpt_oss", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy
+                // aliases (`flow_match_euler`/`flow_match`), which fall back to euler / the native
+                // schedule (N3).
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &["flow_match_euler"],
+                ),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["flow_match"],
+                ),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                // The Lens schedule computes its own empirical-μ shift internally.
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("lens_dit").with_low_res_start(),
             ),
-            schedulers: candle_gen::menu_with_aliases(
-                candle_gen::curated_scheduler_names(),
-                &["flow_match"],
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux2_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::LENS_LATENT_SPACE),
+                pixel_stride: Some(VAE_SCALE_FACTOR),
+                token_width: Some(128),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
             ),
-            // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
-            supported_guidance_methods: vec![],
-            min_size: 256,
-            max_size: 2080,
-            max_count: 8,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
-            requires_sigma_shift: false,
-            supports_sequential_offload: true,
-            // Per-step latent previews (epic 16948, sc-16955). Lens denoises the FLUX.2 32-channel
-            // latent space in the same packed token layout, and loads a VAE whose 250 learned tensors
-            // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
-            // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
-            supports_preview: true,
-            supports_low_res_start: true,
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["gpt_oss"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["lens_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux2_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2080,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(defaults.steps),
+            guidance: Some(defaults.guidance),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Lens' identity + capabilities for `id`, computed from `route_for`.
+fn descriptor_for(id: &'static str) -> ModelDescriptor {
+    route_for(id).compute_descriptor()
 }
 
 /// Public descriptor accessors (used by the registry submits + tests).
@@ -2232,7 +2335,7 @@ fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let defaults = defaults_for(id);
         let desc = descriptor_for(defaults.id);
         let sigmas = build_schedule_for(defaults, req)?;
@@ -2278,7 +2381,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_load_spec(id, spec)?;
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         )));
@@ -2827,13 +2930,6 @@ fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, BASE_DEFAULTS)
 }
 
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
-}
-
 fn registered_lens_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -2972,7 +3068,6 @@ fn registered_lens_turbo_memory_strategy_safety_check(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_lens_valid_fixture(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3000,7 +3095,6 @@ fn registered_lens_valid_fixture(
     Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_lens_begin_request(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -3254,10 +3348,14 @@ mod weights_free_behavior_tests {
 
     #[test]
     fn catalog_surfaces_publish_only_the_contract_eligible_packed_lens_shapes() {
+        let mut turbo = route_for(MODEL_ID_TURBO);
+        turbo.bindings.memory = Default::default();
+        let mut base = route_for(MODEL_ID_BASE);
+        base.bindings.memory = Default::default();
         let registry = register_memory_contract_surfaces(
             candle_gen::gen_core::ProviderRegistryBuilder::new()
-                .register_generator(TURBO_REGISTRATION)
-                .register_generator(BASE_REGISTRATION),
+                .register_route(turbo)
+                .register_route(base),
         )
         .build()
         .expect("Lens surface registry");
@@ -3436,14 +3534,12 @@ const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryR
     contract: registered_lens_base_memory_strategy_contract,
     safety_check: registered_lens_turbo_memory_strategy_safety_check,
 };
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID_TURBO,
         valid_fixtures: registered_lens_valid_fixture,
         begin_request: registered_lens_begin_request,
     };
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID_BASE,
@@ -3465,29 +3561,16 @@ fn compile_lens_base(
     compile_base(MODEL_ID_BASE, spec, req)
 }
 
-const TURBO_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: MODEL_ID_TURBO,
-    compile: compile_lens_turbo,
-};
-const BASE_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: MODEL_ID_BASE,
-    compile: compile_lens_base,
-};
-
-/// Add all Candle Lens generators and trainers to an explicit media registry builder.
+/// Add all Candle Lens generators and trainers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(TURBO_REGISTRATION)
-        .register_render_plan(TURBO_RENDER_PLAN)
-        .register_generator(BASE_REGISTRATION)
-        .register_render_plan(BASE_RENDER_PLAN);
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(BASE_MEMORY_BEHAVIOR);
-    registry.register_trainer(training::TRAINER_REGISTRATION)
+    registry
+        .register_route(route_for(MODEL_ID_TURBO))
+        .register_route(route_for(MODEL_ID_BASE))
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Register only weights-free memory-contract surfaces; safe on every build platform.
@@ -3507,6 +3590,7 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_lens_turbo_surface_contract,
             },
         )
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
@@ -3519,11 +3603,31 @@ pub fn register_memory_contract_surfaces(
                 contract: weights_free_lens_base_surface_contract,
             },
         )
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Lens provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3853,10 +3957,14 @@ mod integration_tests {
         );
 
         // Both weights-free surfaces publish the static namespace, never a production string.
+        let mut turbo = route_for(MODEL_ID_TURBO);
+        turbo.bindings.memory = Default::default();
+        let mut base = route_for(MODEL_ID_BASE);
+        base.bindings.memory = Default::default();
         let registry = register_memory_contract_surfaces(
             candle_gen::gen_core::ProviderRegistryBuilder::new()
-                .register_generator(TURBO_REGISTRATION)
-                .register_generator(BASE_REGISTRATION),
+                .register_route(turbo)
+                .register_route(base),
         )
         .build()
         .expect("Lens surface registry");
@@ -4405,7 +4513,9 @@ mod integration_tests {
                 GenerationOutput::ImagesRgba(_)
                 | GenerationOutput::Video { .. }
                 | GenerationOutput::Audio(_)
-                | GenerationOutput::Interleaved { .. } => {
+                | GenerationOutput::Interleaved { .. }
+                | GenerationOutput::Vector(_)
+                | GenerationOutput::Latents { .. } => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };
@@ -5232,7 +5342,10 @@ mod fingerprint_pin_tests {
                 height: 1024,
                 steps: Some(4),
                 seed: Some(91),
-                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

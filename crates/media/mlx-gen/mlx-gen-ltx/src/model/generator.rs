@@ -49,7 +49,13 @@ impl Generator for Ltx25 {
             req,
         )
         .map_err(mlx_gen::gen_core::Error::from)?;
-        if req.enhance_prompt && req.use_uncensored_enhancer {
+        if req.enhance_prompt
+            && req
+                .extensions
+                .ltx
+                .as_ref()
+                .is_some_and(|ltx| ltx.use_uncensored_enhancer)
+        {
             return Err(mlx_gen::gen_core::Error::Unsupported(
                 "ltx_2_5: use_uncensored_enhancer is unsupported; only the staged stock \
                  google/gemma-4-12B-it enhancer is selectable"
@@ -181,14 +187,23 @@ pub(super) fn validate_request_with_route(
     // first is what keeps the more actionable message: the floor can only say "this engine does
     // not support it", while these name the checkpoint generation that does, which is what a
     // caller needs to act. Deleting them would not un-refuse the knobs, only blur the reason.
-    if model_id == MODEL_ID && req.num_generated_keyframes.is_some_and(|n| n > 0) {
+    let ltx = req.extensions.ltx.as_ref();
+    if model_id == MODEL_ID
+        && ltx
+            .and_then(|ext| ext.num_generated_keyframes)
+            .is_some_and(|n| n > 0)
+    {
         return Err(Error::Unsupported(
             "ltx_2_3: num_generated_keyframes requires a generated-keyframe checkpoint \
              (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
                 .into(),
         ));
     }
-    if model_id == MODEL_ID && req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+    if model_id == MODEL_ID
+        && ltx
+            .and_then(|ext| ext.temporal_upsample_rounds)
+            .is_some_and(|r| r > 0)
+    {
         return Err(Error::Unsupported(
             "ltx_2_3: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
              keyframe slots + the temporal latent upsampler)"
@@ -371,7 +386,13 @@ pub(super) fn validate_request_with_route(
         }
     }
     let fps = Ltx::fps(req);
-    let resolved_frames = match (req.frames, req.auto_duration) {
+    let resolved_frames = match (
+        req.frames,
+        req.extensions
+            .ltx
+            .as_ref()
+            .and_then(|ext| ext.auto_duration),
+    ) {
         (Some(frames), _) => frames,
         (None, Some(range)) => gen_core_ltx::duration_head::resolve_auto_duration_frames(
             range.max_seconds,

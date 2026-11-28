@@ -84,16 +84,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: h,
         frames: Some(n_frames),
         steps: Some(steps),
-        conditioning_fps: Some(7),
-        motion_bucket_id: Some(127.0),
-        noise_aug_strength: Some(0.02),
-        // Chunked VAE decode (production worker default) — avoids the full-clip decode memory spike.
-        decode_chunk_size: Some(chunk),
         seed: Some(42),
         conditioning: vec![Conditioning::Reference {
             image: src,
             strength: None,
         }],
+        extensions: candle_gen::gen_core::FamilyExtensions {
+            svd: Some(candle_gen::gen_core::SvdExtension {
+                conditioning_fps: Some(7),
+                motion_bucket_id: Some(127.0),
+                noise_aug_strength: Some(0.02),
+                decode_chunk_size: Some(chunk),
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

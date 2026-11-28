@@ -42,13 +42,16 @@ use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::block_residency::BlockPlan;
+use mlx_gen::gen_core::{
+    FamilyDriverSpec, ModelBinding, ResidencyPhaseKind, ResidencyPhaseNode, RouteBindings,
+    RouteRecord, TextEncoderDeclaration,
+};
 use mlx_gen::media::Image;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadPhase, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
-    WeightsSource,
+    Conditioning, Error, GenerationOutput, GenerationRequest, Generator, LoadPhase, LoadSpec,
+    Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 
 use mlx_gen_wan::config::WanModelConfig;
@@ -533,48 +536,53 @@ fn task_to_vit_mode(task: &str) -> Option<VitMode> {
     })
 }
 
-/// Stable identity + advertised capabilities for the full Bernini pipeline.
+/// Primary typed route declaration for the full Bernini pipeline (`REG-1`, `AP5`).
+pub fn route_full() -> RouteRecord {
+    let mut route = crate::pipeline::route_renderer();
+    route.route_id = MODEL_ID;
+    route.modality = Modality::Both;
+    route.structure.text_encoders.encoders = vec![
+        TextEncoderDeclaration::new("qwen2_5_vl_7b", None),
+        TextEncoderDeclaration::new("umt5_xxl", Some(512)),
+    ];
+    route.structure.conditioning.modules = vec!["mar_planner", "source_id_rotary_packing"];
+    route.structure.denoiser = ModelBinding::family_driver(
+        FamilyDriverSpec::new(crate::pipeline::bernini_stage2_driver_support("bernini"))
+            .with_expert_switching(),
+    );
+    route.structure.residency.lifetime_graph = vec![
+        ResidencyPhaseNode::new(
+            ResidencyPhaseKind::PromptEncode,
+            ["qwen2_5_vl_7b", "umt5_xxl"],
+            true,
+        ),
+        ResidencyPhaseNode::new(
+            ResidencyPhaseKind::Denoise,
+            ["wan2_2_high_noise_expert", "wan2_2_low_noise_expert"],
+            false,
+        ),
+        ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["wan_z16_vae"], false),
+    ];
+    route.bindings = RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+        .with_footprint(crate::pipeline::component_footprint)
+        .with_memory_registration(crate::memory_strategy::FULL_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(
+                    crate::memory_strategy::FULL_ID,
+                    spec,
+                )
+            },
+        )
+        .with_memory_behavior_registration(crate::memory_strategy::FULL_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Stable identity + advertised capabilities for the full Bernini pipeline, computed from
+/// `route_full`.
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "bernini",
-        backend: "mlx",
-        // Full Bernini covers both still-image (t2i/i2i) and video (t2v/v2v/r2v/rv2v) tasks.
-        modality: Modality::Both,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::MultiReference,
-                ConditioningKind::VideoClip,
-            ],
-            samplers: vec!["unipc"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            supports_kv_cache: true,
-            // Bernini is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds NO
-            // component weights on the generator and loads per generate in phase order — planner
-            // (Qwen2.5-VL-7B) → drop → UMT5-XXL T5 → drop → the two co-resident MoE experts + z16 VAE —
-            // dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified memory is
-            // already bounded to the dominant expert phase. The per-component footprint reports the two
-            // experts as the DiT phase (the peak; the planner is a smaller, earlier, dropped phase), so
-            // fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
-            // Resident-warm mode to toggle, so this is unconditional physical staging rather than a
-            // selectable offload control. The one thing NOT split is the two experts, which the
-            // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: true,
-            ..Default::default()
-        },
-    }
+    route_full().compute_descriptor()
 }
 
 /// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer config/knobs.
@@ -626,10 +634,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-mlx_gen::register_generators! {
-    pub(crate) const FULL_REGISTRATION = descriptor => load;
-    footprint = crate::pipeline::component_footprint
-}
 
 // Hand-written for the same reason as `BerniniRenderer`'s (sc-18609): `mlx_gen::impl_generator!`
 // emits no memory-strategy hooks, so the declared ladder would stay unreachable through the loaded

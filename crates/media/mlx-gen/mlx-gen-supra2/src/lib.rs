@@ -23,13 +23,5 @@ pub use sampling::{Supra2EulerDriver, Supra2VelocityForward};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    use mlx_gen::gen_core::MemoryContractFixtureRegistration;
-    registry
-        .register_generator(model::REGISTRATION)
-        .register_memory_strategy(model::MEMORY)
-        .register_memory_contract_fixture(MemoryContractFixtureRegistration {
-            provider_id: gen_core_checkpoint::supra2::PROVIDER_ID,
-            contract: memory_strategy::fixture,
-            surface_specs: memory_strategy::surface_specs,
-        })
+    registry.register_route(model::route_supra2())
 }

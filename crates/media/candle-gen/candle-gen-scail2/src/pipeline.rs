@@ -117,54 +117,116 @@ pub fn snapshot_layout(root: &Path) -> gen_core::Result<SnapshotLayout> {
     )))
 }
 
-/// Stable identity + advertised capabilities for SCAIL-2 (Wan2.1-14B I2V end-to-end character
-/// animation: reference image + driving video + color-coded masks → animated/identity-replaced video;
-/// plain single-scale CFG; packed-token conditioning + per-source RoPE + CLIP image cross-attn).
-/// `backend = "candle"`, `mac_only = false` (the off-Mac CUDA lane).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle SCAIL-2 (`REG-1`, `AP5`).
+pub(crate) fn route() -> candle_gen::gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = candle_gen::gen_core::RouteBindings::generator(descriptor, load)
+        .with_video_plan(candle_gen::gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        });
+    #[cfg(feature = "cuda")]
+    {
+        bindings = bindings
+            .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+            .with_resident_only_memory_registration(crate::memory_strategy::RESIDENT_ONLY_WITNESS);
+    }
+
+    candle_gen::gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "scail2",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // A character is a strict ordered Reference + Mask pair. The first pair is primary and up
-            // to five later pairs are extra characters. MultiReference is advertised for the shared
-            // multi-reference routing surface, but its image-only payload is rejected below because it
-            // cannot express the matching masks this model requires.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::Mask,
-                ConditioningKind::ControlClip,
-            ],
-            // Inference LoRA / LoKr / LoHa + the lightx2v lightning diff-patch + the Bias-Aware DPO
-            // refinement LoRA, merged into the dense DiT before build (sc-6838,
-            // [`crate::adapters::merge_adapters`]).
-            supports_lora: true,
-            supports_lokr: true,
-            // candle's FlowScheduler is UniPC/Euler; "dpm++" resolves to UniPC (bh2). Advertised to
-            // match the mlx-gen-scail2 descriptor for cross-backend routing parity.
-            samplers: vec!["unipc", "dpm++"],
-            min_size: 32,
-            max_size: 1280,
-            max_count: 1,
-            // The hosted packed Q4/Q8 tiers stay selectable (the Resident *memory* receipt is
-            // dense-bf16 only, which is a separate surface); MLX advertises the same pair.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
-            // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
-            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
-                multiple: DIM_ALIGN,
+        mac_only: false,
+        structure: candle_gen::gen_core::RouteStructure {
+            text_encoders: candle_gen::gen_core::TextEncoderSurface {
+                encoders: vec![candle_gen::gen_core::TextEncoderDeclaration::new(
+                    "umt5_xxl", None,
+                )],
+                ..Default::default()
+            },
+            conditioning: candle_gen::gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::Mask,
+                    ConditioningKind::ControlClip,
+                ],
+                pass0_requirement:
+                    candle_gen::gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: true,
+                modules: vec!["scail_clip"],
+                ..Default::default()
+            },
+            sampling: candle_gen::gen_core::SamplingSurface {
+                samplers: vec!["unipc", "dpm++"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: candle_gen::gen_core::ModelBinding::family_model(
+                candle_gen::gen_core::FamilyModelSpec::new("scail2_14b_dit"),
+            ),
+            latent_codec: candle_gen::gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: candle_gen::gen_core::AdapterSurface::lora_and_lokr(
+                candle_gen::gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: candle_gen::gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    candle_gen::gen_core::ResidencyPhaseNode::new(
+                        candle_gen::gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["umt5_xxl", "scail_clip", "wan_z16_video_vae"],
+                        false,
+                    ),
+                    candle_gen::gen_core::ResidencyPhaseNode::new(
+                        candle_gen::gen_core::ResidencyPhaseKind::Denoise,
+                        ["scail2_14b_dit"],
+                        false,
+                    ),
+                    candle_gen::gen_core::ResidencyPhaseNode::new(
+                        candle_gen::gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_video_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: candle_gen::gen_core::WeightPlanDeclaration {
+                source_kind: candle_gen::gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
             },
             ..Default::default()
         },
+        limits: candle_gen::gen_core::ProductLimits {
+            min_size: 32,
+            max_size: 1280,
+            size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
+                multiple: DIM_ALIGN,
+            },
+            supported_steps: candle_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: candle_gen::gen_core::SeedAndBatchSemantics {
+            seed_scheme: candle_gen::gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: candle_gen::gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("unipc"),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Stable identity + advertised capabilities for SCAIL-2 — computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Load all `.safetensors` in the snapshot subdir `sub` as one f32 mmapped [`VarBuilder`].
@@ -681,8 +743,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         components: Mutex::new(None),
     }))
 }
-
-candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 fn capture_scail2_execution(
     descriptor: &ModelDescriptor,
@@ -1347,7 +1407,7 @@ mod tests {
             (None, false),
         ] {
             let request = GenerationRequest {
-                video_mode: mode.map(str::to_owned),
+                video_mode: mode.map(Into::into),
                 ..Default::default()
             };
             assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");
@@ -2102,7 +2162,7 @@ mod tests {
             guidance: Some(5.0),
             seed: Some(18473),
             fps: Some(16),
-            video_mode: Some("animation".to_owned()),
+            video_mode: Some("animation".into()),
             conditioning: vec![
                 Conditioning::Reference {
                     image: image([120, 80, 40]),

@@ -45,9 +45,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
-    WeightsSource,
+    self, AdapterSpec, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
 pub use adapters::TurboLoraReport;
@@ -296,52 +295,159 @@ impl Generator for Ideogram4Generator {
     }
 }
 
-/// Ideogram 4 (quality) descriptor — asymmetric two-DiT CFG; no text negative prompt (the negative
-/// branch is the trained unconditional DiT). Edit (sc-6598): img2img/Remix via a source `Reference`,
-/// and mask inpaint via a `Mask` (white = repaint) alongside the `Reference`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Ideogram 4 Quality (`SW-6979`, `REG-1`).
+pub(crate) fn route_quality() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "ideogram",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_guidance: true,
-            // Edit (sc-6303/6330 → candle sc-6598): one img2img/inpaint source Reference + optional
-            // inpaint Mask. No control/pose/multi-reference. Works in both quality and turbo.
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
-            supports_lora: true,
-            supports_lokr: true,
-            schedulers: vec!["flow_match_euler"],
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: 8,
-            // sc-9607: advertise the packed tiers so the worker's `resolve_quant` / A-B quant toggle
-            // engages off-Mac (the resolved q4/q8 turnkey subdir self-describes; `build` no-ops the
-            // requested quant — see below). Both quality + turbo share this via `descriptor_turbo`.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Per-step latent previews (epic 16948, sc-16955). Ideogram drives no shared sampler, so
-            // its bespoke flow-match loop emits directly (`crate::preview`); the VAE it loads is the
-            // FLUX.2 one tensor-for-tensor, so it reuses that fit rather than introducing one.
-            // `candle-gen-catalog`'s guard derives this flag from the sources — including from a
-            // bespoke crate's direct emission call — so it cannot run ahead of or behind the wiring.
-            supports_preview: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen3_vl",
+                    Some(config::MAX_TEXT_TOKENS as u32),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // Edit (sc-6303/6330 → candle sc-6598): one img2img/inpaint source Reference +
+                // optional inpaint Mask. No control/pose/multi-reference. Works in both quality and
+                // turbo.
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::Mask],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec![],
+                schedulers: vec!["flow_match_euler"],
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_driver(gen_core::FamilyDriverSpec::new(
+                pipeline::euler_driver_support("candle_ideogram_quality"),
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux2_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(128),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["ideogram4_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux2_ae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(config::DEFAULT_STEPS),
+            guidance: Some(config::DEFAULT_GUIDANCE),
+            sampler: None,
+            schedule: Some("flow_match_euler"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_memory_registration(QUALITY_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                gen_core::candle_memory_contract_surface_specs,
+                quality_weights_free_contract,
+            )
+            .with_memory_surface_resolver(quality_surface_contract)
+            .with_memory_behavior_registration(QUALITY_MEMORY_BEHAVIOR),
     }
 }
 
-/// Ideogram 4 Turbo descriptor — same base, CFG-free single DiT + the bundled TurboTime LoRA;
-/// guidance is inert (`supports_guidance = false`).
+/// Primary typed route declaration for Candle Ideogram 4 Turbo (`SW-6979`, `REG-1`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    let mut route = route_quality();
+    route.route_id = MODEL_ID_TURBO;
+    route.structure.sampling.supports_guidance = false;
+    route.structure.denoiser = gen_core::ModelBinding::family_driver(
+        gen_core::FamilyDriverSpec::new(pipeline::euler_driver_support("candle_ideogram_turbo")),
+    );
+    route.defaults.steps = Some(config::DEFAULT_TURBO_STEPS);
+    route.defaults.guidance = None;
+    route.bindings = gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+        .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            gen_core::candle_memory_contract_surface_specs,
+            turbo_weights_free_contract,
+        )
+        .with_memory_surface_resolver(turbo_surface_contract)
+        .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Ideogram 4 (quality) descriptor, computed from `route_quality`.
+pub fn descriptor() -> ModelDescriptor {
+    route_quality().compute_descriptor()
+}
+
+/// Ideogram 4 Turbo descriptor, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = MODEL_ID_TURBO;
-    d.capabilities.supports_guidance = false;
-    d
+    route_turbo().compute_descriptor()
 }
 
 fn build(
@@ -426,23 +532,15 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor_turbo(), true)
 }
 
-candle_gen::register_generators! {
-    pub(crate) const QUALITY_REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-
-/// Add all Candle Ideogram providers to an explicit media registry builder.
+/// Add all Candle Ideogram providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(QUALITY_REGISTRATION)
-        .register_generator(TURBO_REGISTRATION);
-    register_memory_contract_surfaces(registry)
-        .register_memory_behavior(QUALITY_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+    registry
+        .register_route(route_quality())
+        .register_route(route_turbo())
 }
 
 fn quality_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -540,6 +638,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Ideogram provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -53,8 +53,8 @@ const ENC_DTYPE: DType = DType::F32;
 
 pub(crate) const EDIT_2511_BASE_ROUTE: &str = "qwen_image_edit_2511";
 pub(crate) const EDIT_2511_LIGHTNING_ROUTE: &str = "qwen_image_edit_2511_lightning";
-const EDIT_2511_REPO_DIR: &str = "models--SceneWorks--qwen-image-edit-2511-mlx";
-const EDIT_2511_REVISION: &str = "0dfbf3a018bcee42d77de14494c35f97a7531def";
+pub(crate) const EDIT_2511_REPO_DIR: &str = "models--SceneWorks--qwen-image-edit-2511-mlx";
+pub(crate) const EDIT_2511_REVISION: &str = "0dfbf3a018bcee42d77de14494c35f97a7531def";
 /// Every exact identity the Edit-2511 base may be bound to: the MLX tier tree at any tier, and its
 /// published Candle-native GGML twin at q4/q8 (SW-7285), which SceneWorks resolves on
 /// Windows/Linux. Exact repository + revision; nothing else is admitted.
@@ -627,6 +627,10 @@ impl QwenEdit {
             spec.resolved_route.as_deref() == Some(EDIT_2511_LIGHTNING_ROUTE)
         );
         Ok(model)
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT

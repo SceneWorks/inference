@@ -775,7 +775,7 @@ impl FluxMemoryScope {
             .low_res_context
             .as_ref()
             .and_then(|ctx| ctx.plan.as_ref());
-        let Some(spec) = &request.low_res_start else {
+        let Some(spec) = &request.features.low_res_start else {
             if admitted_plan.is_some() {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: request low_res_start plan changed after memory admission",
@@ -897,7 +897,7 @@ impl FluxMemoryScope {
 impl MemoryRequestScope for FluxMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        if request.use_pid != self.use_pid
+        if request.use_pid() != self.use_pid
             || request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count != self.geometry.batch
@@ -1889,7 +1889,7 @@ mod tests {
         fixture.request.width = 1024;
         fixture.request.height = 1024;
         fixture.request.steps = Some(8);
-        fixture.request.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        fixture.request.features.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
 
         let plan = crate::compile_base_plan(crate::Variant::Dev, &fixture.request).unwrap();
         let low_res = plan
@@ -2069,7 +2069,7 @@ mod tests {
         fixture.request.width = 1024;
         fixture.request.height = 1024;
         fixture.request.steps = Some(8);
-        fixture.request.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        fixture.request.features.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
 
         let plan = crate::compile_base_plan(crate::Variant::Dev, &fixture.request).unwrap();
         let low_res = *plan.low_res_start().expect("low_res_start resolved");
@@ -2119,7 +2119,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         let mut ordinary_req = fixture.request.clone();
-        ordinary_req.low_res_start = None;
+        ordinary_req.features.low_res_start = None;
         one_under_scope
             .configure_request(&mut ordinary_req)
             .expect("ordinary T2I configure_request must succeed");
@@ -2160,7 +2160,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let mut ordinary_req = fixture.request.clone();
-        ordinary_req.low_res_start = None;
+        ordinary_req.features.low_res_start = None;
         unqualified_scope
             .configure_request(&mut ordinary_req)
             .expect("ordinary T2I under UnqualifiedRealEvidence must succeed");
@@ -2225,7 +2225,8 @@ mod tests {
                 "ordinary control request with posture-only context must pass configure_request",
             );
         let mut low_res_control_req = control_fixture.request.clone();
-        low_res_control_req.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        low_res_control_req.features.low_res_start =
+            Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
         let control_err = control_scope
             .configure_request(&mut low_res_control_req)
             .expect_err(

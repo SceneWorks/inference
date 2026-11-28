@@ -1434,7 +1434,7 @@ fn executable_klein_fixture(context: MemoryRunContext) -> mlx_gen::gen_core::Mem
         }],
         _ => unreachable!("provider-owned route validation constructs only executable fixtures"),
     };
-    fixture.request.phases = None;
+    fixture.request.features.phases = None;
     fixture
 }
 
@@ -2677,8 +2677,8 @@ mod tests {
                     .unwrap_or_else(|error| {
                         panic!("{provider_id} fixture is not executable: {error}")
                     });
-                assert_eq!(fixture.request.use_pid, fixture.context.use_pid);
-                assert!(fixture.request.phases.is_none());
+                assert_eq!(fixture.request.use_pid(), fixture.context.use_pid);
+                assert!(fixture.request.features.phases.is_none());
                 assert!(!fixture.context.has_phases);
             }
 

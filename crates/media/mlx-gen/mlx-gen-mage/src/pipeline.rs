@@ -1587,28 +1587,33 @@ pub struct MageMlxDriver<F> {
     support: DriverSupport,
 }
 
+/// Primary [`DriverSupport`] declaration for native MLX Mage flow denoising.
+pub(crate) fn mage_driver_support(driver_id: &'static str) -> DriverSupport {
+    DriverSupport {
+        driver_id,
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: true,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            renoise_from_clean:
+                "native MLX Mage flow driver does not re-noise from clean estimates",
+            geometry_change:
+                "native MLX Mage flow driver does not support geometry-changing phase boundaries",
+            read_only_boundary_estimate:
+                "native MLX Mage flow driver does not expose read-only boundary clean estimates",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F: MageMlxForward> MageMlxDriver<F> {
     pub fn build_support(driver_id: &'static str) -> DriverSupport {
-        DriverSupport {
-            driver_id,
-            arbitrary_slice: true,
-            carry_history: true,
-            reset_history: true,
-            renoise_from_clean: false,
-            geometry_change: false,
-            read_only_boundary_estimate: false,
-            previous_estimate_capture: false,
-            uses_global_rng: false,
-            refusal_reasons: DriverRefusalReasons {
-                renoise_from_clean:
-                    "native MLX Mage flow driver does not re-noise from clean estimates",
-                geometry_change:
-                    "native MLX Mage flow driver does not support geometry-changing phase boundaries",
-                read_only_boundary_estimate:
-                    "native MLX Mage flow driver does not expose read-only boundary clean estimates",
-                ..DriverRefusalReasons::default()
-            },
-        }
+        mage_driver_support(driver_id)
     }
 
     pub fn new(

@@ -98,7 +98,7 @@ pub const PLANNER_TOKENIZER_FILE: &str = "tokenizer.json";
 pub const PLANNER_SIDECAR_FILE: &str = "bernini_planner.json";
 
 /// The three prefix-routed planner component groups (dir-based). `mllm.lm_head` and the bare
-/// `mask_tokens` parameter are handled outside this table (see [`route_bernini_planner_key`]). No prefix
+/// `mask_tokens` parameter are handled outside this table (see `route_bernini_planner_key`). No prefix
 /// here is a prefix of another, so first-match routing is unambiguous.
 const PLANNER_PREFIXES: [(&str, &str); 3] = [
     ("mllm.", PLANNER_MLLM_DIR),

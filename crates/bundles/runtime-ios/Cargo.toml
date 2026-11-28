@@ -45,3 +45,7 @@ simulator-functional = ["device-capture", "mlx-gen-ios-catalog/simulator-functio
 # NOTE: no `audio` feature, and that is deliberate rather than an omission: the Candle audio lane's
 # cross-backend seam (sc-12835) is a sanctioned exception for the platforms that ship it and is not
 # extended to a new platform incidentally.
+
+[[bin]]
+name = "sga-capabilities-export-ios"
+path = "src/bin/sga_capabilities_export.rs"

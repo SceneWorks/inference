@@ -1109,8 +1109,9 @@ impl Flux2RequestBinding {
                 frames: request.frames.unwrap_or(1),
                 reference_count: request.image_reference_count(),
             },
-            use_pid: request.use_pid,
+            use_pid: request.use_pid(),
             has_phases: request
+                .features
                 .phases
                 .as_ref()
                 .is_some_and(|phases| !phases.is_empty()),
@@ -1392,13 +1393,14 @@ impl Flux2MemoryScope {
 impl MemoryRequestScope for Flux2MemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.active()?;
-        if request.use_pid != self.use_pid
+        if request.use_pid() != self.use_pid
             || request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count != self.geometry.batch
             || request.image_reference_count() != self.geometry.reference_count
             || request.frames.unwrap_or(1) != self.geometry.frames
             || request
+                .features
                 .phases
                 .as_ref()
                 .is_some_and(|phases| !phases.is_empty())

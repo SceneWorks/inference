@@ -181,20 +181,44 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &["flux1_dev", "t5_v1_1_xxl"],
     },
     ProviderComponents {
+        provider_id: "flux1_dev_control",
+        components: &[
+            "flux1_dev",
+            "t5_v1_1_xxl",
+            "flux1_dev_controlnet_union_pro_2_0",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "flux1_dev_ip_adapter",
+        components: &["flux1_dev", "t5_v1_1_xxl", "xlabs_flux_ip_adapter"],
+    },
+    ProviderComponents {
         provider_id: "flux1_schnell",
         components: &["flux1_schnell", "t5_v1_1_xxl"],
     },
+    ProviderComponents {
+        provider_id: "flux1_schnell_ip_adapter",
+        components: &["flux1_schnell", "t5_v1_1_xxl", "xlabs_flux_ip_adapter"],
+    },
     // --- flux2 (FLUX.2) ---------------------------------------------------------------------
-    // Candle registers two of MLX's six; edit and control are bespoke and unregistered. The
-    // 32-channel VAE ships inside each FLUX.2 snapshot and rides its row. The Qwen3 tower is a
-    // pinned hole; dev's native enhancement route additionally loads the Mistral3 language tower,
-    // Pixtral vision tower, and multimodal projector, all explicitly pinned as unresolved holes.
     ProviderComponents {
         provider_id: "flux2_dev",
         components: &["flux2_dev"],
     },
     ProviderComponents {
+        provider_id: "flux2_dev_control",
+        components: &["flux2_dev"],
+    },
+    ProviderComponents {
+        provider_id: "flux2_dev_edit",
+        components: &["flux2_dev"],
+    },
+    ProviderComponents {
         provider_id: "flux2_klein_9b",
+        components: &["flux2_klein_9b"],
+    },
+    ProviderComponents {
+        provider_id: "flux2_klein_9b_edit",
         components: &["flux2_klein_9b"],
     },
     // --- flux3 -------------------------------------------------------------------------------
@@ -232,6 +256,17 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "ideogram_4_turbo",
         components: &["ideogram_4_fp8", "ideogram_4_turbotime_lora"],
     },
+    // --- instantid --------------------------------------------------------------------------
+    ProviderComponents {
+        provider_id: "instantid",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+            "instantid",
+        ],
+    },
     // --- iris -------------------------------------------------------------------------------
     // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
     // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
@@ -260,6 +295,14 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "kolors",
         components: &["chatglm3_6b"],
+    },
+    ProviderComponents {
+        provider_id: "kolors_control",
+        components: &["chatglm3_6b"],
+    },
+    ProviderComponents {
+        provider_id: "kolors_ip_adapter",
+        components: &["chatglm3_6b", "kolors_ip_adapter_plus"],
     },
     // --- krea -------------------------------------------------------------------------------
     // The VAE is `Qwen/Qwen-Image` by the Krea `vae/config.json`'s own `_name_or_path`.
@@ -352,10 +395,18 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "moss_image_sft",
         components: &["moss_image_sft"],
     },
+    // --- pulid ------------------------------------------------------------------------------
+    ProviderComponents {
+        provider_id: "pulid_flux",
+        components: &[
+            "flux1_dev",
+            "t5_v1_1_xxl",
+            "pulid",
+            "eva_clip",
+            "facexlib_parsing_bisenet",
+        ],
+    },
     // --- qwen-image -------------------------------------------------------------------------
-    // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
-    // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
-    // built in-house.
     ProviderComponents {
         provider_id: "qwen_image",
         components: &["qwen_image"],
@@ -376,6 +427,26 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "qwen_image_2_1_turbo",
         components: &["qwen_image_2_1_turbo"],
+    },
+    ProviderComponents {
+        provider_id: "qwen_image_control",
+        components: &["qwen_image_2512", "qwen_image_2512_fun_controlnet_union"],
+    },
+    ProviderComponents {
+        provider_id: "qwen_image_edit",
+        components: &["qwen_image_edit"],
+    },
+    ProviderComponents {
+        provider_id: "qwen_image_edit_2509",
+        components: &["qwen_image_edit"],
+    },
+    ProviderComponents {
+        provider_id: "qwen_image_edit_2511",
+        components: &["qwen_image_edit"],
+    },
+    ProviderComponents {
+        provider_id: "qwen_image_edit_2511_lightning",
+        components: &["qwen_image_edit", "qwen_image_edit_2511_lightning"],
     },
     // --- sana -------------------------------------------------------------------------------
     // Each SANA repository ships its own DC-AE autoencoder, so the VAE rides the DiT row; the
@@ -434,6 +505,43 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "realvisxl_v5_0",
             "sdxl_vae_fp16_fix",
             "clip_vit_bigg_14_laion2b",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "sdxl_control",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "sdxl_detail",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "sdxl_edit",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "sdxl_ip_adapter",
+        components: &[
+            "stable_diffusion_xl_base_1_0",
+            "realvisxl_v5_0",
+            "sdxl_vae_fp16_fix",
+            "clip_vit_bigg_14_laion2b",
+            "ip_adapter",
         ],
     },
     // --- seedvr2 ----------------------------------------------------------------------------
@@ -511,8 +619,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &["z_image"],
     },
     ProviderComponents {
+        provider_id: "z_image_control",
+        components: &["z_image", "z_image_fun_controlnet_union_2_1"],
+    },
+    ProviderComponents {
         provider_id: "z_image_turbo",
         components: &["z_image_turbo"],
+    },
+    ProviderComponents {
+        provider_id: "z_image_turbo_control",
+        components: &["z_image_turbo", "z_image_turbo_fun_controlnet_union_2_1"],
     },
 ];
 
@@ -639,7 +755,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 62);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 83);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -671,13 +787,10 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            72,
-            "72 distinct Candle provider ids: 65 generators (qwen_image_2_1_turbo joined in \
-             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323, \
-             supra2_img in sc-24214, krea_2_turbo_control with the Candle Krea pose route, minimax_h3_image in SW-7091) + 20 trainers (16 of them also \
-             generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
-             transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
-             1 transform (iris_3b_restore, sc-25683)"
+            93,
+            "93 distinct Candle provider ids: 86 generators (including SW-6982 bespoke & Qwen Edit \
+             registrations) + 20 trainers (16 also generator ids) + 1 captioner + 2 embedders + \
+             1 transform (iris_3b_restore)"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
@@ -746,7 +859,10 @@ mod tests {
                 &["boogu_qwen3_vl_8b", "boogu_flux1_vae"],
             ),
             ("flux1_dev", &["clip_vit_large_patch14"]),
+            ("flux1_dev_control", &["clip_vit_large_patch14"]),
+            ("flux1_dev_ip_adapter", &["clip_vit_large_patch14"]),
             ("flux1_schnell", &["clip_vit_large_patch14"]),
+            ("flux1_schnell_ip_adapter", &["clip_vit_large_patch14"]),
             (
                 "flux2_dev",
                 &[
@@ -755,11 +871,42 @@ mod tests {
                     "flux2_dev_multimodal_projector",
                 ],
             ),
+            (
+                "flux2_dev_control",
+                &[
+                    "flux2_dev_mistral3_tower",
+                    "flux2_dev_pixtral_vision_tower",
+                    "flux2_dev_multimodal_projector",
+                    "flux2_dev_fun_controlnet_union",
+                ],
+            ),
+            (
+                "flux2_dev_edit",
+                &[
+                    "flux2_dev_mistral3_tower",
+                    "flux2_dev_pixtral_vision_tower",
+                    "flux2_dev_multimodal_projector",
+                ],
+            ),
             ("flux2_klein_9b", &["flux2_klein_qwen3_text_encoder"]),
+            ("flux2_klein_9b_edit", &["flux2_klein_qwen3_text_encoder"]),
             ("ideogram_4", &["ideogram_qwen3_vl_8b"]),
             ("ideogram_4_turbo", &["ideogram_qwen3_vl_8b"]),
+            ("instantid", &["clip_vit_large_patch14"]),
             (
                 "kolors",
+                &["kolors_diffusers", "sceneworks_kolors_chatglm3_tokenizer"],
+            ),
+            (
+                "kolors_control",
+                &[
+                    "kolors_diffusers",
+                    "sceneworks_kolors_chatglm3_tokenizer",
+                    "kolors_controlnet_pose",
+                ],
+            ),
+            (
+                "kolors_ip_adapter",
                 &["kolors_diffusers", "sceneworks_kolors_chatglm3_tokenizer"],
             ),
             ("krea_2_control", &["krea_qwen3_vl_4b"]),
@@ -775,7 +922,20 @@ mod tests {
             // would make the two disclosures differ for identical evidence.
             ("lens", &["microsoft_lens", "lens_transformer"]),
             ("lens_turbo", &["microsoft_lens_turbo", "lens_transformer"]),
+            (
+                "pulid_flux",
+                &[
+                    "antelopev2_arcface_glintr100",
+                    "antelopev2_scrfd_10g",
+                    "clip_vit_large_patch14",
+                ],
+            ),
             ("qwen_image", &["qwen_image_qwen2_5_vl"]),
+            ("qwen_image_control", &["qwen_image_qwen2_5_vl"]),
+            ("qwen_image_edit", &["qwen_image_qwen2_5_vl"]),
+            ("qwen_image_edit_2509", &["qwen_image_qwen2_5_vl"]),
+            ("qwen_image_edit_2511", &["qwen_image_qwen2_5_vl"]),
+            ("qwen_image_edit_2511_lightning", &["qwen_image_qwen2_5_vl"]),
             // All three bundled auxiliaries stay holes; the module doc's "Reusing a module is not
             // provenance" section is why this id is short where `bernini` and `wan_vace` are not.
             (
@@ -792,11 +952,17 @@ mod tests {
                 &["stable_diffusion_3_5_medium", "clip_vit_large_patch14"],
             ),
             ("sdxl", &["clip_vit_large_patch14"]),
+            ("sdxl_control", &["clip_vit_large_patch14"]),
+            ("sdxl_detail", &["clip_vit_large_patch14"]),
+            ("sdxl_edit", &["clip_vit_large_patch14"]),
+            ("sdxl_ip_adapter", &["clip_vit_large_patch14"]),
             ("z_image", &["z_image_qwen3_text_encoder"]),
+            ("z_image_control", &["z_image_qwen3_text_encoder"]),
             ("z_image_turbo", &["z_image_qwen3_text_encoder"]),
+            ("z_image_turbo_control", &["z_image_qwen3_text_encoder"]),
         ];
 
-        assert_eq!(INCOMPLETE.len(), 29);
+        assert_eq!(INCOMPLETE.len(), 50);
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         for (id, missing) in INCOMPLETE {
             assert!(
@@ -905,36 +1071,20 @@ mod tests {
         let pinned_elsewhere: BTreeSet<&str> = BTreeSet::from([
             // MLX-registered generator ids with no Candle sibling.
             "flux2_klein_9b_kv",
-            "z_image_fun_controlnet_union_2_1",
-            "z_image_turbo_fun_controlnet_union_2_1",
-            "qwen_image_2512",
-            "qwen_image_2512_fun_controlnet_union",
-            "qwen_image_edit",
-            "flux1_dev_controlnet_union_pro_2_0",
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
-            // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
-            // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
-            // rows are unreached here as well.
-            "pulid",
-            "eva_clip",
-            "facexlib_parsing_bisenet",
+            // Utility/overlay crates that register no media generator id on this backend.
             "nvidia_pid_students",
             "sam3",
             "sam2_1_hiera_base_plus",
             "sam2_1_hiera_large",
-            "instantid",
             "controlnet_openpose_sdxl_1_0",
             // Caller-selected add-ons, deliberately out of scope for a list with no optionality.
             "anima_official_loras",
             "moss_image_sft_8_steps_dmd",
             "hyper_sd_flux1_dev_8steps_lora",
-            "ip_adapter",
-            "kolors_ip_adapter_plus",
             "qwen_image_lightning",
-            "qwen_image_edit_2511_lightning",
-            "xlabs_flux_ip_adapter",
             // The MiniMax-H3-Image prompt expander runs on the LLM lane (SW-7099), not as a media
             // provider id.
             "minimax_h3_image_pe",

@@ -65,8 +65,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -385,7 +385,7 @@ fn validate_request_for_variant(variant: Variant, req: &GenerationRequest) -> ge
         )));
     }
     pipeline::resolve_reference(req)?;
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
         let executed_steps = sigmas[start_step..].len().saturating_sub(1);
         low_res.resolve_for_descriptor(&descriptor, req, executed_steps, SIZE_MULTIPLE)?;
@@ -494,54 +494,152 @@ pub fn descriptor_medium() -> ModelDescriptor {
 /// advertises neither — so the shared `validate_request` rejects guidance/negative on Turbo (the
 /// distilled-model honesty the Z-Image provider uses), keeping the worker from promising a path
 /// `generate` ignores.
-pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    let (id, cfg) = match variant {
-        Variant::Large => (MODEL_ID, true),
-        Variant::Medium => (MODEL_ID_MEDIUM, true),
-        Variant::LargeTurbo => (MODEL_ID_TURBO, true),
+/// Primary typed route declaration for a Candle SD3.5 variant (`REG-1`, `AP5`).
+pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
+    let (id, cfg, dit_id, bindings) = match variant {
+        Variant::Large => (
+            MODEL_ID,
+            true,
+            "sd3_5_large_mmdit",
+            gen_core::RouteBindings::generator(descriptor, load)
+                .with_render_plan(|spec, req| compile_variant_plan(Variant::Large, spec, req))
+                .with_memory_registration(LARGE_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    large_weights_free_contract,
+                )
+                .with_memory_surface_resolver(large_surface_contract)
+                .with_memory_behavior_registration(LARGE_MEMORY_BEHAVIOR),
+        ),
+        Variant::LargeTurbo => (
+            MODEL_ID_TURBO,
+            true,
+            "sd3_5_large_turbo_mmdit",
+            gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+                .with_render_plan(|spec, req| compile_variant_plan(Variant::LargeTurbo, spec, req))
+                .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    turbo_weights_free_contract,
+                )
+                .with_memory_surface_resolver(turbo_surface_contract)
+                .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR),
+        ),
+        Variant::Medium => (
+            MODEL_ID_MEDIUM,
+            true,
+            "sd3_5_medium_mmdit_x",
+            gen_core::RouteBindings::generator(descriptor_medium, load_medium)
+                .with_render_plan(|spec, req| compile_variant_plan(Variant::Medium, spec, req))
+                .with_memory_registration(MEDIUM_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    medium_weights_free_contract,
+                )
+                .with_memory_surface_resolver(medium_surface_contract)
+                .with_memory_behavior_registration(MEDIUM_MEMORY_BEHAVIOR),
+        ),
     };
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SD3_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id,
+    gen_core::RouteRecord {
+        route_id: id,
         family: "stable-diffusion-3",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Large uses classifier-free guidance with a negative prompt; Turbo is guidance-distilled
-            // (no CFG, no negative branch).
-            supports_negative_prompt: cfg,
-            supports_guidance: cfg,
-            // img2img reference-guided latent-init (sc-11784): a single `Conditioning::Reference` seeds
-            // the denoise from the VAE-encoded reference (`render` + `encode_reference`) — real CFG
-            // (Large/Medium) or the distilled loop (Turbo) over the reduced `start_step..` σ tail. NOT
-            // `MultiReference` (single init image); control / IP-adapter overlays stay refused at load.
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr merged into the MMDiT at load (sc-7881) — kohya `lora_sd3` (fused QKV) +
-            // diffusers-named adapters, folded into the dense weights then quantized.
-            supports_lora: true,
-            supports_lokr: true,
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
-            // VAE stay dense. All three variants share the quant path.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
-            // pipeline, so it does not require the loader to pre-shift.
-            requires_sigma_shift: false,
-            // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
-            // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
-            // for the lane enumeration and the reused epic-16624 16-channel fit.
-            supports_preview: true,
-            supports_low_res_start: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![
+                    gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                    gen_core::TextEncoderDeclaration::new("clip_bigg", Some(77)),
+                    gen_core::TextEncoderDeclaration::new("t5_xxl", Some(256)),
+                ],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: cfg,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                supports_guidance: cfg,
+                requires_sigma_shift: false,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new(dit_id).with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sd3_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::SD3_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["clip_l", "clip_bigg", "t5_xxl"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        [dit_id],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sd3_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps() as u32),
+            guidance: Some(variant.default_cfg()),
+            sampler: Some("euler"),
+            shift: Some(variant.shift()),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// SD3.5 descriptor for `variant` — computed from `route_for`.
+pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 /// Construct the candle SD3.5 **Large** generator from a [`LoadSpec`]. `spec.weights` must be a
@@ -629,43 +727,18 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     }))
 }
 
-// Link-time self-registration into gen-core's model registry — both the Large and Turbo ids.
-candle_gen::register_generators! {
-    pub(crate) const LARGE_REGISTRATION = descriptor => load
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-candle_gen::register_generators! {
-    pub(crate) const MEDIUM_REGISTRATION = descriptor_medium => load_medium
-}
-
-/// Add all Candle SD3 providers to an explicit media registry builder.
+/// Add all Candle SD3 providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(LARGE_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: |spec, req| compile_variant_plan(Variant::Large, spec, req),
-        })
-        .register_generator(TURBO_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID_TURBO,
-            compile: |spec, req| compile_variant_plan(Variant::LargeTurbo, spec, req),
-        })
-        .register_generator(MEDIUM_REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID_MEDIUM,
-            compile: |spec, req| compile_variant_plan(Variant::Medium, spec, req),
-        })
+    registry
+        .register_route(route_for(Variant::Large))
+        .register_route(route_for(Variant::LargeTurbo))
+        .register_route(route_for(Variant::Medium))
         .register_trainer(training::LARGE_TRAINER_REGISTRATION)
-        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION);
-    register_memory_contract_surfaces(registry)
-        .register_memory_behavior(LARGE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_behavior(MEDIUM_MEMORY_BEHAVIOR)
+        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
 }
 
 macro_rules! memory_surface {
@@ -1137,7 +1210,10 @@ mod tests {
                     height: 768,
                     steps: Some(steps as u32),
                     seed: Some(1234),
-                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    features: candle_gen::gen_core::FeatureParams {
+                        low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if via_source_image {

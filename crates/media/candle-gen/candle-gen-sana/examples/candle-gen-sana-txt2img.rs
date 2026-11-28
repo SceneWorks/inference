@@ -106,8 +106,8 @@ fn main() -> Result<()> {
         count,
         seed: Some(seed),
         steps,
-        sampler,
-        scheduler,
+        sampler: sampler.map(Into::into),
+        scheduler: scheduler.map(Into::into),
         ..Default::default()
     };
 

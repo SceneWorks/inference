@@ -305,7 +305,7 @@ fn vace_extend_request() -> GenerationRequest {
         guidance: Some(5.0),
         frames: Some(45),
         fps: Some(16),
-        video_mode: Some("extend_clip".to_owned()),
+        video_mode: Some("extend_clip".into()),
         control_scale: Some(1.0),
         conditioning: vec![Conditioning::ControlClip {
             frames: vec![image.clone(); 45],
@@ -330,7 +330,7 @@ fn ti2v_extend_request() -> GenerationRequest {
         guidance: Some(5.0),
         frames: Some(61),
         fps: Some(16),
-        video_mode: Some("extend_clip".to_owned()),
+        video_mode: Some("extend_clip".into()),
         conditioning: vec![Conditioning::Keyframe {
             image: Image {
                 width: 832,
@@ -347,7 +347,7 @@ fn ti2v_extend_request() -> GenerationRequest {
 fn bridge_keyframes_request() -> GenerationRequest {
     let mut request = ti2v_extend_request();
     request.prompt = "bridge the two clip boundaries".to_owned();
-    request.video_mode = Some("video_bridge".to_owned());
+    request.video_mode = Some("video_bridge".into());
     request.conditioning = vec![
         Conditioning::Keyframe {
             image: Image {
@@ -374,7 +374,7 @@ fn bridge_keyframes_request() -> GenerationRequest {
 fn vace_bridge_request() -> GenerationRequest {
     let mut request = vace_extend_request();
     request.prompt = "bridge the two source clips through a neutral gap".to_owned();
-    request.video_mode = Some("video_bridge".to_owned());
+    request.video_mode = Some("video_bridge".into());
     if let Conditioning::ControlClip { frames, mask, .. } = &mut request.conditioning[0] {
         frames[..1].fill(Image {
             width: 832,
@@ -450,7 +450,7 @@ fn replace_person_request(references: usize, mode: gen_core::ReplacementMode) ->
         guidance: Some(5.0),
         frames: Some(45),
         fps: Some(16),
-        video_mode: Some(format!("replace_person@{}", "a".repeat(64))),
+        video_mode: Some(format!("replace_person@{}", "a".repeat(64)).into()),
         control_scale: Some(0.75),
         conditioning,
         ..Default::default()
@@ -569,7 +569,7 @@ fn replace_person_receipt_rejects_crossed_public_and_physical_identity() {
         request_evidence_revision(&prepared, &request).unwrap(),
         receipt
     );
-    request.video_mode = Some(format!("replace_person@{}", "b".repeat(64)));
+    request.video_mode = Some(format!("replace_person@{}", "b".repeat(64)).into());
     assert_ne!(
         request_evidence_revision(&prepared, &request).unwrap(),
         receipt
@@ -1437,7 +1437,7 @@ fn request(route: WanI2vRoute) -> GenerationRequest {
             guidance,
             frames: Some(frames),
             fps: Some(fps),
-            video_mode: Some("text_to_video".to_owned()),
+            video_mode: Some("text_to_video".into()),
             conditioning: Vec::new(),
             ..Default::default()
         };
@@ -1452,7 +1452,7 @@ fn request(route: WanI2vRoute) -> GenerationRequest {
         guidance,
         frames: Some(frames),
         fps: Some(fps),
-        video_mode: Some("image_to_video".to_owned()),
+        video_mode: Some("image_to_video".into()),
         conditioning: vec![Conditioning::Reference {
             image: Image {
                 width: 16,
@@ -1480,7 +1480,7 @@ fn flf_request(backend: WanI2vBackend) -> GenerationRequest {
         seed: Some(23),
         steps: Some(20),
         guidance: Some(5.0),
-        sampler: (backend == WanI2vBackend::Mlx).then(|| "dpmpp_2m".to_owned()),
+        sampler: (backend == WanI2vBackend::Mlx).then(|| "dpmpp_2m".into()),
         frames: Some(117),
         fps: Some(24),
         video_mode: None,
@@ -1765,7 +1765,7 @@ fn first_last_frame_receipt_binds_roles_indices_strengths_shapes_and_mode() {
     }
     assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
     let mut changed = request.clone();
-    changed.video_mode = Some("image_to_video".to_owned());
+    changed.video_mode = Some("image_to_video".into());
     assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
     let mut changed = request.clone();
     changed.frames = Some(121);
@@ -1823,17 +1823,17 @@ fn first_last_frame_sampler_set_is_backend_truthful() {
                 .unwrap();
         for sampler in [None, Some("uni_pc"), Some("euler")] {
             let mut request = flf_request(backend);
-            request.sampler = sampler.map(str::to_owned);
+            request.sampler = sampler.map(Into::into);
             assert!(validate_request(&prepared, &request).is_ok());
         }
         let mut dpm = flf_request(backend);
-        dpm.sampler = Some("dpmpp_2m".to_owned());
+        dpm.sampler = Some("dpmpp_2m".into());
         assert_eq!(
             validate_request(&prepared, &dpm).is_ok(),
             backend == WanI2vBackend::Mlx
         );
         let mut broad = flf_request(backend);
-        broad.sampler = Some("heun".to_owned());
+        broad.sampler = Some("heun".into());
         assert!(validate_request(&prepared, &broad).is_err());
     }
 }
@@ -2050,7 +2050,7 @@ fn the_unmatched_carrier_refusal_enumerates_every_public_wan_mode() {
     let (_tmp, spec) = vace_fixture(WanI2vBackend::Candle, None);
     let prepared = PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, "wan_vace").unwrap();
     let mut request = vace_extend_request();
-    request.video_mode = Some("not_a_wan_mode".to_owned());
+    request.video_mode = Some("not_a_wan_mode".into());
     let error = validate_request(&prepared, &request)
         .unwrap_err()
         .to_string();

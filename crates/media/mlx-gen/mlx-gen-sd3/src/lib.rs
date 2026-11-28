@@ -115,42 +115,9 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::LARGE_REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: |spec, req| model::compile_base(Sd3Variant::Large, spec, req),
-        })
-        .register_memory_strategy(model::LARGE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_contract(MODEL_ID, spec),
-        })
-        .register_memory_behavior(model::LARGE_MEMORY_BEHAVIOR)
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: TURBO_MODEL_ID,
-            compile: |spec, req| model::compile_base(Sd3Variant::LargeTurbo, spec, req),
-        })
-        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: TURBO_MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_contract(TURBO_MODEL_ID, spec),
-        })
-        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
-        .register_generator(model::MEDIUM_REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: MEDIUM_MODEL_ID,
-            compile: |spec, req| model::compile_base(Sd3Variant::Medium, spec, req),
-        })
-        .register_memory_strategy(model::MEDIUM_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MEDIUM_MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_contract(MEDIUM_MODEL_ID, spec),
-        })
-        .register_memory_behavior(model::MEDIUM_MEMORY_BEHAVIOR)
+        .register_route(model::route_large())
+        .register_route(model::route_turbo())
+        .register_route(model::route_medium())
         .register_trainer(training::LARGE_TRAINER_REGISTRATION)
         .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
 }
@@ -331,7 +298,10 @@ mod explicit_registry_tests {
                     height: 768,
                     steps: Some(steps as u32),
                     seed: Some(1234),
-                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    features: mlx_gen::gen_core::FeatureParams {
+                        low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if via_source_image {

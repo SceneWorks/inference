@@ -162,32 +162,12 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_render_plan(model::RENDER_PLAN_REGISTRATION)
+        .register_route(model::route_base())
         // The text-to-image LoRA/LoKr trainer (sc-24159), under the generator's own id.
         .register_trainer(training::TRAINER_REGISTRATION)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
-            },
-        })
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
         // The distilled Turbo checkpoint (sc-25900): the same generator and memory contract under
         // its own id. No trainer — training stays on the base checkpoint.
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_render_plan(model::TURBO_RENDER_PLAN_REGISTRATION)
-        .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model::TURBO_MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model::TURBO_MODEL_ID, spec)
-            },
-        })
-        .register_memory_behavior(memory_strategy::TURBO_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_route(model::route_turbo())
 }
 
 /// Build the complete explicit MLX Qwen-Image 2.1 provider catalog.

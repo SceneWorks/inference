@@ -197,7 +197,7 @@ fn z_pid_pricing_token(
     request: &GenerationRequest,
     flow_token: &str,
 ) -> Result<String> {
-    if !z_pid_provider(provider) || !request.use_pid {
+    if !z_pid_provider(provider) || !request.use_pid() {
         return Ok(flow_token.to_owned());
     }
     // The ACTUAL request's original UTF-8 bytes; never chars/tokens, a synthetic caption,
@@ -936,7 +936,10 @@ mod z_pid_work_token_tests {
     fn request(prompt: &str, use_pid: bool) -> GenerationRequest {
         GenerationRequest {
             prompt: prompt.into(),
-            use_pid,
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: use_pid.then(mlx_gen::gen_core::PidParams::enabled),
+                ..Default::default()
+            },
             steps: Some(4),
             ..Default::default()
         }

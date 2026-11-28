@@ -746,16 +746,21 @@ pub fn assert_recoverable_case(
         steps: Some(2),
         guidance: Some(1.),
         seed: Some(173),
-        moss_image: Some(gen_core::moss_image::MossImageOptions {
-            max_sequence_length: 32,
-            uncond_skip_layers: Some(Vec::new()),
+        extensions: gen_core::FamilyExtensions {
+            moss_image: Some(gen_core::MossImageExtension::from_options(
+                gen_core::moss_image::MossImageOptions {
+                    max_sequence_length: 32,
+                    uncond_skip_layers: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
-    let generated = model.generate(&request, &mut |_| {})?;
-    match generated {
-        gen_core::GenerationOutput::Images(images) => {
+    let report = model.generate_with_report(&request, &mut |_| {})?;
+    match &report.output {
+        Some(gen_core::GenerationOutput::Images(images)) => {
             assert_eq!(images.len(), 1);
             assert_eq!((images[0].width, images[0].height), (32, 32));
             assert_eq!(images[0].pixels.len(), 32 * 32 * 3);
@@ -763,11 +768,11 @@ pub fn assert_recoverable_case(
         _ => panic!("real generator returned no image"),
     }
     assert!(
-        model.moss_image_execution_report().is_none(),
+        report.moss_image_report().is_none(),
         "synthetic source must never masquerade as a sealed published-author execution receipt"
     );
     assert!(
-        !model.adapter_apply_reports().is_empty(),
+        !report.adapter_apply_reports.is_empty(),
         "saved adapter must actually install on the real generator"
     );
     data.verify()?;

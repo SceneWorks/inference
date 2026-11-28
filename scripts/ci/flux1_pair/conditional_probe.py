@@ -7,7 +7,7 @@ from scripts.ci.flux1_pair import conditional, fixture, overlay
 HERE = Path(__file__).resolve().parent
 
 
-def mlx_setup(case):
+def mlx_setup(case, arm="head"):
     variant = conditional.variant(case)
     common = '''use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
     let mut spec = LoadSpec::new(WeightsSource::Dir(root));
@@ -47,14 +47,22 @@ def mlx_setup(case):
     request.true_cfg = Some(2.0);
     request.negative_prompt = Some("blurred".into());'''
         if case == "pulid-delayed":
-            route += "\n    request.timestep_to_start_cfg = Some(2);"
+            if arm == "base":
+                route += "\n    request.timestep_to_start_cfg = Some(2);"
+            else:
+                route += "\n    request.extensions.pulid = Some(mlx_gen::gen_core::PulidExtension { timestep_to_start_cfg: Some(2) });"
         if case == "pulid-pid":
-            route += '''
+            pid_line = (
+                "    request.use_pid = true;"
+                if arm == "base"
+                else "    request.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());"
+            )
+            route += f'''
     spec = spec.with_pid(
         WeightsSource::File(assets.join("pid_decoder.safetensors")),
         WeightsSource::Dir(PathBuf::from(env::var("PAIR_PID_GEMMA")?)),
     );
-    request.use_pid = true;'''
+{pid_line}'''
         model = "pulid_flux"
     guidance = "Some(3.5)" if variant == "dev" else "None"
     return (common.replace("@GUIDANCE@", guidance).replace("@MODEL@", f'"{model}"')
@@ -204,7 +212,7 @@ def cuda_proof():
 def generate_source(backend, arm, case, tier="tier1"):
     template = (HERE / "conditional_probe.rs.in").read_text(encoding="utf-8")
     mlx = backend == "mlx"
-    setup = mlx_setup(case) if mlx else candle_setup(case)
+    setup = mlx_setup(case, arm) if mlx else candle_setup(case)
     if mlx:
         setup = setup.replace("@REGISTRY@", "mlx_gen_pulid" if case.startswith("pulid-") else "mlx_gen_flux")
     cuda = "" if mlx else cuda_proof()

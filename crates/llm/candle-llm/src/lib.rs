@@ -115,6 +115,20 @@ pub fn cuda_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
     register_cuda_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
 }
 
+/// Build the hardware-free descriptor-only CUDA text-LLM registry (`SW-6980`, `REG-3`).
+///
+/// Produces the exact descriptor surface of [`cuda_text_registry`] under `--features cuda`
+/// (including `candle-starvector-8b` and `CandleCuda` speculative defaults on `candle-llama`)
+/// without requiring the NVIDIA CUDA toolkit.
+pub fn cuda_descriptor_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    core_llm::TextLlmRegistryBuilder::new()
+        .register(provider::CUDA_DESCRIPTOR_REGISTRATION)
+        .register(llava::REGISTRATION)
+        .register(starvector::REGISTRATION)
+        .register(starvector_8b::REGISTRATION)
+        .build()
+}
+
 /// Build the explicit local registry, including capabilities still fail-closed from shipping.
 pub fn local_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
     register_local_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()

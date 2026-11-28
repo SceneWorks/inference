@@ -120,7 +120,7 @@ fn malformed_veda_controls_fail_at_native_request_boundary() {
             mlx_gen::gen_core::VedaBudget::SparsityPercent(100.0),
         ] {
             let mut request = request(1344, 768);
-            request.veda = Some(mlx_gen::gen_core::VedaRequest {
+            request.extensions.h3_mut().veda = Some(mlx_gen::gen_core::VedaRequest {
                 enabled,
                 generated: bad,
                 ..Default::default()
@@ -133,7 +133,7 @@ fn malformed_veda_controls_fail_at_native_request_boundary() {
         for steps in [4, 8, 50] {
             let mut request = request(1344, 768);
             request.steps = Some(steps);
-            request.veda = Some(mlx_gen::gen_core::VedaRequest {
+            request.extensions.h3_mut().veda = Some(mlx_gen::gen_core::VedaRequest {
                 enabled,
                 full_attention_steps: vec![steps as usize],
                 ..Default::default()
@@ -142,13 +142,31 @@ fn malformed_veda_controls_fail_at_native_request_boundary() {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("zero-based index"), "{error}");
-            request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
-            request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+            request
+                .extensions
+                .h3_mut()
+                .veda
+                .as_mut()
+                .unwrap()
+                .full_attention_steps = vec![steps as usize - 1];
+            request
+                .extensions
+                .h3_mut()
+                .veda
+                .as_mut()
+                .unwrap()
+                .full_attention_layers = vec![50];
             assert!(validate_request(&descriptor().capabilities, &request)
                 .unwrap_err()
                 .to_string()
                 .contains("full_attention_layers"));
-            request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+            request
+                .extensions
+                .h3_mut()
+                .veda
+                .as_mut()
+                .unwrap()
+                .full_attention_layers = vec![49];
             validate_request(&descriptor().capabilities, &request).unwrap();
         }
     }
@@ -1064,7 +1082,13 @@ fn validate_refuses_a_reference_image_short_edge_outside_1024_to_2048() {
     let caps = descriptor().capabilities;
     let with = |edge: u32| GenerationRequest {
         frames: Some(124),
-        reference_image_short_edge: Some(edge),
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            h3: Some(mlx_gen::gen_core::H3Extension {
+                reference_image_short_edge: Some(edge),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..request(576, 320)
     };
 

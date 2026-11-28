@@ -151,7 +151,7 @@ impl Fixture {
                 },
                 &mut |_| {},
             )?;
-            let reports = model.adapter_apply_reports();
+            let reports = model.last_adapter_apply_reports();
             match output {
                 MossImageAdvancedOutput::Latents { values, shape } => Ok((values, shape, reports)),
                 _ => Err(gen_core::Error::Msg(
@@ -219,62 +219,35 @@ impl Generator for CpuGenerator {
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         with_cpu(|| self.0.generate_with_execution_report(req, progress))
     }
-    fn generate_moss_image_edit(
+    fn request_memory_peak(
         &self,
         req: &gen_core::GenerationRequest,
-        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(gen_core::Progress),
-    ) -> gen_core::Result<MossImageAdvancedOutput> {
-        with_cpu(|| self.0.generate_moss_image_edit(req, inputs, progress))
+    ) -> gen_core::Result<Option<u64>> {
+        with_cpu(|| self.0.request_memory_peak(req))
     }
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        req: &gen_core::GenerationRequest,
-        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(gen_core::Progress),
-    ) -> gen_core::Result<gen_core::generator::CompletedMossImageEdit> {
-        with_cpu(|| {
-            self.0
-                .generate_moss_image_edit_with_execution_report(req, inputs, progress)
-        })
-    }
-    fn moss_image_edit_request_peak(
-        &self,
-        req: &gen_core::GenerationRequest,
-        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
-    ) -> gen_core::Result<u64> {
-        with_cpu(|| self.0.moss_image_edit_request_peak(req, inputs))
-    }
-    fn moss_image_edit_execution_report(
-        &self,
-    ) -> Option<gen_core::moss_image_edit::MossImageEditExecutionReport> {
-        self.0.moss_image_edit_execution_report()
-    }
-    fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
-        self.0.moss_image_execution_report()
-    }
-    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        self.0.adapter_apply_reports()
+    fn retained_weight_bytes(&self) -> Option<u64> {
+        self.0.retained_weight_bytes()
     }
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         self.0.memory_strategy_contract()
     }
 }
 pub fn generation_request() -> gen_core::GenerationRequest {
-    gen_core::GenerationRequest {
+    let mut req = gen_core::GenerationRequest {
         prompt: "style landscape blue".into(),
         width: 32,
         height: 32,
         steps: Some(2),
         guidance: Some(1.),
         seed: Some(173),
-        moss_image: Some(MossImageOptions {
-            max_sequence_length: 32,
-            uncond_skip_layers: Some(Vec::new()),
-            ..Default::default()
-        }),
         ..Default::default()
-    }
+    };
+    req.extensions.moss_image_mut().options = Some(MossImageOptions {
+        max_sequence_length: 32,
+        uncond_skip_layers: Some(Vec::new()),
+        ..Default::default()
+    });
+    req
 }
 
 #[cfg(test)]

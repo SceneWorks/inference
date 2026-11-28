@@ -1767,7 +1767,7 @@ fn sampling_body() {
                     &["a red fox", "golden hour"]
                 };
                 let mut request = generation_request(prompts, memory);
-                request.sampler = sampler.map(str::to_owned);
+                request.sampler = sampler.map(Into::into);
                 request.steps = Some(steps);
                 request.guidance = Some(guidance);
                 request.cfg_interval = interval;

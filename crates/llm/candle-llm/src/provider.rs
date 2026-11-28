@@ -82,8 +82,9 @@ use chat_template::*;
 use constraint::*;
 use descriptor::*;
 pub use descriptor::{
-    can_load, can_load_audio, can_load_vision, eos_token_ids, provider_descriptor, MTP_MAX_DEPTH,
-    PROMPT_LOOKUP_MAX_DEPTH, REGISTRATION, SPECULATIVE_MAX_DEPTH,
+    can_load, can_load_audio, can_load_vision, cuda_provider_descriptor, eos_token_ids,
+    provider_descriptor, CUDA_DESCRIPTOR_REGISTRATION, MTP_MAX_DEPTH, PROMPT_LOOKUP_MAX_DEPTH,
+    REGISTRATION, SPECULATIVE_MAX_DEPTH,
 };
 #[cfg(test)]
 use generate::*;

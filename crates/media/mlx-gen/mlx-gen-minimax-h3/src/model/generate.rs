@@ -9,7 +9,12 @@ impl MiniMaxH3 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         *self.veda_report.borrow_mut() = mlx_gen::gen_core::VedaExecutionReport {
-            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            requested: req
+                .extensions
+                .h3
+                .as_ref()
+                .and_then(|h3| h3.veda.as_ref())
+                .is_some_and(|v| v.enabled),
             ..Default::default()
         };
         self.validate(req)?;
@@ -194,7 +199,13 @@ impl MiniMaxH3 {
                 req.cancel.clone(),
             )?,
         };
-        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+        if let Some(request) = req
+            .extensions
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.veda.as_ref())
+            .filter(|v| v.enabled)
+        {
             #[cfg(test)]
             if let Some(fixture) = &self.fixture {
                 if fixture.predictor {
@@ -233,9 +244,12 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let mut terminal_probe = req
-            .h3_terminal_telemetry
-            .then(gen_core_telemetry::Collector::default);
+        let h3_terminal_telemetry = req
+            .extensions
+            .h3
+            .as_ref()
+            .is_some_and(|h3| h3.terminal_telemetry);
+        let mut terminal_probe = h3_terminal_telemetry.then(gen_core_telemetry::Collector::default);
         let mut observe_step =
             |index, elapsed| {
                 if let Some(probe) = terminal_probe.as_mut() {
@@ -256,7 +270,7 @@ impl MiniMaxH3 {
             patch,
             &req.cancel,
             &mut on_step,
-            req.h3_terminal_telemetry
+            h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
         if let Some(probe) = terminal_probe {

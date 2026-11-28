@@ -212,11 +212,7 @@ pub fn register_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: model::compile_sdxl,
-        })
+        .register_route(model::route_sdxl())
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 mlx_gen::gen_core::CheckpointBackendBindingRegistration {
@@ -238,22 +234,6 @@ pub fn register_generator(
             ],
             ..mlx_gen::gen_core::SDXL_CHECKPOINT_ADAPTER
         })
-        .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
-        .register_memory_strategy(model::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: MODEL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX SDXL provider catalog.
@@ -383,7 +363,10 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("normal".into()),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -410,7 +393,10 @@ mod explicit_registry_tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let img_plan = registry
@@ -523,8 +509,12 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            use_pid: true,
-            pid_capture_sigma: Some(0.35),
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.35),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let pid_plan = registry

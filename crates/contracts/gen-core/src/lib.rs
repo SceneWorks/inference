@@ -76,6 +76,7 @@ pub mod encoder_contract;
 pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
+pub mod export;
 pub mod face;
 pub mod feature;
 pub use feature::{
@@ -140,6 +141,7 @@ pub use render::{
     RenderPlanRegistration, RenderRun, RenderStage,
 };
 pub mod residency;
+pub mod route;
 pub mod runtime;
 pub use load_activity::{
     LoadActivity, LoadActivityContext, LoadActivityFile, LoadActivityObserver, LoadActivityPhase,
@@ -154,6 +156,7 @@ pub mod tiling;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vector;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod w4a8_int8;
@@ -236,12 +239,17 @@ pub use generator::{
     reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
     ArtifactRecord, AudioArtifacts, AudioEditMode, AudioEditRef, AudioParams, Capabilities,
     CaptionOverflowPolicy, ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef,
-    ControlKind, ConversationRole, ConversationSession, ConversationTurn, GenerationMemory,
-    GenerationOutput, GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning,
-    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter,
-    PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover,
-    SongCoverMode, SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
-    StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
+    ControlKind, ConversationRole, ConversationSession, ConversationTurn, CoreRequest,
+    ExecutionReport, FamilyExecutionReport, FamilyExtension, FamilyExtensionKind, FamilyExtensions,
+    FeatureParams, Flux3Extension, GenerationMemory, GenerationOutput, GenerationPhase,
+    GenerationReport, GenerationRequest, GenerationWarning, Generator, GuidanceMethodId,
+    H3Extension, HdrRequest, KeyframeRef, KreaExtension, LtxExtension, Modality, ModelDescriptor,
+    MossImageExtension, OutputChannels, OutputLimiter, PhaseAdapter, PidParams,
+    PrecisionFloorComponent, PulidExtension, ReplacementMode, RequestWorkspaceBound, SavedPlan,
+    ScheduleId, SeedVr2Extension, SizeFloor, SolverId, SongCover, SongCoverMode, SongCoverVoice,
+    SongDecoder, SongParams, SongPlanning, SpeechSegment, StagedResidencyAvailability, StepSupport,
+    SvdExtension, TimeRegion, TokenSampling, VectorExtension, VectorFinishReason, VectorOutput,
+    VectorTerminalMetadata, VideoClipRef, VideoMode, WanExtension,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
@@ -345,6 +353,16 @@ pub use registry::{
     WAN_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
+pub use route::{
+    route_record_conformance_errors, verify_route_conformance, AdapterInstallPolicy,
+    AdapterSurface, AudioSurface, ConditioningSurface, FamilyDriverSpec, FamilyModelSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, PreviewSupport, ProductLimits,
+    RenderPlanCompiler, RenderPlanScope, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteFeatureBinding, RouteGeneratorBinding, RouteMemoryBindings,
+    RouteRecord, RouteStructure, SamplingSurface, SeedAndBatchSemantics, SeedScheme,
+    TextEncoderDeclaration, TextEncoderSurface, UpsamplerSurface, VideoSurface,
+    WeightPlanDeclaration, WeightSourceKind,
+};
 pub use runtime::{
     with_prompt_encoding, AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactDigestAttestation,
     ArtifactIdentityAttestation, ArtifactSeal, CancelFlag, FileStatFingerprint, HdrFrameSink,

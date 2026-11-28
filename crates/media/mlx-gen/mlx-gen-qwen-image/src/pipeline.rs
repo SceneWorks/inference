@@ -168,7 +168,7 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
             DEFAULT_GUIDANCE
         }),
         base_seed: req.seed.unwrap_or_else(default_seed),
-        sampler_name: req.sampler.clone(),
+        sampler_name: req.sampler.as_deref().map(str::to_owned),
         sigmas,
     })
 }

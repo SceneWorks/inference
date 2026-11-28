@@ -61,7 +61,24 @@ fn native_generation_or_cancel_with_actual_receipt() {
     // This test uses compatibility pin acquisition, then authenticates all exact contents in the
     // same production provider. Product prepared-token acceptance is tested independently.
     let model = MossImage::load(variant, &spec).unwrap();
-    let mut request=GenerationRequest{prompt:std::env::var("MOSS_NATIVE_TEST_PROMPT").unwrap_or_else(|_|"A red ceramic mug on a wooden table, soft window light, detailed studio photograph.".into()),width:std::env::var("MOSS_NATIVE_TEST_WIDTH").map(|v|v.parse().unwrap()).unwrap_or(512),height:std::env::var("MOSS_NATIVE_TEST_HEIGHT").map(|v|v.parse().unwrap()).unwrap_or(512),seed:Some(173),moss_image:Some(MossImageOptions{acceleration:mode,..Default::default()}),..Default::default()};
+    let mut request = GenerationRequest {
+        prompt: std::env::var("MOSS_NATIVE_TEST_PROMPT").unwrap_or_else(|_| {
+            "A red ceramic mug on a wooden table, soft window light, detailed studio photograph."
+                .into()
+        }),
+        width: std::env::var("MOSS_NATIVE_TEST_WIDTH")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(512),
+        height: std::env::var("MOSS_NATIVE_TEST_HEIGHT")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(512),
+        seed: Some(173),
+        ..Default::default()
+    };
+    request.extensions.moss_image_mut().options = Some(MossImageOptions {
+        acceleration: mode,
+        ..Default::default()
+    });
     if let Ok(steps) = std::env::var("MOSS_NATIVE_TEST_STEPS") {
         request.steps = Some(steps.parse().unwrap());
     }
@@ -79,13 +96,20 @@ fn native_generation_or_cancel_with_actual_receipt() {
             .into_iter()
             .enumerate()
         {
-            request.moss_image.as_mut().unwrap().acceleration = policy;
-            let result = model
-                .generate(&request, &mut |event| {
+            request
+                .extensions
+                .moss_image_mut()
+                .options
+                .as_mut()
+                .unwrap()
+                .acceleration = policy;
+            let gen_report = model
+                .generate_with_report(&request, &mut |event| {
                     eprintln!("transition {index}: {event:?}")
                 })
                 .unwrap();
-            let mlx_gen::GenerationOutput::Images(images) = result else {
+            let receipt = gen_report.moss_image_report().cloned().unwrap();
+            let Some(mlx_gen::GenerationOutput::Images(images)) = gen_report.output else {
                 panic!("expected native images")
             };
             let image = &images[0];
@@ -107,7 +131,6 @@ fn native_generation_or_cancel_with_actual_receipt() {
                 image::ColorType::Rgb8,
             )
             .unwrap();
-            let receipt = model.moss_image_execution_report().unwrap();
             assert_eq!(receipt.data().resolved.acceleration, policy);
             std::fs::write(
                 out.join(format!("transition-{index}.json")),
@@ -120,7 +143,7 @@ fn native_generation_or_cancel_with_actual_receipt() {
     let cancel_at = std::env::var("MOSS_NATIVE_TEST_CANCEL_AFTER_STEP")
         .ok()
         .map(|v| v.parse::<u32>().unwrap());
-    let result = model.generate(&request, &mut |event| {
+    let result = model.generate_with_report(&request, &mut |event| {
         eprintln!("MOSS progress {event:?}");
         if let (Some(limit), Progress::Step { current, .. }) = (cancel_at, event) {
             if current >= limit {
@@ -130,7 +153,7 @@ fn native_generation_or_cancel_with_actual_receipt() {
     });
     if cancel_at.is_some() {
         assert!(matches!(result, Err(mlx_gen::gen_core::Error::Canceled)));
-        assert!(model.moss_image_execution_report().is_none());
+        assert!(model.last_execution_report().is_none());
         std::fs::write(
             out.join("cancelled.json"),
             "{\"status\":\"typed_cancel_no_outputs_no_receipt\"}\n",
@@ -150,7 +173,7 @@ fn native_generation_or_cancel_with_actual_receipt() {
                 )
                 .unwrap();
             assert!(matches!(output, MossImageAdvancedOutput::Latents { .. }));
-            let receipt = model.moss_image_execution_report().unwrap();
+            let receipt = model.last_execution_report().unwrap();
             assert_eq!(receipt.data().output_kind, MossImageOutputKind::Latents);
             std::fs::write(
                 out.join("warm-reentry.json"),
@@ -160,7 +183,12 @@ fn native_generation_or_cancel_with_actual_receipt() {
         }
         return;
     }
-    let mlx_gen::GenerationOutput::Images(images) = result.unwrap() else {
+    let gen_report = result.unwrap();
+    let receipt = gen_report
+        .moss_image_report()
+        .cloned()
+        .expect("native execution must publish actual receipt");
+    let Some(mlx_gen::GenerationOutput::Images(images)) = gen_report.output else {
         panic!("expected actual images")
     };
     assert_eq!(images.len(), 1);
@@ -174,9 +202,6 @@ fn native_generation_or_cancel_with_actual_receipt() {
         )
         .unwrap();
     }
-    let receipt = model
-        .moss_image_execution_report()
-        .expect("native execution must publish actual receipt");
     assert_eq!(receipt.data().resolved.acceleration, mode);
     std::fs::write(
         out.join("execution.json"),
@@ -245,7 +270,7 @@ fn native_advanced_supplied_order_receipt() {
     assert_eq!(values.len(), 4 * stride);
     assert!(values.iter().all(|v| v.is_finite()));
     assert!(values.iter().any(|v| v.abs() > 0.0001));
-    let report = model.moss_image_execution_report().unwrap();
+    let report = model.last_execution_report().unwrap();
     assert_eq!(
         report.data().resolved.acceleration,
         MossImageAcceleration::Off

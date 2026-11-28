@@ -186,7 +186,13 @@ fn ordered_reference_edits_match_frozen_source() {
         let prepared = prepare(&input, ReferenceOutputSize::default()).unwrap();
         // Same source colors with alpha0/128/255: AE drops alpha; PUP independently composites.
         let mixed = candle_gen::gen_core::GenerationRequest {
-            flux3_reference_output: Some(ReferenceOutputSize::default()),
+            extensions: candle_gen::gen_core::FamilyExtensions {
+                flux3: Some(candle_gen::gen_core::Flux3Extension {
+                    reference_output: Some(ReferenceOutputSize::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             conditioning: order
                 .iter()
                 .map(|&i| {
