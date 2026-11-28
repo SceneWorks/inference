@@ -1366,6 +1366,56 @@ fn stored_ggml_blocks_are_priced_at_their_stored_bytes_on_candle() {
     assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).is_err());
 }
 
+/// SW-7285: a Candle-native GGML Wan tier's per-expert `quantize_config.json` declares
+/// `quantization = {"bits": N, "storage": "ggml"}` and, by the stored-GGML rule, no `group_size`.
+/// `prepare_load_spec` admits that marker at the selected width; a GGML marker at the other width,
+/// one that also claims a group size, and an affine marker without the group-64 layout stay refused.
+#[test]
+fn candle_ggml_tier_markers_are_admitted_at_their_declared_width() {
+    for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::T2v14b] {
+        let (_tmp, prepared) = candle_fixture(route, Some(Quant::Q4));
+        let WeightsSource::Dir(root) = prepared.weights.clone() else {
+            unreachable!("fixture is a directory")
+        };
+        let experts: &[&str] = if route == WanI2vRoute::Ti2v5b {
+            &["transformer"]
+        } else {
+            &["transformer", "transformer_2"]
+        };
+        let write_markers = |marker: &str| {
+            for expert in experts {
+                write_safetensors(
+                    &root.join(expert).join("model.safetensors"),
+                    &[("proj.weight", "U8", &[64, 2, 20])],
+                );
+                std::fs::write(root.join(expert).join("quantize_config.json"), marker).unwrap();
+            }
+        };
+        let prepare = || {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_resolved_route(route.provider_id());
+            spec.quantize = Some(Quant::Q4);
+            prepare_load_spec(&mut spec, WanI2vBackend::Candle, route.provider_id())
+        };
+
+        write_markers(r#"{"bits":4,"quantization":{"bits":4,"storage":"ggml"}}"#);
+        prepare().unwrap_or_else(|error| panic!("{route:?} GGML q4 marker refused: {error}"));
+
+        for refused in [
+            r#"{"bits":4,"quantization":{"bits":8,"storage":"ggml"}}"#,
+            r#"{"bits":4,"quantization":{"bits":4,"storage":"ggml","group_size":64}}"#,
+            r#"{"bits":4,"quantization":{"bits":4}}"#,
+        ] {
+            write_markers(refused);
+            let error = prepare().expect_err(refused).to_string();
+            assert!(
+                error.contains("packed marker"),
+                "{route:?} {refused}: {error}"
+            );
+        }
+    }
+}
+
 fn request(route: WanI2vRoute) -> GenerationRequest {
     let (width, height, frames, fps, steps, guidance) = match route {
         WanI2vRoute::Ti2v5b => (832, 480, 121, 24, 20, Some(5.0)),
