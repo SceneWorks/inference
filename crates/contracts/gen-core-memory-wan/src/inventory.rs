@@ -76,9 +76,18 @@ pub(super) fn repository_policy(
 /// published: each is one exact `Some(("SceneWorks/wan2.2-…-candle-ggml", "<rev>"))` arm.
 pub(super) fn candle_ggml_twin(route: WanI2vRoute) -> Option<(&'static str, &'static str)> {
     match route {
-        WanI2vRoute::Ti2v5b => None,
-        WanI2vRoute::I2v14b => None,
-        WanI2vRoute::T2v14b => None,
+        WanI2vRoute::Ti2v5b => Some((
+            "SceneWorks/wan2.2-ti2v-5b-candle-ggml",
+            "45cd1dabd86292ae99101302c561205718cbdfc4",
+        )),
+        WanI2vRoute::I2v14b => Some((
+            "SceneWorks/wan2.2-i2v-a14b-candle-ggml",
+            "9333bd5da34230b050b0efbfa9e497939c3eda72",
+        )),
+        WanI2vRoute::T2v14b => Some((
+            "SceneWorks/wan2.2-t2v-a14b-candle-ggml",
+            "4593ce24df61a6232754725187f2a4087ba3e43d",
+        )),
         // VACE ships no packed Candle tier (`unsupported-packed-tier`).
         WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
     }

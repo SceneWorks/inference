@@ -35,7 +35,10 @@ pub const BF16_REVISION: &str = "2e8fb610109bf0db195344cc424df98b301d3cad";
 /// The published Candle-native GGML twin of the `ideogram-4-mlx` q4/q8 tiers (SW-7285), which
 /// SceneWorks resolves on Windows/Linux instead of the MLX tree. `None` until it is published: name
 /// the exact `SceneWorksSnapshot::new("ideogram-4-candle", "<rev>")` here.
-pub const PACKED_CANDLE_TWIN: Option<SceneWorksSnapshot> = None;
+pub const PACKED_CANDLE_TWIN: Option<SceneWorksSnapshot> = Some(SceneWorksSnapshot::new(
+    "ideogram-4-candle",
+    "7debcb619eb9a12d20bcba6fdb62c604664f0d98",
+));
 pub const PID_FLUX2_REVISION: &str = "6d5c1f1049e863f1757f68fd81c6bc850a95609d";
 pub const PID_GEMMA_REVISION: &str = "684c553b5b41a1c835989d89f62f585e6269a7de";
 pub const PUBLIC_GEOMETRIES: &[(u32, u32)] = &[
