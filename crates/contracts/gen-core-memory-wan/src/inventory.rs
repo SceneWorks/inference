@@ -71,6 +71,54 @@ pub(super) fn repository_policy(
     }
 }
 
+/// The published Candle-native GGML twin (`SceneWorks/wan2.2-…-candle-ggml`, SW-7285) of a
+/// route's packed Candle tier, admitted ALONGSIDE the [`repository_policy`] row. `None` until it is
+/// published: each is one exact `Some(("SceneWorks/wan2.2-…-candle-ggml", "<rev>"))` arm.
+pub(super) fn candle_ggml_twin(route: WanI2vRoute) -> Option<(&'static str, &'static str)> {
+    match route {
+        WanI2vRoute::Ti2v5b => None,
+        WanI2vRoute::I2v14b => None,
+        WanI2vRoute::T2v14b => None,
+        // VACE ships no packed Candle tier (`unsupported-packed-tier`).
+        WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+/// Every exact `(repository, revision)` a root of `route` on `backend` at `tier` may be bound to:
+/// the [`repository_policy`] row, plus on a packed Candle tier its published GGML twin.
+pub(super) fn admitted_repositories(
+    backend: WanI2vBackend,
+    route: WanI2vRoute,
+    tier: MemoryNumericTier,
+) -> Vec<(&'static str, &'static str)> {
+    let mut admitted = vec![repository_policy(backend, route, tier)];
+    if backend == WanI2vBackend::Candle && tier.quant.is_some() {
+        admitted.extend(candle_ggml_twin(route));
+    }
+    admitted
+}
+
+/// Bind `root` to exactly one [`admitted_repositories`] identity with [`repository_revision`],
+/// returning that repository and the revision found. The policy row's refusal is reported when
+/// nothing binds.
+pub(super) fn bind_repository_revision(
+    root: &Path,
+    backend: WanI2vBackend,
+    route: WanI2vRoute,
+    tier: MemoryNumericTier,
+) -> gen_core::Result<(&'static str, String)> {
+    let mut refusal = None;
+    for (repository, expected_revision) in admitted_repositories(backend, route, tier) {
+        match repository_revision(root, repository, expected_revision, tier, backend) {
+            Ok(revision) => return Ok((repository, revision)),
+            Err(error) => {
+                refusal.get_or_insert(error);
+            }
+        }
+    }
+    Err(refusal.expect("the repository policy always names one identity"))
+}
+
 pub(super) fn repo_dir(repository: &str) -> String {
     format!("models--{}", repository.replace('/', "--"))
 }

@@ -998,6 +998,74 @@ fn every_candle_dense_leg_accepts_the_staged_snapshot_and_refuses_a_malformed_on
     }
 }
 
+/// SW-7285: a packed Candle root binds to its exact policy repository + revision, or to the
+/// route's exact published `-candle-ggml` twin; a twin not yet published, a crossed
+/// repository/revision pair, and a revision other than the pinned one stay refused, and the MLX
+/// backend never admits a twin. Path parsing only.
+#[test]
+fn packed_candle_roots_bind_the_policy_row_and_only_a_published_ggml_twin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let foreign = "0".repeat(40);
+    let root_at = |repository: &str, revision: &str, tier: &str| {
+        let root = tmp
+            .path()
+            .join(repo_dir(repository))
+            .join("snapshots")
+            .join(revision)
+            .join(tier);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    };
+    for route in [
+        WanI2vRoute::Ti2v5b,
+        WanI2vRoute::T2v14b,
+        WanI2vRoute::I2v14b,
+    ] {
+        for (quant, label) in [(Quant::Q4, "q4"), (Quant::Q8, "q8")] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(quant),
+                component_precision_floors: &[],
+            };
+            let bind =
+                |root: &Path| bind_repository_revision(root, WanI2vBackend::Candle, route, tier);
+            let (repository, revision) = repository_policy(WanI2vBackend::Candle, route, tier);
+            assert!(repository.ends_with("-candle"), "{repository}");
+            assert_eq!(
+                bind(&root_at(repository, revision, label)).unwrap(),
+                (repository, revision.to_owned())
+            );
+            assert!(bind(&root_at(repository, &foreign, label)).is_err());
+            let twin_repository = format!("{repository}-ggml");
+            match candle_ggml_twin(route) {
+                Some((twin, twin_revision)) => {
+                    assert_eq!(twin, twin_repository);
+                    assert_eq!(
+                        bind(&root_at(twin, twin_revision, label)).unwrap(),
+                        (twin, twin_revision.to_owned())
+                    );
+                    assert!(bind(&root_at(twin, revision, label)).is_err());
+                    assert!(bind(&root_at(repository, twin_revision, label)).is_err());
+                    assert!(bind(&root_at(twin, &foreign, label)).is_err());
+                    // The MLX backend never admits the Candle twin.
+                    assert!(bind_repository_revision(
+                        &root_at(twin, twin_revision, label),
+                        WanI2vBackend::Mlx,
+                        route,
+                        tier
+                    )
+                    .is_err());
+                }
+                None => {
+                    for candidate in [revision, foreign.as_str()] {
+                        assert!(bind(&root_at(&twin_repository, candidate, label)).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn mlx_q4_q8_bf16_facts_are_nonzero_differentiated_and_rsd_only() {
     let mut totals = Vec::new();

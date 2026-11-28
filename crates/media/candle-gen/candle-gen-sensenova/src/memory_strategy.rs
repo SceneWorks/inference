@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_source::{
+    path_components, SceneWorksSnapshot, CANDLE_TWIN_TIERS,
+};
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -34,6 +37,29 @@ const FAST_ROUTES: &[&str] = &[
 /// image independently, but admission still prices the caller's complete request geometry.
 const ADVERTISED_GENERATION_COUNTS: &[u32] = &[1, 2, 4];
 
+/// The published Candle-native GGML twins of the SenseNova MLX tiers (SW-7285), keyed by public
+/// route, which SceneWorks resolves on Windows/Linux instead of the MLX tree. Empty until they are
+/// published: each is one exact `(route, SceneWorksSnapshot::new("sensenova-…-candle", "<rev>"))`
+/// row. A twin binds only by its exact repository + revision layout at q4/q8.
+const CANDLE_TWINS: &[(&str, SceneWorksSnapshot)] = &[];
+
+fn candle_twin(route: &str) -> Option<SceneWorksSnapshot> {
+    CANDLE_TWINS
+        .iter()
+        .find(|(candidate, _)| *candidate == route)
+        .map(|(_, twin)| *twin)
+}
+
+/// True when `root` is exactly the published Candle twin of `route` at a q4/q8 tier.
+fn bound_to_candle_twin(route: &str, root: &Path) -> bool {
+    let Some(twin) = candle_twin(route) else {
+        return false;
+    };
+    let components = path_components(root);
+    let tier = components.last().map(String::as_str).unwrap_or_default();
+    CANDLE_TWIN_TIERS.contains(&tier) && twin.suffix_len(&components, &[tier]).is_some()
+}
+
 fn expected_repository(route: &str) -> Option<String> {
     QUALITY_ROUTES
         .iter()
@@ -59,7 +85,7 @@ pub(crate) fn validate_resolved_artifact_binding(spec: &LoadSpec) -> gen_core::R
         let component = component.as_os_str().to_string_lossy();
         component == expected || component == expected_hf || component == expected_app
     });
-    if !bound {
+    if !bound && !bound_to_candle_twin(route, root) {
         return Err(gen_core::Error::Unsupported(format!(
             "sensenova: resolved route {route} requires repository identity SceneWorks/{expected}, but weights path {} carries no matching repository component",
             root.display()
@@ -2108,7 +2134,7 @@ mod tests {
         for route in QUALITY_ROUTES.iter().chain(FAST_ROUTES) {
             let repository = expected_repository(route).unwrap();
             let exact = LoadSpec::new(WeightsSource::Dir(
-                tmp.path().join(repository).join("snapshots/revision/q8"),
+                tmp.path().join(&repository).join("snapshots/revision/q8"),
             ))
             .with_resolved_route(*route);
             assert!(
@@ -2125,6 +2151,54 @@ mod tests {
                 &exact.clone().with_resolved_route(*crossed_route)
             )
             .is_err());
+
+            // SW-7285: a Candle twin binds only once its exact row is published; until then the
+            // `-candle` repository is refused at any revision.
+            let twin_repository = repository.replace("-mlx", "-candle");
+            match candle_twin(route) {
+                Some(twin) => {
+                    assert_eq!(twin.repository, twin_repository);
+                    for tier in ["q4", "q8"] {
+                        let bound = LoadSpec::new(WeightsSource::Dir(
+                            tmp.path()
+                                .join(twin.hf_cache_dir())
+                                .join("snapshots")
+                                .join(twin.revision)
+                                .join(tier),
+                        ))
+                        .with_resolved_route(*route);
+                        assert!(
+                            validate_resolved_artifact_binding(&bound).is_ok(),
+                            "{route}"
+                        );
+                    }
+                    for (revision, tier) in [(twin.revision, "bf16"), ("revision", "q4")] {
+                        let crossed = LoadSpec::new(WeightsSource::Dir(
+                            tmp.path()
+                                .join(twin.hf_cache_dir())
+                                .join("snapshots")
+                                .join(revision)
+                                .join(tier),
+                        ))
+                        .with_resolved_route(*route);
+                        assert!(validate_resolved_artifact_binding(&crossed).is_err());
+                    }
+                }
+                None => {
+                    let unpublished = LoadSpec::new(WeightsSource::Dir(
+                        tmp.path()
+                            .join(format!("models--SceneWorks--{twin_repository}"))
+                            .join("snapshots")
+                            .join("0".repeat(40))
+                            .join("q4"),
+                    ))
+                    .with_resolved_route(*route);
+                    assert!(
+                        validate_resolved_artifact_binding(&unpublished).is_err(),
+                        "{route}"
+                    );
+                }
+            }
         }
     }
 

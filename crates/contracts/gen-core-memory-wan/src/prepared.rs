@@ -88,13 +88,20 @@ impl PreparedWanI2vMemory {
         }
         let root = validate_load_spec(spec, provider_id)?;
         spec.validate_prepared_file_pins()?;
-        let (repository, expected_revision) = repository_policy(backend, route, tier);
-        let revision = if route == WanI2vRoute::Vace {
-            vace_source_receipt_revision(root, backend)?
+        // The repository the receipt names is the one the root is BOUND to: the policy row, or a
+        // packed Candle tier's published GGML twin (SW-7285).
+        let (repository, revision) = if route == WanI2vRoute::Vace {
+            (
+                repository_policy(backend, route, tier).0,
+                vace_source_receipt_revision(root, backend)?,
+            )
         } else if route == WanI2vRoute::VaceFun {
-            vace_fun_source_receipt_revision(root, backend)?
+            (
+                repository_policy(backend, route, tier).0,
+                vace_fun_source_receipt_revision(root, backend)?,
+            )
         } else {
-            repository_revision(root, repository, expected_revision, tier, backend)?
+            bind_repository_revision(root, backend, route, tier)?
         };
         let inventory = match backend {
             WanI2vBackend::Mlx => validate_mlx_inventory(root, route)?,
