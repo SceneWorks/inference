@@ -477,6 +477,74 @@ mod removed {
         concatenate_axis(&[a, b], -1).unwrap()
     }
 
+    /// boogu vision tower `Block::attention` rope closure: f32 cast, `x·cos + nn::rotate_half(x)·sin`
+    /// over a token-major `[seq, heads, d]` stream with `[seq, 1, d]` tables, cast back.
+    pub fn boogu(t: &Array, cos: &Array, sin: &Array) -> Array {
+        let dtype = t.dtype();
+        let f = t.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let r = add(
+            multiply(&f, cos).unwrap(),
+            multiply(crate::nn::rotate_half(&f).unwrap(), sin).unwrap(),
+        )
+        .unwrap();
+        r.as_dtype(dtype).unwrap()
+    }
+
+    /// pulid EVA-CLIP `VisionRope::apply`: f32 cast, `[S, D]` tables reshaped to `[1, 1, S, D]`,
+    /// `rotate_half_interleaved` (`split` lanes, `concatenate (−odd, even)`), cast back.
+    pub fn pulid(x: &Array, cos: &Array, sin: &Array) -> Array {
+        let orig = x.dtype();
+        let xf = x.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let cos = cos
+            .reshape(&[1, 1, cos.shape()[0], cos.shape()[1]])
+            .unwrap();
+        let sin = sin
+            .reshape(&[1, 1, sin.shape()[0], sin.shape()[1]])
+            .unwrap();
+        let sh = xf.shape().to_vec();
+        let last = sh[sh.len() - 1];
+        let mut pair_shape = sh.clone();
+        *pair_shape.last_mut().unwrap() = last / 2;
+        pair_shape.push(2);
+        let xr = xf.reshape(&pair_shape).unwrap();
+        let axis = (pair_shape.len() - 1) as i32;
+        let halves = split(&xr, 2, axis).unwrap();
+        let rot = concatenate_axis(&[&negative(&halves[1]).unwrap(), &halves[0]], axis)
+            .unwrap()
+            .reshape(&sh)
+            .unwrap();
+        add(multiply(&xf, &cos).unwrap(), multiply(&rot, &sin).unwrap())
+            .unwrap()
+            .as_dtype(orig)
+            .unwrap()
+    }
+
+    /// seedvr2 `apply_rope` with a partial width: `take_axis` the leading `rot` channels, rotate
+    /// them in f32 with the `× −1` pairwise lane, cast back, `concatenate` the untouched tail.
+    pub fn seedvr2_partial(t: &Array, cos: &Array, sin: &Array, rot: i32) -> Array {
+        let sh = t.shape();
+        let (n, hd) = (sh[0], sh[2]);
+        let t_mid = t
+            .take_axis(
+                Array::from_slice(&(0..rot).collect::<Vec<i32>>(), &[rot]),
+                2,
+            )
+            .unwrap();
+        let cosf = cos.reshape(&[n, 1, rot]).unwrap();
+        let sinf = sin.reshape(&[n, 1, rot]).unwrap();
+        let mid_f = t_mid.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let rotated = pairwise(&mid_f, &cosf, &sinf, true)
+            .as_dtype(t.dtype())
+            .unwrap();
+        let right = t
+            .take_axis(
+                Array::from_slice(&(rot..hd).collect::<Vec<i32>>(), &[hd - rot]),
+                2,
+            )
+            .unwrap();
+        concatenate_axis(&[&rotated, &right], -1).unwrap()
+    }
+
     /// The private eager modulates: `x·(1 + scale) + shift`, `1` in scale's dtype or strong f32.
     pub fn modulate(x: &Array, scale: &Array, shift: &Array, matching: bool) -> Array {
         let one = if matching {
@@ -615,6 +683,83 @@ fn the_shared_cos_sin_route_reproduces_every_removed_private_rope_bitwise() {
         assert!(
             bits(&got, &want),
             "{dtype:?}: InterleavedFull RestoreInput (seedvr2)"
+        );
+        // ...seedvr2 at a partial width (`take_axis` head, untouched tail).
+        let rot = 8;
+        let (c_rot, s_rot) = tables_1d(RopeStyle::InterleavedFull, s, 3, rot, 10_000.0);
+        let want = removed::seedvr2_partial(&n3, &c_rot, &s_rot, rot);
+        let got = shared(
+            &n3.reshape(&[1, s, h, d]).unwrap(),
+            RopeTables::new(&c_rot, &s_rot),
+            RopeStyle::InterleavedFull,
+            RotationAxes::TokenMajor,
+            Some(rot),
+            RopeDtype::RestoreInput,
+        )
+        .reshape(&[s, h, d])
+        .unwrap();
+        assert!(
+            bits(&got, &want),
+            "{dtype:?}: InterleavedFull partial RestoreInput (seedvr2)"
+        );
+        // pulid EVA-CLIP: head-major, f32 compute, cast back, `split`/`concatenate` lanes.
+        let want = removed::pulid(&hm, &c_int, &s_int);
+        let got = shared(
+            &hm,
+            RopeTables::new(&c_int, &s_int),
+            RopeStyle::InterleavedFull,
+            RotationAxes::HeadMajor,
+            None,
+            RopeDtype::RestoreInput,
+        );
+        assert!(
+            bits(&got, &want),
+            "{dtype:?}: InterleavedFull head-major RestoreInput (pulid)"
+        );
+        // sam3 tracker: the `× −1` lane, head-major, no casts. SAM3's checkpoint is f32 only, and
+        // the bf16 form is NOT bitwise (`× f32 −1` promotes the lane), so pin f32 alone.
+        if dtype == Dtype::Float32 {
+            let want = removed::pairwise(
+                &hm,
+                &c_int.reshape(&[1, 1, s, d]).unwrap(),
+                &s_int.reshape(&[1, 1, s, d]).unwrap(),
+                true,
+            );
+            let got = shared(
+                &hm,
+                RopeTables::new(&c_int, &s_int),
+                RopeStyle::InterleavedFull,
+                RotationAxes::HeadMajor,
+                None,
+                RopeDtype::Promoted,
+            );
+            assert!(
+                bits(&got, &want),
+                "{dtype:?}: InterleavedFull head-major `× −1` (sam3 tracker)"
+            );
+        }
+        // boogu vision tower: token-major rank-3 stream, f32, full-width rotate-half, cast back.
+        let c3 = c_full.reshape(&[s, 1, d]).unwrap();
+        let s3 = s_full.reshape(&[s, 1, d]).unwrap();
+        let want = removed::boogu(&n3, &c3, &s3);
+        let got = shared(
+            &n3.as_dtype(Dtype::Float32)
+                .unwrap()
+                .reshape(&[1, s, h, d])
+                .unwrap(),
+            RopeTables::new(&c_full, &s_full),
+            RopeStyle::RotateHalf,
+            RotationAxes::TokenMajor,
+            None,
+            RopeDtype::Promoted,
+        )
+        .reshape(&[s, h, d])
+        .unwrap()
+        .as_dtype(dtype)
+        .unwrap();
+        assert!(
+            bits(&got, &want),
+            "{dtype:?}: RotateHalf f32 cast back (boogu vision)"
         );
 
         // HalvesPaired head-major over pre-broadcast half tables (lens gpt-oss).

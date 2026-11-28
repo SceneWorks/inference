@@ -29,6 +29,10 @@ LISTING = re.compile(r"^(.+): test$", re.MULTILINE)
 SUMMARY = re.compile(
     r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;.*? (\d+) filtered out;"
 )
+# The `--no-run` compile phase is bounded separately from the suite deadline so a wedged
+# compiler or build script fails fast. Lanes whose measured cold build exceeds this default
+# (e.g. the Windows CUDA exhaustive lane) pass `--compile-seconds` explicitly.
+COMPILE_SECONDS = 2400
 
 
 def registry(path: Path = MANIFEST) -> list[dict]:
@@ -226,7 +230,9 @@ def libtest_target(package: dict, artifact: dict) -> dict:
     return matches[0]
 
 
-def execute_safe(command: list[str], controls: list[dict], deadline_seconds: int) -> None:
+def execute_safe(
+    command: list[str], controls: list[dict], deadline_seconds: int, compile_seconds: int = COMPILE_SECONDS
+) -> None:
     if command[:1] != ["cargo"] or "test" not in command or "--" in command or "--no-run" in command:
         raise ValueError("expected unfiltered cargo test build arguments")
     boundary = command.index("test")
@@ -241,7 +247,7 @@ def execute_safe(command: list[str], controls: list[dict], deadline_seconds: int
     metadata = json.loads(run(metadata_command, remaining(120)))
     by_id = {package["id"]: package for package in metadata["packages"]}
     packages = {identity: package["name"] for identity, package in by_id.items()}
-    output = run(command + ["--no-run", "--message-format=json"], remaining(2400))
+    output = run(command + ["--no-run", "--message-format=json"], remaining(compile_seconds))
     built = artifacts(output)
     built_keys = {target_key(artifact, packages) for artifact in built}
     built_packages = {key[0] for key in built_keys}
@@ -296,7 +302,9 @@ def execute_safe(command: list[str], controls: list[dict], deadline_seconds: int
     print(f"audited-safe: {executed} exact controls passed; {compiled_only} targets compiled only (not passes)", flush=True)
 
 
-def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: int) -> None:
+def execute(
+    mode: str, command: list[str], cases: list[dict], deadline_seconds: int, compile_seconds: int = COMPILE_SECONDS
+) -> None:
     if command[:2] != ["cargo", "test"] or "--" in command or "--no-run" in command:
         raise ValueError("expected cargo test build arguments without libtest filters")
     deadline = time.monotonic() + deadline_seconds
@@ -320,7 +328,7 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
             for target in targets
         ):
             raise ValueError(f"registered target is absent from Cargo metadata: {case}")
-    output = run(command + ["--no-run", "--message-format=json"], remaining(2400))
+    output = run(command + ["--no-run", "--message-format=json"], remaining(compile_seconds))
     built = artifacts(output)
     rust_lib = run(["rustc", "--print", "target-libdir"], remaining(60))
     package_features = {}
@@ -400,17 +408,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("audited-safe", "routine", "exhaustive", "check"))
     parser.add_argument("--deadline-seconds", type=int)
+    parser.add_argument(
+        "--compile-seconds", type=int, default=COMPILE_SECONDS,
+        help="bound on the `--no-run` compile child (default %(default)s); it never extends the suite deadline",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.compile_seconds <= 0:
+        parser.error("--compile-seconds must be positive")
     cases = registry()
     if args.mode == "check":
         print(f"{len(cases)} reviewed exhaustive identities; {len(safe_controls())} exact safe controls")
         return 0
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if args.mode == "audited-safe":
-        execute_safe(command, safe_controls(), args.deadline_seconds or 2700)
+        execute_safe(command, safe_controls(), args.deadline_seconds or 2700, args.compile_seconds)
     else:
-        execute(args.mode, command, cases, args.deadline_seconds or (7200 if args.mode == "exhaustive" else 2700))
+        execute(
+            args.mode, command, cases,
+            args.deadline_seconds or (7200 if args.mode == "exhaustive" else 2700),
+            args.compile_seconds,
+        )
     return 0
 
 
