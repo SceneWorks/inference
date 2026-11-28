@@ -34,10 +34,13 @@ use candle_gen::logical_weights::{
     plan_logical_weights_delegating_w4a8, CandleCodecResidency, LogicalTensor, LogicalWeightReader,
 };
 
-use candle_gen::candle_core::quantized::QTensor;
+use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
+use candle_gen::quant::stored_ggml::{
+    qtensor_from_stored, stored_block_geometry, validate_stored, StoredGgmlRefusal,
+};
 use candle_gen::quant::{
     dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, AdaptLinear, Int8Context,
     Nvfp4Fallback, Nvfp4Linear, Nvfp4Regime, PackedConfig, PackedWeightSidecars,
@@ -973,6 +976,7 @@ impl Weights {
                 ))),
             };
         }
+        self.guard_dense_read(name)?;
         self.st
             .load(&self.resolve(name), &self.device)?
             .to_dtype(self.dtype)
@@ -1034,6 +1038,7 @@ impl Weights {
                 ))),
             };
         }
+        self.guard_dense_read(name)?;
         self.st
             .load(&self.resolve(name), &self.device)?
             .to_dtype(DType::F32)
@@ -1140,9 +1145,72 @@ impl Weights {
         self.packed
     }
 
-    /// Load one packed projection from its mapped device-format artifact. The source mmap is
-    /// intentionally not passed through this seam, making per-window format conversion impossible.
+    /// The stored-GGML geometry of tensor `key` (SW-7285 Candle-native tier: `U8 [rows, cols / 32,
+    /// block_bytes]`), read from the safetensors **header** only. `None` for an overlaid (merged,
+    /// dense) key, a codec-planned key (its stored dtype is the codec's, never a GGML block), and
+    /// anything that is not a stored block.
+    fn stored_ggml_key(&self, key: &str) -> Option<(GgmlDType, usize, usize)> {
+        if self.overlay.contains_key(key) || self.planned(key).is_some() {
+            return None;
+        }
+        let view = self.st.get(&self.resolve(key)).ok()?;
+        let dtype = DType::try_from(view.dtype()).ok()?;
+        stored_block_geometry(dtype, view.shape())
+    }
+
+    /// `{base}.weight`'s stored-GGML geometry, validated for a projection: a `.scales` sibling beside
+    /// a stored block is refused (the shared [`validate_stored`] both-forms rule). `None` when the
+    /// weight is not a stored block (dense, MLX codes, overlaid, codec-planned or absent).
+    pub(crate) fn stored_ggml(&self, base: &str) -> Result<Option<(GgmlDType, usize, usize)>> {
+        let Some(geometry) = self.stored_ggml_key(&format!("{base}.weight")) else {
+            return Ok(None);
+        };
+        validate_stored(
+            "krea",
+            base,
+            geometry,
+            self.contains(&format!("{base}.scales")),
+            None,
+        )
+        .map_err(Error::from)?;
+        Ok(Some(geometry))
+    }
+
+    /// Build `{base}.weight`'s stored GGML blocks as a resident [`QTensor`] on `device`, used exactly
+    /// as published: no repack, no device-format sidecar, no saved-quantization cache entry. The
+    /// blocks are read on the host and uploaded once. `None` when the weight is not a stored block.
+    pub(crate) fn load_stored_ggml(&self, base: &str, device: &Device) -> Result<Option<QTensor>> {
+        if self.stored_ggml(base)?.is_none() {
+            return Ok(None);
+        }
+        let key = self.resolve(&format!("{base}.weight"));
+        let stored = self.read_source_unchanged(|| self.st.load(&key, &Device::Cpu))?;
+        Ok(Some(qtensor_from_stored(&stored, device)?))
+    }
+
+    /// Refuse a stored GGML block at a dense read ([`Self::get`] / [`Self::get_f32`]): casting the
+    /// block bytes to a float is silent garbage (sc-14980). Projections reach their stored blocks
+    /// through [`linear_detect`] / [`embedding_detect`] / [`Self::get_dense_or_dequant`] instead.
+    fn guard_dense_read(&self, name: &str) -> Result<()> {
+        if let Some((dtype, ..)) = self.stored_ggml_key(name) {
+            return Err(StoredGgmlRefusal::DenseOnly {
+                context: "krea".into(),
+                base: name.strip_suffix(".weight").unwrap_or(name).into(),
+                dtype,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Load one packed projection in device format: a Candle-native tier's stored GGML blocks
+    /// ([`Self::load_stored_ggml`]) as published, else the mapped device-format sidecar the MLX
+    /// triple was prepared into. The source triple is intentionally not passed through this seam,
+    /// making per-window format conversion impossible.
     fn load_packed_device_format(&self, base: &str) -> Result<QTensor> {
+        if let Some(stored) = self.load_stored_ggml(base, &self.device)? {
+            return Ok(stored);
+        }
         self.sidecars
             .as_ref()
             .ok_or_else(|| {
@@ -1178,6 +1246,13 @@ impl Weights {
         // checkpoint (sc-9300), where a dense baseline weight a diff-patch folds into (e.g.
         // `text_fusion.projector` → `txtfusion.projector.weight`) would otherwise 404. On the MLX-packed
         // path resolution is a no-op (that tier is diffusers-keyed), so this is behavior-preserving there.
+        // A Candle-native GGML tier's stored blocks (SW-7285) dequantize to the same f32 grid the
+        // MLX triple's repack holds — the mergeable base.
+        if let Some(base) = weight_key.strip_suffix(".weight") {
+            if let Some(stored) = self.load_stored_ggml(base, &Device::Cpu)? {
+                return stored.dequantize(&Device::Cpu);
+            }
+        }
         let key = self.resolve(weight_key);
         if let Some(base) = key.strip_suffix(".weight") {
             let scales_key = format!("{base}.scales");
@@ -1214,6 +1289,13 @@ impl Weights {
             return self.get(weight_key);
         }
         if let Some(base) = weight_key.strip_suffix(".weight") {
+            // A stored GGML block (SW-7285) dequantizes on the host exactly like the triple below.
+            if let Some(stored) = self.load_stored_ggml(base, &Device::Cpu)? {
+                return stored
+                    .dequantize(&Device::Cpu)?
+                    .to_device(&self.device)?
+                    .to_dtype(self.dtype);
+            }
             let scales_key = format!("{base}.scales");
             if let (Some(cfg), true) = (self.packed, self.st.get(&scales_key).is_ok()) {
                 let wq = self.st.load(weight_key, &Device::Cpu)?;
@@ -1496,8 +1578,9 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
             .ok_or_else(|| Error::Msg(format!("{weight_key}: missing native projection")))?;
         return Ok(QLinear::Adapt(projection));
     }
-    // (2) A packed tier with a `.scales` sibling → transfer the prepared device-format artifact.
-    if let (Some(_cfg), true) = (w.packed(), w.contains(&scales_key)) {
+    // (2) A packed tier with a `.scales` sibling → transfer the prepared device-format artifact; a
+    // Candle-native GGML tier's stored blocks (SW-7285) ARE that device format and load as stored.
+    if (w.packed().is_some() && w.contains(&scales_key)) || w.stored_ggml(base)?.is_some() {
         let dense_bias = if bias {
             Some(w.get(&format!("{base}.bias"))?)
         } else {
@@ -1727,6 +1810,11 @@ fn check_representation(
 /// hosted q4/q8 tiers, so today this takes the dense arm; the packed arm is the future-proof path (and
 /// guards against a silent dense read of u32 codes should a tier ever pack the table).
 pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
+    // A Candle-native GGML tier's stored table (SW-7285): host-resident rows (the shared
+    // `QEmbedding` keeps only the compact row source), dequantized to f32 like the triple's.
+    if let Some(table) = w.load_stored_ggml(base, &Device::Cpu)? {
+        return QEmbedding::packed_device_format(table, DType::F32);
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(_cfg), true) = (w.packed(), w.contains(&scales_key)) {
         // Dequantize the packed table to **f32** (the encoder's compute dtype), not `w.dtype()`
@@ -2536,6 +2624,187 @@ mod tests {
         );
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::linear_dequantizes_packed_tier");
+        Ok(())
+    }
+
+    /// The stored GGML block tensor a Candle-native tier ships for an MLX triple (SW-7285): exactly
+    /// the blocks the load-time repack builds, computed without the cache.
+    fn stored_from_triple(wq: &Tensor, s: &Tensor, b: &Tensor) -> Tensor {
+        let qt = candle_gen::quant::repack_packed_weight_uncached(wq, s, b, G, &Device::Cpu)
+            .expect("repack the synthetic triple");
+        candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(&qt)
+            .expect("persist the blocks")
+    }
+
+    /// A Candle-native GGML component: stored blocks + the `storage: "ggml"` marker (no group).
+    fn write_ggml_component(dir: &Path, tensors: HashMap<String, Tensor>) {
+        std::fs::create_dir_all(dir).unwrap();
+        safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+        let cfg = serde_json::json!({ "quantization": { "bits": 4, "storage": "ggml" } });
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    }
+
+    /// **SW-7285: a Candle-native GGML Krea tier loads as stored blocks.** Every Krea-owned packed
+    /// seam — `linear_detect`, `embedding_detect`, the dense `linear` used by the composable DiT, the
+    /// adapter-merge base, and the control-inference `lora_proj_packed` — builds the stored blocks as
+    /// published; the device-format sidecar preparation converts nothing and writes nothing; a
+    /// dense sibling stays dense; and a dense read of a stored block is refused rather than cast.
+    /// Construction and host dequantization only — no forward runs.
+    #[test]
+    fn stored_ggml_tier_builds_every_packed_seam_without_sidecars() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (128usize, 256usize);
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let (ewq, es, eb, _) = q4_packed(64, 128);
+        let map = HashMap::from([
+            (
+                "attn.to_q.weight".to_owned(),
+                stored_from_triple(&wq, &s, &b),
+            ),
+            (
+                "attn.to_q.bias".to_owned(),
+                Tensor::zeros(out_dim, DType::F32, &dev)?,
+            ),
+            (
+                "attn.to_k.weight".to_owned(),
+                Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
+            ),
+            (
+                "embed_tokens.weight".to_owned(),
+                stored_from_triple(&ewq, &es, &eb),
+            ),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("transformer");
+        write_ggml_component(&dir, map);
+        let w = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert!(
+            w.packed().is_some(),
+            "the ggml marker still declares a packed tier"
+        );
+        let sidecars = w
+            .packed_sidecars()
+            .expect("packed tiers open the sidecar seam");
+        assert_eq!(sidecars.created_count(), 0, "nothing to convert");
+        assert!(!sidecars.contains("attn.to_q"));
+        assert!(
+            !dir.join(".candle-device-format-v1").exists(),
+            "a stored tier writes no device-format cache"
+        );
+
+        assert_eq!(
+            w.stored_ggml("attn.to_q")?,
+            Some((GgmlDType::Q4_1, out_dim, in_dim))
+        );
+        assert_eq!(w.stored_ggml("attn.to_k")?, None, "dense sibling");
+        assert!(linear_detect(&w, "attn.to_q", true)?.is_packed());
+        assert!(!linear_detect(&w, "attn.to_k", false)?.is_packed());
+        assert!(embedding_detect(&w, "embed_tokens")?.is_packed());
+        assert!(matches!(
+            crate::train_dit::lora_proj_packed(&w, "attn.to_q", true)?,
+            crate::train_dit::ComposableLinear::Adapt(_)
+        ));
+
+        // The dense seams dequantize the stored blocks to the triple's grid instead of casting.
+        let merge = w.get_cpu_merge_base("attn.to_q.weight")?;
+        assert_eq!(merge.dims(), &[out_dim, in_dim]);
+        assert!(tensor_cosine(&merge, &grid) > 0.99999);
+        let lin = linear(&w, "attn.to_q", false)?;
+        assert_eq!(lin.weight().dims(), &[out_dim, in_dim]);
+        assert!(tensor_cosine(lin.weight(), &grid) > 0.99999);
+
+        let err = w.get("attn.to_q.weight").unwrap_err().to_string();
+        assert!(err.contains("dense-only"), "{err}");
+        let err = w.get_f32("embed_tokens.weight").unwrap_err().to_string();
+        assert!(err.contains("dense-only"), "{err}");
+        assert!(
+            !dir.join(".candle-device-format-v1").exists(),
+            "building the stored projections wrote no cache either"
+        );
+        Ok(())
+    }
+
+    /// A projection stored BOTH as GGML blocks and as an MLX triple is refused at every Krea seam
+    /// (sidecar preparation, or the detect itself), never silently resolved to one form.
+    #[test]
+    fn stored_ggml_beside_a_scales_sibling_is_refused() -> Result<()> {
+        let dev = Device::Cpu;
+        let (wq, s, b, _) = q4_packed(128, 256);
+        let mut map = HashMap::from([(
+            "attn.to_q.weight".to_owned(),
+            stored_from_triple(&wq, &s, &b),
+        )]);
+        map.insert("attn.to_q.scales".into(), s);
+        map.insert("attn.to_q.biases".into(), b);
+        let tmp = tempfile::tempdir().unwrap();
+        // Through the packed seam: preparation refuses the both-forms projection.
+        let packed = tmp.path().join("packed");
+        write_component(&packed, map.clone(), true);
+        let err = Weights::from_dir(&packed, &dev, DType::F32)
+            .err()
+            .expect("both forms refused at open")
+            .to_string();
+        assert!(err.contains("never both"), "{err}");
+        // Without a packed marker the detect itself refuses.
+        let dense = tmp.path().join("dense");
+        write_component(&dense, map, false);
+        let w = Weights::from_dir(&dense, &dev, DType::F32)?;
+        let err = linear_detect(&w, "attn.to_q", false)
+            .err()
+            .expect("both forms refused")
+            .to_string();
+        assert!(err.contains("never both"), "{err}");
+        Ok(())
+    }
+
+    /// The stored-GGML Krea tier's forward equals the MLX tier's: both serve identical Q4_1 / Q8_0
+    /// blocks through `linear_detect`, so the projection outputs are bit-identical. Executes the
+    /// dequant-dense matmul, so it is an explicit proof only.
+    #[test]
+    #[ignore = "model inference; explicit model workflow only"]
+    fn stored_ggml_krea_projection_forward_equals_the_mlx_tier() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (128usize, 256usize);
+        let (wq, s, b, _) = q4_packed(out_dim, in_dim);
+        let tmp = tempfile::tempdir().unwrap();
+        let mlx = tmp.path().join("mlx");
+        write_component(
+            &mlx,
+            HashMap::from([
+                ("attn.to_q.weight".to_owned(), wq.clone()),
+                ("attn.to_q.scales".to_owned(), s.clone()),
+                ("attn.to_q.biases".to_owned(), b.clone()),
+            ]),
+            true,
+        );
+        let ggml = tmp.path().join("ggml");
+        write_ggml_component(
+            &ggml,
+            HashMap::from([(
+                "attn.to_q.weight".to_owned(),
+                stored_from_triple(&wq, &s, &b),
+            )]),
+        );
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let want = linear_detect(
+            &Weights::from_dir(&mlx, &dev, DType::F32)?,
+            "attn.to_q",
+            false,
+        )?
+        .forward(&x)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        let got = linear_detect(
+            &Weights::from_dir(&ggml, &dev, DType::F32)?,
+            "attn.to_q",
+            false,
+        )?
+        .forward(&x)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        assert_eq!(got, want, "stored blocks == the MLX tier's repacked blocks");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::stored_ggml_krea_projection_forward_equals_the_mlx_tier");
         Ok(())
     }
 

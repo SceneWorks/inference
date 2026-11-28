@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_source::{
+    path_components, SceneWorksSnapshot, CANDLE_TWIN_TIERS,
+};
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -34,6 +37,29 @@ const FAST_ROUTES: &[&str] = &[
 /// image independently, but admission still prices the caller's complete request geometry.
 const ADVERTISED_GENERATION_COUNTS: &[u32] = &[1, 2, 4];
 
+/// The published Candle-native GGML twins of the SenseNova MLX tiers (SW-7285), keyed by public
+/// route, which SceneWorks resolves on Windows/Linux instead of the MLX tree. Empty until they are
+/// published: each is one exact `(route, SceneWorksSnapshot::new("sensenova-…-candle", "<rev>"))`
+/// row. A twin binds only by its exact repository + revision layout at q4/q8.
+const CANDLE_TWINS: &[(&str, SceneWorksSnapshot)] = &[];
+
+fn candle_twin(route: &str) -> Option<SceneWorksSnapshot> {
+    CANDLE_TWINS
+        .iter()
+        .find(|(candidate, _)| *candidate == route)
+        .map(|(_, twin)| *twin)
+}
+
+/// True when `root` is exactly the published Candle twin of `route` at a q4/q8 tier.
+fn bound_to_candle_twin(route: &str, root: &Path) -> bool {
+    let Some(twin) = candle_twin(route) else {
+        return false;
+    };
+    let components = path_components(root);
+    let tier = components.last().map(String::as_str).unwrap_or_default();
+    CANDLE_TWIN_TIERS.contains(&tier) && twin.suffix_len(&components, &[tier]).is_some()
+}
+
 fn expected_repository(route: &str) -> Option<String> {
     QUALITY_ROUTES
         .iter()
@@ -59,7 +85,7 @@ pub(crate) fn validate_resolved_artifact_binding(spec: &LoadSpec) -> gen_core::R
         let component = component.as_os_str().to_string_lossy();
         component == expected || component == expected_hf || component == expected_app
     });
-    if !bound {
+    if !bound && !bound_to_candle_twin(route, root) {
         return Err(gen_core::Error::Unsupported(format!(
             "sensenova: resolved route {route} requires repository identity SceneWorks/{expected}, but weights path {} carries no matching repository component",
             root.display()
@@ -216,7 +242,7 @@ impl CheckpointInventory {
     }
 
     pub(crate) fn validate_numeric_tier(&self, spec: &LoadSpec) -> gen_core::Result<()> {
-        let actual = detect_checkpoint_quantization(&self.files)?;
+        let (actual, stored_blocks) = detect_checkpoint_quantization(&self.files)?;
         let declared = spec.quantize.map(|quant| quant.bits() as u8);
         if declared != actual {
             return Err(gen_core::Error::Unsupported(format!(
@@ -251,7 +277,12 @@ impl CheckpointInventory {
                     .get("group_size")
                     .and_then(|value| value.as_u64()),
             );
-            if recorded != (actual.map(u64::from), Some(64)) {
+            // A Candle-native GGML tier (SW-7285) records `{bits, storage: "ggml"}` and no group:
+            // its stored blocks carry their own block geometry.
+            let ggml = quantization.get("storage").and_then(|value| value.as_str())
+                == Some(candle_gen::quant::stored_ggml::GGML_STORAGE);
+            let expected_group = if ggml { None } else { Some(64) };
+            if recorded != (actual.map(u64::from), expected_group) || ggml != stored_blocks {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: config quantization provenance {recorded:?} crosses checkpoint tensor packing {:?}/group64",
                     actual
@@ -367,10 +398,12 @@ fn is_backbone_linear(base: &str) -> bool {
     })
 }
 
-/// Header-only mirror of `quant::detect_linear`: no tensor data is materialized.
+/// Header-only mirror of `quant::detect_linear`: no tensor data is materialized. Returns the
+/// packed bit width (`None` for dense) and whether the packed projections are Candle-native stored
+/// GGML blocks (SW-7285) rather than affine triples.
 fn detect_checkpoint_quantization(
     files: &[(PathBuf, gen_core::PinnedWeightsFile)],
-) -> gen_core::Result<Option<u8>> {
+) -> gen_core::Result<(Option<u8>, bool)> {
     // Capped header reads (no mmap); the retained pins reject mutation. Shards are concatenated in
     // order, exactly as the previous multi-file mapping enumerated them.
     let mut views = Vec::new();
@@ -383,6 +416,7 @@ fn detect_checkpoint_quantization(
         .collect::<std::collections::BTreeSet<_>>();
     let mut detected = None;
     let mut projections = 0_usize;
+    let mut stored_form = false;
     for weight in &views {
         let name = &weight.name;
         let Some(base) = name.strip_suffix(".weight") else {
@@ -395,7 +429,29 @@ fn detect_checkpoint_quantization(
         let scales_name = format!("{base}.scales");
         let biases_name = format!("{base}.biases");
         let packed = names.contains(scales_name.as_str());
-        let tier = if packed {
+        let stored = weight.shape.len() == 3 && weight.is_stored_ggml_block();
+        if projections > 1 && stored != stored_form {
+            return Err(gen_core::Error::Unsupported(
+                "sensenova: checkpoint mixes stored GGML blocks with other projection storage"
+                    .into(),
+            ));
+        }
+        stored_form = stored;
+        let tier = if stored {
+            // A Candle-native GGML tier (SW-7285): the stored block type is the tier; a projection
+            // is stored one way, never as blocks AND an affine triple.
+            if packed || names.contains(biases_name.as_str()) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "sensenova: projection {base} is stored as GGML blocks and also carries \
+                     affine sidecars — never both"
+                )));
+            }
+            let bits = weight
+                .stored_ggml_block_bits()
+                .and_then(|bits| u8::try_from(bits).ok())
+                .expect("a stored GGML block header has a bit width");
+            Some(bits)
+        } else if packed {
             if !names.contains(biases_name.as_str()) {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base} has scales but no affine biases"
@@ -484,7 +540,7 @@ fn detect_checkpoint_quantization(
             "sensenova: checkpoint contains no recognizable decoder projection weights".into(),
         ));
     }
-    Ok(detected)
+    Ok((detected, stored_form))
 }
 
 pub(crate) fn validate_load_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<()> {
@@ -1947,6 +2003,51 @@ mod tests {
         assert!(inventory.ensure_unchanged().is_err());
     }
 
+    /// SW-7285: a Candle-native GGML SenseNova tier (stored `U8 [out, in / 32, block_bytes]`
+    /// projections, `{bits, storage: "ggml"}` provenance with no group) is the tier its block type
+    /// encodes; a crossed provenance, the other request and a both-forms projection are refused.
+    #[test]
+    fn stored_ggml_tier_matches_its_block_width_and_storage_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tier");
+        let base = "language_model.model.layers.0.self_attn.k_proj";
+        let write = |block: usize, config: &str, scales: bool| {
+            std::fs::create_dir_all(&root).unwrap();
+            let mut tensors = HashMap::from([(
+                format!("{base}.weight"),
+                Tensor::zeros((2, 2, block), DType::U8, &Device::Cpu).unwrap(),
+            )]);
+            if scales {
+                tensors.insert(
+                    format!("{base}.scales"),
+                    Tensor::ones((2, 1), DType::BF16, &Device::Cpu).unwrap(),
+                );
+            }
+            candle_gen::candle_core::safetensors::save(&tensors, root.join("model.safetensors"))
+                .unwrap();
+            std::fs::write(root.join("config.json"), config).unwrap();
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        for (bits, block, quant, other) in
+            [(4, 20, Quant::Q4, Quant::Q8), (8, 34, Quant::Q8, Quant::Q4)]
+        {
+            let ggml = format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#);
+            write(block, &ggml, false);
+            validate_artifact_tier(&spec.clone().with_quant(quant)).unwrap();
+            assert!(validate_artifact_tier(&spec.clone().with_quant(other)).is_err());
+            assert!(validate_artifact_tier(&spec).is_err(), "dense request");
+            // An affine provenance (group 64, no storage marker) crosses stored blocks.
+            write(
+                block,
+                &format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                false,
+            );
+            assert!(validate_artifact_tier(&spec.clone().with_quant(quant)).is_err());
+            write(block, &ggml, true);
+            assert!(validate_artifact_tier(&spec.clone().with_quant(quant)).is_err());
+        }
+    }
+
     #[test]
     fn declared_numeric_tier_must_match_turnkey_provenance() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2033,7 +2134,7 @@ mod tests {
         for route in QUALITY_ROUTES.iter().chain(FAST_ROUTES) {
             let repository = expected_repository(route).unwrap();
             let exact = LoadSpec::new(WeightsSource::Dir(
-                tmp.path().join(repository).join("snapshots/revision/q8"),
+                tmp.path().join(&repository).join("snapshots/revision/q8"),
             ))
             .with_resolved_route(*route);
             assert!(
@@ -2050,6 +2151,54 @@ mod tests {
                 &exact.clone().with_resolved_route(*crossed_route)
             )
             .is_err());
+
+            // SW-7285: a Candle twin binds only once its exact row is published; until then the
+            // `-candle` repository is refused at any revision.
+            let twin_repository = repository.replace("-mlx", "-candle");
+            match candle_twin(route) {
+                Some(twin) => {
+                    assert_eq!(twin.repository, twin_repository);
+                    for tier in ["q4", "q8"] {
+                        let bound = LoadSpec::new(WeightsSource::Dir(
+                            tmp.path()
+                                .join(twin.hf_cache_dir())
+                                .join("snapshots")
+                                .join(twin.revision)
+                                .join(tier),
+                        ))
+                        .with_resolved_route(*route);
+                        assert!(
+                            validate_resolved_artifact_binding(&bound).is_ok(),
+                            "{route}"
+                        );
+                    }
+                    for (revision, tier) in [(twin.revision, "bf16"), ("revision", "q4")] {
+                        let crossed = LoadSpec::new(WeightsSource::Dir(
+                            tmp.path()
+                                .join(twin.hf_cache_dir())
+                                .join("snapshots")
+                                .join(revision)
+                                .join(tier),
+                        ))
+                        .with_resolved_route(*route);
+                        assert!(validate_resolved_artifact_binding(&crossed).is_err());
+                    }
+                }
+                None => {
+                    let unpublished = LoadSpec::new(WeightsSource::Dir(
+                        tmp.path()
+                            .join(format!("models--SceneWorks--{twin_repository}"))
+                            .join("snapshots")
+                            .join("0".repeat(40))
+                            .join("q4"),
+                    ))
+                    .with_resolved_route(*route);
+                    assert!(
+                        validate_resolved_artifact_binding(&unpublished).is_err(),
+                        "{route}"
+                    );
+                }
+            }
         }
     }
 

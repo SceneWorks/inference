@@ -160,6 +160,7 @@ pub(crate) mod tests {
                     shape: (32, 32).into(),
                     padded_shape: Some(gen_core::mxfp8_padded_shape),
                     source_packed: true,
+                    dtype: None,
                 }))
             } else {
                 SimpleBackend::tensor_info(&self.0, key)

@@ -8,6 +8,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::snapshot_inventory::{
     collect_regular_files, hex_lower, sha256_file, update_framed, InventoryPolicy,
 };
+use candle_gen::gen_core::snapshot_source::{path_components, SceneWorksSnapshot, TierSources};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
@@ -33,6 +34,20 @@ pub(crate) struct RouteIdentity {
     pub provider: &'static str,
     pub repository: &'static str,
     pub revision: &'static str,
+    /// The published Candle-native GGML twin of this route's q4/q8 tiers (SW-7285), which
+    /// SceneWorks resolves on Windows/Linux instead of the MLX tree. `None` until it is published:
+    /// add the exact `SceneWorksSnapshot::new("chroma1-…-candle", "<rev>")` row in [`ROUTES`].
+    pub candle_twin: Option<SceneWorksSnapshot>,
+}
+
+impl RouteIdentity {
+    /// Every exact identity a tier root of this route may be bound to.
+    pub(crate) const fn sources(self) -> TierSources {
+        TierSources {
+            primary: SceneWorksSnapshot::new(self.repository, self.revision),
+            candle_twin: self.candle_twin,
+        }
+    }
 }
 
 pub(crate) const ROUTES: &[RouteIdentity] = &[
@@ -40,16 +55,19 @@ pub(crate) const ROUTES: &[RouteIdentity] = &[
         provider: crate::CHROMA1_HD_ID,
         repository: "chroma1-hd-mlx",
         revision: "9d99afe1ebca67032476756bc70d4a7152bc1bd5",
+        candle_twin: None,
     },
     RouteIdentity {
         provider: crate::CHROMA1_BASE_ID,
         repository: "chroma1-base-mlx",
         revision: "e7330dda29d00ffdeeb719b28e92ee74cff0884c",
+        candle_twin: None,
     },
     RouteIdentity {
         provider: crate::CHROMA1_FLASH_ID,
         repository: "chroma1-flash-mlx",
         revision: "6a9cb6178709559461506bf247f708d0d1008d00",
+        candle_twin: None,
     },
 ];
 
@@ -167,6 +185,9 @@ pub(crate) struct PidReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChromaLoadReceipt {
     pub route: RouteIdentity,
+    /// The exact identity [`validate_snapshot_binding`] bound the root to: the route's MLX tree or
+    /// its Candle twin. The adapter overlay digest names this one, never the route's default.
+    pub source: SceneWorksSnapshot,
     pub canonical_root: PathBuf,
     inventory: Vec<(PathBuf, gen_core::PinnedWeightsFile, [u8; 32])>,
     pub tier: Option<Quant>,
@@ -188,7 +209,7 @@ impl ChromaLoadReceipt {
         let WeightsSource::Dir(root) = &spec.weights else {
             unreachable!("validated above")
         };
-        validate_snapshot_binding(root, route)?;
+        let source = validate_snapshot_binding(root, route)?;
         let lexical_root = std::path::absolute(root)?;
         let canonical_root = std::fs::canonicalize(&lexical_root)?;
         let inventory_paths = recursive_artifact_files(&lexical_root)?;
@@ -300,6 +321,7 @@ impl ChromaLoadReceipt {
         };
         let receipt = Self {
             route,
+            source,
             canonical_root,
             inventory,
             tier: packed.0,
@@ -378,8 +400,8 @@ impl ChromaLoadReceipt {
         }
         let mut digest = Sha256::new();
         update_framed(&mut digest, self.route.provider.as_bytes());
-        update_framed(&mut digest, self.route.repository.as_bytes());
-        update_framed(&mut digest, self.route.revision.as_bytes());
+        update_framed(&mut digest, self.source.repository.as_bytes());
+        update_framed(&mut digest, self.source.revision.as_bytes());
         for adapter in &self.adapters {
             update_framed(&mut digest, &(adapter.order as u64).to_le_bytes());
             update_framed(
@@ -526,34 +548,30 @@ fn validate_load_shape(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<(
     Ok(())
 }
 
-fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Result<()> {
-    let repo_hf = format!("models--SceneWorks--{}", route.repository);
-    let repo_app = format!("SceneWorks__{}", route.repository);
-    let components = root
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+/// Bind the tier root to one exact identity of `route`: its MLX tree at any tier, or its published
+/// Candle twin at q4/q8 (SW-7285). Every other repository or revision is refused.
+fn validate_snapshot_binding(
+    root: &Path,
+    route: RouteIdentity,
+) -> gen_core::Result<SceneWorksSnapshot> {
+    let components = path_components(root);
     let Some(tier) = components.last().map(String::as_str) else {
         return Err(gen_core::Error::Unsupported(
             "chroma: empty weights path".into(),
         ));
     };
-    let canonical_hf = [repo_hf.as_str(), "snapshots", route.revision, tier];
-    let canonical_app = [repo_app.as_str(), route.revision, tier];
-    let canonical_plain = [route.repository, route.revision, tier];
-    if !(components.ends_with(&canonical_hf.map(str::to_owned))
-        || components.ends_with(&canonical_app.map(str::to_owned))
-        || components.ends_with(&canonical_plain.map(str::to_owned)))
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: weights path {} is not bound to SceneWorks/{}@{}",
-            route.provider,
-            root.display(),
-            route.repository,
-            route.revision
-        )));
-    }
-    Ok(())
+    let sources = route.sources();
+    sources
+        .bind(&components, tier)
+        .map(|(source, _)| source)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: weights path {} is not bound to {}",
+                route.provider,
+                root.display(),
+                sources.describe(tier)
+            ))
+        })
 }
 
 fn config_quant(config_pin: &gen_core::PinnedWeightsFile) -> gen_core::Result<Option<(u8, usize)>> {
@@ -598,6 +616,51 @@ fn inspect_transformer_tier(
         .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let config_packed = config_quant(config)?;
+    // A Candle-native GGML tier (SW-7285): `{base}.weight` stored as GGML blocks (`U8 [out, in /
+    // 32, block_bytes]`, no affine sidecars) whose block type is the physical width.
+    let stored_bases = headers
+        .values()
+        .filter(|header| header.is_stored_ggml_block())
+        .filter_map(|header| header.name.strip_suffix(".weight").map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    if !stored_bases.is_empty() {
+        let Some((bits, group)) = config_packed else {
+            return Err(gen_core::Error::Unsupported(
+                "chroma: stored GGML transformer has no matching config quantization block".into(),
+            ));
+        };
+        for base in &stored_bases {
+            let header = &headers[&format!("{base}.weight")];
+            if packed_bases.contains(base)
+                || headers.contains_key(&format!("{base}.biases"))
+                || header.stored_ggml_block_bits() != Some(usize::from(bits))
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "chroma: stored GGML {base} crosses the config's Q{bits} width or is also \
+                     stored as an affine triple"
+                )));
+            }
+        }
+        if !packed_bases.is_empty() {
+            return Err(gen_core::Error::Unsupported(
+                "chroma: transformer mixes stored GGML blocks with affine triples".into(),
+            ));
+        }
+        for (name, header) in &headers {
+            let stored = name
+                .strip_suffix(".weight")
+                .is_some_and(|base| stored_bases.contains(base));
+            if !stored && header.dtype != Dtype::BF16 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "chroma: non-packed transformer tensor {name} must be BF16"
+                )));
+            }
+        }
+        return Ok((
+            Some(if bits == 4 { Quant::Q4 } else { Quant::Q8 }),
+            Some(group),
+        ));
+    }
     if packed_bases.is_empty() {
         if config_packed.is_some() {
             return Err(gen_core::Error::Unsupported(
@@ -718,6 +781,11 @@ fn projected_transformer_header(
                 gen_core::Error::Unsupported("chroma: packed tensor lacks group size".into())
             })?,
         );
+    }
+    // A stored GGML block (SW-7285; validated by `inspect_transformer_tier`) is built as
+    // published: its stored bytes are the resident weight.
+    if header.name.ends_with(".weight") && header.is_stored_ggml_block() {
+        return Ok(header.data_bytes);
     }
     if header.dtype != gen_core::weightsmeta::Dtype::BF16 {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1836,6 +1904,63 @@ mod tests {
         MemoryStrategyParameters, OffloadPolicy,
     };
 
+    /// SW-7285: a Candle-native GGML Chroma transformer (stored `U8 [out, in / 32, block_bytes]`
+    /// blocks under a `{bits, storage: "ggml"}` config) resolves to the tier its blocks encode and
+    /// prices them at their stored bytes; the other width, a missing config and a both-forms
+    /// projection are refused. Header-only.
+    #[test]
+    fn stored_ggml_transformer_resolves_and_prices_its_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (bits, block, other) in [(4u8, 20usize, 34usize), (8, 34, 20)] {
+            let dir = tmp.path().join(format!("q{bits}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("model.safetensors");
+            let config = dir.join("config.json");
+            let write_config = |marker: bool| {
+                let body = if marker {
+                    format!(r#"{{"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#)
+                } else {
+                    "{}".to_owned()
+                };
+                std::fs::write(&config, body).unwrap();
+                gen_core::PinnedWeightsFile::pin(&config).unwrap()
+            };
+            write_safetensors(
+                &model,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("n.weight", "BF16", &[4], 8),
+                ],
+            );
+            let files = vec![model.clone()];
+            let (tier, group) = inspect_transformer_tier(&files, &write_config(true)).unwrap();
+            assert_eq!(tier.map(|q| q.bits()), Some(i32::from(bits)));
+            assert_eq!(group, Some(candle_gen::quant::MLX_GROUP_SIZE));
+            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&model).unwrap();
+            let by_name = headers
+                .iter()
+                .map(|h| (h.name.clone(), h.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let stored = headers.iter().find(|h| h.name == "a.weight").unwrap();
+            assert_eq!(
+                projected_transformer_header(stored, &by_name, &BTreeSet::new(), group).unwrap(),
+                (4 * 2 * block) as u64
+            );
+            assert!(inspect_transformer_tier(&files, &write_config(false)).is_err());
+            write_safetensors(&model, &[("a.weight", "U8", &[4, 2, other], 4 * 2 * other)]);
+            assert!(inspect_transformer_tier(&files, &write_config(true)).is_err());
+            write_safetensors(
+                &model,
+                &[
+                    ("a.weight", "U8", &[4, 2, block], 4 * 2 * block),
+                    ("a.scales", "BF16", &[4, 1], 8),
+                    ("a.biases", "BF16", &[4, 1], 8),
+                ],
+            );
+            assert!(inspect_transformer_tier(&files, &write_config(true)).is_err());
+        }
+    }
+
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0_usize;
         let mut header = serde_json::Map::new();
@@ -2125,6 +2250,73 @@ mod tests {
 
         std::fs::write(root.join("transformer/config.json"), b"{}").unwrap();
         assert!(ChromaLoadReceipt::capture(base.provider, &spec(root, base.provider)).is_err());
+    }
+
+    /// SW-7285: the tier root binds to the route's exact MLX tree at any tier, or to its exact
+    /// published Candle twin at q4/q8 only. A twin not yet published, a crossed repository/revision
+    /// pair, and any other repository or revision stay refused. Path parsing only.
+    #[test]
+    fn snapshot_binding_admits_the_mlx_tree_and_only_a_published_candle_twin() {
+        let hf = |repository: &str, revision: &str, tier: &str| {
+            PathBuf::from("hub")
+                .join(format!("models--SceneWorks--{repository}"))
+                .join("snapshots")
+                .join(revision)
+                .join(tier)
+        };
+        let foreign_revision = "0".repeat(40);
+        for route in ROUTES.iter().copied() {
+            for tier in ["q4", "q8", "bf16"] {
+                let bound =
+                    validate_snapshot_binding(&hf(route.repository, route.revision, tier), route)
+                        .unwrap();
+                assert_eq!(bound, route.sources().primary);
+            }
+            assert!(validate_snapshot_binding(
+                &hf(route.repository, &foreign_revision, "q4"),
+                route
+            )
+            .is_err());
+            let twin_repository = route.repository.replace("-mlx", "-candle");
+            match route.candle_twin {
+                Some(twin) => {
+                    assert_eq!(twin.repository, twin_repository);
+                    for tier in ["q4", "q8"] {
+                        assert_eq!(
+                            validate_snapshot_binding(
+                                &hf(twin.repository, twin.revision, tier),
+                                route
+                            )
+                            .unwrap(),
+                            twin
+                        );
+                    }
+                    for crossed in [
+                        hf(twin.repository, twin.revision, "bf16"),
+                        hf(twin.repository, route.revision, "q4"),
+                        hf(route.repository, twin.revision, "q4"),
+                        hf(twin.repository, &foreign_revision, "q4"),
+                    ] {
+                        assert!(validate_snapshot_binding(&crossed, route).is_err());
+                    }
+                }
+                None => {
+                    for revision in [route.revision, foreign_revision.as_str()] {
+                        assert!(validate_snapshot_binding(
+                            &hf(&twin_repository, revision, "q4"),
+                            route
+                        )
+                        .is_err());
+                    }
+                }
+            }
+        }
+        // A sibling route's identity never binds this route.
+        assert!(validate_snapshot_binding(
+            &hf(ROUTES[0].repository, ROUTES[0].revision, "q4"),
+            ROUTES[1]
+        )
+        .is_err());
     }
 
     #[test]

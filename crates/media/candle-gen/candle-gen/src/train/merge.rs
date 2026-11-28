@@ -261,6 +261,7 @@ impl MergeTargets for CheckpointDeltas {
                 shape: op.dims().into(),
                 source_packed: true,
                 padded_shape: None,
+                dtype: None,
             }));
         }
         let cpu = self.base.clone().set_device(Device::Cpu);

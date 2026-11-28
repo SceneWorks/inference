@@ -180,13 +180,21 @@ fn validate_expert(path: &Path, label: &str, bits: i32) -> Result<()> {
             })
             .collect();
     let names: BTreeSet<&str> = headers.keys().map(String::as_str).collect();
+    // A Candle-native GGML tier (SW-7285) stores a projection as ONE `{base}.weight` of GGML blocks
+    // — the packed equivalent of a triple — so it counts as a packed payload here.
     let packed: Vec<&str> = names
         .iter()
-        .filter_map(|name| name.strip_suffix(".scales"))
+        .filter_map(|name| {
+            name.strip_suffix(".scales").or_else(|| {
+                name.strip_suffix(".weight")
+                    .filter(|_| stored_geometry(&headers[*name]).is_some())
+            })
+        })
         .collect();
     if packed.is_empty() {
         return Err(CandleError::Msg(format!(
-            "wan VACE-Fun {label} expert {} has no MLX-affine `.scales` payloads; q{bits} must not mix with dense experts",
+            "wan VACE-Fun {label} expert {} has no MLX-affine `.scales` or stored GGML block \
+             payloads; q{bits} must not mix with dense experts",
             path.display()
         )));
     }
@@ -228,6 +236,19 @@ fn validate_expert(path: &Path, label: &str, bits: i32) -> Result<()> {
     Ok(())
 }
 
+/// The stored-GGML geometry (SW-7285, `U8 [out, in / 32, block_bytes]`) of a header, or `None`.
+fn stored_geometry(
+    header: &TensorHeader,
+) -> Option<(candle_gen::candle_core::quantized::GgmlDType, usize, usize)> {
+    if header.shape.len() != 3 {
+        return None;
+    }
+    candle_gen::candle_layers::llm_projection::ggml_block_storage(
+        header.dtype == "U8",
+        &header.shape,
+    )
+}
+
 /// Validate an MLX affine triple's key schema, scalar dtypes, group-64 shape relation, and exact
 /// payload bit-width. `require_dense_bias` applies to the VACE-Fun projection surface consumed by
 /// `QLinear::linear_detect(..., bias = true)`; without the sidecar, loading must fail here rather
@@ -251,6 +272,39 @@ fn validate_packed_projection(
     let weight = headers
         .get(&key("weight"))
         .ok_or_else(|| missing("weight"))?;
+    // A stored GGML block projection (SW-7285): no affine sidecars, the declared width, and the
+    // same dense output bias the triple carries.
+    if let Some((dtype, out, _)) = stored_geometry(weight) {
+        if headers.contains_key(&key("scales")) || headers.contains_key(&key("biases")) {
+            return Err(CandleError::Msg(format!(
+                "wan VACE-Fun {label} expert {} stores {base} as GGML blocks and also carries \
+                 affine sidecars — a tier stores a projection one way, never both",
+                path.display()
+            )));
+        }
+        let actual = candle_gen::quant::stored_ggml::stored_ggml_bits(dtype);
+        if actual != Some(expected_bits as usize) {
+            return Err(CandleError::Msg(format!(
+                "wan VACE-Fun {label} expert {} marker says q{expected_bits}, but {base} stores \
+                 {dtype:?} blocks; refusing a mixed tier",
+                path.display()
+            )));
+        }
+        if require_dense_bias {
+            let bias = headers.get(&key("bias")).ok_or_else(|| missing("bias"))?;
+            if !is_floating_dtype(&bias.dtype) || bias.shape.as_slice() != [out] {
+                return Err(CandleError::Msg(format!(
+                    "wan VACE-Fun {label} expert {} has invalid dense bias {}: dtype={} \
+                     shape={:?}, expected floating [{out}]",
+                    path.display(),
+                    key("bias"),
+                    bias.dtype,
+                    bias.shape
+                )));
+            }
+        }
+        return Ok(());
+    }
     let scales = headers
         .get(&key("scales"))
         .ok_or_else(|| missing("scales"))?;
@@ -493,6 +547,60 @@ mod tests {
             );
             let scales = mapped.get("blocks.0.attn1.to_q.scales").unwrap();
             assert_eq!(scales.shape(), [OUT, IN / MLX_GROUP_SIZE]);
+        }
+    }
+
+    /// SW-7285: a VACE-Fun expert whose projections are Candle-native stored GGML blocks (no affine
+    /// sidecars) validates at the marker's width, and the packed-adapter gates see it as packed; the
+    /// other width and a both-forms projection are refused. Header inspection only.
+    #[test]
+    fn stored_ggml_experts_validate_as_the_packed_tier() {
+        let to_stored = |map: &mut HashMap<String, Tensor>, block: usize| {
+            for base in required_packed_bases() {
+                map.remove(&format!("{base}.scales"));
+                map.remove(&format!("{base}.biases"));
+                map.insert(
+                    format!("{base}.weight"),
+                    Tensor::zeros((OUT, IN / 32, block), DType::U8, &Device::Cpu).unwrap(),
+                );
+            }
+        };
+        for (bits, block, other) in [(4, 20usize, 34usize), (8, 34, 20)] {
+            let tmp = tier(bits);
+            write_expert(&tmp.path().join(HIGH), bits, |map| to_stored(map, block));
+            write_expert(&tmp.path().join(LOW), bits, |map| to_stored(map, block));
+            let paths = VaceFunTierPaths::detect(tmp.path()).unwrap().unwrap();
+            let vb = paths
+                .component_vb("transformer", DType::F32, &Device::Cpu)
+                .unwrap();
+            assert!(
+                candle_gen::quant::stored_ggml::stored_ggml_vb(&vb, "blocks.0.attn1.to_q")
+                    .unwrap()
+                    .is_some(),
+                "the stored blocks are classified from the header"
+            );
+
+            write_expert(&tmp.path().join(LOW), bits, |map| to_stored(map, other));
+            let err = VaceFunTierPaths::detect(tmp.path())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("refusing a mixed tier"), "{err}");
+
+            write_expert(&tmp.path().join(LOW), bits, |map| {
+                to_stored(map, block);
+                map.insert(
+                    "blocks.0.attn1.to_q.scales".into(),
+                    Tensor::ones((OUT, 1), DType::F32, &Device::Cpu).unwrap(),
+                );
+                map.insert(
+                    "blocks.0.attn1.to_q.biases".into(),
+                    Tensor::zeros((OUT, 1), DType::F32, &Device::Cpu).unwrap(),
+                );
+            });
+            let err = VaceFunTierPaths::detect(tmp.path())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("never both"), "{err}");
         }
     }
 

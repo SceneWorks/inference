@@ -2439,13 +2439,22 @@ fn packed_encoder_inventory_is_exact(
             ("gate_up_proj", 2 * cfg.intermediate_size, cfg.hidden_size),
             ("down_proj", cfg.hidden_size, cfg.intermediate_size),
         ] {
-            if !in_dim.is_multiple_of(group_size) || !in_dim.is_multiple_of(codes_per_word) {
-                return false;
-            }
             let base = format!("model.layers.{layer}.mlp.experts.{projection}");
             let Ok(weight) = source.get(&format!("{base}.weight")) else {
                 return false;
             };
+            // A Candle-native GGML tier (SW-7285) stores each fused expert projection as stacked
+            // GGML blocks `U8 [E, out, in / 32, block_bytes]` with no affine sidecars — the same
+            // per-expert blocks the triple repacks into, so it streams exactly like the triple.
+            if weight.shape().len() == 4 && weight.dtype() == safetensors::tensor::Dtype::U8 {
+                if !stored_experts_match(source, &base, &weight, cfg, bits, out_dim, in_dim) {
+                    return false;
+                }
+                continue;
+            }
+            if !in_dim.is_multiple_of(group_size) || !in_dim.is_multiple_of(codes_per_word) {
+                return false;
+            }
             let Ok(scales) = source.get(&format!("{base}.scales")) else {
                 return false;
             };
@@ -2464,6 +2473,48 @@ fn packed_encoder_inventory_is_exact(
         }
     }
     true
+}
+
+/// A stored-GGML tier's stacked expert projection (SW-7285): `U8 [E, out, in / 32, block_bytes]`
+/// whose block type is the declared `bits`, at the encoder's exact `[E, out, in]`, with no `.scales`
+/// / `.biases` sibling (a projection is stored one way, never both).
+fn stored_experts_match(
+    source: &MmapedSafetensors,
+    base: &str,
+    weight: &safetensors::tensor::TensorView<'_>,
+    cfg: &EncoderConfig,
+    bits: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> bool {
+    use candle_gen::quant::stored_ggml::stored_ggml_bits;
+    let shape = weight.shape();
+    let Some((dtype, _, cols)) = candle_gen::candle_layers::llm_projection::ggml_block_storage(
+        weight.dtype() == safetensors::tensor::Dtype::U8,
+        shape,
+    ) else {
+        return false;
+    };
+    stored_ggml_bits(dtype) == Some(bits)
+        && shape.len() == 4
+        && shape[0] == cfg.num_local_experts
+        && shape[1] == out_dim
+        && cols == in_dim
+        && source.get(&format!("{base}.scales")).is_err()
+        && source.get(&format!("{base}.biases")).is_err()
+}
+
+/// Whether a safetensors view is a rank-3 **stored GGML block** (SW-7285): `U8 [out, in / 32,
+/// block_bytes]`, classified from the header. `Some(bits)` of its block type.
+fn stored_block_bits(view: &safetensors::tensor::TensorView<'_>) -> Option<Option<usize>> {
+    if view.shape().len() != 3 {
+        return None;
+    }
+    let (dtype, ..) = candle_gen::candle_layers::llm_projection::ggml_block_storage(
+        view.dtype() == safetensors::tensor::Dtype::U8,
+        view.shape(),
+    )?;
+    Some(candle_gen::quant::stored_ggml::stored_ggml_bits(dtype))
 }
 
 fn transformer_numeric_tier_matches(spec: &LoadSpec, expected_bits: usize) -> bool {
@@ -2493,9 +2544,23 @@ component.join("config.json"),
     };
     let mut packed_triples = 0usize;
     let mut u32_weights = 0usize;
+    // Stored GGML blocks (SW-7285) count as packed linears: the same blocks the triple repacks into.
+    let mut stored_blocks = 0usize;
     for (name, view) in source.tensors() {
         if name.ends_with(".weight") && view.dtype() == safetensors::tensor::Dtype::U32 {
             u32_weights += 1;
+        }
+        if let (Some(base), Some(bits)) = (name.strip_suffix(".weight"), stored_block_bits(&view)) {
+            // A projection stored both ways, or blocks of a different width than the request, is
+            // not this tier.
+            if declared.is_none()
+                || bits != Some(expected_bits)
+                || source.get(&format!("{base}.scales")).is_ok()
+            {
+                return false;
+            }
+            stored_blocks += 1;
+            continue;
         }
         let Some(base) = name.strip_suffix(".scales") else {
             continue;
@@ -2534,7 +2599,7 @@ component.join("config.json"),
     matches!(declared, Some(packed)
         if packed.bits == expected_bits as i32
             && packed.group_size == candle_gen::quant::MLX_GROUP_SIZE as i32
-            && packed_triples > 0
+            && packed_triples + stored_blocks > 0
             && packed_triples == u32_weights)
 }
 
@@ -2619,10 +2684,15 @@ fn component_is_provably_dense(spec: &LoadSpec, component: &str) -> bool {
     let Ok(source) = candle_gen::mmap_safetensors_multi(&files) else {
         return false;
     };
-    !source
-        .tensors()
-        .iter()
-        .any(|(name, _)| name.ends_with(".scales"))
+    // A stored GGML block (SW-7285, rank 3 or a rank-4 stacked expert) is the other packed marker.
+    !source.tensors().iter().any(|(name, view)| {
+        name.ends_with(".scales")
+            || candle_gen::candle_layers::llm_projection::ggml_block_storage(
+                view.dtype() == safetensors::tensor::Dtype::U8,
+                view.shape(),
+            )
+            .is_some()
+    })
 }
 
 /// The tier the snapshot on disk actually is: the declared `config.json` marker cross-checked
@@ -4085,6 +4155,103 @@ mod integration_tests {
             !transformer_numeric_tier_matches(&spec, 4),
             "rung 4 requires a packed transformer whose blocks are transfer-ready"
         );
+    }
+
+    /// SW-7285: a Candle-native GGML tier passes the same streamability / tier gates the MLX triple
+    /// does — stored DiT blocks count as packed linears and stacked stored experts satisfy the
+    /// encoder inventory — while a mismatched width, a both-forms projection or a stored block under
+    /// a dense declaration is still refused. Header inspection only.
+    #[test]
+    fn stored_ggml_tiers_pass_the_stream_and_tier_gates() {
+        let u8_zeros = |shape: &[usize]| Tensor::zeros(shape, DType::U8, &Device::Cpu).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let component = root.join("transformer");
+        std::fs::create_dir_all(&component).unwrap();
+        let ggml =
+            |bits: i32| format!(r#"{{"quantization": {{"bits": {bits}, "storage": "ggml"}}}}"#);
+        std::fs::write(component.join("config.json"), ggml(4)).unwrap();
+        let mut stored = std::collections::HashMap::from([
+            ("proj.weight".to_owned(), u8_zeros(&[4, 2, 20])),
+            (
+                "norm.weight".to_owned(),
+                Tensor::zeros(64, DType::BF16, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        let save = |tensors: &std::collections::HashMap<String, Tensor>| {
+            candle_gen::candle_core::safetensors::save(tensors, component.join("model.safetensors"))
+                .unwrap()
+        };
+        save(&stored);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(
+            transformer_numeric_tier_matches(&spec, 4),
+            "Q4_1 blocks back q4"
+        );
+        assert!(!transformer_numeric_tier_matches(&spec, 8), "but not q8");
+        assert!(
+            !component_is_provably_dense(&spec, "transformer"),
+            "stored blocks are a packed marker"
+        );
+        std::fs::write(component.join("config.json"), ggml(8)).unwrap();
+        stored.insert("proj.weight".to_owned(), u8_zeros(&[4, 2, 34]));
+        save(&stored);
+        assert!(
+            transformer_numeric_tier_matches(&spec, 8),
+            "Q8_0 blocks back q8"
+        );
+        stored.insert(
+            "proj.scales".to_owned(),
+            Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+        );
+        save(&stored);
+        assert!(
+            !transformer_numeric_tier_matches(&spec, 8),
+            "a projection stored both ways is refused"
+        );
+        stored.remove("proj.scales");
+        save(&stored);
+        std::fs::write(component.join("config.json"), r#"{"dtype": "bfloat16"}"#).unwrap();
+        assert!(
+            !transformer_numeric_tier_matches(&spec, 8),
+            "stored blocks under an absent declaration fail closed"
+        );
+
+        // The encoder inventory: every layer's stacked stored experts at the declared width.
+        let mut cfg = EncoderConfig::gpt_oss_20b();
+        cfg.num_hidden_layers = 2;
+        cfg.num_local_experts = 2;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 64;
+        for (bits, block) in [(4, 20usize), (8, 34)] {
+            let mut experts = std::collections::HashMap::new();
+            for layer in 0..cfg.num_hidden_layers {
+                for (projection, out_dim, in_dim) in [
+                    ("gate_up_proj", 2 * cfg.intermediate_size, cfg.hidden_size),
+                    ("down_proj", cfg.hidden_size, cfg.intermediate_size),
+                ] {
+                    experts.insert(
+                        format!("model.layers.{layer}.mlp.experts.{projection}.weight"),
+                        u8_zeros(&[cfg.num_local_experts, out_dim, in_dim / 32, block]),
+                    );
+                }
+            }
+            let file = root.join(format!("experts-q{bits}.safetensors"));
+            candle_gen::candle_core::safetensors::save(&experts, &file).unwrap();
+            // SAFETY: immutable test fixture, alive for the duration of these assertions.
+            let source = unsafe { MmapedSafetensors::multi(std::slice::from_ref(&file)).unwrap() };
+            assert!(packed_encoder_inventory_is_exact(&source, &cfg, bits, 64));
+            let other = if bits == 4 { 8 } else { 4 };
+            assert!(
+                !packed_encoder_inventory_is_exact(&source, &cfg, other, 64),
+                "q{bits} blocks do not back a q{other} declaration"
+            );
+            let mut wrong = cfg.clone();
+            wrong.num_local_experts = 3;
+            assert!(!packed_encoder_inventory_is_exact(
+                &source, &wrong, bits, 64
+            ));
+        }
     }
 
     #[test]

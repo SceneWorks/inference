@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, Var};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::loader::MappedWeights;
@@ -307,6 +308,16 @@ pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
 /// if a future tier ever packs `model.visual.*`. This guard turns that latent silent-garbage into a
 /// hard load error. (Dense components with no packed config are unaffected: `packed()` is `None`.)
 pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if let Some((dtype, ..)) = stored_ggml_geometry(w, base) {
+        return Err(
+            candle_gen::quant::stored_ggml::StoredGgmlRefusal::DenseOnly {
+                context: "boogu".into(),
+                base: base.into(),
+                dtype,
+            }
+            .into(),
+        );
+    }
     if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "boogu: `{base}` has a `.scales` sibling in a packed component but is loaded dense — the \
@@ -315,6 +326,43 @@ pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear>
         )));
     }
     linear(w, base, bias)
+}
+
+/// The GGML block type and logical `[rows, cols]` of `{base}.weight` when it is a **stored GGML
+/// block tensor** (a Candle-native tier, SW-7285), classified from its header alone
+/// ([`candle_gen::quant::stored_ggml::stored_block_geometry`]) — no payload is read. `None` for
+/// any other weight (absent, dense, MLX-packed or encoded).
+pub fn stored_ggml_geometry(w: &Weights, base: &str) -> Option<(GgmlDType, usize, usize)> {
+    let (dtype, shape) = w.native_header(&format!("{base}.weight"))?;
+    candle_gen::quant::stored_ggml::stored_block_geometry(dtype, &shape)
+}
+
+/// `{base}.weight`'s stored GGML blocks read **on the host** for a projection loader, after
+/// refusing a `.scales` sibling beside them; `None` for any other weight. A mapped component reads
+/// through the shared mapped-set helper
+/// ([`candle_gen::quant::stored_ggml::stored_ggml_mmap_host`], the one the Ideogram loader uses),
+/// so the caller's [`candle_gen::quant::stored_ggml::qtensor_from_stored`] uploads the final
+/// `QTensor` once instead of copying the blocks to the device and straight back. A training set's
+/// owned tensors are already live and are returned as they are.
+pub fn stored_ggml_checked(w: &Weights, context: &str, base: &str) -> Result<Option<Tensor>> {
+    match &w.storage {
+        WeightStorage::Mmap(st) => {
+            candle_gen::quant::stored_ggml::stored_ggml_mmap_host(st.mmap(), context, base)
+        }
+        WeightStorage::Owned(tensors) => {
+            let Some(geometry) = stored_ggml_geometry(w, base) else {
+                return Ok(None);
+            };
+            candle_gen::quant::stored_ggml::validate_stored(
+                context,
+                base,
+                geometry,
+                tensors.contains_key(&format!("{base}.scales")),
+                None,
+            )?;
+            Ok(tensors.get(&format!("{base}.weight")).cloned())
+        }
+    }
 }
 
 /// **Packed-detecting** [`QLinear`] loader (sc-9410): when the component is a packed q4 tier *and*
@@ -326,6 +374,15 @@ pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear>
 /// survive any `to_out.0`-style nesting — the key-remap trap: build the base string first, then detect
 /// (the `linear_detect_fires_on_to_out_remap` test pins this on the real boogu `to_out.0` layout).
 pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
+    // A Candle-native GGML tier (SW-7285): built as stored — no repack, no cache entry.
+    if let Some(stored) = stored_ggml_checked(w, "boogu", base)? {
+        let dense_bias = if bias {
+            Some(w.get(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        return QLinear::from_stored_ggml(&stored, dense_bias, w.device());
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let wq = w.get_native(&format!("{base}.weight"))?;
@@ -346,6 +403,17 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
 /// dtype parity with the dense table), else a dense [`Embedding`] from `{base}.weight` (`hidden`
 /// inferred from the stored `[vocab, hidden]` shape). The Qwen3-VL TE `embed_tokens` is packed in q4.
 pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
+    // A Candle-native GGML tier's stored table (SW-7285): host-resident rows, dequantized to f32
+    // exactly like the packed triple's (sc-12828).
+    if let Some(stored) = stored_ggml_checked(w, "boogu", base)? {
+        let table = candle_gen::quant::stored_ggml::qtensor_from_stored(
+            &stored,
+            &candle_gen::candle_core::Device::Cpu,
+        )?;
+        return Ok(QEmbedding::Packed(
+            candle_gen::quant::QEmbedding::from_qtensor(table, DType::F32)?,
+        ));
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let wq = w.get_native(&format!("{base}.weight"))?;
@@ -806,6 +874,66 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::packed_embedding_dequants_f32_on_bf16_store");
+        Ok(())
+    }
+
+    /// SW-7285 review: a stored GGML projection is read on the HOST through the shared mapped-set
+    /// helper and uploaded once, as the final `QTensor` — never copied to the component device and
+    /// straight back. A CPU-only host cannot tell the two residencies apart, so this pins what it
+    /// can: the read is the host U8 block tensor whatever the component device, the dense-only
+    /// guards classify from the header alone, a `.scales` sibling is refused, and the projection
+    /// and embedding build as stored. Construction only; no forward runs.
+    #[test]
+    fn stored_ggml_blocks_are_read_on_the_host_and_built_as_stored() -> Result<()> {
+        use candle_gen::candle_core::quantized::QTensor;
+        let dense = Tensor::arange(0f32, 64. * 64., &Device::Cpu)?
+            .reshape((64, 64))?
+            .affine(1e-3, -1.)?;
+        let blocks = candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(
+            &QTensor::quantize(&dense, GgmlDType::Q8_0)?,
+        )
+        .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        let temp = tempfile::tempdir().unwrap();
+        let stored = temp.path().join("stored");
+        write_component(
+            &stored,
+            HashMap::from([
+                ("p.weight".to_string(), blocks.clone()),
+                ("e.weight".to_string(), blocks.clone()),
+            ]),
+            true,
+        );
+        let w = Weights::from_dir(&stored, &Device::Cpu, DType::F32)?;
+        assert_eq!(
+            stored_ggml_geometry(&w, "p"),
+            Some((GgmlDType::Q8_0, 64, 64))
+        );
+        let host = stored_ggml_checked(&w, "boogu", "p")?.expect("a stored block tensor");
+        assert!(host.device().is_cpu());
+        assert_eq!((host.dtype(), host.dims()), (DType::U8, &[64, 2, 34][..]));
+        assert!(linear_detect(&w, "p", false)?.is_packed());
+        assert!(matches!(embedding_detect(&w, "e")?, QEmbedding::Packed(_)));
+        let err = linear_guard_dense(&w, "p", false).unwrap_err().to_string();
+        assert!(err.contains("dense-only"), "{err}");
+
+        // A stored block beside an affine `.scales` sibling is refused, not read either way.
+        let (_, scales, biases, _) = q4_packed(64, 64);
+        let both = temp.path().join("both");
+        write_component(
+            &both,
+            HashMap::from([
+                ("p.weight".to_string(), blocks),
+                ("p.scales".to_string(), scales),
+                ("p.biases".to_string(), biases),
+            ]),
+            true,
+        );
+        let w = Weights::from_dir(&both, &Device::Cpu, DType::F32)?;
+        let err = linear_detect(&w, "p", false)
+            .err()
+            .expect("both forms must be refused")
+            .to_string();
+        assert!(err.contains("never both"), "{err}");
         Ok(())
     }
 }

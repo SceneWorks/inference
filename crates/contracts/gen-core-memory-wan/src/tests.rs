@@ -10,6 +10,7 @@ fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
         let width = match dtype {
             "F32" | "U32" => 4,
             "F16" | "BF16" => 2,
+            "U8" => 1,
             _ => panic!("dtype"),
         };
         let bytes = shape.iter().product::<usize>() * width;
@@ -997,6 +998,74 @@ fn every_candle_dense_leg_accepts_the_staged_snapshot_and_refuses_a_malformed_on
     }
 }
 
+/// SW-7285: a packed Candle root binds to its exact policy repository + revision, or to the
+/// route's exact published `-candle-ggml` twin; a twin not yet published, a crossed
+/// repository/revision pair, and a revision other than the pinned one stay refused, and the MLX
+/// backend never admits a twin. Path parsing only.
+#[test]
+fn packed_candle_roots_bind_the_policy_row_and_only_a_published_ggml_twin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let foreign = "0".repeat(40);
+    let root_at = |repository: &str, revision: &str, tier: &str| {
+        let root = tmp
+            .path()
+            .join(repo_dir(repository))
+            .join("snapshots")
+            .join(revision)
+            .join(tier);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    };
+    for route in [
+        WanI2vRoute::Ti2v5b,
+        WanI2vRoute::T2v14b,
+        WanI2vRoute::I2v14b,
+    ] {
+        for (quant, label) in [(Quant::Q4, "q4"), (Quant::Q8, "q8")] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(quant),
+                component_precision_floors: &[],
+            };
+            let bind =
+                |root: &Path| bind_repository_revision(root, WanI2vBackend::Candle, route, tier);
+            let (repository, revision) = repository_policy(WanI2vBackend::Candle, route, tier);
+            assert!(repository.ends_with("-candle"), "{repository}");
+            assert_eq!(
+                bind(&root_at(repository, revision, label)).unwrap(),
+                (repository, revision.to_owned())
+            );
+            assert!(bind(&root_at(repository, &foreign, label)).is_err());
+            let twin_repository = format!("{repository}-ggml");
+            match candle_ggml_twin(route) {
+                Some((twin, twin_revision)) => {
+                    assert_eq!(twin, twin_repository);
+                    assert_eq!(
+                        bind(&root_at(twin, twin_revision, label)).unwrap(),
+                        (twin, twin_revision.to_owned())
+                    );
+                    assert!(bind(&root_at(twin, revision, label)).is_err());
+                    assert!(bind(&root_at(repository, twin_revision, label)).is_err());
+                    assert!(bind(&root_at(twin, &foreign, label)).is_err());
+                    // The MLX backend never admits the Candle twin.
+                    assert!(bind_repository_revision(
+                        &root_at(twin, twin_revision, label),
+                        WanI2vBackend::Mlx,
+                        route,
+                        tier
+                    )
+                    .is_err());
+                }
+                None => {
+                    for candidate in [revision, foreign.as_str()] {
+                        assert!(bind(&root_at(&twin_repository, candidate, label)).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn mlx_q4_q8_bf16_facts_are_nonzero_differentiated_and_rsd_only() {
     let mut totals = Vec::new();
@@ -1263,6 +1332,88 @@ fn a_packed_file_prices_a_dense_output_head_but_still_refuses_stripped_quant_met
     let path = tmp.path().join("dense_only.safetensors");
     write_safetensors(&path, &[("head.head.weight", "BF16", &[64, 64])]);
     assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+}
+
+/// SW-7285: a Candle-native GGML Wan transformer (stored `U8 [out, in / 32, block_bytes]` blocks,
+/// no affine leaves) is priced on the Candle backend at the blocks' stored bytes plus the dense
+/// residual; MLX (no reader), the other width, and a both-forms projection are refused.
+#[test]
+fn stored_ggml_blocks_are_priced_at_their_stored_bytes_on_candle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("high_noise_model.safetensors");
+    write_safetensors(
+        &path,
+        &[
+            ("blocks.0.self_attn.q.weight", "U8", &[64, 2, 20]),
+            ("blocks.0.norm1.weight", "BF16", &[64]),
+            ("head.head.weight", "BF16", &[64, 64]),
+        ],
+    );
+    assert_eq!(
+        packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).unwrap(),
+        64 * 2 * 20 + (64 + 64 * 64) * 2
+    );
+    assert!(packed_transformer_bytes(&path, Quant::Q8, WanI2vBackend::Candle).is_err());
+    assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+    write_safetensors(
+        &path,
+        &[
+            ("blocks.0.self_attn.q.weight", "U8", &[64, 2, 20]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+        ],
+    );
+    assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).is_err());
+}
+
+/// SW-7285: a Candle-native GGML Wan tier's per-expert `quantize_config.json` declares
+/// `quantization = {"bits": N, "storage": "ggml"}` and, by the stored-GGML rule, no `group_size`.
+/// `prepare_load_spec` admits that marker at the selected width; a GGML marker at the other width,
+/// one that also claims a group size, and an affine marker without the group-64 layout stay refused.
+#[test]
+fn candle_ggml_tier_markers_are_admitted_at_their_declared_width() {
+    for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::T2v14b] {
+        let (_tmp, prepared) = candle_fixture(route, Some(Quant::Q4));
+        let WeightsSource::Dir(root) = prepared.weights.clone() else {
+            unreachable!("fixture is a directory")
+        };
+        let experts: &[&str] = if route == WanI2vRoute::Ti2v5b {
+            &["transformer"]
+        } else {
+            &["transformer", "transformer_2"]
+        };
+        let write_markers = |marker: &str| {
+            for expert in experts {
+                write_safetensors(
+                    &root.join(expert).join("model.safetensors"),
+                    &[("proj.weight", "U8", &[64, 2, 20])],
+                );
+                std::fs::write(root.join(expert).join("quantize_config.json"), marker).unwrap();
+            }
+        };
+        let prepare = || {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_resolved_route(route.provider_id());
+            spec.quantize = Some(Quant::Q4);
+            prepare_load_spec(&mut spec, WanI2vBackend::Candle, route.provider_id())
+        };
+
+        write_markers(r#"{"bits":4,"quantization":{"bits":4,"storage":"ggml"}}"#);
+        prepare().unwrap_or_else(|error| panic!("{route:?} GGML q4 marker refused: {error}"));
+
+        for refused in [
+            r#"{"bits":4,"quantization":{"bits":8,"storage":"ggml"}}"#,
+            r#"{"bits":4,"quantization":{"bits":4,"storage":"ggml","group_size":64}}"#,
+            r#"{"bits":4,"quantization":{"bits":4}}"#,
+        ] {
+            write_markers(refused);
+            let error = prepare().expect_err(refused).to_string();
+            assert!(
+                error.contains("packed marker"),
+                "{route:?} {refused}: {error}"
+            );
+        }
+    }
 }
 
 fn request(route: WanI2vRoute) -> GenerationRequest {

@@ -662,6 +662,10 @@ impl Weight {
 /// packing leaves intact — because once repacked into a `QTensor` there is nothing left to slice.
 enum RawWeight {
     Dense(Tensor),
+    /// A Candle-native GGML tier's stored blocks (SW-7285): host `U8 [out, in / 32, block_bytes]`,
+    /// already the device format the packed triple repacks into. Row slicing stays valid because
+    /// GGML blocks run along the input axis.
+    Stored(Tensor),
     Packed {
         q: Tensor,
         scales: Tensor,
@@ -679,6 +683,44 @@ impl RawWeight {
     /// the candle twin of `mlx_gen_ltx::diff_vae::ProjWeight::load`.
     fn load(vb: &VarBuilder, prefix: &str, quant: Option<crate::tier::Ltx25Quant>) -> Result<Self> {
         let scales_key = format!("{prefix}.scales");
+        if let Some(geometry) = candle_gen::quant::stored_ggml::stored_ggml_vb(vb, prefix)? {
+            candle_gen::quant::stored_ggml::validate_stored(
+                "ltx diffvae",
+                prefix,
+                geometry,
+                vb.contains_tensor(&scales_key),
+                None,
+            )?;
+            let Some(quant) = quant else {
+                return Err(Error::Msg(format!(
+                    "ltx diffvae: `{prefix}.weight` is a stored {:?} GGML block tensor but the \
+                     caller declared this checkpoint dense; reading GGML blocks as a float weight \
+                     would decode the decoder into noise.",
+                    geometry.0
+                )));
+            };
+            // The stored block type must be the one the declared width repacks into.
+            let declared = match quant.bits {
+                4 => candle_gen::candle_core::quantized::GgmlDType::Q4_1,
+                8 => candle_gen::candle_core::quantized::GgmlDType::Q8_0,
+                bits => {
+                    return Err(Error::Msg(format!(
+                        "ltx diffvae: unsupported declared width {bits} for `{prefix}`"
+                    )))
+                }
+            };
+            if geometry.0 != declared {
+                return Err(Error::Msg(format!(
+                    "ltx diffvae: `{prefix}.weight` is stored {:?}, but the tier declares {} bits \
+                     ({declared:?})",
+                    geometry.0, quant.bits
+                )));
+            }
+            let host = vb.clone().set_device(Device::Cpu);
+            return Ok(RawWeight::Stored(
+                host.get_unchecked_dtype(&format!("{prefix}.weight"), DType::U8)?,
+            ));
+        }
         if !vb.contains_tensor(&scales_key) {
             return Ok(RawWeight::Dense(
                 vb.get_unchecked(&format!("{prefix}.weight"))?,
@@ -735,6 +777,7 @@ impl RawWeight {
     fn rows(&self) -> Result<usize> {
         Ok(match self {
             RawWeight::Dense(w) => w.dims2()?.0,
+            RawWeight::Stored(w) => w.dim(0)?,
             RawWeight::Packed { q, .. } => q.dims2()?.0,
         })
     }
@@ -744,6 +787,7 @@ impl RawWeight {
     fn narrow_rows(&self, start: usize, len: usize) -> Result<Self> {
         Ok(match self {
             RawWeight::Dense(w) => RawWeight::Dense(w.narrow(0, start, len)?.contiguous()?),
+            RawWeight::Stored(w) => RawWeight::Stored(w.narrow(0, start, len)?.contiguous()?),
             RawWeight::Packed {
                 q,
                 scales,
@@ -762,6 +806,16 @@ impl RawWeight {
     fn build(self, device: &Device) -> Result<Weight> {
         match self {
             RawWeight::Dense(w) => Ok(Weight::Dense(w)),
+            RawWeight::Stored(w) => {
+                // Built exactly as stored: no repack, no saved-quantization cache entry.
+                let weight = candle_gen::quant::stored_ggml::qtensor_from_stored(&w, device)?;
+                let (out, inp) = weight.shape().dims2()?;
+                Ok(Weight::Packed {
+                    weight: std::sync::Arc::new(weight),
+                    out,
+                    inp,
+                })
+            }
             RawWeight::Packed {
                 q,
                 scales,

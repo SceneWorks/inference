@@ -24,6 +24,7 @@ pub mod nvfp4_path;
 pub mod prism;
 pub mod quant;
 pub mod repack;
+pub mod stored_ggml;
 pub mod switch;
 pub mod w4a8_int8;
 

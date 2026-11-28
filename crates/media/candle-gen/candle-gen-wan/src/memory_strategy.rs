@@ -397,9 +397,11 @@ fn transformer_assets(root: &Path) -> gen_core::Result<TransformerAssets> {
         .into_iter()
         .map(|tensor| (tensor.name.clone(), tensor))
         .collect::<BTreeMap<_, _>>();
+    // A Candle-native GGML tier's stored block weights (SW-7285) are packed leaves too.
     let carries_packed_leaves = tensors.values().any(|tensor| {
         is_packed_leaf(&tensor.name)
-            || (tensor.name.ends_with(".weight") && tensor.dtype == Dtype::U32)
+            || (tensor.name.ends_with(".weight")
+                && (tensor.dtype == Dtype::U32 || tensor.is_stored_ggml_block()))
     });
 
     let marker = match packed_marker(&path) {
@@ -456,6 +458,30 @@ fn transformer_assets(root: &Path) -> gen_core::Result<TransformerAssets> {
 
     let mut packed_bases = BTreeSet::new();
     let mut packed_bytes = 0_u64;
+    // Stored GGML block projections (SW-7285): built as published, resident at their stored bytes,
+    // at the marker's width, and never also carrying an affine triple.
+    for weight in tensors
+        .values()
+        .filter(|tensor| tensor.name.ends_with(".weight") && tensor.is_stored_ggml_block())
+    {
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        if tensors.contains_key(&format!("{base}.scales"))
+            || tensors.contains_key(&format!("{base}.biases"))
+            || weight.stored_ggml_block_bits() != Some(quant.bits() as usize)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: stored GGML transformer weight {base} is not a Q{} block weight \
+                 stored one way",
+                quant.bits()
+            )));
+        }
+        packed_bytes = packed_bytes.checked_add(weight.data_bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{MODEL_ID}: packed transformer resident byte total overflows u64"
+            ))
+        })?;
+        packed_bases.insert(base.to_owned());
+    }
     for weight in tensors
         .values()
         .filter(|tensor| tensor.name.ends_with(".weight") && tensor.shape.len() == 2)
@@ -1234,6 +1260,45 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         write_shard(&dir.join("model.safetensors"), tensors);
+    }
+
+    /// SW-7285: a Candle-native GGML transformer (stored `U8 [out, in / 32, block_bytes]` blocks
+    /// under the `bits` marker) prices each block at its stored bytes plus the bf16 residual, and
+    /// is refused at the other width. Header-only.
+    #[test]
+    fn stored_ggml_transformer_assets_price_blocks_at_their_stored_bytes() {
+        let cpu = candle_gen::candle_core::Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let u8s = |shape: &[usize]| Tensor::zeros(shape, CandleDType::U8, &cpu).unwrap();
+        let norm = || Tensor::zeros(64, CandleDType::BF16, &cpu).unwrap();
+        for (bits, block, other) in [(4, 20usize, 34usize), (8, 34, 20)] {
+            let root = tmp.path().join(format!("q{bits}"));
+            write_component(
+                &root,
+                "transformer",
+                [
+                    ("blocks.0.attn1.to_q.weight", u8s(&[64, 2, block])),
+                    ("blocks.0.norm.weight", norm()),
+                ],
+            );
+            std::fs::write(
+                root.join("transformer/quantize_config.json"),
+                format!(r#"{{"bits":{bits},"quantization":{{"bits":{bits},"storage":"ggml"}}}}"#),
+            )
+            .unwrap();
+            let assets = transformer_assets(&root).unwrap();
+            assert_eq!(assets.bytes, (64 * 2 * block + 64 * 2) as u64);
+            assert_eq!(assets.tier.map(|q| q.bits()), Some(bits));
+            write_component(
+                &root,
+                "transformer",
+                [("blocks.0.attn1.to_q.weight", u8s(&[64, 2, other]))],
+            );
+            assert!(
+                transformer_assets(&root).is_err(),
+                "q{bits} marker, other blocks"
+            );
+        }
     }
 
     fn write_shard(path: &Path, tensors: impl IntoIterator<Item = (&'static str, Tensor)>) {

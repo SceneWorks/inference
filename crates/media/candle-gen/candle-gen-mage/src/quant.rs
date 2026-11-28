@@ -97,6 +97,20 @@ pub(crate) fn capture_direct_with_loaded_quant(
 /// The packed branch derives each tensor's true width from its shapes in the shared repacker, so the
 /// q8 `norm_out.linear` inside a component whose tier marker is q4 stays q8.
 pub(crate) fn linear(weights: &Weights, base: &str, bias: bool) -> Result<QLinear> {
+    // A Candle-native GGML tier (SW-7285): the stored blocks are built as-is (no repack, no
+    // saved-quantization cache entry) and carry their own `[out, in]`.
+    if let Some(stored) = candle_gen_boogu::loader::stored_ggml_checked(weights, "mage", base)? {
+        let qt = candle_gen::quant::stored_ggml::qtensor_from_stored(&stored, weights.device())?;
+        let (out_dim, in_dim) = qt.shape().dims2()?;
+        let dense_bias = if bias {
+            Some(weights.get(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        let base =
+            candle_gen::quant::QLinear::from_qtensor_dequant(std::sync::Arc::new(qt), dense_bias);
+        return Ok(QLinear::from_packed(base, in_dim, out_dim));
+    }
     let scales_key = format!("{base}.scales");
     if let (Some(config), true) = (weights.packed(), weights.contains(&scales_key)) {
         let packed = weights.get_native(&format!("{base}.weight"))?;

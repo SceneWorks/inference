@@ -433,6 +433,11 @@ fn f32_or_packed_tensor_headers(
         }
 
         let loaded = match tensor.dtype {
+            // A Candle-native GGML tier's stored blocks (SW-7285) are built as-is: their stored
+            // bytes ARE the resident GGUF weight — never cast to F32, never re-folded.
+            _ if tensor.name.ends_with(".weight") && tensor.is_stored_ggml_block() => {
+                tensor.data_bytes
+            }
             // Both the imported map (`build_comfyui_dit_map`) and snapshot VarBuilders request the
             // pipeline's F32 dtype. Accepted integer tensors are therefore cast to F32 too; a rank-2
             // projection then takes the same GGML fold as a floating source when Q4/Q8 is selected.
@@ -1964,6 +1969,33 @@ mod tests {
             packed.asset_facts.base_bytes,
             packed_conditioning + packed.asset_facts.transformer_bytes + 32
         );
+    }
+
+    /// SW-7285: a Candle-native GGML tier's stored block tensor (embedding or projection) is
+    /// priced at its stored bytes on every tier, not cast to F32 like an ordinary integer tensor.
+    #[test]
+    fn stored_ggml_blocks_are_priced_at_their_stored_bytes() {
+        use gen_core::weightsmeta::Dtype;
+        let header = |name: &str, dtype, shape: Vec<usize>, data_bytes| {
+            gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.into(),
+                dtype,
+                shape,
+                data_bytes,
+            }
+        };
+        let tensors = [
+            header("model.embed_tokens.weight", Dtype::U8, vec![16, 2, 20], 640),
+            header("model.layers.0.q.weight", Dtype::U8, vec![8, 4, 34], 1_088),
+            header("model.layers.0.norm.weight", Dtype::BF16, vec![64], 128),
+        ];
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            assert_eq!(
+                f32_or_packed_tensor_headers(&tensors, quant, "test", true, false, "test").unwrap(),
+                640 + 1_088 + 64 * 4,
+                "{quant:?}"
+            );
+        }
     }
 
     #[test]

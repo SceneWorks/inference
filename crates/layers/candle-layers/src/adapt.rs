@@ -1254,6 +1254,7 @@ impl AdaptLinear {
     /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
     /// fixtures.
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        crate::stored_ggml::guard_dense_vb(&vb)?;
         Ok(Self::from_dense(
             candle_nn::linear(in_dim, out_dim, vb)?,
             in_dim,
@@ -1267,6 +1268,7 @@ impl AdaptLinear {
         out_dim: usize,
         vb: VarBuilder,
     ) -> candle_core::Result<Self> {
+        crate::stored_ggml::guard_dense_vb(&vb)?;
         Ok(Self::from_dense(
             candle_nn::linear_no_bias(in_dim, out_dim, vb)?,
             in_dim,
@@ -1292,7 +1294,11 @@ impl AdaptLinear {
         bias: bool,
         group_size: usize,
     ) -> candle_core::Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
+        // An MLX affine triple OR a Candle-native stored GGML block (SW-7285): both are packed,
+        // and the shared `lin_gs` builds (or refuses) either.
+        if vb.contains_tensor(&format!("{base}.scales"))
+            || crate::stored_ggml::stored_ggml_vb(vb, base)?.is_some()
+        {
             return Ok(Self {
                 base: Base::Packed(lin_gs(vb, base, in_dim, out_dim, bias, group_size)?),
                 out_features: out_dim,
@@ -1326,6 +1332,22 @@ impl AdaptLinear {
     /// MLX-packed triple at their native dtypes (u32 codes must NOT be cast through the vb's float
     /// dtype) at group 64; otherwise read the dense `{name}.weight` unchanged.
     pub fn detect(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
+        // A stored GGML block carries its own `[out, in]` (SW-7285).
+        if let Some(q) = crate::stored_ggml::stored_ggml_qtensor_vb(
+            vb,
+            crate::stored_ggml::SHARED_CONTEXT,
+            name,
+            None,
+            vb.device(),
+        )? {
+            let (out_features, in_features) = q.shape().dims2()?;
+            return Ok(Self {
+                base: Base::Packed(QLinear::from_qtensor_dequant(std::sync::Arc::new(q), None)),
+                out_features,
+                in_features,
+                adapters: Vec::new(),
+            });
+        }
         let scales_key = format!("{name}.scales");
         if vb.contains_tensor(&scales_key) {
             let device = vb.device().clone();
@@ -1360,6 +1382,7 @@ impl AdaptLinear {
 
     fn from_builder(vb: &VarBuilder, name: &str, bias: bool) -> candle_core::Result<Self> {
         let sub = vb.pp(name);
+        crate::stored_ggml::guard_dense_vb(&sub)?;
         let layer = CandleNnLinear::from_var_builder(&sub, bias)?;
         let (out_features, in_features) = layer.weight_dims()?;
         Ok(Self::from_dense(layer, in_features, out_features))

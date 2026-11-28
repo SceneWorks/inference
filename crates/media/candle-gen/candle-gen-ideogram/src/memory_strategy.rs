@@ -8,6 +8,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::snapshot_inventory::{
     collect_regular_files, hex_lower, sha256_file, update_framed, InventoryPolicy,
 };
+use candle_gen::gen_core::snapshot_source::{path_components, SceneWorksSnapshot, TierSources};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
@@ -31,6 +32,13 @@ pub const PACKED_REPOSITORY: &str = "ideogram-4-mlx";
 pub const PACKED_REVISION: &str = "a3095855b8819dc0d6b067cb1354aaa7da189ff8";
 pub const BF16_REPOSITORY: &str = "ideogram-4";
 pub const BF16_REVISION: &str = "2e8fb610109bf0db195344cc424df98b301d3cad";
+/// The published Candle-native GGML twin of the `ideogram-4-mlx` q4/q8 tiers (SW-7285), which
+/// SceneWorks resolves on Windows/Linux instead of the MLX tree. `None` until it is published: name
+/// the exact `SceneWorksSnapshot::new("ideogram-4-candle", "<rev>")` here.
+pub const PACKED_CANDLE_TWIN: Option<SceneWorksSnapshot> = Some(SceneWorksSnapshot::new(
+    "ideogram-4-candle",
+    "67ac436b1e5d9f59ce75921e3d7f4dced8d02473",
+));
 pub const PID_FLUX2_REVISION: &str = "6d5c1f1049e863f1757f68fd81c6bc850a95609d";
 pub const PID_GEMMA_REVISION: &str = "684c553b5b41a1c835989d89f62f585e6269a7de";
 pub const PUBLIC_GEOMETRIES: &[(u32, u32)] = &[
@@ -52,9 +60,14 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RouteIdentity {
     pub provider: &'static str,
+    /// The exact identity the root is bound to. [`route_identity`] seeds it with the tier's primary
+    /// source; [`validate_snapshot_binding`] replaces it with the one the path actually spells (the
+    /// MLX tree or its Candle twin), so every receipt digest names the bound artifact.
     pub repository: &'static str,
     pub revision: &'static str,
     pub tier: Option<Quant>,
+    /// Every exact identity this tier root may be bound to.
+    pub sources: TierSources,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,8 +180,7 @@ impl IdeogramLoadReceipt {
         let WeightsSource::Dir(root) = &spec.weights else {
             unreachable!("validated directory above")
         };
-        let route = route_identity(provider_id, root)?;
-        validate_snapshot_binding(root, route)?;
+        let route = validate_snapshot_binding(root, route_identity(provider_id, root)?)?;
         let lexical_root = std::path::absolute(root)?;
         let canonical_root = std::fs::canonicalize(&lexical_root)?;
         let inventory_paths =
@@ -532,10 +544,15 @@ fn route_identity(provider_id: &str, root: &Path) -> gen_core::Result<RouteIdent
         .ok_or_else(|| {
             gen_core::Error::Unsupported("ideogram: missing tier path component".into())
         })?;
-    let (repository, revision, tier) = match tier {
-        "q4" => (PACKED_REPOSITORY, PACKED_REVISION, Some(Quant::Q4)),
-        "q8" => (PACKED_REPOSITORY, PACKED_REVISION, Some(Quant::Q8)),
-        "bf16" => (BF16_REPOSITORY, BF16_REVISION, None),
+    let packed = TierSources {
+        primary: SceneWorksSnapshot::new(PACKED_REPOSITORY, PACKED_REVISION),
+        candle_twin: PACKED_CANDLE_TWIN,
+    };
+    let dense = TierSources::primary_only(SceneWorksSnapshot::new(BF16_REPOSITORY, BF16_REVISION));
+    let (sources, tier) = match tier {
+        "q4" => (packed, Some(Quant::Q4)),
+        "q8" => (packed, Some(Quant::Q8)),
+        "bf16" => (dense, None),
         value => {
             return Err(gen_core::Error::Unsupported(format!(
                 "ideogram: unsupported physical tier {value:?}"
@@ -548,14 +565,17 @@ fn route_identity(provider_id: &str, root: &Path) -> gen_core::Result<RouteIdent
         } else {
             MODEL_ID_TURBO
         },
-        repository,
-        revision,
+        repository: sources.primary.repository,
+        revision: sources.primary.revision,
         tier,
+        sources,
     })
 }
 
-fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Result<()> {
-    validate_snapshot_path(root, route)?;
+/// Bind both the lexical and the canonical root to the same exact identity of `route` (the MLX
+/// tree, or at q4/q8 its published Candle twin) and return the route re-keyed to it.
+fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Result<RouteIdentity> {
+    let lexical = validate_snapshot_path(root, route)?;
     let canonical = std::fs::canonicalize(root).map_err(|error| {
         gen_core::Error::Unsupported(format!(
             "{}: cannot resolve canonical snapshot root {}: {error}",
@@ -563,37 +583,38 @@ fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Res
             root.display()
         ))
     })?;
-    validate_snapshot_path(&canonical, route)?;
-    Ok(())
+    let canonical_source = validate_snapshot_path(&canonical, route)?;
+    if canonical_source != lexical {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: lexical root {} and canonical root {} bind different identities ({lexical} vs {canonical_source})",
+            route.provider,
+            root.display(),
+            canonical.display()
+        )));
+    }
+    Ok(RouteIdentity {
+        repository: lexical.repository,
+        revision: lexical.revision,
+        ..route
+    })
 }
 
-fn validate_snapshot_path(root: &Path, route: RouteIdentity) -> gen_core::Result<()> {
-    let hf = format!("models--SceneWorks--{}", route.repository);
-    let app = format!("SceneWorks__{}", route.repository);
+/// The exact identity `root` spells (see [`validate_snapshot_binding`]), with every component of
+/// that identity suffix required to be a real directory rather than a symlink.
+fn validate_snapshot_path(
+    root: &Path,
+    route: RouteIdentity,
+) -> gen_core::Result<SceneWorksSnapshot> {
     let tier = root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let components = root
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let suffixes = [
-        vec![hf, "snapshots".into(), route.revision.into(), tier.into()],
-        vec![app, route.revision.into(), tier.into()],
-        vec![route.repository.into(), route.revision.into(), tier.into()],
-    ];
-    let Some(identity_depth) = suffixes
-        .iter()
-        .find(|suffix| components.ends_with(suffix))
-        .map(Vec::len)
-    else {
+    let Some((source, identity_depth)) = route.sources.bind(&path_components(root), tier) else {
         return Err(gen_core::Error::Unsupported(format!(
-            "{}: weights path {} crosses SceneWorks/{}@{}",
+            "{}: weights path {} crosses {}",
             route.provider,
             root.display(),
-            route.repository,
-            route.revision
+            route.sources.describe(tier)
         )));
     };
     let mut identity_component = root;
@@ -610,7 +631,7 @@ fn validate_snapshot_path(root: &Path, route: RouteIdentity) -> gen_core::Result
         }
         identity_component = identity_component.parent().unwrap_or(identity_component);
     }
-    Ok(())
+    Ok(source)
 }
 
 fn validate_load_shape(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<()> {
@@ -650,7 +671,34 @@ fn inspect_component_tier(paths: &[PathBuf], component: &str) -> gen_core::Resul
         .keys()
         .filter_map(|name| name.strip_suffix(".scales").map(str::to_owned))
         .collect::<BTreeSet<_>>();
+    // A Candle-native GGML tier (SW-7285): stored block weights carry their tier in their block
+    // type, with no affine sidecars. Every one must agree, and none may also carry a triple.
+    let mut stored_bits = None;
+    for header in headers.values().filter(|h| h.name.ends_with(".weight")) {
+        let Some(bits) = header.stored_ggml_block_bits() else {
+            continue;
+        };
+        let base = header.name.strip_suffix(".weight").expect("suffix checked");
+        if packed.contains(base)
+            || headers.contains_key(&format!("{base}.biases"))
+            || stored_bits.replace(bits).is_some_and(|prior| prior != bits)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "ideogram: mixed or both-forms stored {component} {base}"
+            )));
+        }
+    }
     if packed.is_empty() {
+        if let Some(bits) = stored_bits {
+            if headers.values().any(|header| {
+                !header.is_stored_ggml_block() && !matches!(header.dtype, Dtype::BF16 | Dtype::F32)
+            }) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ideogram: stored {component} contains a non-BF16/F32 dense tensor"
+                )));
+            }
+            return Ok(Some(if bits == 4 { Quant::Q4 } else { Quant::Q8 }));
+        }
         if headers
             .values()
             .any(|header| !matches!(header.dtype, Dtype::BF16 | Dtype::F32))
@@ -709,6 +757,7 @@ fn inspect_component_tier(paths: &[PathBuf], component: &str) -> gen_core::Resul
             })?;
         if rows != scale_rows
             || !matches!(bits, 4 | 8)
+            || stored_bits.is_some_and(|stored| stored != bits)
             || resolved_bits
                 .replace(bits)
                 .is_some_and(|prior| prior != bits)
@@ -773,6 +822,11 @@ fn capture_component(
                         biases,
                         candle_gen::quant::MLX_GROUP_SIZE,
                     );
+                }
+                // A stored GGML block (SW-7285) is built as published: its stored bytes are
+                // resident (never a float width).
+                if tier.is_some() && header.is_stored_ggml_block() {
+                    return Ok(header.data_bytes);
                 }
                 if tier.is_some() && header.dtype == gen_core::weightsmeta::Dtype::U32 {
                     return Err(gen_core::Error::Unsupported(
@@ -2114,6 +2168,54 @@ mod tests {
         MemoryStrategyParameters, OffloadPolicy,
     };
 
+    /// SW-7285: a component of stored GGML blocks resolves to the tier its block type encodes;
+    /// mixed widths and a both-forms projection are refused. Header-only.
+    #[test]
+    fn stored_ggml_component_resolves_its_block_tier() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, tensors: Vec<(&str, Tensor)>| {
+            let path = tmp.path().join(name);
+            let map = tensors
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect::<std::collections::HashMap<_, _>>();
+            candle_gen::candle_core::safetensors::save(&map, &path).unwrap();
+            vec![path]
+        };
+        let u8s = |block: usize| Tensor::zeros((4, 2, block), DType::U8, &Device::Cpu).unwrap();
+        let norm = || Tensor::zeros(4, DType::BF16, &Device::Cpu).unwrap();
+        let q4 = write(
+            "q4.safetensors",
+            vec![("a.weight", u8s(20)), ("n.weight", norm())],
+        );
+        assert_eq!(
+            inspect_component_tier(&q4, "transformer").unwrap(),
+            Some(Quant::Q4)
+        );
+        let q8 = write("q8.safetensors", vec![("a.weight", u8s(34))]);
+        assert_eq!(
+            inspect_component_tier(&q8, "transformer").unwrap(),
+            Some(Quant::Q8)
+        );
+        let mixed = write(
+            "mixed.safetensors",
+            vec![("a.weight", u8s(20)), ("b.weight", u8s(34))],
+        );
+        assert!(inspect_component_tier(&mixed, "transformer").is_err());
+        let both = write(
+            "both.safetensors",
+            vec![
+                ("a.weight", u8s(20)),
+                (
+                    "a.scales",
+                    Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+            ],
+        );
+        assert!(inspect_component_tier(&both, "transformer").is_err());
+    }
+
     /// AC (epic SC-22657, E2): both Ideogram providers publish the geometry the loader actually
     /// builds — the `Ideogram4DitConfig::v4` trunk plus the `crate::config` latent/patch/decoder
     /// constants — the contract passes the shared facts conformance check, and the weights-free
@@ -2491,6 +2593,64 @@ mod tests {
         let mut crossed = spec(root, MODEL_ID);
         crossed.quantize = Some(Quant::Q4);
         assert!(IdeogramLoadReceipt::capture(MODEL_ID, &crossed).is_err());
+    }
+
+    /// SW-7285: a q4/q8 root binds to the exact `ideogram-4-mlx` tree or its exact published
+    /// Candle twin; bf16 binds only to the dense re-host. A twin not yet published, a crossed
+    /// repository/revision pair, and any other repository or revision stay refused. Path parsing
+    /// only.
+    #[test]
+    fn snapshot_path_admits_the_mlx_tree_and_only_a_published_candle_twin() {
+        let hf = |repository: &str, revision: &str, tier: &str| {
+            PathBuf::from("hub")
+                .join(format!("models--SceneWorks--{repository}"))
+                .join("snapshots")
+                .join(revision)
+                .join(tier)
+        };
+        let bind = |root: PathBuf, provider: &str| {
+            route_identity(provider, &root).and_then(|route| validate_snapshot_path(&root, route))
+        };
+        let foreign_revision = "0".repeat(40);
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            for tier in ["q4", "q8"] {
+                assert_eq!(
+                    bind(hf(PACKED_REPOSITORY, PACKED_REVISION, tier), provider).unwrap(),
+                    SceneWorksSnapshot::new(PACKED_REPOSITORY, PACKED_REVISION)
+                );
+                assert!(bind(hf(PACKED_REPOSITORY, &foreign_revision, tier), provider).is_err());
+                assert!(bind(hf(BF16_REPOSITORY, BF16_REVISION, tier), provider).is_err());
+            }
+            assert_eq!(
+                bind(hf(BF16_REPOSITORY, BF16_REVISION, "bf16"), provider).unwrap(),
+                SceneWorksSnapshot::new(BF16_REPOSITORY, BF16_REVISION)
+            );
+            assert!(bind(hf(PACKED_REPOSITORY, PACKED_REVISION, "bf16"), provider).is_err());
+            match PACKED_CANDLE_TWIN {
+                Some(twin) => {
+                    assert_eq!(twin.repository, "ideogram-4-candle");
+                    for tier in ["q4", "q8"] {
+                        assert_eq!(
+                            bind(hf(twin.repository, twin.revision, tier), provider).unwrap(),
+                            twin
+                        );
+                    }
+                    for crossed in [
+                        hf(twin.repository, twin.revision, "bf16"),
+                        hf(twin.repository, PACKED_REVISION, "q4"),
+                        hf(PACKED_REPOSITORY, twin.revision, "q4"),
+                        hf(twin.repository, &foreign_revision, "q4"),
+                    ] {
+                        assert!(bind(crossed, provider).is_err());
+                    }
+                }
+                None => {
+                    for revision in [PACKED_REVISION, foreign_revision.as_str()] {
+                        assert!(bind(hf("ideogram-4-candle", revision, "q4"), provider).is_err());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

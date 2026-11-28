@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_source::{SceneWorksSnapshot, TierSources};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
@@ -20,6 +21,13 @@ use sha2::{Digest, Sha256};
 pub const PROVIDER_ID: &str = crate::pipeline::MODEL_ID;
 pub const CANONICAL_REPOSITORY: &str = "SceneWorks/scail2-mlx";
 pub const CANONICAL_REVISION: &str = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3";
+/// Every exact identity a SCAIL-2 tier root may be bound to: the canonical MLX re-host at any
+/// tier, and its published Candle-native GGML twin at q4/q8 (SW-7285), which SceneWorks resolves
+/// on Windows/Linux. Exact repository + revision; nothing else is admitted.
+pub const CANONICAL_SOURCES: TierSources = TierSources::with_candle_twin(
+    SceneWorksSnapshot::new("scail2-mlx", CANONICAL_REVISION),
+    SceneWorksSnapshot::new("scail2-candle", "b091ec1e6b8e528b55707d4dc88c4f49a4c1ae6e"),
+);
 pub const PUBLIC_BUCKETS: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 704), (704, 1280)];
 pub const PUBLIC_FRAMES: &[u32] = &[45, 61, 77];
 /// Domain separator for the provider-side animation-carrier content digest.
@@ -272,7 +280,9 @@ impl AdapterReceipt {
 struct ArtifactReceipt {
     root: PathBuf,
     pins: Vec<gen_core::PinnedWeightsFile>,
-    canonical: bool,
+    /// The exact identity in [`CANONICAL_SOURCES`] the root is bound to, when it is one and the
+    /// route is the public one; `None` for every other snapshot.
+    source: Option<SceneWorksSnapshot>,
     /// The tier PROVEN from the snapshot's own `config.json` marker, never `LoadSpec::quantize`
     /// read on its own (sc-22736).
     packed: Option<Quant>,
@@ -373,8 +383,8 @@ impl ArtifactReceipt {
         let receipt = Self {
             root: root.clone(),
             pins,
-            canonical: canonical_artifact_path(&root, packed)
-                && spec.resolved_route.as_deref() == Some(PROVIDER_ID),
+            source: canonical_artifact_path(&root, packed)
+                .filter(|_| spec.resolved_route.as_deref() == Some(PROVIDER_ID)),
             packed,
             facts: MemoryAssetFacts {
                 base_bytes,
@@ -443,6 +453,33 @@ fn packed_dit_bytes(path: &Path, quant: Quant) -> gen_core::Result<u64> {
         .collect::<BTreeMap<_, _>>();
     let mut packed_bases = BTreeSet::new();
     let mut packed = 0_u64;
+    // A Candle-native GGML tier (SW-7285): the stored blocks ARE the resident GGUF weight, so they
+    // are charged their own stored bytes — never a float width — and must be the declared width.
+    for weight in tensors
+        .values()
+        .filter(|header| header.name.ends_with(".weight"))
+    {
+        let Some((dtype, ..)) = candle_gen::quant::stored_ggml::stored_header_geometry(weight)
+        else {
+            continue;
+        };
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        if tensors.contains_key(&format!("{base}.scales"))
+            || tensors.contains_key(&format!("{base}.biases"))
+            || candle_gen::quant::stored_ggml::stored_ggml_bits(dtype)
+                != Some(quant.bits() as usize)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: stored {dtype:?} projection {base} is not a Q{} GGML block weight \
+                 stored one way",
+                quant.bits()
+            )));
+        }
+        packed = packed.checked_add(weight.data_bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!("{PROVIDER_ID}: packed resident total overflow"))
+        })?;
+        packed_bases.insert(base.to_owned());
+    }
     for weight in tensors
         .values()
         .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
@@ -553,17 +590,21 @@ fn packed_dit_bytes(path: &Path, quant: Quant) -> gen_core::Result<u64> {
     })
 }
 
-fn canonical_artifact_path(root: &Path, packed: Option<Quant>) -> bool {
-    root.file_name().and_then(|name| name.to_str()) == Some(tier_directory(packed))
-        && root.components().any(|part| {
-            matches!(
-                part.as_os_str().to_str(),
-                Some("models--SceneWorks--scail2-mlx") | Some("SceneWorks__scail2-mlx")
-            )
-        })
-        && root
-            .components()
-            .any(|part| part.as_os_str().to_str() == Some(CANONICAL_REVISION))
+/// The identity in [`CANONICAL_SOURCES`] whose repository directory AND revision `root` both carry,
+/// under the tier directory `packed` names. Repository and revision are matched as a pair, so the
+/// MLX repository never borrows the twin's revision or the reverse.
+fn canonical_artifact_path(root: &Path, packed: Option<Quant>) -> Option<SceneWorksSnapshot> {
+    let tier = tier_directory(packed);
+    if root.file_name().and_then(|name| name.to_str()) != Some(tier) {
+        return None;
+    }
+    let has = |wanted: &str| {
+        root.components()
+            .any(|part| part.as_os_str().to_str() == Some(wanted))
+    };
+    CANONICAL_SOURCES.admitted(tier).find(|source| {
+        (has(&source.hf_cache_dir()) || has(&source.app_cache_dir())) && has(source.revision)
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -594,18 +635,19 @@ impl PreparedMemory {
             quant: artifact.packed,
             component_precision_floors: &[],
         };
-        if !artifact.canonical {
+        let Some(source) = artifact.source else {
             return Err(gen_core::Error::Unsupported(format!(
-                "{PROVIDER_ID}: weights must be the canonical {CANONICAL_REPOSITORY}@{CANONICAL_REVISION}/{} artifact",
+                "{PROVIDER_ID}: weights must be the canonical {}/{} artifact",
+                CANONICAL_SOURCES.describe(tier_directory(artifact.packed)),
                 tier_directory(artifact.packed)
             )));
-        }
+        };
         let contract = build_contract(
             spec,
             artifact.facts,
             production_calibration_identity(spec, tier, !adapters.is_empty()),
         );
-        let structural_evidence = build_structural_evidence(&artifact, &adapters, tier);
+        let structural_evidence = build_structural_evidence(&artifact, source, &adapters, tier);
         structural_evidence.validate()?;
         Ok(Self {
             contract,
@@ -814,12 +856,16 @@ impl Drop for Scail2MemoryScope<'_> {
 
 fn build_structural_evidence(
     artifact: &ArtifactReceipt,
+    source: SceneWorksSnapshot,
     adapters: &[AdapterReceipt],
     tier: MemoryNumericTier,
 ) -> MemoryStructuralResidentEvidence {
+    // The bound identity, spelled owner-qualified like `CANONICAL_REPOSITORY`, so the MLX re-host's
+    // receipt bytes are unchanged and a Candle-twin receipt names the twin.
+    let repository = format!("SceneWorks/{}", source.repository);
     let mut hasher = Sha256::new();
-    hasher.update(CANONICAL_REPOSITORY);
-    hasher.update(CANONICAL_REVISION);
+    hasher.update(&repository);
+    hasher.update(source.revision);
     // sc-22736: both lanes seal the same `SceneWorks/scail2-mlx` bf16 root, so without a backend
     // token the two receipts are the same 64 hex characters.
     hasher.update(CALIBRATION_BACKEND);
@@ -839,8 +885,8 @@ fn build_structural_evidence(
     MemoryStructuralResidentEvidence {
         abi: MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
         provider_id: PROVIDER_ID.to_owned(),
-        repository: CANONICAL_REPOSITORY.to_owned(),
-        revision: CANONICAL_REVISION.to_owned(),
+        repository,
+        revision: source.revision.to_owned(),
         variant: "bf16".to_owned(),
         receipt_sha256: format!("{:x}", hasher.finalize()),
         tier,
@@ -1725,14 +1771,65 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// SW-7285: a stored-GGML DiT prices each stored block at its own stored bytes (the resident
+    /// GGUF weight, never a float width) and refuses blocks of the other width or stored both ways.
+    #[test]
+    fn packed_dit_bytes_prices_stored_ggml_blocks_at_their_stored_bytes() {
+        use safetensors::{serialize, tensor::TensorView, Dtype};
+        let temp = tempfile::tempdir().unwrap();
+        for (quant, block, other) in [(Quant::Q4, 20_usize, Quant::Q8), (Quant::Q8, 34, Quant::Q4)]
+        {
+            let path = temp.path().join(format!("stored-{block}.safetensors"));
+            let (rows, blocks) = (2_usize, 2_usize);
+            let weight = vec![0_u8; rows * blocks * block];
+            let bias = vec![0_u8; rows * 4];
+            let write = |extra: bool| {
+                let mut tensors = vec![
+                    (
+                        "proj.weight",
+                        TensorView::new(Dtype::U8, vec![rows, blocks, block], &weight).unwrap(),
+                    ),
+                    (
+                        "proj.bias",
+                        TensorView::new(Dtype::F32, vec![rows], &bias).unwrap(),
+                    ),
+                ];
+                if extra {
+                    tensors.push((
+                        "proj.scales",
+                        TensorView::new(Dtype::F32, vec![rows, 1], &bias[..rows * 4]).unwrap(),
+                    ));
+                }
+                std::fs::write(&path, serialize(tensors, None).unwrap()).unwrap();
+            };
+            write(false);
+            assert_eq!(
+                packed_dit_bytes(&path, quant).unwrap(),
+                (rows * blocks * block + rows * 4) as u64,
+                "stored blocks at their bytes + the F32 bias"
+            );
+            assert!(packed_dit_bytes(&path, other).is_err());
+            write(true);
+            assert!(packed_dit_bytes(&path, quant).is_err(), "stored both ways");
+        }
+    }
+
     /// A canonical packed-tier fixture: the `q4` / `q8` sibling of [`candle_fixture`].
     fn candle_packed_fixture(quant: Quant) -> (tempfile::TempDir, LoadSpec) {
+        candle_packed_fixture_at(quant, CANONICAL_SOURCES.primary)
+    }
+
+    /// [`candle_packed_fixture`] under the HF-cache layout of `source`.
+    fn candle_packed_fixture_at(
+        quant: Quant,
+        source: SceneWorksSnapshot,
+    ) -> (tempfile::TempDir, LoadSpec) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp
             .path()
-            .join("models--SceneWorks--scail2-mlx")
+            .join(source.hf_cache_dir())
             .join("snapshots")
-            .join(CANONICAL_REVISION)
+            .join(source.revision)
             .join(tier_directory(Some(quant)));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -1882,6 +1979,87 @@ pub(crate) mod tests {
         let mut moved = LoadSpec::new(WeightsSource::Dir(renamed)).with_quant(Quant::Q4);
         moved.resolved_route = Some(PROVIDER_ID.to_owned());
         assert!(PreparedMemory::prepare(&moved).is_err());
+    }
+
+    /// SW-7285: a q4/q8 root binds to the exact MLX re-host or its exact published Candle twin,
+    /// and the sealed structural evidence names the bound one. The twin never stands in for the
+    /// dense tier, repository and revision never cross, and any other repository or revision stays
+    /// refused. Path parsing plus header-only fixtures; no model compute.
+    #[test]
+    fn canonical_identity_admits_the_mlx_rehost_and_its_published_candle_twin() {
+        let mlx = CANONICAL_SOURCES.primary;
+        let twin = CANONICAL_SOURCES.candle_twin.expect("published twin");
+        assert_eq!(
+            format!("SceneWorks/{}", mlx.repository),
+            CANONICAL_REPOSITORY
+        );
+        assert_eq!(twin.repository, "scail2-candle");
+        let hf = |repository_dir: &str, revision: &str, tier: &str| {
+            PathBuf::from("hub")
+                .join(repository_dir)
+                .join("snapshots")
+                .join(revision)
+                .join(tier)
+        };
+        for quant in [Quant::Q4, Quant::Q8] {
+            let tier = tier_directory(Some(quant));
+            for source in [mlx, twin] {
+                assert_eq!(
+                    canonical_artifact_path(
+                        &hf(&source.hf_cache_dir(), source.revision, tier),
+                        Some(quant)
+                    ),
+                    Some(source)
+                );
+                assert_eq!(
+                    canonical_artifact_path(
+                        &PathBuf::from("app")
+                            .join(source.app_cache_dir())
+                            .join(source.revision)
+                            .join(tier),
+                        Some(quant)
+                    ),
+                    Some(source)
+                );
+            }
+            for crossed in [
+                hf(&twin.hf_cache_dir(), mlx.revision, tier),
+                hf(&mlx.hf_cache_dir(), twin.revision, tier),
+                hf(&twin.hf_cache_dir(), &"0".repeat(40), tier),
+                hf(
+                    "models--SceneWorks--scail2-candle-ggml",
+                    twin.revision,
+                    tier,
+                ),
+                hf("models--SceneWorks--krea-2-raw-candle", twin.revision, tier),
+            ] {
+                assert_eq!(
+                    canonical_artifact_path(&crossed, Some(quant)),
+                    None,
+                    "{crossed:?}"
+                );
+            }
+        }
+        assert_eq!(
+            canonical_artifact_path(&hf(&mlx.hf_cache_dir(), mlx.revision, "bf16"), None),
+            Some(mlx)
+        );
+        assert_eq!(
+            canonical_artifact_path(&hf(&twin.hf_cache_dir(), twin.revision, "bf16"), None),
+            None
+        );
+
+        // The receipt a twin-bound load seals names the twin; the MLX one still names the MLX
+        // re-host, byte for byte as before.
+        for (source, expected) in [
+            (mlx, CANONICAL_REPOSITORY.to_owned()),
+            (twin, "SceneWorks/scail2-candle".to_owned()),
+        ] {
+            let (_temp, spec) = candle_packed_fixture_at(Quant::Q4, source);
+            let prepared = PreparedMemory::prepare(&spec).unwrap();
+            assert_eq!(prepared.structural_evidence.repository, expected);
+            assert_eq!(prepared.structural_evidence.revision, source.revision);
+        }
     }
 
     /// sc-27307: every production calibration fingerprint, byte for byte, pinned before the table

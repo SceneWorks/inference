@@ -521,6 +521,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "rayon",
+ "regex",
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-testkit",
@@ -4102,6 +4103,7 @@ version = "0.1.0"
 dependencies = [
  "core-llm",
  "libc",
+ "regex",
  "safetensors 0.4.5",
  "sceneworks-gen-core-moss-image-policy",
  "sceneworks-gen-core-pag-policy",

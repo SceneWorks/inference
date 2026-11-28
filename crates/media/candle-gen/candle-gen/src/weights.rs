@@ -67,7 +67,8 @@ pub struct Weights {
     companion_keys: std::collections::BTreeSet<String>,
     pub(crate) projection_resources: std::sync::Arc<ProjectionResources>,
     /// The device the set is *destined for* when some tensors were deliberately left on the host
-    /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
+    /// (see [`Weights::from_files_filtered_host_packed`], and any set holding stored GGML block
+    /// tensors, which every constructor keeps on the host). `None` otherwise.
     target: Option<Device>,
     projection_window_device: Option<Device>,
 }
@@ -323,6 +324,7 @@ impl Weights {
         let mut names = std::collections::BTreeSet::new();
         let mut execution_metadata = std::collections::BTreeSet::new();
         let mut packed_bases = std::collections::HashSet::new();
+        let mut stored_blocks = false;
         for (key, view) in st.tensors() {
             if !prefixes.iter().any(|prefix| key.starts_with(prefix)) {
                 continue;
@@ -351,18 +353,21 @@ impl Weights {
                 if let Some(base) = key.strip_suffix(".scales") {
                     packed_bases.insert(base.to_owned());
                 }
-                // A stored GGML block tensor (a Candle-native pre-quantized tier) is already in
-                // its device format; it stays on the host only so its one upload is the final
-                // `QTensor` build, never a device round-trip through `from_ggml_block_tensor`.
-                if let Some(base) = key.strip_suffix(".weight") {
-                    if candle_layers::llm_projection::ggml_block_storage(
-                        view.dtype() == safetensors::Dtype::U8,
-                        view.shape(),
-                    )
-                    .is_some()
-                    {
-                        packed_bases.insert(base.to_owned());
-                    }
+            }
+            // A stored GGML block tensor (a Candle-native pre-quantized tier) is already in its
+            // device format, and every consumer builds it into a `QTensor` on the set's
+            // destination. It stays on the host under EVERY constructor so its one upload is that
+            // final buffer — never a device copy that `from_ggml_block_tensor` reads straight back
+            // (two device copies while the set is alive).
+            if let Some(base) = key.strip_suffix(".weight") {
+                if candle_layers::llm_projection::ggml_block_storage(
+                    view.dtype() == safetensors::Dtype::U8,
+                    view.shape(),
+                )
+                .is_some()
+                {
+                    packed_bases.insert(base.to_owned());
+                    stored_blocks = true;
                 }
             }
         }
@@ -410,15 +415,20 @@ impl Weights {
                         .projection_bias_dtype(&format!("{base}.weight"))
                 })
                 .unwrap_or(dtype);
-            let t = if let Some(place) = place_staged {
+            let t = if host {
+                load_map_tensor(mmap, &key, &Device::Cpu, dtype)?
+            } else if let Some(place) = place_staged {
                 place(load_map_tensor(mmap, &key, &Device::Cpu, dtype)?)?
             } else {
-                load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?
+                load_map_tensor(mmap, &key, device, dtype)?
             };
             weights.map.insert(key, t);
         }
         weights.source = source.ok().map(|src| (src, device.clone(), dtype));
-        weights.target = host_packed.then(|| device.clone());
+        // A host-resident stored block names its destination explicitly, as a host-packed triple
+        // does; every other tensor is already on `device`, so the target is the same device the
+        // tensors themselves name.
+        weights.target = (host_packed || stored_blocks).then(|| device.clone());
         #[cfg(feature = "model-inference-proof")]
         gen_core::model_input_proof::record_reader_paths(
             proof_site,
@@ -597,8 +607,10 @@ impl Weights {
     }
 
     /// The destination device of a [`from_files_filtered_host_packed`](Self::from_files_filtered_host_packed)
-    /// set, whose packed triples sit on the host so the triple's own tensors cannot name it. `None`
-    /// for every other constructor — consumers then keep using the weight tensor's device.
+    /// set, whose packed triples sit on the host so the triple's own tensors cannot name it — and of
+    /// any set carrying stored GGML block tensors, which every constructor keeps on the host for the
+    /// same reason (SW-7285). `None` otherwise — consumers then keep using the weight tensor's
+    /// device.
     pub fn host_packed_target(&self) -> Option<&Device> {
         self.target.as_ref()
     }
@@ -1147,6 +1159,58 @@ mod tests {
             hp.require("lm.q.weight").unwrap().to_vec1::<u32>().unwrap(),
             vec![0x1234_5678, 7]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SW-7285: a stored GGML block tensor stays on the host under EVERY constructor, which then
+    /// names the set's destination, so the shared packed loaders upload only the final `QTensor`
+    /// (never a device copy of the blocks read straight back). The residency itself cannot differ
+    /// on a CPU-only host; what this pins is the classification, the recorded destination, and that
+    /// the shared loader builds the projection on it.
+    #[test]
+    fn stored_ggml_blocks_stay_on_the_host_with_an_explicit_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "stored_host");
+        let a = dir.join("a.safetensors");
+        let blocks = Tensor::zeros((8, 4, 34), DType::U8, &Device::Cpu).unwrap();
+        let mut m = HashMap::new();
+        m.insert("p.weight".to_string(), blocks);
+        m.insert(
+            "n.weight".to_string(),
+            Tensor::new(&[3.0f32], &Device::Cpu).unwrap(),
+        );
+        cst::save(&m, &a).unwrap();
+        for w in [
+            Weights::from_files(&[&a], &Device::Cpu, DType::F32).unwrap(),
+            Weights::from_files_filtered(&[&a], &Device::Cpu, DType::F32, &[""]).unwrap(),
+        ] {
+            assert!(w.host_packed_target().is_some_and(Device::is_cpu));
+            let stored = w.require("p.weight").unwrap();
+            assert!(stored.device().is_cpu());
+            assert_eq!(
+                (stored.dtype(), stored.dims()),
+                (DType::U8, &[8, 4, 34][..])
+            );
+            let q = crate::quant::linear_from_weights(&w, "p", false).unwrap();
+            assert_eq!(
+                q.quant_dtype(),
+                Some(candle_core::quantized::GgmlDType::Q8_0)
+            );
+        }
+        // A set with no stored block keeps the ordinary contract: no explicit destination.
+        let b = dir.join("b.safetensors");
+        cst::save(
+            &HashMap::from([(
+                "n.weight".to_string(),
+                Tensor::new(&[3.0f32], &Device::Cpu).unwrap(),
+            )]),
+            &b,
+        )
+        .unwrap();
+        assert!(Weights::from_files(&[&b], &Device::Cpu, DType::F32)
+            .unwrap()
+            .host_packed_target()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -182,6 +182,7 @@ pub mod gpu;
 // The MLX-packed → GGML repack seam (sc-9085 spike → sc-9086, epic 9083): lets the candle lane
 // load the hosted MLX quant tiers (epic 8506) directly — no dense staging, no second artifact
 // matrix. Provider crates' packed-detect loaders build on this.
+pub mod ggml_tier;
 pub mod quant;
 pub mod text_encoder;
 

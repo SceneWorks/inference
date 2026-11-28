@@ -11,6 +11,7 @@ pub mod eight_bit_linear;
 pub mod nvfp4_kitchen;
 pub mod repack;
 pub mod sidecar;
+pub mod stored_ggml;
 pub mod w4a8_int8;
 
 pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};

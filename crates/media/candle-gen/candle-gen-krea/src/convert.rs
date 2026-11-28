@@ -330,6 +330,16 @@ fn check_shape(w: &Weights, key: &str, expected: &[usize]) -> Result<()> {
     // A packed (quantized) `{base}.weight` is u32-codes with a different on-disk shape; skip the
     // dense-shape check when a sibling `{base}.scales` marks it pre-quantized.
     if let Some(base) = key.strip_suffix(".weight") {
+        // A Candle-native GGML tier (SW-7285) stores `[out, in / 32, block_bytes]`; its blocks'
+        // decoded `[rows, cols]` is the logical shape, so check THAT rather than skipping.
+        if let Some((_, rows, cols)) = w.stored_ggml(base)? {
+            if [rows, cols] == expected {
+                return Ok(());
+            }
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea: {key} stored GGML blocks decode to [{rows}, {cols}], expected {expected:?}"
+            )));
+        }
         if w.contains(&format!("{base}.scales")) {
             return Ok(());
         }

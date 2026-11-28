@@ -49,6 +49,12 @@ pub struct TensorInfo {
     pub source_packed: bool,
     /// A source without declared matrix axes may describe its storage shape by padding model axes.
     pub padded_shape: Option<fn([usize; 2]) -> [usize; 2]>,
+    /// The tensor's **stored** dtype, when the backend knows it without reading the payload
+    /// (a safetensors header, an in-memory tensor). `None` for a backend that cannot tell, or for a
+    /// codec-planned tensor whose stored dtype is not the dtype a reader returns. Lets a loader
+    /// classify a stored GGML block tensor (`U8 [rows, blocks, block_bytes]`) before choosing
+    /// between a quantized and a dense read (SceneWorks SW-7285).
+    pub dtype: Option<DType>,
 }
 
 impl TensorInfo {
@@ -70,6 +76,15 @@ impl TensorInfo {
             shape,
             source_packed: false,
             padded_shape: None,
+            dtype: None,
+        }
+    }
+
+    /// [`Self::dense`] with the stored dtype known.
+    pub fn stored(shape: Shape, dtype: DType) -> Self {
+        Self {
+            dtype: Some(dtype),
+            ..Self::dense(shape)
         }
     }
 }
@@ -491,7 +506,9 @@ impl SimpleBackend for Zeros {
 
 impl SimpleBackend for HashMap<String, Tensor> {
     fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
-        Ok(self.get(name).map(|t| TensorInfo::dense(t.shape().clone())))
+        Ok(self
+            .get(name)
+            .map(|t| TensorInfo::stored(t.shape().clone(), t.dtype())))
     }
     fn get(
         &self,
@@ -710,7 +727,10 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
         Ok(self
             .get(name)
             .ok()
-            .map(|t| TensorInfo::dense(t.shape().into())))
+            .map(|t| match DType::try_from(t.dtype()) {
+                Ok(dtype) => TensorInfo::stored(t.shape().into(), dtype),
+                Err(_) => TensorInfo::dense(t.shape().into()),
+            }))
     }
     fn get(
         &self,
@@ -742,6 +762,15 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
 }
 
 impl SimpleBackend for candle::safetensors::BufferedSafetensors {
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        Ok(self
+            .get(name)
+            .ok()
+            .map(|t| match DType::try_from(t.dtype()) {
+                Ok(dtype) => TensorInfo::stored(t.shape().into(), dtype),
+                Err(_) => TensorInfo::dense(t.shape().into()),
+            }))
+    }
     fn get(
         &self,
         s: Shape,
@@ -772,6 +801,15 @@ impl SimpleBackend for candle::safetensors::BufferedSafetensors {
 }
 
 impl SimpleBackend for candle::safetensors::SliceSafetensors<'_> {
+    fn tensor_info(&self, name: &str) -> Result<Option<TensorInfo>> {
+        Ok(self
+            .get(name)
+            .ok()
+            .map(|t| match DType::try_from(t.dtype()) {
+                Ok(dtype) => TensorInfo::stored(t.shape().into(), dtype),
+                Err(_) => TensorInfo::dense(t.shape().into()),
+            }))
+    }
     fn get(
         &self,
         s: Shape,

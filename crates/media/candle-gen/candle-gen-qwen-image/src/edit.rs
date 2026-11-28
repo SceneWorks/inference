@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::snapshot_source::{SceneWorksSnapshot, TierSources};
 use candle_gen::gen_core::{
     AdapterSpec, GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, OffloadPolicy,
     PreviewSink, Progress, WeightsSource,
@@ -54,6 +55,16 @@ pub(crate) const EDIT_2511_BASE_ROUTE: &str = "qwen_image_edit_2511";
 pub(crate) const EDIT_2511_LIGHTNING_ROUTE: &str = "qwen_image_edit_2511_lightning";
 pub(crate) const EDIT_2511_REPO_DIR: &str = "models--SceneWorks--qwen-image-edit-2511-mlx";
 pub(crate) const EDIT_2511_REVISION: &str = "0dfbf3a018bcee42d77de14494c35f97a7531def";
+/// Every exact identity the Edit-2511 base may be bound to: the MLX tier tree at any tier, and its
+/// published Candle-native GGML twin at q4/q8 (SW-7285), which SceneWorks resolves on
+/// Windows/Linux. Exact repository + revision; nothing else is admitted.
+const EDIT_2511_SOURCES: TierSources = TierSources::with_candle_twin(
+    SceneWorksSnapshot::new("qwen-image-edit-2511-mlx", EDIT_2511_REVISION),
+    SceneWorksSnapshot::new(
+        "qwen-image-edit-2511-candle",
+        "c8cb2566415852b1f3c9929b3462b3e828e49b5f",
+    ),
+);
 const EDIT_2511_LIGHTNING_REPO_DIR: &str = "models--lightx2v--Qwen-Image-Edit-2511-Lightning";
 const EDIT_2511_LIGHTNING_REVISION: &str = "d74eba145674fd7e31b949324e148e21e7118abd";
 const EDIT_2511_LIGHTNING_FILE: &str =
@@ -1182,10 +1193,17 @@ fn exact_base_tier(spec: &candle_gen::gen_core::LoadSpec) -> Result<&'static str
         ("q4", Some(candle_gen::gen_core::Quant::Q4)),
         ("q8", Some(candle_gen::gen_core::Quant::Q8)),
     ] {
-        if path_has_suffix(
-            &resolved,
-            &[EDIT_2511_REPO_DIR, "snapshots", EDIT_2511_REVISION, tier],
-        ) {
+        if EDIT_2511_SOURCES.admitted(tier).any(|source| {
+            path_has_suffix(
+                &resolved,
+                &[
+                    source.hf_cache_dir().as_str(),
+                    "snapshots",
+                    source.revision,
+                    tier,
+                ],
+            )
+        }) {
             if spec.quantize != quant {
                 return Err(CandleError::Msg(format!(
                     "qwen edit: canonical {tier} artifact requires quantize={quant:?}, got {:?}",
@@ -1196,7 +1214,11 @@ fn exact_base_tier(spec: &candle_gen::gen_core::LoadSpec) -> Result<&'static str
         }
     }
     Err(CandleError::Msg(format!(
-        "qwen edit: optimized memory requires {EDIT_2511_REPO_DIR}/snapshots/{EDIT_2511_REVISION}/<bf16|q4|q8>, got {}",
+        "qwen edit: optimized memory requires {EDIT_2511_REPO_DIR}/snapshots/{EDIT_2511_REVISION}/<bf16|q4|q8> or, at q4/q8, its Candle twin {}, got {}",
+        EDIT_2511_SOURCES
+            .candle_twin
+            .map(|twin| twin.to_string())
+            .unwrap_or_default(),
         root.display()
     )))
 }
@@ -1756,6 +1778,58 @@ mod tests {
             assert_eq!(
                 validate_memory_artifact_recipe(&tier_spec).unwrap(),
                 QwenEditArtifactRecipe::Plain
+            );
+        }
+
+        // SW-7285: the exact published Candle twin binds at q4/q8; never at bf16, never under a
+        // crossed repository/revision pair, and never at any other revision or repository.
+        let twin = EDIT_2511_SOURCES.candle_twin.expect("published twin");
+        let tier_spec = |repository_dir: &str, revision: &str, tier: &str| {
+            let root = plain_tmp
+                .path()
+                .join(repository_dir)
+                .join("snapshots")
+                .join(revision)
+                .join(tier);
+            std::fs::create_dir_all(&root).unwrap();
+            let spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(root))
+                .with_resolved_route(EDIT_2511_BASE_ROUTE);
+            match tier {
+                "q4" => spec.with_quant(candle_gen::gen_core::Quant::Q4),
+                "q8" => spec.with_quant(candle_gen::gen_core::Quant::Q8),
+                _ => spec,
+            }
+        };
+        for tier in ["q4", "q8"] {
+            assert_eq!(
+                validate_memory_artifact_recipe(&tier_spec(
+                    &twin.hf_cache_dir(),
+                    twin.revision,
+                    tier
+                ))
+                .unwrap(),
+                QwenEditArtifactRecipe::Plain
+            );
+        }
+        for (repository_dir, revision, tier) in [
+            (twin.hf_cache_dir(), twin.revision, "bf16"),
+            (twin.hf_cache_dir(), EDIT_2511_REVISION, "q4"),
+            (EDIT_2511_REPO_DIR.to_owned(), twin.revision, "q4"),
+            (
+                twin.hf_cache_dir(),
+                "0000000000000000000000000000000000000000",
+                "q4",
+            ),
+            (
+                "models--SceneWorks--qwen-image-candle".to_owned(),
+                "148b1894cb9c5c7881baa532f5765e263b219c26",
+                "q4",
+            ),
+        ] {
+            assert!(
+                validate_memory_artifact_recipe(&tier_spec(&repository_dir, revision, tier))
+                    .is_err(),
+                "{repository_dir}@{revision}/{tier}"
             );
         }
 

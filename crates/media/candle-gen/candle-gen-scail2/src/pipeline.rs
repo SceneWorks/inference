@@ -427,10 +427,16 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
         .into_iter()
         .map(|header| (header.name.clone(), header))
         .collect();
+    // A Candle-native GGML tier (SW-7285) stores a packed projection as ONE `{base}.weight` of GGML
+    // blocks (`U8 [out, in / 32, block_bytes]`), the packed equivalent of the affine triple.
+    let stored = |header: &candle_gen::gen_core::SafetensorsTensorHeader| {
+        candle_gen::quant::stored_ggml::stored_header_geometry(header)
+    };
     let has_packed_leaf = tensors.iter().any(|(name, header)| {
         name.ends_with(".scales")
             || name.ends_with(".biases")
-            || (name.ends_with(".weight") && header.dtype == Dtype::U32)
+            || (name.ends_with(".weight")
+                && (header.dtype == Dtype::U32 || stored(header).is_some()))
     });
     let Some(quant) = cfg.packed_quant else {
         if has_packed_leaf {
@@ -459,11 +465,11 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
         }
     }
     for (name, header) in &tensors {
-        if name.ends_with(".weight") && header.dtype == Dtype::U32 {
+        if name.ends_with(".weight") && (header.dtype == Dtype::U32 || stored(header).is_some()) {
             let base = name.strip_suffix(".weight").expect("suffix checked");
             if !expected.contains_key(base) {
                 return Err(CandleError::Msg(format!(
-                    "scail2: packed DiT has unrecognized U32 weight {name}"
+                    "scail2: packed DiT has unrecognized packed weight {name}"
                 )));
             }
         }
@@ -476,6 +482,17 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
         let weight = tensors.get(&weight_key).ok_or_else(|| {
             CandleError::Msg(format!("scail2: packed DiT is missing {weight_key}"))
         })?;
+        if let Some((dtype, rows, cols)) = stored(weight) {
+            validate_stored_projection(
+                &base,
+                (dtype, rows, cols),
+                schema,
+                quant,
+                tensors.contains_key(&scales_key) || tensors.contains_key(&biases_key),
+                tensors.get(&bias_key).map(|bias| bias.shape.as_slice()),
+            )?;
+            continue;
+        }
         let scales = tensors.get(&scales_key).ok_or_else(|| {
             CandleError::Msg(format!("scail2: packed DiT is missing {scales_key}"))
         })?;
@@ -536,6 +553,45 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
                 quant.bits()
             )));
         }
+    }
+    Ok(())
+}
+
+/// One stored-GGML SCAIL2 projection (SW-7285) against its schema: the blocks decode to exactly the
+/// logical `[output, input]`, their block type is the declared width, no affine sidecar rides beside
+/// them (a projection is stored one way, never both), and the dense `.bias` is present.
+fn validate_stored_projection(
+    base: &str,
+    (dtype, rows, cols): (candle_gen::candle_core::quantized::GgmlDType, usize, usize),
+    schema: PackedProjectionSchema,
+    quant: Quant,
+    has_affine_sidecar: bool,
+    bias: Option<&[usize]>,
+) -> CResult<()> {
+    if has_affine_sidecar {
+        return Err(CandleError::Msg(format!(
+            "scail2: packed DiT {base} is stored as GGML blocks and also carries an affine \
+             sidecar — a tier stores a projection one way, never both"
+        )));
+    }
+    if (rows, cols) != (schema.output, schema.input) {
+        return Err(CandleError::Msg(format!(
+            "scail2: packed DiT {base} stored {dtype:?} blocks decode to [{rows}, {cols}], \
+             expected [{}, {}]",
+            schema.output, schema.input
+        )));
+    }
+    if candle_gen::quant::stored_ggml::stored_ggml_bits(dtype) != Some(quant.bits() as usize) {
+        return Err(CandleError::Msg(format!(
+            "scail2: packed DiT {base} is stored {dtype:?}, but config.json declares Q{}",
+            quant.bits()
+        )));
+    }
+    if bias != Some(&[schema.output][..]) {
+        return Err(CandleError::Msg(format!(
+            "scail2: packed DiT {base} bias must be [{}], got {bias:?}",
+            schema.output
+        )));
     }
     Ok(())
 }
@@ -1419,6 +1475,63 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, b"").unwrap();
+    }
+
+    /// The Candle-native GGML form of [`packed_dit_map`] (SW-7285): each projection's triple
+    /// replaced by the stored GGML blocks its repack builds — no `.scales` / `.biases`.
+    fn stored_dit_map(bits: usize) -> HashMap<String, Tensor> {
+        let mut out = packed_dit_map(bits);
+        for (base, _) in expected_packed_dit_projections(&mini_packed_config(Some(Quant::Q4))) {
+            let wq = out.remove(&format!("{base}.weight")).unwrap();
+            let scales = out.remove(&format!("{base}.scales")).unwrap();
+            let biases = out.remove(&format!("{base}.biases")).unwrap();
+            let qt = candle_gen::quant::repack_packed_weight_uncached(
+                &wq,
+                &scales,
+                &biases,
+                64,
+                &Device::Cpu,
+            )
+            .unwrap();
+            out.insert(
+                format!("{base}.weight"),
+                candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(&qt).unwrap(),
+            );
+        }
+        out
+    }
+
+    /// SW-7285: the published-format gate admits a stored-GGML SCAIL2 DiT at its declared width,
+    /// and refuses it at the other width, under a dense config, or stored both ways. Header-only.
+    #[test]
+    fn shared_packed_dit_gate_accepts_stored_ggml_blocks_at_the_declared_width() {
+        for (bits, quant, other) in [(4, Quant::Q4, Quant::Q8), (8, Quant::Q8, Quant::Q4)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let stored = stored_dit_map(bits);
+            write_dit(tmp.path(), &stored);
+            validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(quant))).unwrap();
+            let err = validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(other)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("config.json declares"), "{err}");
+            let err = validate_shared_packed_dit(tmp.path(), &mini_packed_config(None))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("dense config.json"), "{err}");
+
+            let mut both = stored.clone();
+            let (base, schema) = expected_packed_dit_projections(&mini_packed_config(Some(quant)))
+                .into_iter()
+                .next()
+                .unwrap();
+            let (_, scales, _) = packed_projection(bits, schema.output, schema.input);
+            both.insert(format!("{base}.scales"), scales);
+            write_dit(tmp.path(), &both);
+            let err = validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(quant)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("never both"), "{err}");
+        }
     }
 
     #[test]

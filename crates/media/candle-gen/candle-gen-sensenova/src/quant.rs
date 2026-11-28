@@ -58,6 +58,26 @@ pub(crate) const PACKED_GROUP_SIZE: usize = 64;
 /// pure store-dtype/packed-detect change with no new failure mode on a checkpoint whose dims differ
 /// from what the config implies — the dims are only ever read back from the tensors themselves.
 pub(crate) fn detect_linear(vb: &VarBuilder, base: &str, bias: bool) -> Result<QLinear> {
+    // A Candle-native GGML tier (SW-7285): the stored blocks carry their own `[out, in]` and are
+    // built as stored — no repack, no saved-quantization cache entry. `.scales` beside them is
+    // refused by the shared helper.
+    if let Some(weight) = candle_gen::quant::stored_ggml::stored_ggml_qtensor_vb(
+        vb,
+        "sensenova",
+        base,
+        None,
+        vb.device(),
+    )? {
+        let bias = if bias {
+            Some(vb.get_unchecked_dtype(&format!("{base}.bias"), DType::F32)?)
+        } else {
+            None
+        };
+        return Ok(QLinear::from_qtensor_dequant(
+            std::sync::Arc::new(weight),
+            bias,
+        ));
+    }
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device: Device = vb.device().clone();

@@ -375,6 +375,9 @@ impl PackedWeightSidecars {
         }
         check_cancel(cancel)?;
         let source = crate::loader::mmap_safetensors_multi(source_paths)?;
+        if let Some(cache) = Self::stored_only(&source, component_dir, base_prefix) {
+            return Ok((source, cache));
+        }
         if let Some(cache) = trusted_runtime_cache(
             &source,
             component_dir,
@@ -417,6 +420,42 @@ impl PackedWeightSidecars {
         Ok((source, cache))
     }
 
+    /// A **Candle-native GGML tier** (SW-7285): the selected projections are stored GGML blocks
+    /// (`U8 [out, in / 32, block_bytes]`) with no MLX `.scales` triple at all. Those blocks already
+    /// ARE the device format this cache exists to produce, so there is nothing to convert and nothing
+    /// to write: the result has no entries, creates no cache directory, and the consumer's
+    /// `.scales`-absent branch builds each projection straight from the source through the shared
+    /// stored-GGML detect (`lin_gs` / `AdaptLinear::linear_detect`). `None` when the selection holds
+    /// any affine triple (the normal preparation then runs, refusing a projection stored both ways)
+    /// or no stored block at all (the normal "no `.scales` triples" refusal stands).
+    fn stored_only(
+        source: &MmapedSafetensors,
+        component_dir: &Path,
+        base_prefix: Option<&str>,
+    ) -> Option<Self> {
+        let selected = |base: &str| base_prefix.is_none_or(|prefix| base.starts_with(prefix));
+        let mut stored = false;
+        for (name, view) in source.tensors() {
+            if name.strip_suffix(".scales").is_some_and(selected) {
+                return None;
+            }
+            stored |=
+                name.strip_suffix(".weight").is_some_and(selected) && is_stored_ggml_view(&view);
+        }
+        stored.then(|| Self {
+            entries: HashMap::new(),
+            replacement: std::sync::OnceLock::new(),
+            prepared: Vec::new(),
+            cache_dir: component_dir.join(CACHE_DIR),
+            created: 0,
+            reused: 0,
+            source_bytes_hashed: 0,
+            payload_bytes_hashed: 0,
+            sidecar_bytes: 0,
+            rebuild: None,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_impl(
         source: &MmapedSafetensors,
@@ -448,6 +487,9 @@ impl PackedWeightSidecars {
             )));
         }
 
+        if let Some(cache) = Self::stored_only(source, component_dir, base_prefix) {
+            return Ok(cache);
+        }
         if trust_ready {
             if let Some(cache) = trusted_runtime_cache(
                 source,
@@ -831,6 +873,13 @@ fn prepare_projections(
                 "device-format sidecar: `{scales_key}` has no `{weight_key}` sibling: {e}"
             ))
         })?;
+        if is_stored_ggml_view(&weight) {
+            return Err(Error::Msg(format!(
+                "device-format sidecar: `{weight_key}` is a stored GGML block tensor but \
+                 `{scales_key}` is also present — a tier stores a projection either as GGML blocks \
+                 or as an MLX affine triple, never both"
+            )));
+        }
         let scales = source.get(&scales_key)?;
         let biases = source.get(&biases_key).map_err(|e| {
             Error::Msg(format!(
@@ -910,6 +959,16 @@ fn prepare_projections(
         }
     }
     Ok(prepared)
+}
+
+/// Whether a safetensors view is a rank-3 stored GGML block tensor (SW-7285), from its header.
+fn is_stored_ggml_view(view: &safetensors::tensor::TensorView<'_>) -> bool {
+    view.shape().len() == 3
+        && crate::candle_layers::llm_projection::ggml_block_storage(
+            view.dtype() == SafeDtype::U8,
+            view.shape(),
+        )
+        .is_some()
 }
 
 fn cache_is_complete(
@@ -3126,6 +3185,90 @@ mod tests {
             payload_len(GgmlDType::Q8_0, 2, 64)?,
             None,
         )?);
+        Ok(())
+    }
+
+    /// A stored GGML block of `layers.0.proj` — the Candle-native tier form of the triple.
+    fn stored_proj(bits: usize) -> Result<Tensor> {
+        let dense = Tensor::arange(0f32, 128f32, &Device::Cpu)?
+            .reshape((2, 64))?
+            .affine(0.01, -0.5)?;
+        let (wq, scales, biases) = pack_mlx_affine(&dense, bits, 64)?;
+        let qt =
+            crate::quant::repack_packed_weight_uncached(&wq, &scales, &biases, 64, &Device::Cpu)?;
+        crate::candle_layers::llm_projection::to_ggml_block_tensor(&qt)
+            .map_err(|e| Error::Msg(e.to_string()))
+    }
+
+    /// SW-7285: a component whose projections are all stored GGML blocks needs no device-format
+    /// cache — its blocks already are the device format. Preparation converts nothing, creates no
+    /// cache directory, and leaves every projection to the shared stored-GGML detect.
+    #[test]
+    fn a_stored_ggml_component_prepares_no_sidecars_and_writes_nothing() -> Result<()> {
+        for bits in [4, 8] {
+            let dir = TestDir::new("stored-ggml");
+            let path = dir.path().join("model.safetensors");
+            safetensors::save(
+                &HashMap::from([("layers.0.proj.weight".to_string(), stored_proj(bits)?)]),
+                &path,
+            )?;
+            let cancel = CancelFlag::new();
+            let (_, sidecars) = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+                std::slice::from_ref(&path),
+                dir.path(),
+                PackedConfig {
+                    bits: bits as i32,
+                    group_size: 64,
+                },
+                &Device::Cpu,
+                &cancel,
+                "layers.",
+            )?;
+            assert!(!sidecars.contains("layers.0.proj"));
+            assert_eq!(sidecars.created_count(), 0);
+            assert_eq!(sidecars.source_bytes_hashed(), 0);
+            assert!(!dir.path().join(CACHE_DIR).exists(), "no cache directory");
+            let source = open(&path)?;
+            let prepared = PackedWeightSidecars::prepare(
+                &source,
+                dir.path(),
+                PackedConfig {
+                    bits: bits as i32,
+                    group_size: 64,
+                },
+                &Device::Cpu,
+            )?;
+            assert_eq!(prepared.created_count(), 0);
+            assert!(!dir.path().join(CACHE_DIR).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_projection_stored_both_ways_is_refused_by_preparation() -> Result<()> {
+        let dir = TestDir::new("stored-both");
+        let dense = Tensor::arange(0f32, 128f32, &Device::Cpu)?.reshape((2, 64))?;
+        let (_, scales, biases) = pack_mlx_affine(&dense, 4, 64)?;
+        let path = dir.path().join("model.safetensors");
+        safetensors::save(
+            &HashMap::from([
+                ("layers.0.proj.weight".to_string(), stored_proj(4)?),
+                ("layers.0.proj.scales".to_string(), scales),
+                ("layers.0.proj.biases".to_string(), biases),
+            ]),
+            &path,
+        )?;
+        let err = PackedWeightSidecars::prepare(
+            &open(&path)?,
+            dir.path(),
+            PackedConfig {
+                bits: 4,
+                group_size: 64,
+            },
+            &Device::Cpu,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("never both"), "{err}");
         Ok(())
     }
 }

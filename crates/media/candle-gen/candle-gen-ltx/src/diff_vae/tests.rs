@@ -1435,6 +1435,61 @@ fn an_unplannable_geometry_is_a_catchable_error_naming_the_budget() {
     );
 }
 
+/// SW-7285: a Candle-native GGML tier's projection loads as stored blocks — sliced along the output
+/// axis like the fused `qkv` split, built without a repack — and refuses a declaration that does not
+/// match its block type, a dense declaration, and a `.scales` sibling. Construction only.
+#[test]
+fn a_stored_ggml_projection_builds_as_stored_and_is_validated() {
+    use candle_gen::candle_core::quantized::GgmlDType;
+    let grid = Tensor::arange(0f32, 24.0 * 128.0, &Device::Cpu)
+        .unwrap()
+        .reshape((24, 128))
+        .unwrap()
+        .affine(0.001, -1.0)
+        .unwrap();
+    let (wq, scales, biases) = candle_gen::quant::pack_mlx_affine(&grid, 4, 64).unwrap();
+    let qt =
+        candle_gen::quant::repack_packed_weight_uncached(&wq, &scales, &biases, 64, &Device::Cpu)
+            .unwrap();
+    let stored = candle_gen::candle_layers::llm_projection::to_ggml_block_tensor(&qt).unwrap();
+    let vb = |extra: Option<(Tensor, Tensor)>| {
+        let mut map = HashMap::new();
+        map.insert("qkv.weight".to_string(), stored.clone());
+        if let Some((s, b)) = extra {
+            map.insert("qkv.scales".to_string(), s);
+            map.insert("qkv.biases".to_string(), b);
+        }
+        VarBuilder::from_tensors(map, DType::F32, &Device::Cpu)
+    };
+    let q4 = Some(crate::tier::Ltx25Quant { bits: 4, group: 64 });
+    let raw = RawWeight::load(&vb(None), "qkv", q4).unwrap();
+    assert!(matches!(raw, RawWeight::Stored(_)));
+    assert_eq!(raw.rows().unwrap(), 24);
+    match raw.narrow_rows(8, 8).unwrap().build(&Device::Cpu).unwrap() {
+        Weight::Packed { weight, out, inp } => {
+            assert_eq!((out, inp), (8, 128));
+            assert_eq!(weight.dtype(), GgmlDType::Q4_1);
+        }
+        Weight::Dense(_) => panic!("a stored block must stay packed"),
+    }
+    let q8 = Some(crate::tier::Ltx25Quant { bits: 8, group: 64 });
+    let err = RawWeight::load(&vb(None), "qkv", q8)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("declares 8 bits"), "{err}");
+    let err = RawWeight::load(&vb(None), "qkv", None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("declared this checkpoint dense"), "{err}");
+    let err = RawWeight::load(&vb(Some((scales, biases))), "qkv", q4)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("never both"), "{err}");
+}
+
 /// SW-6129 route: `rotate_axis` is the shared `candle_gen::rope::apply_rope`; the former private
 /// chain is the oracle.
 mod rope_route_tests {

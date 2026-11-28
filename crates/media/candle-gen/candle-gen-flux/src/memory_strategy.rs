@@ -275,6 +275,23 @@ fn resident_component_bytes(
                 )?,
                 PackedResidency::DequantizedDense => dequantized_dense_bytes(tensor, scales)?,
             }
+        } else if let Some((rows, cols)) = tensor.stored_ggml_block_matrix() {
+            // A Candle-native GGML tier's stored blocks (SW-7285): resident as published on the
+            // GGML loaders, dequantized to a dense `[rows, cols]` matrix by the VAE.
+            match packed {
+                PackedResidency::Ggml => tensor.data_bytes,
+                PackedResidency::DequantizedDense => u64::try_from(rows)
+                    .ok()
+                    .zip(u64::try_from(cols).ok())
+                    .and_then(|(rows, cols)| rows.checked_mul(cols))
+                    .and_then(|elements| elements.checked_mul(float_width()))
+                    .ok_or_else(|| {
+                        gen_core::Error::Msg(format!(
+                            "flux1: dense size overflow for {:?}",
+                            tensor.name
+                        ))
+                    })?,
+            }
         } else if tensor.is_float() {
             tensor.materialized_bytes(float_width())?
         } else {
@@ -1191,6 +1208,39 @@ pub(crate) fn assert_conditioned_plan_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-7285: a stored GGML block is priced at its stored bytes on the GGML loaders (DiT / text
+    /// encoders) and at its dequantized dense `[rows, cols]` matrix on the VAE, which dequantizes
+    /// it; a dense leaf keeps the activation width. Header-only.
+    #[test]
+    fn stored_ggml_blocks_are_priced_per_component_residency() {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vae.safetensors");
+        candle_gen::candle_core::safetensors::save(
+            &std::collections::HashMap::from([
+                (
+                    "mid.attn.to_q.weight".to_owned(),
+                    Tensor::zeros((8, 4, 20), DType::U8, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "mid.norm.weight".to_owned(),
+                    Tensor::zeros(8, DType::F32, &Device::Cpu).unwrap(),
+                ),
+            ]),
+            &path,
+        )
+        .unwrap();
+        let norm = 8 * float_width();
+        assert_eq!(
+            resident_component_bytes(&path, PackedResidency::Ggml).unwrap(),
+            8 * 4 * 20 + norm
+        );
+        assert_eq!(
+            resident_component_bytes(&path, PackedResidency::DequantizedDense).unwrap(),
+            8 * 128 * float_width() + norm
+        );
+    }
 
     #[test]
     fn conditioned_public_modes_are_provider_specific() {

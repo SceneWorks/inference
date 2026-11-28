@@ -8,11 +8,12 @@ impl EncoderContract {
         &self,
         headers: &[SafetensorsTensorHeader],
         path: &Path,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         dtype_policy: EncoderDtypePolicy,
     ) -> Result<()> {
         let prefix = self.expected_header_prefix()?;
         self.validate_architecture_signature(headers, path, prefix)?;
+        let component = headers;
         let lm_head_prefix = self
             .requires_lm_head
             .then(|| self.expected_lm_head_prefix())
@@ -260,6 +261,20 @@ impl EncoderContract {
         }
         self.validate_all_packed_triples(headers, path, packed_quant, &allowed_packed_bases)?;
         self.validate_dense_storage_probe(headers, path)?;
+        // A stored-GGML tier's width declaration over the WHOLE component (SW-7285), after the
+        // per-matrix checks have named any loaded projection: every block's width admitted, and
+        // each `overrides` record's `count` equal to the blocks it matches — exactly what the tier
+        // builder counted when it wrote the marker.
+        if let Some(widths) = packed_quant.and_then(PackedQuantization::ggml_widths) {
+            widths.admit_headers(component).map_err(|error| {
+                self.mismatch(
+                    path,
+                    "quantization.overrides",
+                    format!("the declared Q{} width contract", widths.bits()),
+                    error,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -382,7 +397,7 @@ impl EncoderContract {
     pub(super) fn validate_packing_config(
         &self,
         path: &Path,
-        packed: Option<PackedQuantization>,
+        packed: Option<&PackedQuantization>,
         is_file: bool,
     ) -> Result<()> {
         match (packed, self.packing) {
@@ -393,19 +408,18 @@ impl EncoderContract {
                 "directory-backed packed encoder",
                 "single File source",
             )),
-            (Some(actual), Some(expected)) if actual.group_size == expected.group_size => Ok(()),
-            (Some(actual), Some(expected)) => Err(self.mismatch(
-                path,
-                "quantization.group_size",
-                expected.group_size,
-                actual.group_size,
-            )),
-            (Some(actual), None) => Err(self.mismatch(
-                path,
-                "quantization",
-                "dense-only encoder",
-                format!("Q{} group_size {}", actual.bits, actual.group_size),
-            )),
+            // A stored GGML block's group is fixed by its type (SW-7285): the provider's affine
+            // group size constrains only the MLX triple form.
+            (Some(actual), Some(_)) if actual.is_ggml() => Ok(()),
+            (Some(actual), Some(expected)) if actual.group_size() == Some(expected.group_size) => {
+                Ok(())
+            }
+            (Some(actual), Some(expected)) => {
+                Err(self.mismatch(path, "quantization.group_size", expected.group_size, actual))
+            }
+            (Some(actual), None) => {
+                Err(self.mismatch(path, "quantization", "dense-only encoder", actual))
+            }
         }
     }
 
@@ -449,7 +463,7 @@ impl EncoderContract {
         &self,
         headers: &[SafetensorsTensorHeader],
         path: &Path,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         allowed_packed_bases: &BTreeSet<String>,
     ) -> Result<()> {
         let find = |name: &str| headers.iter().find(|header| header.name == name);
@@ -462,6 +476,7 @@ impl EncoderContract {
         for weight in headers.iter().filter(|header| {
             header.name.ends_with(".weight")
                 && (header.dtype == Dtype::U32
+                    || header.is_stored_ggml_block()
                     || find(&format!(
                         "{}.scales",
                         header.name.strip_suffix(".weight").unwrap_or(&header.name)
@@ -487,6 +502,12 @@ impl EncoderContract {
             }
             let scales = find(&format!("{base}.scales"));
             let biases = find(&format!("{base}.biases"));
+            // A stored GGML block projection (SW-7285) on an allowed base: its width and matrix
+            // are checked by `validate_matrix`; a sibling `.scales` / `.biases` falls through to
+            // the triple check below, which refuses its U8 weight.
+            if weight.is_stored_ggml_block() && scales.is_none() && biases.is_none() {
+                continue;
+            }
             let (Some(scales), Some(biases)) = (scales, biases) else {
                 return Err(self.mismatch(
                     path,
@@ -526,14 +547,24 @@ impl EncoderContract {
                     ),
                 ));
             }
+            // A `{bits, storage: "ggml"}` tier stores every packed matrix as GGML blocks: an
+            // affine triple under that marker is a mixed surface.
+            let Some(group_size) = quant.group_size() else {
+                return Err(self.mismatch(
+                    path,
+                    "packed_storage",
+                    format!("stored GGML block tensor for {base} ({quant})"),
+                    "MLX affine triple",
+                ));
+            };
             let logical_input = weight.shape[1]
                 .checked_mul(32)
                 .and_then(|value| value.checked_div(quant.bits))
                 .ok_or_else(|| {
                     self.mismatch(path, "packed_geometry", "non-overflowing matrix", base)
                 })?;
-            if !logical_input.is_multiple_of(quant.group_size)
-                || scales.shape[1] != logical_input / quant.group_size
+            if !logical_input.is_multiple_of(group_size)
+                || scales.shape[1] != logical_input / group_size
             {
                 return Err(self.mismatch(
                     path,
@@ -541,9 +572,9 @@ impl EncoderContract {
                     format!(
                         "[{}, {}] from bits={} group_size={}",
                         weight.shape[0],
-                        logical_input / quant.group_size,
+                        logical_input / group_size,
                         quant.bits,
-                        quant.group_size
+                        group_size
                     ),
                     format!("scales={:?}, biases={:?}", scales.shape, biases.shape),
                 ));
@@ -700,7 +731,7 @@ impl EncoderContract {
         headers: &[SafetensorsTensorHeader],
         path: &Path,
         expectation: MatrixExpectation<'_>,
-        packed_quant: Option<PackedQuantization>,
+        packed_quant: Option<&PackedQuantization>,
         dtype_policy: EncoderDtypePolicy,
     ) -> Result<()> {
         let MatrixExpectation {
@@ -720,14 +751,71 @@ impl EncoderContract {
             .iter()
             .find(|header| header.name == format!("{base}.biases"));
         match (scales, biases) {
-            (None, None) => {
-                if must_be_packed {
+            // A Candle-native GGML tier (SW-7285): ONE stored block weight `U8 [out, in / 32,
+            // block_bytes]` is the packed surface, at the declared width and the exact matrix.
+            (None, None) if weight.shape.len() == 3 && weight.is_stored_ggml_block() => {
+                if !must_be_packed {
                     return Err(self.mismatch(
                         path,
                         "packed_surface",
-                        format!("packed triple for {base}"),
-                        "dense weight",
+                        format!("dense weight for {base}"),
+                        "stored GGML blocks",
                     ));
+                }
+                let quant = packed_quant.ok_or_else(|| {
+                    self.mismatch(
+                        path,
+                        "quantization",
+                        "sibling config.json with bits",
+                        format!("stored GGML blocks {base} without authoritative metadata"),
+                    )
+                })?;
+                // C3: the marker must declare this storage (`{bits, storage: "ggml"}`); an MLX
+                // affine marker over stored blocks is a mislabelled tier.
+                if !quant.is_ggml() {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_storage",
+                        format!("MLX affine triple for {base} ({quant})"),
+                        "stored GGML blocks",
+                    ));
+                }
+                // The block width: the marker's `bits`, or a declared override of exactly this
+                // width (a q4 `--keep-q8` projection) — the one shared admission rule.
+                let geometry = crate::stored_ggml::stored_ggml_header_geometry(weight)
+                    .expect("is_stored_ggml_block classified this header");
+                let widths = quant
+                    .ggml_widths()
+                    .expect("is_ggml checked the storage above");
+                if let Err(error) = widths.admit(base, geometry.block) {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_dtype",
+                        format!("Q{} GGML blocks or a declared override", quant.bits),
+                        error,
+                    ));
+                }
+                let cols = Some(geometry.cols);
+                if weight.shape[0] != expected_output {
+                    return Err(self.mismatch(path, field, expected_output, weight.shape[0]));
+                }
+                if cols != Some(expected_input) {
+                    return Err(self.mismatch(
+                        path,
+                        "hidden_size",
+                        expected_input,
+                        format!("{:?} stored blocks", weight.shape),
+                    ));
+                }
+            }
+            (None, None) => {
+                if must_be_packed {
+                    let expected = if packed_quant.is_some_and(PackedQuantization::is_ggml) {
+                        format!("stored GGML block tensor for {base}")
+                    } else {
+                        format!("packed triple for {base}")
+                    };
+                    return Err(self.mismatch(path, "packed_surface", expected, "dense weight"));
                 }
                 if !dtype_policy.accepts_dense(weight.dtype) {
                     return Err(self.mismatch(
@@ -774,6 +862,24 @@ impl EncoderContract {
                         format!("packed tensor {base} without authoritative metadata"),
                     )
                 })?;
+                if weight.is_stored_ggml_block() {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_components",
+                        format!(
+                            "{base}.weight as a stored GGML block tensor or an MLX affine triple"
+                        ),
+                        "both a stored block and .scales/.biases",
+                    ));
+                }
+                let Some(group_size) = quant.group_size() else {
+                    return Err(self.mismatch(
+                        path,
+                        "packed_storage",
+                        format!("stored GGML block tensor for {base} ({quant})"),
+                        "MLX affine triple",
+                    ));
+                };
                 if weight.dtype != Dtype::U32 {
                     return Err(self.mismatch(
                         path,
@@ -801,7 +907,7 @@ impl EncoderContract {
                             format!("input={expected_input}, bits={}", quant.bits),
                         )
                     })?;
-                if !expected_input.is_multiple_of(quant.group_size)
+                if !expected_input.is_multiple_of(group_size)
                     || !packed_input_bits.is_multiple_of(32)
                 {
                     return Err(self.mismatch(
@@ -809,13 +915,13 @@ impl EncoderContract {
                         "packed_geometry",
                         "group-aligned Q4/Q8 matrix",
                         format!(
-                            "input={expected_input}, bits={}, group_size={}",
-                            quant.bits, quant.group_size
+                            "input={expected_input}, bits={}, group_size={group_size}",
+                            quant.bits
                         ),
                     ));
                 }
                 let expected_weight = vec![expected_output, packed_input_bits / 32];
-                let expected_affine = vec![expected_output, expected_input / quant.group_size];
+                let expected_affine = vec![expected_output, expected_input / group_size];
                 if weight.shape != expected_weight {
                     return Err(self.mismatch(
                         path,

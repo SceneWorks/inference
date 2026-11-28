@@ -38,6 +38,8 @@ safetensors = "0.7"
 half = "2"
 # Row-parallel Q4 repack (sc-26691); already in the lockfile via candle-gen-seedvr2.
 rayon = "1"
+# `candle_ggml_tier --keep-q8 <regex>` (SW-7285 q4 recipe override); already in the lockfile.
+regex = { workspace = true }
 # The NVFP4 codec + cuBLASLt fp8/int8/NVFP4 wrapper, lifted into a shared crate so candle-llm can
 # serve the same implementation (sc-24135). Re-exported at `candle_gen::quant::{nvfp4, cublaslt,
 # nvfp4_linear, nvfp4_outlier}` so media callers are unchanged.
