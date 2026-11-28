@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, QuantizationArtifact,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, QuantizationArtifact,
     QuantizationArtifactCache, QuantizationArtifactKey, QuantizationCacheContext, WeightsSource,
 };
 
@@ -81,12 +81,12 @@ fn main() {
     let out = PathBuf::from(env("SD3_TIER_OUT").expect("SD3_TIER_OUT"));
     let tier = env("SD3_TIER").unwrap_or_else(|| "q4".into());
     let id = env("SD3_TIER_ID").unwrap_or_else(|| "sd3_5_large".into());
-    let quant = match tier.as_str() {
-        "q4" => Some(Quant::Q4),
-        "q8" => Some(Quant::Q8),
-        "bf16" => None,
-        other => panic!("SD3_TIER must be q4, q8 or bf16, got {other:?}"),
-    };
+    // `SD3_TIER` only labels the report: an SD3.5 turnkey reads its physical tier from the snapshot
+    // and refuses `spec.quantize`; the load instead requires the exact `resolved_route`.
+    assert!(
+        matches!(tier.as_str(), "q4" | "q8" | "bf16"),
+        "SD3_TIER must be q4, q8 or bf16, got {tier:?}"
+    );
     let width: u32 = env_or("SD3_TIER_W", 1024);
     let height: u32 = env_or("SD3_TIER_H", 1024);
     let seed: u64 = env_or("SD3_TIER_SEED", 42);
@@ -112,9 +112,7 @@ fn main() {
     let started = std::time::Instant::now();
     let load_phase = probe.phase();
     let mut spec = LoadSpec::new(WeightsSource::Dir(tier_dir.clone()));
-    if let Some(quant) = quant {
-        spec = spec.with_quant(quant);
-    }
+    spec.resolved_route = Some(id.clone());
     let generator = candle_gen_sd3::provider_registry()
         .expect("provider registry")
         .load(&id, &spec)
