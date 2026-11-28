@@ -23,7 +23,7 @@ use std::sync::Arc;
 use candle_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant,
     QuantizationArtifact, QuantizationArtifactCache, QuantizationArtifactKey,
-    QuantizationCacheContext, ReplacementMode, WeightsSource,
+    QuantizationCacheContext, ReplacementMode, VideoMode, WeightsSource,
 };
 
 fn env(key: &str) -> Option<String> {
@@ -212,7 +212,7 @@ fn main() {
         fps: Some(16),
         seed: Some(seed),
         steps,
-        video_mode: Some("animation".to_owned()),
+        video_mode: Some(VideoMode::Animation),
         conditioning: vec![
             Conditioning::Reference {
                 image: reference,

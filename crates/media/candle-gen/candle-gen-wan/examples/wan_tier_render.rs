@@ -22,7 +22,7 @@ use std::sync::Arc;
 use candle_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant,
     QuantizationArtifact, QuantizationArtifactCache, QuantizationArtifactKey,
-    QuantizationCacheContext, WeightsSource,
+    QuantizationCacheContext, VideoMode, WeightsSource,
 };
 
 fn env(key: &str) -> Option<String> {
@@ -198,14 +198,11 @@ fn run() {
         seed: Some(seed),
         steps,
         // The worker spells the mode the prepared memory receipt selects its row by.
-        video_mode: Some(
-            if reference.is_some() {
-                "image_to_video"
-            } else {
-                "text_to_video"
-            }
-            .to_owned(),
-        ),
+        video_mode: Some(if reference.is_some() {
+            VideoMode::ImageToVideo
+        } else {
+            VideoMode::TextToVideo
+        }),
         conditioning: reference
             .into_iter()
             .map(|image| Conditioning::Reference {
