@@ -104,7 +104,12 @@ fn render_gain(gen: &dyn mlx_gen::Generator, gain: Option<f32>) -> Image {
         count: 1,
         seed: Some(0),
         steps: Some(8),
-        text_style_gain: gain,
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            krea: Some(mlx_gen::gen_core::KreaExtension {
+                text_style_gain: gain,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let out = gen.generate(&req, &mut |_| {}).expect("generate");

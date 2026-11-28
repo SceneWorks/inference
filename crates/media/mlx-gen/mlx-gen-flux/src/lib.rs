@@ -58,108 +58,18 @@ pub const DEV_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemor
         },
     };
 
-/// Add all MLX FLUX.1 providers to an explicit media registry builder.
+/// Add all MLX FLUX.1 providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](mlx_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: FLUX1_SCHNELL_ID,
-            compile: |spec, req| model::compile_base(FluxVariant::Schnell, spec, req),
-        })
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: FLUX1_DEV_ID,
-            compile: |spec, req| model::compile_base(FluxVariant::Dev, spec, req),
-        })
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: FLUX1_DEV_CONTROL_ID,
-            compile: model_control::compile_control,
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: "flux1_schnell_ip_adapter",
-            parent_provider_id: Some(FLUX1_SCHNELL_ID),
-            descriptor: model::descriptor_schnell_ip_adapter,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: "flux1_schnell_ip_adapter",
-                compile: |spec, req| model::compile_ip_adapter(FluxVariant::Schnell, spec, req),
-            }),
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: "flux1_dev_ip_adapter",
-            parent_provider_id: Some(FLUX1_DEV_ID),
-            descriptor: model::descriptor_dev_ip_adapter,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: "flux1_dev_ip_adapter",
-                compile: |spec, req| model::compile_ip_adapter(FluxVariant::Dev, spec, req),
-            }),
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: FLUX1_DEV_CONTROL_ID,
-            parent_provider_id: Some(FLUX1_DEV_ID),
-            descriptor: model_control::descriptor_dev_control,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: FLUX1_DEV_CONTROL_ID,
-                compile: model_control::compile_control,
-            }),
-        })
-        .register_generator(model::SCHNELL_REGISTRATION)
-        .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: FLUX1_SCHNELL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(FLUX1_SCHNELL_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: FLUX1_SCHNELL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(FLUX1_SCHNELL_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::SCHNELL_MEMORY_BEHAVIOR)
-        .register_generator(model::DEV_REGISTRATION)
-        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: FLUX1_DEV_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: FLUX1_DEV_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(FLUX1_DEV_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(model::DEV_MEMORY_BEHAVIOR)
-        .register_activation_memory(DEV_ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model_control::DEV_CONTROL_REGISTRATION)
-        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: FLUX1_DEV_CONTROL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: FLUX1_DEV_CONTROL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_surface_contract(
-                        FLUX1_DEV_CONTROL_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model_control::DEV_CONTROL_MEMORY_BEHAVIOR)
+        .register_route(model::route_schnell())
+        .register_route(model::route_dev())
+        .register_route(model_control::route_dev_control())
+        .register_route(model::route_schnell_ip_adapter())
+        .register_route(model::route_dev_ip_adapter())
 }
 
 /// Build the complete explicit MLX FLUX.1 provider catalog.
@@ -237,11 +147,14 @@ mod explicit_registry_tests {
             prompt: "a phased test".into(),
             width: 512,
             height: 512,
-            phases: Some(vec![GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            }]),
+            features: mlx_gen::gen_core::FeatureParams {
+                phases: Some(vec![GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for id in ["flux1_schnell", "flux1_dev"] {
@@ -286,6 +199,112 @@ mod explicit_registry_tests {
             registry.compile_render_plan("flux1_dev_control", &control_spec, &control_phased),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn route_records_preserve_exact_pre_migration_descriptor_and_capability_parity() {
+        use mlx_gen::gen_core::{
+            AcceptedControlKinds, ConditioningKind, ControlKind, Modality, Quant, SizeFloor,
+            StepSupport, FLUX1_LATENT_SPACE,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 5);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+
+        let schnell = registry.generator_descriptor("flux1_schnell").unwrap();
+        assert_eq!(schnell.family, "flux");
+        assert_eq!(schnell.backend, "mlx");
+        assert_eq!(schnell.modality, Modality::Image);
+        assert_eq!(
+            schnell.denoiser_output_latent_space,
+            Some(&FLUX1_LATENT_SPACE)
+        );
+        assert!(schnell.encoder_contract.is_none());
+        assert!(schnell.control_kinds.is_none());
+        assert!(schnell.required_components.is_empty());
+        assert!(!schnell.capabilities.supports_negative_prompt);
+        assert!(!schnell.capabilities.supports_guidance);
+        assert!(!schnell.capabilities.supports_true_cfg);
+        assert_eq!(
+            schnell.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        assert_eq!(
+            schnell.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
+        assert!(schnell.capabilities.supports_lora);
+        assert!(schnell.capabilities.supports_lokr);
+        assert!(schnell.capabilities.samplers.contains(&"flow_match"));
+        assert!(!schnell.capabilities.samplers.contains(&"hyper"));
+        assert!(schnell.capabilities.schedulers.contains(&"linear"));
+        assert_eq!(schnell.capabilities.min_size, 256);
+        assert_eq!(schnell.capabilities.max_size, 2048);
+        assert_eq!(schnell.capabilities.max_count, 8);
+        assert_eq!(schnell.capabilities.size_floor, SizeFloor::RangeChecked);
+        assert_eq!(
+            schnell.capabilities.supported_steps,
+            StepSupport::Unconstrained
+        );
+        assert!(schnell.capabilities.mac_only);
+        assert!(!schnell.capabilities.requires_sigma_shift);
+        assert!(schnell.capabilities.supports_sequential_offload);
+        assert!(schnell.capabilities.supports_preview);
+        assert!(schnell.capabilities.supports_low_res_start);
+        assert!(!schnell.capabilities.supports_phases);
+        assert_eq!(
+            schnell.capabilities.pag,
+            Some(super::FluxVariant::Schnell.pag_capability())
+        );
+
+        let dev = registry.generator_descriptor("flux1_dev").unwrap();
+        assert!(dev.capabilities.supports_guidance);
+        assert!(dev.capabilities.requires_sigma_shift);
+        assert!(dev.capabilities.samplers.contains(&"hyper"));
+        assert!(dev.capabilities.supports_low_res_start);
+        assert_eq!(
+            dev.capabilities.pag,
+            Some(super::FluxVariant::Dev.pag_capability())
+        );
+        assert_eq!(
+            registry.activation_memory_bytes_1024("flux1_dev").unwrap(),
+            Some(15_096_810_046)
+        );
+        let dev_route = registry.route_record("flux1_dev").unwrap();
+        assert_eq!(dev_route.defaults.steps, Some(25));
+        assert_eq!(dev_route.defaults.guidance, Some(3.5));
+
+        let ctrl = registry.generator_descriptor("flux1_dev_control").unwrap();
+        assert_eq!(
+            ctrl.capabilities.conditioning,
+            vec![ConditioningKind::Control]
+        );
+        assert_eq!(
+            ctrl.control_kinds,
+            Some(AcceptedControlKinds::Only(vec![
+                ControlKind::Pose,
+                ControlKind::Canny,
+                ControlKind::Depth,
+            ]))
+        );
+        assert!(ctrl.capabilities.supports_guidance);
+        assert!(ctrl.capabilities.supports_preview);
+        assert!(!ctrl.capabilities.supports_low_res_start);
+
+        for ip_id in ["flux1_schnell_ip_adapter", "flux1_dev_ip_adapter"] {
+            let ip_route = registry.route_record(ip_id).unwrap();
+            assert!(!ip_route.compute_capabilities().supports_low_res_start);
+        }
     }
 }
 

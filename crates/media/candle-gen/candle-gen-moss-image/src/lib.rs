@@ -29,9 +29,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
-use gen_core::generator::{
-    CompletedGeneration, CompletedMossImageAdvanced, CompletedMossImageEdit, ExecutionIdentity,
-};
+use gen_core::generator::{CompletedGeneration, CompletedMossImageAdvanced, ExecutionIdentity};
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use loader::Sources;
 use release::release_then_sync;
@@ -234,7 +232,7 @@ impl MossImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
         self.run_with_execution(request, inputs, edit, on_progress)
-            .map(|(output, _, _)| output)
+            .map(|(output, _, _, _, _)| output)
     }
     #[allow(clippy::type_complexity)]
     fn run_with_execution(
@@ -247,6 +245,8 @@ impl MossImageGenerator {
         MossImageAdvancedOutput,
         Option<PagExecutionReport>,
         ExecutionIdentity,
+        Option<gen_core::FamilyExecutionReport>,
+        Vec<AdapterApplyReport>,
     )> {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
@@ -277,7 +277,19 @@ impl MossImageGenerator {
                 &self.sources.spec.adapters,
                 &state.apply_reports,
             )?;
-            Ok((output, pag, execution))
+            let family_report = if edit.is_some() {
+                state
+                    .edit_report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImageEdit(Box::new(r)))
+            } else {
+                state
+                    .report
+                    .clone()
+                    .map(|r| gen_core::FamilyExecutionReport::MossImage(Box::new(r)))
+            };
+            let apply_reports = state.apply_reports.clone();
+            Ok((output, pag, execution, family_report, apply_reports))
         });
         // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
         // synchronize after release so the next admission sees the recovered driver budget.
@@ -626,8 +638,27 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedMossImageAdvanced> {
-        let (output, _, execution) = self.run_with_execution(request, inputs, None, on_progress)?;
+        let (output, _, execution, _, _) =
+            self.run_with_execution(request, inputs, None, on_progress)?;
         CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
+    }
+}
+impl MossImageGenerator {
+    /// Last-run MOSS-Image execution report for concrete `MossImageAdvancedGenerator` callers.
+    /// Generic `Generator` callers receive this directly on `GenerationReport::moss_image_report()`.
+    pub fn last_execution_report(&self) -> Option<MossImageExecutionReport> {
+        candle_gen::lock_recover(&self.state).report.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
+        candle_gen::lock_recover(&self.state).edit_report.clone()
+    }
+
+    /// Last-run adapter apply reports for concrete advanced-generator test harnesses.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        candle_gen::lock_recover(&self.state).apply_reports.clone()
     }
 }
 impl Generator for MossImageGenerator {
@@ -644,57 +675,50 @@ impl Generator for MossImageGenerator {
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedGeneration> {
-        let (output, pag, execution) =
-            self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?;
-        let MossImageAdvancedOutput::Images(images) = output else {
-            unreachable!("default image output")
+        let edit_req = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        let (output, pag, execution, family_report, apply_reports) = if let Some(edit_req) =
+            edit_req
+        {
+            let inputs = edit_req.as_inputs();
+            self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?
+        } else {
+            self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?
         };
-        let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = GenerationReport::from_output(GenerationOutput::from(output));
         report.pag = pag;
+        report.adapter_apply_reports = apply_reports;
+        report.family_report = family_report;
         CompletedGeneration::new(report, execution, &self.descriptor)
     }
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<CompletedMossImageEdit> {
-        let (output, _, execution) =
-            self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
-        CompletedMossImageEdit::new(output, execution, &self.descriptor)
-    }
-    fn generate_moss_image_edit(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<MossImageAdvancedOutput> {
-        self.run_with_edit(request, inputs.advanced, Some(inputs), progress)
-    }
-    fn moss_image_edit_request_peak(
-        &self,
-        request: &GenerationRequest,
-        inputs: MossImageEditInputs<'_>,
-    ) -> gen_core::Result<u64> {
-        memory_strategy::edit_request_peak(self.variant(), &self.sources.spec, request, inputs)
-    }
-    fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
-        candle_gen::lock_recover(&self.state).edit_report.clone()
+    fn request_memory_peak(&self, request: &GenerationRequest) -> gen_core::Result<Option<u64>> {
+        let Some(edit_req) = request
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref())
+        else {
+            return Ok(None);
+        };
+        memory_strategy::edit_request_peak(
+            self.variant(),
+            &self.sources.spec,
+            request,
+            edit_req.as_inputs(),
+        )
+        .map(Some)
     }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
-    fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
-        candle_gen::lock_recover(&self.state).report.clone()
-    }
-    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+    fn retained_weight_bytes(&self) -> Option<u64> {
         self.state
             .lock()
             .ok()
             .and_then(|state| self.cached_resident_bytes(&state).ok())
-    }
-    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        candle_gen::lock_recover(&self.state).apply_reports.clone()
     }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.contract)
@@ -709,21 +733,27 @@ impl Generator for MossImageGenerator {
         decision
     }
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        let edit_req = req
+            .extensions
+            .moss_image
+            .as_ref()
+            .and_then(|ext| ext.edit.as_ref());
+        let normalized;
+        let (req, advanced) = if let Some(edit) = edit_req {
+            let inputs = edit.as_inputs();
+            inputs.validate()?;
+            edit::check_precision(&self.device)?;
+            normalized = edit_request(req)?;
+            (&normalized, inputs.advanced)
+        } else {
+            (req, MossImageAdvancedInputs::default())
+        };
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
         let r = MossImageResolved::resolve(self.variant(), req)?;
-        MossImageAdvancedInputs::default().validate(req, &r)?;
-        checked_host_elements(
-            req,
-            req.prompt_batch
-                .len()
-                .max(1)
-                .checked_mul(req.count as usize)
-                .ok_or_else(|| {
-                    gen_core::Error::Unsupported("MOSS expanded batch overflow".into())
-                })?,
-        )?;
+        let images = advanced.validate(req, &r)?;
+        checked_host_elements(req, images)?;
         memory_strategy::check_request(req)?;
         self.selected_sources(r.acceleration, &req.cancel)?
             .assets(r.acceleration)?;
@@ -734,10 +764,9 @@ impl Generator for MossImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        match self.run(req, MossImageAdvancedInputs::default(), on_progress)? {
-            MossImageAdvancedOutput::Images(images) => Ok(GenerationOutput::Images(images)),
-            MossImageAdvancedOutput::Latents { .. } => unreachable!("default image output"),
-        }
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("MOSS generation produced no output".into()))
     }
 }
 
@@ -789,40 +818,110 @@ fn component_dtypes(mode: MossImageAcceleration, cpu: bool) -> BTreeMap<String, 
     }
     d
 }
-fn descriptor(v: MossImageVariant) -> ModelDescriptor {
-    ModelDescriptor {
-        id: v.provider_id(),
+pub(crate) fn route(v: MossImageVariant) -> gen_core::RouteRecord {
+    let bindings = match v {
+        MossImageVariant::Base => gen_core::RouteBindings::generator(descriptor_base, load_base)
+            .with_footprint(footprint_base)
+            .with_memory(contract_base, memory_strategy::safety_check)
+            .with_resident_only_memory(witness_specs, witness_base),
+        MossImageVariant::Sft => gen_core::RouteBindings::generator(descriptor_sft, load_sft)
+            .with_footprint(footprint_sft)
+            .with_memory(contract_sft, memory_strategy::safety_check)
+            .with_resident_only_memory(witness_specs, witness_sft),
+    };
+    gen_core::RouteRecord {
+        route_id: v.provider_id(),
         family: "moss_image",
         backend: "candle",
         modality: Modality::Image,
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
-        control_kinds: None,
-        required_components: if v == MossImageVariant::Base {
-            &[MOSS_SHARED_SNAPSHOT_COMPONENT]
-        } else {
-            &[]
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen35", None)],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["euler"],
+                schedulers: vec!["moss_training_grid"],
+                guidance_methods: vec!["cfg"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("moss_image_dit")
+                    .with_pag(moss_image_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux2_vae"),
+                output_latent_space: Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen35"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["moss_image_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux2_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                required_components: if v == MossImageVariant::Base {
+                    &[MOSS_SHARED_SNAPSHOT_COMPONENT]
+                } else {
+                    &[]
+                },
+                ..Default::default()
+            },
+            supported_family_extensions: vec![gen_core::FamilyExtensionKind::MossImage],
+            ..Default::default()
         },
-        capabilities: Capabilities {
-            supports_lora: true,
-            supports_lokr: true,
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_prompt_batch: true,
-            supports_sequential_offload: true,
-            samplers: vec!["euler"],
-            schedulers: vec!["moss_training_grid"],
-            supported_guidance_methods: vec!["cfg"],
+        limits: gen_core::ProductLimits {
             min_size: SIZE_MULTIPLE,
             max_size: u32::MAX,
-            max_count: u32::MAX,
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
-            pag: Some(moss_image_pag_capability()),
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: u32::MAX,
+            supports_prompt_batch: true,
+        },
+        defaults: gen_core::RouteDefaults {
+            sampler: Some("euler"),
+            schedule: Some("moss_training_grid"),
+            dimensions: Some((1024, 1024)),
             ..Default::default()
         },
+        bindings,
     }
+}
+fn descriptor(v: MossImageVariant) -> ModelDescriptor {
+    route(v).compute_descriptor()
 }
 /// Frozen Base descriptor.
 pub fn descriptor_base() -> ModelDescriptor {
@@ -866,9 +965,8 @@ fn contract_sft(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
         &Sources::new(MossImageVariant::Sft, spec)?,
     )
 }
-candle_gen::register_generators! {pub(crate) const BASE_REGISTRATION=descriptor_base=>load_base;footprint=footprint_base}
-candle_gen::register_generators! {pub(crate) const SFT_REGISTRATION=descriptor_sft=>load_sft;footprint=footprint_sft}
-/// Compose both frozen generator, footprint and memory registrations.
+/// Compose both frozen generator, footprint and memory registrations via one-call
+/// [`ProviderRegistryBuilder::register_route`] (`SW-6979`, `REG-1`).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     registry
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
@@ -882,30 +980,10 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
             }],
             ..gen_core::MOSS_IMAGE_CHECKPOINT_ADAPTER
         })
-        .register_generator(BASE_REGISTRATION)
-        .register_generator(SFT_REGISTRATION)
+        .register_route(route(MossImageVariant::Base))
+        .register_route(route(MossImageVariant::Sft))
         .register_trainer(training::BASE_REGISTRATION)
         .register_trainer(training::SFT_REGISTRATION)
-        .register_memory_strategy(MemoryRegistration {
-            provider_id: "moss_image_base",
-            contract: contract_base,
-            safety_check: memory_strategy::safety_check,
-        })
-        .register_memory_strategy(MemoryRegistration {
-            provider_id: "moss_image_sft",
-            contract: contract_sft,
-            safety_check: memory_strategy::safety_check,
-        })
-        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: "moss_image_base",
-            contract: witness_base,
-            surface_specs: witness_specs,
-        })
-        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: "moss_image_sft",
-            contract: witness_sft,
-            surface_specs: witness_specs,
-        })
 }
 
 fn witness_specs() -> Vec<MemoryContractSurfaceSpec> {

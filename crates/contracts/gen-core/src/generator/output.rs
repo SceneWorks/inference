@@ -1,12 +1,82 @@
 //! What a generation returns: outputs, reports, artifacts and warnings, plus the output-shape knobs a request names.
 
+use serde::{Deserialize, Serialize};
+
 use super::*;
+
+/// Why autoregressive vector generation stopped (`PIPE-12`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorFinishReason {
+    /// Emitted end-of-sequence or closing `</svg>` terminator cleanly.
+    #[default]
+    Stop,
+    /// Reached `max_tokens` before closing cleanly.
+    Length,
+    /// Stopped early due to cancellation.
+    Canceled,
+}
+
+/// Terminal metadata attached to a sanitized vector generation (`PIPE-12`, ready for StarVector).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorTerminalMetadata {
+    /// Optional sanitizer policy/version identifier applied to produce the canonical SVG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanitizer_id: Option<String>,
+    /// Optional canonical viewport `[width, height]` extracted from the sanitized SVG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<[u32; 2]>,
+    /// Optional SHA-256 hex digest of the sanitized canonical SVG UTF-8 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_sha256: Option<String>,
+    /// Optional count of SVG elements/primitives retained after sanitization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_count: Option<usize>,
+    /// Optional provider-native terminal finish reason (e.g. `"complete_root"`, `"eos"`,
+    /// `"token_limit"`, `"byte_limit"`, `"wall_time_limit"`, `"cancelled"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_finish_reason: Option<String>,
+    /// Optional raw UTF-8 source byte count emitted by the vector provider before sanitization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_bytes: Option<usize>,
+    /// Optional underlying provider identifier that produced the vector stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Optional KV-cache telemetry report emitted by the autoregressive vector decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<crate::core_llm::KvCacheReport>,
+}
+
+/// Sanitized canonical SVG plus optional rendered preview and terminal metadata (`PIPE-12`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorOutput {
+    /// Sanitized canonical SVG document (UTF-8).
+    pub svg: String,
+    /// Optional rasterized RGB preview of the sanitized SVG.
+    #[serde(skip)]
+    pub preview: Option<Image>,
+    /// Why generation terminated.
+    pub finish_reason: VectorFinishReason,
+    /// Number of generated tokens emitted by the vector model.
+    pub generated_tokens: usize,
+    /// Optional number of prompt tokens consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<usize>,
+    /// Whether output was truncated before natural completion.
+    pub truncated: bool,
+    /// Sanitizer provenance, viewport, and digest metadata.
+    #[serde(default)]
+    pub terminal: VectorTerminalMetadata,
+}
 
 /// What a [`Generator`] produced. The `Video` variant's `audio` is `Some` for LTX (always
 /// audio) and `None` for Wan — no contract change needed across the two. The `Audio` variant
 /// is a **pure** audio synthesis (TTS / music — `Modality::Audio`); audio attached to a video
 /// stays on the `Video` variant.
 #[derive(Clone, Debug)]
+// `GenerationOutput` is returned once per generation (never stored in dense arrays), and keeping
+// `Vector(VectorOutput)` unboxed preserves source compatibility for pattern matches.
+#[allow(clippy::large_enum_variant)]
 pub enum GenerationOutput {
     Images(Vec<Image>),
     /// Four-channel images with a **straight (un-premultiplied) alpha** channel (sc-24111) — the
@@ -36,6 +106,15 @@ pub enum GenerationOutput {
     Interleaved {
         text: String,
         images: Vec<Image>,
+    },
+    /// Sanitized canonical SVG plus its optional rendered preview and terminal metadata for
+    /// vector generation (`PIPE-12`, ready for StarVector).
+    Vector(VectorOutput),
+    /// Raw FP32 NCHW latent batch `[batch, channels, height, width]` emitted when a provider's
+    /// request selects latent-space output rather than RGB/RGBA decode (`PIPE-12`).
+    Latents {
+        values: Vec<f32>,
+        shape: [usize; 4],
     },
 }
 
@@ -124,13 +203,25 @@ impl HdrRequest {
     }
 }
 
-/// The complete result of one generation (sc-22988), returned by
-/// [`Generator::generate_with_report`]: the rendered output, the reproducibility record the render
-/// published, and the non-fatal conditions the caller must see.
-///
-/// [`Generator::generate`] returns only [`Self::output`]; a caller that must know a render was
-/// truncated, or that reads an artifacts-only render (a plan with no audio), calls
-/// [`Generator::generate_with_report`] instead.
+/// Family-specific per-run execution receipt carried directly inside [`GenerationReport`]
+/// (`PIPE-12`), replacing mutable `&self` side-channel getters on [`Generator`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum FamilyExecutionReport {
+    /// Observed sparse-attention outcome for a MiniMax-H3 run.
+    Veda(Box<crate::VedaExecutionReport>),
+    /// Observed MOSS-Image execution receipt.
+    MossImage(Box<crate::moss_image::MossImageExecutionReport>),
+    /// Observed MOSS-Image-Edit execution receipt.
+    MossImageEdit(Box<crate::moss_image_edit::MossImageEditExecutionReport>),
+}
+
+/// Canonical alias for the per-run execution report returned from generation (`PIPE-12`).
+pub type ExecutionReport = GenerationReport;
+
+/// The complete result of one generation (sc-22988, `PIPE-12`), returned by
+/// [`Generator::generate_with_report`] and wrapped inside [`CompletedGeneration`]: the rendered
+/// output, the reproducibility record the render published, non-fatal warnings, adapter apply
+/// outcomes, and any family-specific per-run execution receipt.
 #[derive(Clone, Debug)]
 pub struct GenerationReport {
     /// What was rendered. `None` only for an artifacts-only request ([`SongParams::plan_only`]),
@@ -155,6 +246,12 @@ pub struct GenerationReport {
     /// `estimator`, `estimate_provenance`, `transition_arithmetic_id`, `transition_seed_derivation_id`,
     /// and evaluation accounting) when active (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`, `E3`).
     pub low_res_start: Option<crate::LowResStartExecutionReport>,
+    /// Actual per-adapter install outcomes observed during this run (`PIPE-12`), replacing the
+    /// former `&self` `Generator::adapter_apply_reports` side-channel getter.
+    pub adapter_apply_reports: Vec<crate::AdapterApplyReport>,
+    /// Optional family-specific execution receipt observed during this run (`PIPE-12`), replacing
+    /// the former `&self` family report getters on [`Generator`].
+    pub family_report: Option<FamilyExecutionReport>,
 }
 
 impl GenerationReport {
@@ -168,6 +265,34 @@ impl GenerationReport {
             prefix_kv_cache: None,
             pag: None,
             low_res_start: None,
+            adapter_apply_reports: Vec::new(),
+            family_report: None,
+        }
+    }
+
+    /// Borrow the Veda sparse-attention report attached to this run, if present.
+    pub fn veda_report(&self) -> Option<&crate::VedaExecutionReport> {
+        match self.family_report.as_ref() {
+            Some(FamilyExecutionReport::Veda(report)) => Some(report.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Borrow the MOSS-Image execution report attached to this run, if present.
+    pub fn moss_image_report(&self) -> Option<&crate::moss_image::MossImageExecutionReport> {
+        match self.family_report.as_ref() {
+            Some(FamilyExecutionReport::MossImage(report)) => Some(report.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Borrow the MOSS-Image-Edit execution report attached to this run, if present.
+    pub fn moss_image_edit_report(
+        &self,
+    ) -> Option<&crate::moss_image_edit::MossImageEditExecutionReport> {
+        match self.family_report.as_ref() {
+            Some(FamilyExecutionReport::MossImageEdit(report)) => Some(report.as_ref()),
+            _ => None,
         }
     }
 }

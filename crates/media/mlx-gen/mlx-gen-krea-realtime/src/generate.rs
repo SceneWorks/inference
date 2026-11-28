@@ -516,6 +516,32 @@ pub struct KreaRealtimeArDriver<F> {
     forward: RefCell<F>,
 }
 
+/// Primary [`DriverSupport`] declaration for Krea Realtime AR causal chunk denoising.
+pub(crate) fn krea_realtime_driver_support() -> DriverSupport {
+    DriverSupport {
+        driver_id: "krea_realtime_ar",
+        arbitrary_slice: true,
+        carry_history: true,
+        reset_history: false,
+        renoise_from_clean: false,
+        geometry_change: false,
+        read_only_boundary_estimate: false,
+        previous_estimate_capture: false,
+        uses_global_rng: false,
+        refusal_reasons: DriverRefusalReasons {
+            reset_history:
+                "Krea Realtime AR causal KV trajectory cannot reset block/cache state mid-trajectory",
+            renoise_from_clean:
+                "Krea Realtime AR driver owns its per-step Self-Forcing renoise chain and refuses external Renoise transitions",
+            geometry_change:
+                "Krea Realtime AR driver does not support mid-trajectory spatial resampling",
+            read_only_boundary_estimate:
+                "Krea Realtime AR chunk driver does not expose a separate read-only boundary clean estimate",
+            ..DriverRefusalReasons::default()
+        },
+    }
+}
+
 impl<F: KreaArBlockForward> KreaRealtimeArDriver<F> {
     /// Construct a typed Krea Realtime AR driver over `forward`.
     #[allow(clippy::too_many_arguments)]
@@ -534,28 +560,7 @@ impl<F: KreaArBlockForward> KreaRealtimeArDriver<F> {
         forward: F,
     ) -> Self {
         Self {
-            support: DriverSupport {
-                driver_id: "krea_realtime_ar",
-                arbitrary_slice: true,
-                carry_history: true,
-                reset_history: false,
-                renoise_from_clean: false,
-                geometry_change: false,
-                read_only_boundary_estimate: false,
-                previous_estimate_capture: false,
-                uses_global_rng: false,
-                refusal_reasons: DriverRefusalReasons {
-                    reset_history:
-                        "Krea Realtime AR causal KV trajectory cannot reset block/cache state mid-trajectory",
-                    renoise_from_clean:
-                        "Krea Realtime AR driver owns its per-step Self-Forcing renoise chain and refuses external Renoise transitions",
-                    geometry_change:
-                        "Krea Realtime AR driver does not support mid-trajectory spatial resampling",
-                    read_only_boundary_estimate:
-                        "Krea Realtime AR chunk driver does not expose a separate read-only boundary clean estimate",
-                    ..DriverRefusalReasons::default()
-                },
-            },
+            support: krea_realtime_driver_support(),
             schedule,
             channels,
             frame_seq_length,

@@ -62,7 +62,12 @@ fn gen_frame_count(model_dir: &std::path::Path, trim: Option<u32>) -> usize {
         steps: Some(4),
         seed: Some(7),
         sampler: Some("unipc".into()),
-        trim_first_frames: trim,
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            wan: Some(mlx_gen::gen_core::WanExtension {
+                trim_first_frames: trim,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut noop = |_p| {};

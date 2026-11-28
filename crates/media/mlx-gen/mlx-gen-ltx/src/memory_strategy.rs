@@ -1557,7 +1557,12 @@ impl LtxMemoryRequestScope {
             .into_iter()
             .flat_map(|overlay| overlay.split('+'))
             .any(|axis| axis == "enhancer:uncensored");
-        let request_enhancer = if request.use_uncensored_enhancer {
+        let use_uncensored_enhancer = request
+            .extensions
+            .ltx
+            .as_ref()
+            .is_some_and(|ltx| ltx.use_uncensored_enhancer);
+        let request_enhancer = if use_uncensored_enhancer {
             Some("uncensored")
         } else if request.enhance_prompt {
             Some("standard")
@@ -1573,7 +1578,7 @@ impl LtxMemoryRequestScope {
                 "ltx_2_3: enhancer flavor does not match admitted overlay".into(),
             ));
         }
-        if request.use_uncensored_enhancer && !expected_has_enhancer {
+        if use_uncensored_enhancer && !expected_has_enhancer {
             return Err(gen_core::Error::Unsupported(
                 "ltx_2_3: uncensored enhancer does not match the loaded overlay".into(),
             ));
@@ -2350,7 +2355,13 @@ mod tests {
                 ..request.clone()
             },
             GenerationRequest {
-                use_uncensored_enhancer: true,
+                extensions: mlx_gen::gen_core::FamilyExtensions {
+                    ltx: Some(mlx_gen::gen_core::LtxExtension {
+                        use_uncensored_enhancer: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
                 ..request.clone()
             },
         ] {
@@ -2396,8 +2407,14 @@ mod tests {
         assert!(error.contains("enhancer flavor does not match admitted overlay"));
         let mut admitted_uncensored = GenerationRequest {
             enhance_prompt: true,
-            use_uncensored_enhancer: true,
             enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..enhancer_fixture.request.clone()
         };
         enhancer_scope
@@ -2406,8 +2423,14 @@ mod tests {
         assert!(admitted_uncensored.memory.unwrap().stage_residency);
         let mut crossed_token_budget = GenerationRequest {
             enhance_prompt: true,
-            use_uncensored_enhancer: true,
             enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS + 1),
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..enhancer_fixture.request.clone()
         };
         let error = enhancer_scope
@@ -2444,7 +2467,13 @@ mod tests {
             .unwrap();
         assert!(admitted_standard.memory.unwrap().stage_residency);
         let mut crossed_uncensored = GenerationRequest {
-            use_uncensored_enhancer: true,
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                ltx: Some(mlx_gen::gen_core::LtxExtension {
+                    use_uncensored_enhancer: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..request.clone()
         };
         let error = standard_scope

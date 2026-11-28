@@ -434,7 +434,7 @@ impl Flux1 {
         let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
             return Ok(None);
         };
-        if req.use_pid
+        if req.use_pid()
             || !memory.stage_residency
             || !self
                 .memory_strategy
@@ -827,12 +827,12 @@ impl Flux1 {
         // bundle: a PiD request keeps Conditioning open across the residency handoff until the
         // decoder (and its caption) is prepared; an ordinary single-source img2img request also
         // keeps Conditioning open until its init image is VAE-encoded at phase-0 geometry.
-        let hold_conditioning = conditioning_started || req.use_pid || req.source_image.is_some();
+        let hold_conditioning = conditioning_started || req.use_pid() || req.source_image.is_some();
         let result = self.residency.run_request_scoped(
             stage_residency,
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &FluxTextOwned| {
                 if hold_conditioning {
@@ -1090,12 +1090,12 @@ impl Flux1 {
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
         // As in the single-branch path, a PiD request holds Conditioning through decoder preparation.
-        let hold_conditioning = conditioning_started || req.use_pid;
+        let hold_conditioning = conditioning_started || req.use_pid();
         let result = self.residency.run_request_scoped(
             matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &FluxTextOwned| {
                 let encode_text = || {
@@ -1629,18 +1629,82 @@ pub fn compile_trajectory_for(
     )?)
 }
 
+pub(crate) fn route_schnell() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Schnell.route_record();
+    route.bindings = gen_core::RouteBindings::generator(descriptor_schnell, |spec| {
+        load_schnell(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(FluxVariant::Schnell, spec, req))
+    .with_memory_registration(SCHNELL_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(crate::FLUX1_SCHNELL_ID, spec)
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_memory_surface_contract(
+            crate::FLUX1_SCHNELL_ID,
+            surface,
+        )
+    })
+    .with_memory_behavior_registration(SCHNELL_MEMORY_BEHAVIOR);
+    route
+}
+
+pub(crate) fn route_dev() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Dev.route_record();
+    route.bindings = gen_core::RouteBindings::generator(descriptor_dev, |spec| {
+        load_dev(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_render_plan(|spec, req| compile_base(FluxVariant::Dev, spec, req))
+    .with_memory_registration(DEV_MEMORY_REGISTRATION)
+    .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+        crate::memory_strategy::weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, spec)
+    })
+    .with_memory_surface_resolver(|surface| {
+        crate::memory_strategy::weights_free_memory_surface_contract(crate::FLUX1_DEV_ID, surface)
+    })
+    .with_memory_behavior_registration(DEV_MEMORY_BEHAVIOR)
+    .with_activation_memory(crate::DEV_ACTIVATION_MEMORY_REGISTRATION.anchor);
+    route
+}
+
+pub(crate) fn route_schnell_ip_adapter() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Schnell.route_record();
+    route.route_id = "flux1_schnell_ip_adapter";
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.defaults.strength = Some(DEFAULT_IP_SCALE);
+    route.bindings = gen_core::RouteBindings::feature_route(
+        Some(crate::FLUX1_SCHNELL_ID),
+        descriptor_schnell_ip_adapter,
+    )
+    .with_render_plan(|spec, req| compile_ip_adapter(FluxVariant::Schnell, spec, req));
+    route
+}
+
+pub(crate) fn route_dev_ip_adapter() -> gen_core::RouteRecord {
+    let mut route = FluxVariant::Dev.route_record();
+    route.route_id = "flux1_dev_ip_adapter";
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.defaults.strength = Some(DEFAULT_IP_SCALE);
+    route.bindings = gen_core::RouteBindings::feature_route(
+        Some(crate::FLUX1_DEV_ID),
+        descriptor_dev_ip_adapter,
+    )
+    .with_render_plan(|spec, req| compile_ip_adapter(FluxVariant::Dev, spec, req));
+    route
+}
+
 pub(crate) fn descriptor_schnell_ip_adapter() -> ModelDescriptor {
-    let mut descriptor = descriptor_schnell();
-    descriptor.id = "flux1_schnell_ip_adapter";
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route_schnell_ip_adapter().compute_descriptor()
 }
 
 pub(crate) fn descriptor_dev_ip_adapter() -> ModelDescriptor {
-    let mut descriptor = descriptor_dev();
-    descriptor.id = "flux1_dev_ip_adapter";
-    descriptor.capabilities.supports_low_res_start = false;
-    descriptor
+    route_dev_ip_adapter().compute_descriptor()
 }
 
 pub(crate) fn compile_ip_adapter(
@@ -1654,7 +1718,7 @@ pub(crate) fn compile_ip_adapter(
             variant.id()
         )));
     }
-    if req.low_res_start.is_some() {
+    if req.features.low_res_start.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}_ip_adapter: low_res_start is not supported by this model route",
             variant.id()
@@ -1679,7 +1743,7 @@ pub(crate) fn compile_base(
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
-    if req.use_pid && spec.pid.is_none() {
+    if req.use_pid() && spec.pid.is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: PiD decode needs a loaded overlay",
             variant.id()
@@ -1782,7 +1846,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id
         )));
     }
-    if req.phases.is_some() {
+    if req.features.phases.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: multi-phase denoise (phases) is not supported",
             desc.id
@@ -1881,7 +1945,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             }
         }
     }
-    if req.low_res_start.is_some() {
+    if req.features.low_res_start.is_some() {
         if !desc.capabilities.supports_low_res_start {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start is not supported by this model route",
@@ -1921,11 +1985,6 @@ pub(crate) fn component_footprint(
         &["transformer"],
         &["vae"],
     )
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell;
-    footprint = component_footprint
 }
 
 pub const SCHNELL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
@@ -1970,10 +2029,6 @@ pub const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
             )
         },
     };
-mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
-    footprint = component_footprint
-}
 
 #[cfg(test)]
 mod tests {
@@ -2047,7 +2102,7 @@ mod tests {
                 .unwrap()
                 .expect("loaded generator must open its registered request scope");
             let mut request = fixture.request.clone();
-            request.use_pid = use_pid;
+            request.features.pid = (use_pid).then(mlx_gen::gen_core::PidParams::enabled);
             scope.configure_request(&mut request).unwrap();
             assert!(request.memory.unwrap().stage_residency);
         }
@@ -2444,13 +2499,13 @@ mod tests {
         );
         assert_eq!(
             model
-                .matches("let hold_conditioning = conditioning_started || req.use_pid || req.source_image.is_some();")
+                .matches("let hold_conditioning = conditioning_started || req.use_pid() || req.source_image.is_some();")
                 .count(),
             1
         );
         assert_eq!(
             model
-                .matches("let hold_conditioning = conditioning_started || req.use_pid;")
+                .matches("let hold_conditioning = conditioning_started || req.use_pid();")
                 .count(),
             1
         );
@@ -2975,7 +3030,7 @@ mod tests {
             .requested_transformer_window(&wrong_component, None)
             .is_err());
         let mut pid = request.clone();
-        pid.use_pid = true;
+        pid.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
         assert!(model.requested_transformer_window(&pid, None).is_err());
 
         std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v2").unwrap();
@@ -3013,7 +3068,10 @@ mod tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
 
@@ -3043,7 +3101,10 @@ mod tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img.clone()),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
         let img2img_plan = compile_trajectory(FluxVariant::Dev, &img2img_ok).unwrap();
@@ -3052,7 +3113,10 @@ mod tests {
 
         // K = 4 >= M = 4 after strength truncation is refused with a typed error!
         let img2img_bad_k = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..img2img_ok
         };
         assert!(validate_request(&descriptor_dev(), &img2img_bad_k).is_err());
@@ -3350,9 +3414,12 @@ mod tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                low_res_start: Some(
-                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(
+                        LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 
@@ -3495,7 +3562,10 @@ mod tests {
                 },
                 strength: Some(0.75),
             }],
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

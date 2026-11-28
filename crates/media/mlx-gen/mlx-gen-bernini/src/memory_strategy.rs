@@ -1787,7 +1787,7 @@ pub(crate) fn registered_valid_fixture(
     let mut fixture = MemoryBehaviorFixture::new(context);
     fixture.request.prompt = "weights-free bernini memory behavior".to_owned();
     fixture.request.fps = Some(16);
-    fixture.request.video_mode = Some("v2v".to_owned());
+    fixture.request.video_mode = Some("v2v".into());
     fixture.request.conditioning.clear();
     fixture
         .request
@@ -1801,7 +1801,7 @@ pub(crate) fn registered_valid_fixture(
             frame_idx: 0,
             strength: 1.0,
         });
-    fixture.request.phases = None;
+    fixture.request.features.phases = None;
     let images = vec![
         mlx_gen::gen_core::Image {
             width: 40,
@@ -1816,7 +1816,7 @@ pub(crate) fn registered_valid_fixture(
     ];
     let mut r2v_request = fixture.request.clone();
     r2v_request.prompt = "weights-free bernini r2v memory behavior".to_owned();
-    r2v_request.video_mode = Some("r2v".to_owned());
+    r2v_request.video_mode = Some("r2v".into());
     r2v_request.conditioning = vec![mlx_gen::gen_core::Conditioning::MultiReference { images }];
     let reference_axis = r2v_reference_receipt(&contract.provider_id, &r2v_request)?;
     let mut r2v_context = fixture.context.clone();
@@ -1825,7 +1825,7 @@ pub(crate) fn registered_valid_fixture(
     r2v_context.overlay = Some(format!("provider_video_mode:r2v+{reference_axis}"));
     let mut rv2v_request = r2v_request.clone();
     rv2v_request.prompt = "weights-free bernini rv2v memory behavior".to_owned();
-    rv2v_request.video_mode = Some("rv2v".to_owned());
+    rv2v_request.video_mode = Some("rv2v".into());
     rv2v_request.width = 848;
     rv2v_request.height = 480;
     rv2v_request.frames = Some(45);
@@ -1858,7 +1858,7 @@ pub(crate) fn registered_valid_fixture(
     rv2v_context.overlay = Some(format!("provider_video_mode:rv2v+{rv2v_reference_axis}"));
     let mut mv2v_request = fixture.request.clone();
     mv2v_request.prompt = "weights-free bernini mv2v memory behavior".to_owned();
-    mv2v_request.video_mode = Some("mv2v".to_owned());
+    mv2v_request.video_mode = Some("mv2v".into());
     mv2v_request.width = 848;
     mv2v_request.height = 480;
     mv2v_request.frames = Some(45);
@@ -1881,7 +1881,7 @@ pub(crate) fn registered_valid_fixture(
     mv2v_context.overlay = Some(format!("provider_video_mode:mv2v+{mv2v_axis}"));
     let mut ads2v_request = rv2v_request.clone();
     ads2v_request.prompt = "weights-free Bernini ads2v memory behavior".to_owned();
-    ads2v_request.video_mode = Some("ads2v".to_owned());
+    ads2v_request.video_mode = Some("ads2v".into());
     let clip = match &ads2v_request.conditioning[0] {
         mlx_gen::gen_core::Conditioning::VideoClip {
             frames,
@@ -2084,7 +2084,7 @@ fn begin_with_cleanup(
 }
 
 fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()> {
-    if request.phases.is_some() {
+    if request.features.phases.is_some() {
         return Err(CoreError::Unsupported(
             "bernini memory scope does not implement multi-phase denoise requests".to_owned(),
         ));
@@ -2126,7 +2126,7 @@ fn validate_reference_to_video_request(
     provider_id: &str,
     request: &GenerationRequest,
 ) -> CoreResult<String> {
-    if request.phases.is_some() {
+    if request.features.phases.is_some() {
         return Err(CoreError::Unsupported(
             "bernini r2v memory scope does not implement multi-phase denoise requests".to_owned(),
         ));
@@ -2164,7 +2164,7 @@ fn validate_reference_video_to_video_request(
     provider_id: &str,
     request: &GenerationRequest,
 ) -> CoreResult<String> {
-    if request.phases.is_some()
+    if request.features.phases.is_some()
         || request.video_mode.as_deref() != Some("rv2v")
         || request.fps.unwrap_or(16) != 16
         || request.count != 1
@@ -2192,7 +2192,7 @@ fn validate_multi_video_to_video_request(
     provider_id: &str,
     request: &GenerationRequest,
 ) -> CoreResult<String> {
-    if request.phases.is_some()
+    if request.features.phases.is_some()
         || request.fps.unwrap_or(16) != 16
         || request.count != 1
         || !matches!(request.frames, Some(45 | 61 | 77))
@@ -2206,7 +2206,7 @@ fn validate_multi_video_to_video_request(
 }
 
 fn validate_ads2v_request(provider_id: &str, request: &GenerationRequest) -> CoreResult<String> {
-    if request.phases.is_some()
+    if request.features.phases.is_some()
         || request.fps.unwrap_or(16) != 16
         || request.count != 1
         || !matches!(request.frames, Some(45 | 61 | 77))
@@ -3013,14 +3013,14 @@ mod tests {
             height: 480,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("v2v".to_owned()),
+            video_mode: Some("v2v".into()),
             conditioning: vec![clip.clone()],
             ..Default::default()
         };
         assert!(validate_video_to_video_request(&valid).is_ok());
         valid.video_mode = None;
         assert!(validate_video_to_video_request(&valid).is_err());
-        valid.video_mode = Some("v2v".to_owned());
+        valid.video_mode = Some("v2v".into());
         valid.fps = Some(24);
         assert!(validate_video_to_video_request(&valid).is_err());
         valid.fps = Some(16);
@@ -3038,7 +3038,7 @@ mod tests {
                     height,
                     frames: Some(frames),
                     fps: Some(16),
-                    video_mode: Some("v2v".to_owned()),
+                    video_mode: Some("v2v".into()),
                     conditioning: vec![Conditioning::VideoClip {
                         frames: vec![mlx_gen::gen_core::Image {
                             width: 2,
@@ -3061,7 +3061,7 @@ mod tests {
             height: 640,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("v2v".to_owned()),
+            video_mode: Some("v2v".into()),
             conditioning: vec![Conditioning::VideoClip {
                 frames: vec![mlx_gen::gen_core::Image {
                     width: 2,
@@ -3124,7 +3124,7 @@ mod tests {
             height: 480,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("r2v".to_owned()),
+            video_mode: Some("r2v".into()),
             conditioning: vec![Conditioning::MultiReference {
                 images: vec![
                     mlx_gen::gen_core::Image {
@@ -3146,7 +3146,7 @@ mod tests {
     fn rv2v_request() -> GenerationRequest {
         let mut request = r2v_request();
         request.prompt = "ordered clip and subjects".to_owned();
-        request.video_mode = Some("rv2v".to_owned());
+        request.video_mode = Some("rv2v".into());
         let [Conditioning::MultiReference { images }] = request.conditioning.as_mut_slice() else {
             unreachable!()
         };
@@ -3170,7 +3170,7 @@ mod tests {
     fn mv2v_request(count: usize) -> GenerationRequest {
         let mut request = rv2v_request();
         request.prompt = "ordered multi-source clips".to_owned();
-        request.video_mode = Some("mv2v".to_owned());
+        request.video_mode = Some("mv2v".into());
         let frame = mlx_gen::gen_core::Image {
             width: request.width,
             height: request.height,
@@ -3214,7 +3214,7 @@ mod tests {
     #[test]
     fn ads2v_receipt_binds_roles_images_and_three_to_four_source_schedule() {
         let mut request = rv2v_request();
-        request.video_mode = Some("ads2v".to_owned());
+        request.video_mode = Some("ads2v".into());
         let clip = request.conditioning[0].clone();
         let mut images = match request.conditioning.pop() {
             Some(mlx_gen::gen_core::Conditioning::MultiReference { images }) => images,
@@ -3852,7 +3852,7 @@ mod tests {
             .unwrap()
             .remove(1);
         let mut empty_phases = fixture.request.clone();
-        empty_phases.phases = Some(Vec::new());
+        empty_phases.features.phases = Some(Vec::new());
         assert!(validate_reference_to_video_request(FULL_ID, &empty_phases).is_err());
         for outcome in [
             MemoryRunOutcome::Complete,
@@ -3892,7 +3892,7 @@ mod tests {
             .unwrap()
             .expect("scope");
         let mut phased = fixture.request;
-        phased.phases = Some(vec![mlx_gen::gen_core::GenerationPhase {
+        phased.features.phases = Some(vec![mlx_gen::gen_core::GenerationPhase {
             steps: 1,
             ..Default::default()
         }]);

@@ -22,9 +22,9 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Result, StepSupport, WeightsSource,
+    curated_sampler_names, default_seed, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Result, StepSupport, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -69,44 +69,125 @@ const MAX_FRAMES: u32 = 64;
 /// value from pinning the GPU for an unbounded time.
 const MAX_STEPS: u32 = 200;
 
-/// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SVD_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for SVD-XT (`REG-1`, `AP5`).
+pub(crate) fn route_svd() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "svd",
         backend: "mlx",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // SVD uses a frame-wise guidance ramp (min→max); `req.guidance` overrides the ceiling.
-            supports_guidance: true,
-            // image→video is a single `Reference` image.
-            conditioning: vec![ConditioningKind::Reference],
-            // Curated unified solvers (epic 7114, sc-7122): SVD exposes the SAMPLER axis but NO scheduler
-            // (matching ComfyUI) — it keeps its native Karras EDM σ schedule and only swaps the
-            // integrator (over `EdmModelSampling`, v-prediction). An unset sampler → the native EDM Euler
-            // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
-            samplers: curated_sampler_names(),
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface::default(),
+            conditioning: gen_core::ConditioningSurface {
+                // image->video is a single `Reference` image.
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: false,
+                modules: vec!["clip_vit_h14"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: Vec::new(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "svd_unet_spatiotemporal",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("svd_temporal_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::SVD_LATENT_SPACE),
+                pixel_stride: Some(SIZE_ALIGN),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["clip_vit_h14", "svd_temporal_vae"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["svd_unet_spatiotemporal"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["svd_temporal_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: false,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: 256,
             max_size: 1024,
-            max_count: 1,
-            // SVD-XT's engine bound, advertised rather than hidden (sc-19559). It lived only in
-            // `validate_output_params` below, so a consumer could not learn the ceiling without
-            // dispatching a job; the shared floor now enforces the same number from the same
-            // constant. `candle-gen-svd` declares the identical range from its own `MAX_STEPS`.
+            size_floor: gen_core::SizeFloor::RangeChecked,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            mac_only: true,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(25),
+            guidance: Some(3.0),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 576)),
             ..Default::default()
         },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_video_plan(gen_core::VideoPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_video_plan,
+        })
+        .with_memory_registration(crate::memory_strategy::MEMORY_REGISTRATION)
+        .with_resident_only_memory_registration(crate::memory_strategy::RESIDENT_ONLY_WITNESS),
     }
+}
+
+/// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
+pub fn descriptor() -> ModelDescriptor {
+    route_svd().compute_descriptor()
 }
 
 /// The loaded SVD model: the assembled pipeline + the cached descriptor.
@@ -276,23 +357,22 @@ impl SvdParams {
         // model was trained on, ~7) — it comes from `conditioning_fps`, NOT `req.fps`. `req.fps` is the
         // OUTPUT/playback cadence and is applied below at return time, so the two are decoupled
         // (diffusers `StableVideoDiffusionPipeline(fps=…)` vs `export_to_video(fps=…)`; sc-3764).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps as i32;
+        if let Some(svd) = req.extensions.svd.as_ref() {
+            if let Some(cfps) = svd.conditioning_fps {
+                params.fps = cfps as i32;
+            }
+            if let Some(m) = svd.motion_bucket_id {
+                params.motion_bucket_id = m;
+            }
+            if let Some(n) = svd.noise_aug_strength {
+                params.noise_aug_strength = n;
+            }
+            if let Some(c) = svd.decode_chunk_size {
+                params.decode_chunk_size = c as i32;
+            }
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
-        }
-        // SVD micro-conditioning knobs (sc-3523): `motion_bucket_id` / `noise_aug_strength` drive the
-        // `added_time_ids` motion conditioning; `decode_chunk_size` is the chunked-VAE memory knob.
-        // Each falls back to the reference default when the request leaves it `None`.
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as i32;
         }
         params
     }
@@ -327,7 +407,8 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
     // The motion-conditioning fps is baked into `added_time_ids` as `fps − 1`; a 0 would feed −1.0 to
     // the model (a silently degenerate micro-conditioning) rather than erroring. Reject it here at the
     // request boundary (L-E).
-    if let Some(fps) = req.conditioning_fps {
+    let svd = req.extensions.svd.as_ref();
+    if let Some(fps) = svd.and_then(|s| s.conditioning_fps) {
         if fps == 0 {
             return Err(Error::Msg(
                 "svd_xt: conditioning_fps must be >= 1 (added_time_ids encodes fps − 1)".into(),
@@ -339,14 +420,14 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
     // provider-specific knob). Require both finite, and `noise_aug_strength >= 0` (it scales added
     // Gaussian noise). Finiteness is also enforced centrally by the shared floor, but the checks here
     // keep `validate_output_params` self-contained/unit-testable without a loaded model.
-    if let Some(m) = req.motion_bucket_id {
+    if let Some(m) = svd.and_then(|s| s.motion_bucket_id) {
         if !m.is_finite() {
             return Err(Error::Msg(format!(
                 "svd_xt: motion_bucket_id must be finite (got {m})"
             )));
         }
     }
-    if let Some(n) = req.noise_aug_strength {
+    if let Some(n) = svd.and_then(|s| s.noise_aug_strength) {
         if !n.is_finite() || n < 0.0 {
             return Err(Error::Msg(format!(
                 "svd_xt: noise_aug_strength must be finite and >= 0 (got {n})"
@@ -723,10 +804,6 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     mlx_gen::image::u8_frames_to_images(&x.squeeze_axes(&[0])?)
 }
 
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`.
-mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,8 +927,14 @@ mod tests {
         let mk = |m: Option<f32>, n: Option<f32>| GenerationRequest {
             width: 512,
             height: 512,
-            motion_bucket_id: m,
-            noise_aug_strength: n,
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                svd: Some(mlx_gen::gen_core::SvdExtension {
+                    motion_bucket_id: m,
+                    noise_aug_strength: n,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

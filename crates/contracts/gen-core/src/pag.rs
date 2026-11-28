@@ -69,10 +69,13 @@ mod tests {
             .validate_request(
                 "flux1_schnell",
                 &GenerationRequest {
-                    pag: Some(PagConfig {
-                        scale: 2.0,
+                    features: crate::FeatureParams {
+                        pag: Some(PagConfig {
+                            scale: 2.0,
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
+                    },
                     ..Default::default()
                 },
             )
@@ -85,11 +88,14 @@ mod tests {
         let caps = pag_caps();
         // Scale 0.0 is a strict zero-pass no-op.
         let noop_req = GenerationRequest {
-            pag: Some(PagConfig {
-                scale: 0.0,
-                layers: Some(vec![0, 37]),
+            features: crate::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![0, 37]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         caps.validate_request("z_image", &noop_req).unwrap();
@@ -97,11 +103,14 @@ mod tests {
 
         // Out-of-range block index is refused even when scale == 0.0.
         let bad_zero = GenerationRequest {
-            pag: Some(PagConfig {
-                scale: 0.0,
-                layers: Some(vec![38]),
+            features: crate::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![38]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(caps.validate_request("z_image", &bad_zero).is_err());
@@ -141,7 +150,10 @@ mod tests {
             ),
         ] {
             let req = GenerationRequest {
-                pag: Some(pag),
+                features: crate::FeatureParams {
+                    pag: Some(pag),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             assert_eq!(
@@ -195,7 +207,10 @@ mod tests {
             },
         ] {
             let req = GenerationRequest {
-                pag: Some(bad.clone()),
+                features: crate::FeatureParams {
+                    pag: Some(bad.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             assert!(
@@ -206,13 +221,16 @@ mod tests {
 
         // Valid PAG resolves sorted/deduped layers and step window.
         let active_req = GenerationRequest {
-            pag: Some(PagConfig {
-                scale: 3.0,
-                layers: Some(vec![30, 5, 30]),
-                start: Some(0.25),
-                stop: Some(0.75),
-                adaptive_scale: Some(1.0),
-            }),
+            features: crate::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 3.0,
+                    layers: Some(vec![30, 5, 30]),
+                    start: Some(0.25),
+                    stop: Some(0.75),
+                    adaptive_scale: Some(1.0),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         caps.validate_request("z_image", &active_req).unwrap();
@@ -226,8 +244,30 @@ mod tests {
 
     #[test]
     fn moss_image_pag_is_gated_validated_and_resolved_by_shared_request_floor() {
+        let moss_req = |pag: Option<PagConfig>, moss_pag: Option<PagConfig>| GenerationRequest {
+            features: crate::FeatureParams {
+                pag,
+                ..Default::default()
+            },
+            extensions: crate::FamilyExtensions {
+                moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                    pag: moss_pag,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         // (a) moss_image.pag cannot bypass Capabilities::pag == None on MOSS or non-MOSS models.
         let unsupported_moss = Capabilities {
+            min_size: 256,
+            max_size: 2048,
+            max_count: 4,
+            pag: None,
+            supported_family_extensions: vec![crate::FamilyExtensionKind::MossImage],
+            ..Default::default()
+        };
+        let non_moss = Capabilities {
             min_size: 256,
             max_size: 2048,
             max_count: 4,
@@ -235,14 +275,7 @@ mod tests {
             ..Default::default()
         };
         // Baseline: MOSS controls without PAG pass on moss_image_sft when Capabilities::pag == None.
-        let moss_without_pag = GenerationRequest {
-            pag: None,
-            moss_image: Some(MossImageOptions {
-                pag: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let moss_without_pag = moss_req(None, None);
         unsupported_moss
             .validate_request("moss_image_sft", &moss_without_pag)
             .unwrap();
@@ -254,17 +287,13 @@ mod tests {
         );
 
         for scale in [2.0_f32, 0.0_f32] {
-            let bypass_req = GenerationRequest {
-                pag: None,
-                moss_image: Some(MossImageOptions {
-                    pag: Some(PagConfig {
-                        scale,
-                        ..Default::default()
-                    }),
+            let bypass_req = moss_req(
+                None,
+                Some(PagConfig {
+                    scale,
                     ..Default::default()
                 }),
-                ..Default::default()
-            };
+            );
             assert!(matches!(
                 unsupported_moss.validate_request("moss_image_sft", &bypass_req),
                 Err(Error::Unsupported(msg)) if msg.contains("Perturbed-Attention Guidance (PAG)")
@@ -274,7 +303,7 @@ mod tests {
                 Err(Error::Unsupported(msg)) if msg.contains("Perturbed-Attention Guidance (PAG)")
             ));
             assert!(matches!(
-                unsupported_moss.validate_request("flux1_schnell", &bypass_req),
+                non_moss.validate_request("flux1_schnell", &bypass_req),
                 Err(Error::Unsupported(_))
             ));
         }
@@ -286,6 +315,7 @@ mod tests {
             max_size: 2048,
             max_count: 4,
             pag: Some(moss_image_pag_capability()),
+            supported_family_extensions: vec![crate::FamilyExtensionKind::MossImage],
             ..Default::default()
         };
         for bad in [
@@ -314,14 +344,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let req = GenerationRequest {
-                pag: None,
-                moss_image: Some(MossImageOptions {
-                    pag: Some(bad.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = moss_req(None, Some(bad.clone()));
             assert!(
                 matches!(
                     moss_caps.validate_request("moss_image_sft", &req),
@@ -340,20 +363,16 @@ mod tests {
 
         // (c) Conflicting req.pag vs moss_image.pag is rejected by effective_pag, validate_request,
         // and resolve_pag; identical values succeed.
-        let conflict_req = GenerationRequest {
-            pag: Some(PagConfig {
+        let conflict_req = moss_req(
+            Some(PagConfig {
                 scale: 2.0,
                 ..Default::default()
             }),
-            moss_image: Some(MossImageOptions {
-                pag: Some(PagConfig {
-                    scale: 3.0,
-                    ..Default::default()
-                }),
+            Some(PagConfig {
+                scale: 3.0,
                 ..Default::default()
             }),
-            ..Default::default()
-        };
+        );
         assert!(matches!(
             conflict_req.effective_pag(),
             Err(Error::Msg(msg)) if msg.contains("conflicting top-level pag and moss_image.pag")
@@ -372,14 +391,7 @@ mod tests {
             layers: Some(vec![20]),
             ..Default::default()
         };
-        let equal_req = GenerationRequest {
-            pag: Some(matching_pag.clone()),
-            moss_image: Some(MossImageOptions {
-                pag: Some(matching_pag),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let equal_req = moss_req(Some(matching_pag.clone()), Some(matching_pag));
         moss_caps
             .validate_request("moss_image_sft", &equal_req)
             .unwrap();
@@ -393,20 +405,16 @@ mod tests {
         );
 
         // (d) Valid moss_image.pag (with req.pag == None) is validated and resolved by resolve_pag.
-        let moss_active_req = GenerationRequest {
-            pag: None,
-            moss_image: Some(MossImageOptions {
-                pag: Some(PagConfig {
-                    scale: 2.5,
-                    layers: Some(vec![41, 20, 41]),
-                    start: Some(0.25),
-                    stop: Some(0.75),
-                    adaptive_scale: Some(0.5),
-                }),
-                ..Default::default()
+        let moss_active_req = moss_req(
+            None,
+            Some(PagConfig {
+                scale: 2.5,
+                layers: Some(vec![41, 20, 41]),
+                start: Some(0.25),
+                stop: Some(0.75),
+                adaptive_scale: Some(0.5),
             }),
-            ..Default::default()
-        };
+        );
         moss_caps
             .validate_request("moss_image_sft", &moss_active_req)
             .unwrap();
@@ -425,18 +433,14 @@ mod tests {
             }
         );
 
-        let moss_noop_req = GenerationRequest {
-            pag: None,
-            moss_image: Some(MossImageOptions {
-                pag: Some(PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![20]),
-                    ..Default::default()
-                }),
+        let moss_noop_req = moss_req(
+            None,
+            Some(PagConfig {
+                scale: 0.0,
+                layers: Some(vec![20]),
                 ..Default::default()
             }),
-            ..Default::default()
-        };
+        );
         moss_caps
             .validate_request("moss_image_sft", &moss_noop_req)
             .unwrap();
@@ -490,17 +494,23 @@ mod tests {
 
         // MOSS DMD + PAG receipt validation and round-trip.
         let dmd_req = GenerationRequest {
-            pag: Some(PagConfig {
-                scale: 2.5,
-                layers: None,
-                start: Some(0.0),
-                stop: Some(0.75),
-                adaptive_scale: Some(0.5),
-            }),
-            moss_image: Some(MossImageOptions {
-                acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+            features: crate::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 2.5,
+                    layers: None,
+                    start: Some(0.0),
+                    stop: Some(0.75),
+                    adaptive_scale: Some(0.5),
+                }),
                 ..Default::default()
-            }),
+            },
+            extensions: crate::FamilyExtensions {
+                moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                    acceleration: MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let resolved_dmd = MossImageResolved::resolve(MossImageVariant::Sft, &dmd_req).unwrap();
@@ -612,15 +622,21 @@ mod tests {
         let edit_req = GenerationRequest {
             steps: Some(30),
             guidance: Some(4.0),
-            pag: Some(PagConfig {
-                scale: 2.0,
-                layers: Some(vec![20]),
+            features: crate::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 2.0,
+                    layers: Some(vec![20]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            moss_image: Some(MossImageOptions {
-                uncond_skip_layers: Some(vec![]),
+            },
+            extensions: crate::FamilyExtensions {
+                moss_image: Some(crate::MossImageExtension::from_options(MossImageOptions {
+                    uncond_skip_layers: Some(vec![]),
+                    ..Default::default()
+                })),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         let resolved_edit = MossImageResolved::resolve(MossImageVariant::Sft, &edit_req).unwrap();

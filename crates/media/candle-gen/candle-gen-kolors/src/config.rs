@@ -17,11 +17,9 @@
 //! ControlNet-pose and IP-Adapter stay on their existing bespoke Candle providers and are rejected
 //! by this registered generator rather than silently dropped (the false-capability trap).
 
-use candle_gen::gen_core::{
-    Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant, StepSupport,
-};
-
-use crate::sampler::NUM_TRAIN_TIMESTEPS;
+use candle_gen::gen_core::ModelDescriptor;
+#[cfg(test)]
+use candle_gen::gen_core::{ConditioningKind, Modality, Quant};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -38,88 +36,9 @@ pub const DEFAULT_SAMPLER: &str = "euler_discrete";
 /// Kolors works in the SDXL VAE's /8 latent — both image dims must be multiples of 8.
 pub const SIZE_MULTIPLE: u32 = 8;
 
-/// Kolors' identity + the surface this candle lane wires: real classifier-free guidance (negative
-/// prompt + CFG scale), txt2img, single-reference img2img, and packed **Q4/Q8** MLX-tier inference
-/// (sc-10819). User LoRA/LoKr applies at load; ControlNet-pose and IP-Adapter retain separate Candle
-/// providers, so this descriptor never promises a path `generate` cannot serve. Two backend-correct
-/// deviations from `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
-///
-/// epic 7114 P4 (sc-7124): the native leading `euler_discrete` is the byte-exact DEFAULT, but the
-/// curated ε/DDPM sampler menu (euler / euler_ancestral / heun / dpmpp_2m / dpmpp_sde / uni_pc / lcm /
-/// ddim) + the curated σ-schedule axis (normal / karras / sgm_uniform / …) are ADDED over
-/// `DiscreteModelSampling`; a curated solver name OR a curated scheduler (sc-8984) routes the new EPS
-/// path while the default request keeps the native leading-Euler loop (see `crate::pipeline`). The
-/// `discrete` scheduler alias is retained.
+/// Kolors' identity + capabilities, computed from `crate::route_base`.
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
-        family: "kolors",
-        // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".
-        backend: "candle",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // The registered generator accepts one Reference as a deterministic latent-init img2img.
-            // ControlNet-pose and IP-Adapter remain separate, already-wired bespoke providers.
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr merge into the vendored SDXL-family UNet on dense and packed tiers.
-            supports_lora: true,
-            supports_lokr: true,
-            // epic 7114 P4 (sc-7124): the native leading EulerDiscrete (`euler_discrete`) stays the
-            // byte-exact DEFAULT (N1), but the curated ε/DDPM menu (euler / euler_ancestral / heun /
-            // dpmpp_2m / dpmpp_sde / uni_pc / lcm / ddim) is ADDED over `DiscreteModelSampling`, plus the
-            // curated σ-schedule axis (normal / karras / sgm_uniform / …). A curated solver name OR a
-            // curated scheduler (sc-8984) routes the new EPS path; `euler_discrete` (the native default)
-            // and the legacy `discrete` scheduler alias keep their native behaviour.
-            samplers: candle_gen::menu_with_aliases(
-                candle_gen::curated_sampler_names(),
-                &[DEFAULT_SAMPLER],
-            ),
-            schedulers: candle_gen::menu_with_aliases(
-                candle_gen::curated_scheduler_names(),
-                &["discrete"],
-            ),
-            min_size: 512,
-            max_size: 2048,
-            max_count: 8,
-            // Kolors' train-timestep count is a real upper bound (see the mlx twin and F-124):
-            // above it every timestep collapses to 1 and the render is silent garbage. Declared
-            // so a consumer can read the bound without dispatching a job (sc-19559).
-            supported_steps: StepSupport::Range {
-                min: 1,
-                max: NUM_TRAIN_TIMESTEPS as u32,
-            },
-            // Packed q4/q8 MLX-tier inference (sc-10819, epic 9083): the `SceneWorks/kolors-mlx` tier
-            // packs the SDXL-family UNet + the four ChatGLM3 projections (VAE dense), and the candle
-            // loader packed-detects it from disk (`pipeline::load_components`). Advertise Q4/Q8; the
-            // `LoadSpec::quantize` overlay is an advisory no-op on an already-packed tier (as with
-            // sdxl/boogu/flux2-dev). bf16 tiers stay dense (Quant::None).
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
-            // emit -- the curated driver lane and the native leading-Euler loop -- as do the
-            // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
-            // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
-            supports_preview: true,
-            supports_low_res_start: true,
-            // sc-18317: Kolors runs real classifier-free guidance, and the one convention this lane
-            // implements is the doubled `[uncond, cond]` batch `common::cfg_batch_context` builds.
-            // Declaring the single mode makes it planner-selectable and makes `sequential` a refusal
-            // by name at the shared floor rather than a silently batched run.
-            execution: candle_gen::gen_core::ExecutionSurface {
-                cfg_batching: candle_gen::gen_core::CfgBatchingDomain::Modes(
-                    crate::common::CFG_BATCHING_MODES.to_vec(),
-                ),
-                ..candle_gen::gen_core::ExecutionSurface::default()
-            },
-            ..Default::default()
-        },
-    }
+    crate::route_base().compute_descriptor()
 }
 
 /// ChatGLM3-6B text config (the Kolors `text_encoder/config.json` values), hardcoded as in the mlx

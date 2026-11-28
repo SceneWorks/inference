@@ -38,22 +38,13 @@ pub use model::{
 pub use sampling::{Supra2EulerDriver, Supra2VelocityForward};
 
 /// Compose the Supra2 generator, its memory strategy and its resident-only contract witness into
-/// an explicit registry. The loader is resident-only (no quantization, staging or deferred
-/// materialization), so — like the other resident-only Candle routes — it publishes a typed
-/// [`ResidentOnlyMemoryContractRegistration`](candle_gen::gen_core::ResidentOnlyMemoryContractRegistration)
-/// rather than optimized contract surfaces.
+/// an explicit registry via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    use candle_gen::gen_core::ResidentOnlyMemoryContractRegistration;
-    registry
-        .register_generator(model::REGISTRATION)
-        .register_memory_strategy(model::MEMORY)
-        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: gen_core_checkpoint::supra2::PROVIDER_ID,
-            contract: memory_strategy::witness,
-            surface_specs: memory_strategy::witness_specs,
-        })
+    registry.register_route(model::route())
 }
 
 /// Build the explicit Candle Supra2 provider catalog.

@@ -35,6 +35,11 @@ media-flash-attn = ["media", "candle-gen-catalog?/flash-attn"]
 # Dedicated H3 acceptance only: fixed route controls and positive learned-device witnesses.
 # Ordinary product and CI configurations leave this disabled.
 h3-memory-proof = ["media", "candle-gen-catalog?/h3-memory-proof"]
+# Opt-in test fixtures, trainer probes, and proof observation hooks for downstream integration
+# tests (REG-5). Never enabled in default/production builds.
+test-support = ["media", "candle-gen-catalog?/test-support"]
+testkit = ["media", "candle-gen-catalog?/testkit"]
+model-inference-proof = ["media", "testkit", "candle-gen-catalog?/model-inference-proof"]
 
 [dev-dependencies]
 # The registry-wide memory-contract facts walk (sc-22661): the bundle's own acceptance test for

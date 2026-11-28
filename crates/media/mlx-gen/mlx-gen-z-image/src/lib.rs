@@ -361,109 +361,28 @@ pub fn register_turbo_generators(
 pub fn register_turbo_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: model::MODEL_ID,
-            compile: model::compile_turbo,
-        })
-        .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
-        .register_memory_strategy(model::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
-            },
-        })
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
+    registry.register_route(model::route_turbo())
 }
 
 /// Add the base `z_image` generator with its complete memory-strategy registration.
 pub fn register_base_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model_base::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: model_base::MODEL_ID,
-            compile: model::compile_base,
-        })
-        .register_memory_strategy(model_base::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model_base::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(model_base::MODEL_ID, spec)
-            },
-        })
-        .register_memory_behavior(model_base::MEMORY_BEHAVIOR_REGISTRATION)
+    registry.register_route(model_base::route_base())
 }
 
 /// Add the base `z_image_control` generator with its complete memory-strategy registration.
 pub fn register_base_control_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model_base_control::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: model_base_control::MODEL_ID,
-            compile: model::compile_base_control,
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: model_base_control::MODEL_ID,
-            parent_provider_id: Some(model_base::MODEL_ID),
-            descriptor: model_base_control::descriptor,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: model_base_control::MODEL_ID,
-                compile: model::compile_base_control,
-            }),
-        })
-        .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model_base_control::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    model_base_control::MODEL_ID,
-                    spec,
-                )
-            },
-        })
-        .register_memory_behavior(model_base_control::MEMORY_BEHAVIOR_REGISTRATION)
+    registry.register_route(model_base_control::route_base_control())
 }
 
 /// Add `z_image_turbo_control` with its complete memory-strategy registration.
 pub fn register_turbo_control_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model_control::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: model_control::MODEL_ID,
-            compile: model::compile_turbo_control,
-        })
-        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
-            route_id: model_control::MODEL_ID,
-            parent_provider_id: Some(model::MODEL_ID),
-            descriptor: model_control::descriptor,
-            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
-                provider_id: model_control::MODEL_ID,
-                compile: model::compile_turbo_control,
-            }),
-        })
-        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: model_control::MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    model_control::MODEL_ID,
-                    spec,
-                )
-            },
-        })
-        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
+    registry.register_route(model_control::route_turbo_control())
 }
 
 /// Build the complete explicit Z-Image MLX provider catalog.
@@ -742,7 +661,10 @@ mod explicit_registry_tests {
                 prompt: "a red fox in snow".into(),
                 width: 1024,
                 height: 1024,
-                low_res_start: Some(LowResStartSpec::new(k, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(k, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry
@@ -770,7 +692,10 @@ mod explicit_registry_tests {
                     image: ref_img,
                     strength: Some(0.5),
                 }],
-                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let img2img_plan = registry
@@ -837,7 +762,10 @@ mod explicit_registry_tests {
                     kind: ControlKind::Pose,
                     scale: Some(0.8),
                 }],
-                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let ctrl_spec = spec

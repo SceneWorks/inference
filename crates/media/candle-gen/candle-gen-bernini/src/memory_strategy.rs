@@ -1862,7 +1862,7 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
 }
 
 /// The Candle Bernini memory profile (sc-27307): the requested tier, the route gate
-/// ([`route_ok`]) inside the shared pipeline, the snapshot-gated preset geometry and the
+/// (`route_ok`) inside the shared pipeline, the snapshot-gated preset geometry and the
 /// fingerprint spelling. Its behavior fixtures are provider-owned (multi-request assembly).
 const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
     gates: gen_core::MemoryProfileGates::within(profile_route_gate),
@@ -1903,8 +1903,8 @@ fn validate_still_request(request: &GenerationRequest) -> gen_core::Result<()> {
         let expected_references = u32::from(request.video_mode.as_deref() == Some("i2i"));
         if request.frames != Some(1)
             || request.count != 1
-            || request.phases.is_some()
-            || request.use_pid
+            || request.features.phases.is_some()
+            || request.use_pid()
             || !request.video_clips().is_empty()
             || references != expected_references
             || !ADVERTISED_STILL_GEOMETRIES.contains(&(request.width, request.height))
@@ -1942,7 +1942,7 @@ fn validate_memory_request(
     request: &GenerationRequest,
     route: BerniniMemoryRoute,
 ) -> gen_core::Result<Option<String>> {
-    if request.phases.is_some() {
+    if request.features.phases.is_some() {
         return Err(gen_core::Error::Unsupported(
             "Bernini Candle memory scope does not implement multi-phase denoise requests"
                 .to_owned(),
@@ -2166,7 +2166,7 @@ pub fn registered_valid_fixtures(
     }
     let mut fixture = MemoryBehaviorFixture::new(context);
     fixture.request.prompt = "weights-free Bernini v2v memory behavior".to_owned();
-    fixture.request.video_mode = Some("v2v".to_owned());
+    fixture.request.video_mode = Some("v2v".into());
     fixture.request.fps = Some(16);
     fixture.request.conditioning.clear();
     fixture.request.conditioning.push(Conditioning::VideoClip {
@@ -2192,7 +2192,7 @@ pub fn registered_valid_fixtures(
     ];
     let mut r2v_request = fixture.request.clone();
     r2v_request.prompt = "weights-free Bernini r2v memory behavior".to_owned();
-    r2v_request.video_mode = Some("r2v".to_owned());
+    r2v_request.video_mode = Some("r2v".into());
     r2v_request.conditioning = vec![Conditioning::MultiReference { images }];
     let reference_axis = r2v_reference_receipt(&contract.provider_id, &r2v_request)?;
     let mut r2v_context = fixture.context.clone();
@@ -2205,7 +2205,7 @@ pub fn registered_valid_fixtures(
     r2v_context.overlay = Some(r2v_axes.join("+"));
     let mut rv2v_request = r2v_request.clone();
     rv2v_request.prompt = "weights-free Bernini rv2v memory behavior".to_owned();
-    rv2v_request.video_mode = Some("rv2v".to_owned());
+    rv2v_request.video_mode = Some("rv2v".into());
     rv2v_request.width = 848;
     rv2v_request.height = 480;
     rv2v_request.frames = Some(45);
@@ -2238,7 +2238,7 @@ pub fn registered_valid_fixtures(
     rv2v_context.overlay = Some(rv2v_axes.join("+"));
     let mut mv2v_request = fixture.request.clone();
     mv2v_request.prompt = "weights-free Bernini mv2v memory behavior".to_owned();
-    mv2v_request.video_mode = Some("mv2v".to_owned());
+    mv2v_request.video_mode = Some("mv2v".into());
     mv2v_request.width = 848;
     mv2v_request.height = 480;
     mv2v_request.frames = Some(45);
@@ -2267,7 +2267,7 @@ pub fn registered_valid_fixtures(
     // positive control of its own: [source clip, reference clip, 1-8 ordered images].
     let mut ads2v_request = fixture.request.clone();
     ads2v_request.prompt = "weights-free Bernini ads2v memory behavior".to_owned();
-    ads2v_request.video_mode = Some("ads2v".to_owned());
+    ads2v_request.video_mode = Some("ads2v".into());
     ads2v_request.width = 848;
     ads2v_request.height = 480;
     ads2v_request.frames = Some(45);
@@ -2775,7 +2775,7 @@ mod tests {
             height: 480,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("v2v".to_owned()),
+            video_mode: Some("v2v".into()),
             conditioning: vec![clip],
             ..Default::default()
         };
@@ -2792,7 +2792,7 @@ mod tests {
             BerniniMemoryRoute::Clip
         )
         .is_err());
-        request.video_mode = Some("v2v".to_owned());
+        request.video_mode = Some("v2v".into());
         request.fps = Some(24);
         assert!(validate_memory_request(
             crate::bernini::MODEL_ID,
@@ -2809,12 +2809,12 @@ mod tests {
             width: 512,
             height: 512,
             frames: Some(1),
-            video_mode: Some("t2i".to_owned()),
+            video_mode: Some("t2i".into()),
             ..Default::default()
         };
         assert!(validate_request(&request).is_ok());
 
-        request.video_mode = Some("i2i".to_owned());
+        request.video_mode = Some("i2i".into());
         request.conditioning = vec![Conditioning::MultiReference {
             images: vec![gen_core::Image {
                 width: 16,
@@ -2838,7 +2838,7 @@ mod tests {
                     height,
                     frames: Some(frames),
                     fps: Some(16),
-                    video_mode: Some("v2v".to_owned()),
+                    video_mode: Some("v2v".into()),
                     conditioning: vec![Conditioning::VideoClip {
                         frames: vec![gen_core::Image {
                             width: 2,
@@ -2866,7 +2866,7 @@ mod tests {
             height: 640,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("v2v".to_owned()),
+            video_mode: Some("v2v".into()),
             conditioning: vec![Conditioning::VideoClip {
                 frames: vec![gen_core::Image {
                     width: 2,
@@ -2902,7 +2902,7 @@ mod tests {
             height: 480,
             frames: Some(45),
             fps: Some(16),
-            video_mode: Some("r2v".to_owned()),
+            video_mode: Some("r2v".into()),
             conditioning: vec![Conditioning::MultiReference {
                 images: vec![
                     gen_core::Image {
@@ -2924,7 +2924,7 @@ mod tests {
     fn rv2v_request() -> GenerationRequest {
         let mut request = r2v_request();
         request.prompt = "ordered clip and subjects".to_owned();
-        request.video_mode = Some("rv2v".to_owned());
+        request.video_mode = Some("rv2v".into());
         let [Conditioning::MultiReference { images }] = request.conditioning.as_mut_slice() else {
             unreachable!()
         };
@@ -2948,7 +2948,7 @@ mod tests {
     fn mv2v_request(count: usize) -> GenerationRequest {
         let mut request = rv2v_request();
         request.prompt = "ordered multi-source clips".to_owned();
-        request.video_mode = Some("mv2v".to_owned());
+        request.video_mode = Some("mv2v".into());
         let frame = gen_core::Image {
             width: request.width,
             height: request.height,
@@ -2993,7 +2993,7 @@ mod tests {
     #[test]
     fn candle_ads2v_receipt_binds_roles_images_and_three_to_four_source_schedule() {
         let mut request = rv2v_request();
-        request.video_mode = Some("ads2v".to_owned());
+        request.video_mode = Some("ads2v".into());
         let clip = request.conditioning[0].clone();
         let mut images = match request.conditioning.pop() {
             Some(Conditioning::MultiReference { images }) => images,
@@ -3429,7 +3429,7 @@ mod tests {
             .unwrap()
             .remove(1);
         let mut empty_phases = fixture.request.clone();
-        empty_phases.phases = Some(Vec::new());
+        empty_phases.features.phases = Some(Vec::new());
         assert!(validate_memory_request(
             crate::bernini::MODEL_ID,
             &empty_phases,
@@ -3437,7 +3437,7 @@ mod tests {
         )
         .is_err());
         let mut crossed = fixture.request.clone();
-        crossed.video_mode = Some("v2v".to_owned());
+        crossed.video_mode = Some("v2v".into());
         assert!(validate_memory_request(
             crate::bernini::MODEL_ID,
             &crossed,
@@ -3464,7 +3464,7 @@ mod tests {
             .unwrap()
             .expect("scope");
         let mut phased = fixture.request;
-        phased.phases = Some(vec![gen_core::GenerationPhase {
+        phased.features.phases = Some(vec![gen_core::GenerationPhase {
             steps: 1,
             ..Default::default()
         }]);

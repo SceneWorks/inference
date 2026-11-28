@@ -97,26 +97,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::BASE_REGISTRATION)
-        .register_generator(model::SPRINT_REGISTRATION)
-        .register_activation_memory(SPRINT_ACTIVATION_MEMORY_REGISTRATION)
-        .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
-        })
-        .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR_REGISTRATION)
-        .register_memory_strategy(model::SPRINT_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: SPRINT_MODEL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(SPRINT_MODEL_ID, spec)
-            },
-        })
-        .register_memory_behavior(model::SPRINT_MEMORY_BEHAVIOR_REGISTRATION)
-        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
+        .register_route(model::route_base())
+        .register_route(model::route_sprint())
 }
 
 /// Build the complete explicit MLX Sana provider catalog.

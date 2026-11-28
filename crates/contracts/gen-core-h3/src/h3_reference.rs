@@ -118,7 +118,7 @@ fn nearest_multiple(value: f64, multiple: f64) -> f64 {
 ///
 /// `target_width` x `target_height` is the request's resolved canvas (only
 /// [`Match`](ReferenceImageResizeMode::Match) reads it); `short_edge` is the effective
-/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge) (only `max`
+/// [`reference_image_short_edge`](gen_core::H3Extension::reference_image_short_edge) (only `max`
 /// and `diffusers` read it); `multiple` is the lattice, [`REFERENCE_IMAGE_MULTIPLE`] for the
 /// released checkpoint.
 ///
@@ -371,7 +371,7 @@ pub fn condition_frame_groups(indices: &[usize], temporal_patch: usize) -> Vec<(
 /// on the image and `short_edge`, never on the request's canvas.
 ///
 /// `short_edge` is the request's effective
-/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge)
+/// [`reference_image_short_edge`](gen_core::H3Extension::reference_image_short_edge)
 /// — [`REFERENCE_IMAGE_SHORT_EDGE`] unless the caller lowered it, admitted over 1024..=2048
 /// (sc-23402). It buys **reference token count**, roughly quadratic in it, and does not change the
 /// rendered clip's size. The caller passes an already-validated value; a non-positive one is refused
@@ -400,7 +400,7 @@ pub fn normalize_reference_image(
 /// every side rounded half-to-even onto `canvas_multiple`, and an aspect outside 1:4..=4:1 refused.
 /// `target_width` x `target_height` is the resolved render canvas (read by `match` only);
 /// `short_edge` is the effective
-/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge) (read by
+/// [`reference_image_short_edge`](gen_core::H3Extension::reference_image_short_edge) (read by
 /// `max` / `diffusers` only). [`normalize_reference_image`] is the `diffusers` special case.
 pub fn resize_reference_image(
     image: &Image,

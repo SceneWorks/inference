@@ -161,7 +161,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
     for frame in frames {
         save_rgb8_png_in(
             &artifact_dir(),
-            &format!("{}.png", &format!("{name}_frame{:02}", frame.current)),
+            &format!("{name}_frame{:02}.png", frame.current),
             &frame.image.pixels,
             frame.image.width,
             frame.image.height,
@@ -169,7 +169,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
     }
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("{name}_strip")),
+        &format!("{name}_strip.png"),
         &strip,
         width,
         height,
@@ -362,7 +362,7 @@ fn t2i_preview_frames_evolve_toward_the_final_image() {
     save_strip(&frames, &format!("t2i_{size}_s{steps}"));
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("t2i_{size}_s{steps}_final")),
+        &format!("t2i_{size}_s{steps}_final.png"),
         &active.pixels,
         active.width,
         active.height,
@@ -465,7 +465,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     save_strip(&frames, &format!("edit_{size}_s{steps}"));
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("edit_{size}_s{steps}_final")),
+        &format!("edit_{size}_s{steps}_final.png"),
         &active.pixels,
         active.width,
         active.height,
@@ -591,7 +591,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     save_strip(&frames, &format!("control_{size}_s{steps}"));
     save_rgb8_png_in(
         &artifact_dir(),
-        &format!("{}.png", &format!("control_{size}_s{steps}_final")),
+        &format!("control_{size}_s{steps}_final.png"),
         &active.pixels,
         active.width,
         active.height,

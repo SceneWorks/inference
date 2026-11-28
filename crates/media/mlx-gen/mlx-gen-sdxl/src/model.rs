@@ -181,80 +181,112 @@ pub const MODEL_ID: &str = "sdxl";
 /// which register under this same `"sdxl"` generator) reuse this tag rather than redeclaring it.
 pub const PID_BACKBONE: &str = "sdxl";
 
-/// SDXL's identity + capabilities — constructible without loading weights (registry
-/// introspection). Capability flags are turned on as each slice lands and is parity-proven, so the
-/// descriptor never advertises a path that isn't wired (avoids the false-capability trap —
-/// [[false-green-gates-mask-descope]]).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for MLX SDXL (`REG-1`, `AP5`).
+pub(crate) fn route_sdxl() -> mlx_gen::gen_core::RouteRecord {
+    let mut schedulers = vec!["discrete"];
+    schedulers.extend(curated_scheduler_names());
+
+    mlx_gen::gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "sdxl",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
-            // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
-            // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
-            // vendored path, which rejects LoKr) are wired.
-            conditioning: vec![
-                ConditioningKind::Reference,
-                ConditioningKind::Mask,
-                ConditioningKind::Control,
-            ],
-            supports_lora: true,
-            supports_lokr: true,
-            // `euler_ancestral` is the production default (full-CFG, 30-step, the bespoke vendored
-            // ancestral loop); `lcm`/`lightning`/`hyper` are the few-step acceleration samplers
-            // (sc-2769), each driven by its diffusers-faithful schedule and paired with an acceleration
-            // LoRA at load. The remaining names (`euler`/`heun`/`dpmpp_2m`/`dpmpp_sde`/`uni_pc`/`ddim`)
-            // are the unified curated solvers (epic 7114, sc-7121) — the additive k-diffusion path over
-            // `DiscreteModelSampling`; selecting one (or a non-`discrete` scheduler) routes to
-            // `denoise_curated` while the default stays byte-exact. A request naming any other sampler
-            // is rejected in `validate_request` rather than silently downgraded.
-            samplers: vec![
-                "euler_ancestral",
-                "lcm",
-                "lightning",
-                "hyper",
-                "euler",
-                "heun",
-                "dpmpp_2m",
-                "dpmpp_sde",
-                "uni_pc",
-                "ddim",
-            ],
-            // `discrete` is the native ancestral schedule; the rest are the curated σ schedulers
-            // (epic 7114 scheduler axis) usable with any curated sampler.
-            schedulers: {
-                let mut s = vec!["discrete"];
-                s.extend(curated_scheduler_names());
-                s
+        mac_only: false,
+        structure: mlx_gen::gen_core::RouteStructure {
+            text_encoders: mlx_gen::gen_core::TextEncoderSurface {
+                encoders: vec![
+                    mlx_gen::gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                    mlx_gen::gen_core::TextEncoderDeclaration::new("clip_g", Some(77)),
+                ],
+                ..Default::default()
             },
-            // Plain CFG (the shared `gen_core::guidance::cfg` over `MlxLatentOps`, epic 7434 P3 sc-7443;
-            // byte-identical to the retired hand form, shared by Kolors/InstantID/PuLID via
-            // `denoise_core`), plus CFG++ (`cfg_pp`, sc-8256) on the curated path — gated at dispatch to a
-            // CFG++-compatible base solver (euler/ddim/dpmpp_2m) + an active guidance gap.
-            supported_guidance_methods: vec!["cfg", "cfg_pp"],
-            min_size: 512,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: false,
-            // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
-            // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
-            // sc-26268: both CFG batchings are implemented on every denoise route (ancestral,
-            // curated, CFG++), through `pipeline::guided_eps_pair`.
+            conditioning: mlx_gen::gen_core::ConditioningSurface {
+                kinds: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::Mask,
+                    ConditioningKind::Control,
+                ],
+                control_kinds: None,
+                pass0_requirement:
+                    mlx_gen::gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["sdxl_ip_adapter", "sdxl_controlnet"],
+                ..Default::default()
+            },
+            sampling: mlx_gen::gen_core::SamplingSurface {
+                samplers: vec![
+                    "euler_ancestral",
+                    "lcm",
+                    "lightning",
+                    "hyper",
+                    "euler",
+                    "heun",
+                    "dpmpp_2m",
+                    "dpmpp_sde",
+                    "uni_pc",
+                    "ddim",
+                ],
+                schedulers,
+                guidance_methods: vec!["cfg", "cfg_pp"],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: mlx_gen::gen_core::ModelBinding::family_model(
+                mlx_gen::gen_core::FamilyModelSpec::new("sdxl_unet").with_low_res_start(),
+            ),
+            latent_codec: mlx_gen::gen_core::LatentCodecDeclaration {
+                codec_id: Some("sdxl_vae"),
+                output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(4),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: mlx_gen::gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: mlx_gen::gen_core::AdapterSurface::lora_and_lokr(
+                mlx_gen::gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: mlx_gen::gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["clip_l", "clip_g"],
+                        true,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Denoise,
+                        ["sdxl_unet"],
+                        false,
+                    ),
+                    mlx_gen::gen_core::ResidencyPhaseNode::new(
+                        mlx_gen::gen_core::ResidencyPhaseKind::Decode,
+                        ["sdxl_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: mlx_gen::gen_core::WeightPlanDeclaration {
+                source_kind: mlx_gen::gen_core::WeightSourceKind::DirectoryOrFile,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: mlx_gen::gen_core::OutputSurface {
+                preview: mlx_gen::gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             execution: mlx_gen::gen_core::ExecutionSurface {
                 cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Modes(
                     CFG_BATCHING_MODES.to_vec(),
@@ -263,7 +295,50 @@ pub fn descriptor() -> ModelDescriptor {
             },
             ..Default::default()
         },
+        limits: mlx_gen::gen_core::ProductLimits {
+            min_size: 512,
+            max_size: 2048,
+            size_floor: mlx_gen::gen_core::SizeFloor::RangeChecked,
+            supported_steps: mlx_gen::gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: mlx_gen::gen_core::SeedAndBatchSemantics {
+            seed_scheme: mlx_gen::gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: mlx_gen::gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: Some("euler_ancestral"),
+            schedule: Some("discrete"),
+            shift: None,
+            strength: Some(DEFAULT_STRENGTH),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: mlx_gen::gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(compile_sdxl)
+        .with_activation_memory(ACTIVATION_MEMORY_REGISTRATION.anchor)
+        .with_memory_registration(MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        )
+        .with_memory_surface_resolver(|surface| {
+            crate::memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+        })
+        .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION),
     }
+}
+
+/// SDXL's identity + capabilities — constructible without loading weights (registry
+/// introspection).
+pub fn descriptor() -> ModelDescriptor {
+    route_sdxl().compute_descriptor()
 }
 
 /// The CFG batchings this provider implements (sc-26268): the historical doubled batch and the
@@ -1385,7 +1460,7 @@ impl Sdxl {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
                 run.encode(|| encode_conditioning_windows(&text.0, &text.1, &request.tokens))
@@ -1490,7 +1565,7 @@ impl Sdxl {
             request.stage_residency,
             false,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
                 encode_conditioning_windows(&text.0, &text.1, &request.tokens)
@@ -1736,7 +1811,7 @@ impl Sdxl {
         init: &SdxlInitLatents,
     ) -> Result<Option<VpCapturePlan>> {
         let req = request.req;
-        if !(req.use_pid && req.pid_capture_sigma.is_some()) {
+        if !(req.use_pid() && req.pid_capture_sigma().is_some()) {
             return Ok(None);
         }
         let is_accel = request.sampling.route().is_acceleration();
@@ -1766,7 +1841,7 @@ impl Sdxl {
         let edm_sigmas = if request.sampling.route().is_curated() {
             let full_sigmas = request.sampling.curated_full_sigmas(&self.alpha_schedule)?;
             match init.requested_strength() {
-                Some(strength_opt) if req.low_res_start.is_some() => {
+                Some(strength_opt) if req.features.low_res_start.is_some() => {
                     let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
                     let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                         full_sigmas.len().saturating_sub(1),
@@ -1787,7 +1862,7 @@ impl Sdxl {
             };
             AncestralEuler::new(&self.sampler, eff, start_time)?.edm_sigmas()
         };
-        Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma))
+        Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma()))
     }
 }
 
@@ -2516,7 +2591,7 @@ pub(crate) fn validate_low_res_start_request(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if has_identity || spec.is_some_and(|s| s.identity.is_some()) {
@@ -2576,8 +2651,8 @@ pub(crate) fn validate_low_res_start_request(
         None => full_sigmas,
     };
     let keep = match req
-        .use_pid
-        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+        .use_pid()
+        .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
         .flatten()
     {
         Some(p) => p.keep,
@@ -2680,7 +2755,7 @@ fn compile_sdxl_for_mode(
             let full_sigmas = sampling.curated_full_sigmas(&alpha_schedule)?;
             let run_sigmas = match true_init_strength {
                 Some(strength_opt) => {
-                    if req.low_res_start.is_some() {
+                    if req.features.low_res_start.is_some() {
                         let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
                         let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
                             full_sigmas.len().saturating_sub(1),
@@ -2695,8 +2770,8 @@ fn compile_sdxl_for_mode(
                 None => full_sigmas,
             };
             let keep = match req
-                .use_pid
-                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+                .use_pid()
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
                 .flatten()
             {
                 Some(p) => p.keep,
@@ -2740,8 +2815,8 @@ fn compile_sdxl_for_mode(
                 sigmas.push(0.0);
                 sigmas
             };
-            let keep = match (req.use_pid && mask.is_none())
-                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
+            let keep = match (req.use_pid() && mask.is_none())
+                .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma()))
                 .flatten()
             {
                 Some(p) => p.keep,
@@ -2995,11 +3070,6 @@ fn fused_ldm_component_footprint(
         ));
     }
     Ok(out)
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
 }
 
 /// The weights-free memory-strategy registration (SC-15525) — the shared registry conformance

@@ -3702,7 +3702,10 @@ fn mem5_scope_lifecycle_records_phase_transitions_and_keeps_rungs_across_phases(
         height: 1024,
         count: 1,
         steps: Some(8),
-        low_res_start: Some(crate::LowResStartSpec::new(4, Some(0.5))),
+        features: crate::FeatureParams {
+            low_res_start: Some(crate::LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let sigmas = vec![1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0];

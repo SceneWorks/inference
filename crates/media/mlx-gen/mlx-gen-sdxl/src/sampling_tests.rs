@@ -540,7 +540,7 @@ fn descriptor_routes_reach_real_host_factories_and_cover_capture_classes() {
                     (7.0, CfgBatching::Sequential),
                 ] {
                     let mut req = request(name);
-                    req.scheduler = scheduler.map(str::to_owned);
+                    req.scheduler = scheduler.map(Into::into);
                     req.guidance_method = Some(method.into());
                     req.guidance = Some(guidance);
                     req.memory.get_or_insert_with(Default::default).cfg_batching = Some(batching);
@@ -682,7 +682,7 @@ fn defaults_scheduler_switch_and_cfgpp_fallback_are_effective_execution() {
         SamplingRoute::Curated(Solver::EulerAncestral)
     );
     for scheduler in [None, Some("discrete")] {
-        req.scheduler = scheduler.map(str::to_owned);
+        req.scheduler = scheduler.map(Into::into);
         assert_eq!(
             ResolvedSampling::resolve(&req).unwrap().route(),
             SamplingRoute::Ancestral
@@ -804,11 +804,14 @@ fn schedules_use_actual_transition_count_strength_and_nonzero_terminal() {
     }
     req.scheduler = Some("normal".into());
     req.steps = Some(4);
-    req.use_pid = true;
-    req.pid_capture_sigma = Some(0.9);
+    req.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
+    req.features
+        .pid
+        .get_or_insert_with(mlx_gen::gen_core::PidParams::enabled)
+        .capture_sigma = Some(0.9);
     let resolved = ResolvedSampling::resolve(&req).unwrap();
     let full = resolved.curated_full_sigmas(&alpha()).unwrap();
-    let plan = vp_capture_plan(&full, req.pid_capture_sigma).unwrap();
+    let plan = vp_capture_plan(&full, req.pid_capture_sigma()).unwrap();
     let run = resolved.curated_sigmas(&alpha(), None).unwrap();
     assert_eq!(run, full[..plan.keep]);
     assert!(*run.last().unwrap() > 0.0);

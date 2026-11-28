@@ -31,28 +31,7 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(crate::registry::REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: crate::registry::compile_kolors,
-        })
-        .register_memory_strategy(crate::registry::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: MODEL_ID,
-            contract: |spec| {
-                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: MODEL_ID,
-                contract: |surface| {
-                    crate::memory_strategy::weights_free_surface_contract(MODEL_ID, surface)
-                },
-            },
-        )
-        .register_memory_behavior(crate::registry::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_route(crate::registry::route())
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -77,6 +56,7 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["kolors"]);
         assert_eq!(explicit_trainers, ["kolors"]);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 
     /// Weights-free behavioral oracle for the shared memory ladder (SC-15521).
@@ -125,7 +105,10 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("normal".into()),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -152,7 +135,10 @@ mod explicit_registry_tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            features: mlx_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let img_plan = registry
@@ -253,8 +239,12 @@ mod explicit_registry_tests {
             steps: Some(8),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            use_pid: true,
-            pid_capture_sigma: Some(0.35),
+            features: mlx_gen::gen_core::FeatureParams {
+                pid: Some(mlx_gen::gen_core::PidParams {
+                    capture_sigma: Some(0.35),
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let pid_plan = registry

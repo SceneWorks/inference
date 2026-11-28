@@ -558,6 +558,41 @@ REVIEWED_FLASH_PREBUILT = {
     'scripts/ci/fetch_flash_attn_prebuilt.py': 'a62d338af735b551b6a02f5249b9003e857a867466957e89fdd2b81565a79bdb',
 }
 
+# SW-6980 (REG-3): these exact hardware-free binaries serialize static RouteRecord descriptors
+# into canonical `sga.capabilities/2` JSON and verify determinism (`--self-check`). They never
+# load weights, allocate tensors, or touch GPU devices. A source change requires fresh review.
+REVIEWED_SGA_CAPABILITY_EXPORTS = {
+    ('run', '--locked', '-p', 'runtime-cpu', '--bin', 'sga-capabilities-export-candle', '--', '--self-check'): (
+        'crates/bundles/runtime-cpu/src/bin/sga_capabilities_export.rs',
+        'e6f3e13b1486b254af9ce2ce105fc5527e23dca6b2113a0de5abab4fb9110873',
+    ),
+    ('run', '--locked', '-p', 'runtime-macos', '--bin', 'sga-capabilities-export-macos', '--', '--self-check'): (
+        'crates/bundles/runtime-macos/src/bin/sga_capabilities_export.rs',
+        'baa51daca5771dd4a4200262a14a9d96fb9af27b3d33d536f89e3d0127ea1557',
+    ),
+    ('run', '--locked', '-p', 'runtime-ios', '--bin', 'sga-capabilities-export-ios', '--', '--self-check'): (
+        'crates/bundles/runtime-ios/src/bin/sga_capabilities_export.rs',
+        '0ef8ffd1e21b7d6acecc369da4d39bee7d6abf099305379495361f91223b57c5',
+    ),
+    ('run', '--locked', '--no-default-features', '-p', 'runtime-ios', '--bin', 'sga-capabilities-export-ios', '--', '--self-check'): (
+        'crates/bundles/runtime-ios/src/bin/sga_capabilities_export.rs',
+        '0ef8ffd1e21b7d6acecc369da4d39bee7d6abf099305379495361f91223b57c5',
+    ),
+}
+
+
+def reviewed_sga_capability_export(root: Path, args: list[str]) -> bool:
+    entry = REVIEWED_SGA_CAPABILITY_EXPORTS.get(tuple(args))
+    if not entry:
+        return False
+    relative, digest = entry
+    path = root / relative
+    return (
+        path.is_file()
+        and path.resolve().is_relative_to(root.resolve())
+        and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    )
+
 
 def reviewed_storage_cleanup(root: Path) -> bool:
     for relative, digest in REVIEWED_STORAGE_CLEANUP.items():
@@ -720,6 +755,8 @@ class RunGraph:
                     return
             if any(flag in args for flag in ('--ignored', '--include-ignored', '--run-ignored')):
                 self.finding('model', chain, 'Cargo overrides model-test ignores')
+            elif operation == 'run' and reviewed_sga_capability_export(self.root, args):
+                self.finding('ordinary', chain, 'reviewed hardware-free SGA capability export self-check: ' + ' '.join(args))
             elif operation == 'run':
                 self.finding('model', chain, 'Cargo native driver execution')
             elif operation not in ('test', 'build', 'check', 'clippy', 'fmt', 'metadata', 'tree', 'doc', 'clean', 'install', 'deny', 'rustc', '--version'):
@@ -890,7 +927,7 @@ class RunGraph:
             # and dense-materialization methods panic; only installation/routing is exercised.
             # MLX source format reporting and load-admission controls use only JSON and measured metadata.
             # Includes iOS fake-provider receipt forwarding and source-aware window metadata controls.
-            controls_sha = '34df6fed1d42a1a8bf462989c729403c4eb7b21a4f1d44200ee34f5431cb962e'
+            controls_sha = '250647d9914841d34ad7327135d4fafc7fbafcef85a887d014e5305fa597a18b'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

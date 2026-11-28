@@ -116,126 +116,11 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::TURBO_REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: KREA_2_TURBO_ID,
-            compile: model::compile_turbo_render_plan,
-        })
-        .register_activation_memory(TURBO_ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model::RAW_REGISTRATION)
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: KREA_2_RAW_ID,
-            compile: model::compile_raw_render_plan,
-        })
-        .register_generator(model::EDIT_REGISTRATION)
-        .register_generator(model::TURBO_EDIT_REGISTRATION)
-        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: KREA_2_TURBO_ID,
-            contract: |spec| {
-                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_TURBO_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: KREA_2_TURBO_ID,
-                contract: |surface| {
-                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
-                        KREA_2_TURBO_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
-        .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: KREA_2_RAW_ID,
-            contract: |spec| {
-                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_RAW_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: KREA_2_RAW_ID,
-                contract: |surface| {
-                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
-                        KREA_2_RAW_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
-        .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: KREA_2_EDIT_ID,
-            contract: |spec| {
-                block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_EDIT_ID, spec)
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: KREA_2_EDIT_ID,
-                contract: |surface| {
-                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
-                        KREA_2_EDIT_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
-        .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: KREA_2_TURBO_EDIT_ID,
-            contract: |spec| {
-                block_memory_strategy::weights_free_memory_strategy_contract(
-                    KREA_2_TURBO_EDIT_ID,
-                    spec,
-                )
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: KREA_2_TURBO_EDIT_ID,
-                contract: |surface| {
-                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
-                        KREA_2_TURBO_EDIT_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model::TURBO_EDIT_MEMORY_BEHAVIOR)
-        .register_generator(model_control::CONTROL_REGISTRATION)
-        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: KREA_2_TURBO_CONTROL_ID,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    KREA_2_TURBO_CONTROL_ID,
-                    spec,
-                )
-            },
-        })
-        .register_memory_contract_surface_resolver(
-            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
-                provider_id: KREA_2_TURBO_CONTROL_ID,
-                contract: |surface| {
-                    memory_strategy::weights_free_memory_strategy_surface_contract(
-                        KREA_2_TURBO_CONTROL_ID,
-                        surface,
-                    )
-                },
-            },
-        )
-        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_route(model::route_turbo())
+        .register_route(model::route_raw())
+        .register_route(model::route_edit())
+        .register_route(model::route_turbo_edit())
+        .register_route(model_control::route_control())
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 mlx_gen::gen_core::CheckpointBackendBindingRegistration {
@@ -316,6 +201,7 @@ mod explicit_registry_tests {
         use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
 
         let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
         let root = snapshot(&tmp, "registry-memory");
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)

@@ -26,10 +26,9 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, AcceptedControlKinds,
-    Capabilities, ConditioningKind, ControlBranch, ControlKind, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Residency,
-    Result,
+    default_seed, AcceptedControlKinds, ConditioningKind, ControlBranch, ControlKind,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    Progress, Residency, Result,
 };
 
 use crate::model::validate_request;
@@ -45,48 +44,44 @@ use crate::text_encoder::TextEncoder;
 /// `z_image`, `z_image_turbo`, and `z_image_turbo_control` — distinct id and registration, no clash.
 pub const MODEL_ID: &str = "z_image_control";
 
+/// Primary typed route declaration for base Z-Image Fun-Controlnet-Union (`REG-1`, `AP5`).
+pub(crate) fn route_base_control() -> mlx_gen::gen_core::RouteRecord {
+    let mut route = crate::model_base::route_base();
+    route.route_id = MODEL_ID;
+    route.structure.conditioning.kinds =
+        vec![ConditioningKind::Control, ConditioningKind::Reference];
+    route.structure.conditioning.control_kinds = Some(accepted_kinds());
+    route.structure.conditioning.pass0_requirement =
+        mlx_gen::gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["z_image_fun_controlnet_union"];
+    route.structure.denoiser = mlx_gen::gen_core::ModelBinding::family_model(
+        mlx_gen::gen_core::FamilyModelSpec::new("z_image_dit_control")
+            .with_pag(crate::model_base::base_pag_capability()),
+    );
+    route.structure.upsamplers.components.clear();
+    route.structure.adapters.install_policy =
+        mlx_gen::gen_core::AdapterInstallPolicy::BaseDenoiserOnly;
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.bindings = mlx_gen::gen_core::RouteBindings::generator(descriptor, |spec| {
+        load(spec).map_err(Into::into)
+    })
+    .with_footprint(crate::model::component_footprint)
+    .with_render_plan(crate::model::compile_base_control)
+    .with_feature_route(Some(crate::model_base::MODEL_ID), descriptor)
+    .with_memory_registration(MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+    )
+    .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION);
+    route
+}
+
 /// The base control variant's identity + capabilities. Same undistilled base (real CFG + a negative
 /// prompt) as `z_image`, plus `Control` conditioning (the required structural control image) and
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::active_encoder_contract()),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: Some(accepted_kinds()),
-        required_components: &[],
-        id: MODEL_ID,
-        family: "z-image",
-        backend: "mlx",
-        modality: Modality::Image,
-        capabilities: Capabilities {
-            // Advertised so a weights-free caller can reject a bad `kind` before
-            // paying for a load. Same expression the `ControlBranch` override
-            // returns, so the two cannot drift.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
-            // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Control (required) + an optional img2img Reference init.
-            conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated unified-framework integrator menu (epic 7114 P3), as the base variant.
-            samplers: curated_sampler_names(),
-            // Curated scheduler menu (epic 7114), as the base variant — static-shift default.
-            schedulers: curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            pag: Some(crate::model_base::base_pag_capability()),
-            ..Default::default()
-        },
-    }
+    route_base_control().compute_descriptor()
 }
 
 /// A loaded base control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
@@ -457,16 +452,6 @@ impl Generator for ZImageControl {
     }
 }
 
-// The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`. The `impl Generator` above stays
-// hand-written because `validate` adds a control-specific check beyond the shared `validate_request`,
-// so it is not the plain delegation `impl_generator!` expresses. A distinct id (`z_image_control`) →
-// no clash with the base / turbo / turbo-control submissions in the same crate.
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
-}
-
 /// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
 /// the worker can select a strategy from the static declaration plus its own measured evidence.
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration = mlx_gen::gen_core::profile_memory_registration!(
@@ -483,7 +468,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::{OffloadPolicy, WeightsSource};
+    use mlx_gen::{Modality, OffloadPolicy, WeightsSource};
 
     #[test]
     fn descriptor_is_z_image_control() {

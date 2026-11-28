@@ -93,7 +93,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    self, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, PidWeights, PinnedWeightsFile, Progress, Quant, WeightsSource,
     BASE_SNAPSHOT_COMPONENT,
 };
@@ -1062,7 +1062,7 @@ impl Pipeline {
             }
             None => None,
         };
-        if req.use_pid || clean_init.is_some() {
+        if req.use_pid() || clean_init.is_some() {
             self.device.synchronize()?;
             run.end_conditioning().map_err(CandleError::from)?;
         }
@@ -1628,10 +1628,10 @@ pub(crate) fn validate_base_request(
             req.width, req.height
         )));
     }
-    if req.low_res_start.is_some() || req.source_image.is_some() {
+    if req.features.low_res_start.is_some() || req.source_image.is_some() {
         let sigmas = base_schedule_for_request(variant, req)?;
         let executed_steps = sigmas.len().saturating_sub(1);
-        if let Some(spec) = &req.low_res_start {
+        if let Some(spec) = &req.features.low_res_start {
             spec.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
         }
     }
@@ -1684,7 +1684,7 @@ pub fn compile_conditioned_plan(
     }
     let sigmas = base_schedule_for_request(variant, req)?;
     let executed_steps = sigmas.len().saturating_sub(1);
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         low_res.resolve_for_descriptor(descriptor, req, executed_steps, SIZE_MULTIPLE)?;
     }
     let guidance = req.guidance.unwrap_or(variant.default_guidance());
@@ -1709,7 +1709,7 @@ fn validate_preload_pid(
     req: &GenerationRequest,
     variant: Flux2Variant,
 ) -> gen_core::Result<()> {
-    if !req.use_pid {
+    if !req.use_pid() {
         return Ok(());
     }
     if spec.pid.is_none() {
@@ -1718,7 +1718,7 @@ fn validate_preload_pid(
             variant.id()
         )));
     }
-    if req.pid_capture_sigma.is_some() {
+    if req.pid_capture_sigma().is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
             variant.id()
@@ -1744,16 +1744,6 @@ fn compile_dev_plan(
     validate_preload_pid(spec, req, Flux2Variant::Dev)?;
     compile_base_plan(Flux2Variant::Dev, req).map(|plan| Some(plan.bind_load(spec)))
 }
-
-const KLEIN_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: config::FLUX2_KLEIN_9B_ID,
-    compile: compile_klein_plan,
-};
-
-const DEV_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: config::FLUX2_DEV_ID,
-    compile: compile_dev_plan,
-};
 
 impl Generator for Flux2Generator {
     fn generate_with_execution_report(
@@ -1909,7 +1899,7 @@ impl Generator for Flux2Generator {
                 self.descriptor.id
             )));
         }
-        if req.use_pid
+        if req.use_pid()
             && req.memory.is_some_and(|memory| {
                 memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
             })
@@ -1933,10 +1923,10 @@ impl Generator for Flux2Generator {
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             |text| {
-                if req.use_pid || req.source_image.is_some() {
+                if req.use_pid() || req.source_image.is_some() {
                     run.begin_conditioning()?;
                     self.pipe.encode_phase(text, req, plan.guidance())
                 } else {
@@ -1970,59 +1960,173 @@ impl Generator for Flux2Generator {
     }
 }
 
-/// The txt2img descriptor for `variant`. **klein**: guidance advertised (defaults to 1.0 / CFG-free,
-/// but >1.0 runs a classifier-free negative pass), so `supports_negative_prompt`. **dev**: guidance is
-/// the embedded scalar (single forward, no negative pass), so `supports_negative_prompt = false`.
-/// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
-fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(variant.encoder_contract()),
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.id(),
+/// Primary typed route declaration for a Candle FLUX.2 base variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_base(variant: Flux2Variant) -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = match variant {
+        Flux2Variant::Klein9b => gen_core::RouteBindings::generator(descriptor_klein, load_klein)
+            .with_render_plan(compile_klein_plan),
+        Flux2Variant::Dev => gen_core::RouteBindings::generator(descriptor_dev, load_dev)
+            .with_render_plan(compile_dev_plan),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        bindings = match variant {
+            Flux2Variant::Klein9b => bindings
+                .with_memory_registration(KLEIN_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::klein_provider_contract,
+                )
+                .with_memory_behavior_registration(KLEIN_MEMORY_BEHAVIOR),
+            Flux2Variant::Dev => bindings
+                .with_memory_registration(DEV_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    memory_strategy::provider_contract,
+                )
+                .with_memory_behavior_registration(DEV_MEMORY_BEHAVIOR),
+        };
+    }
+
+    let text_encoder_name = match variant {
+        Flux2Variant::Klein9b => "qwen3_8b",
+        Flux2Variant::Dev => "mistral3_24b",
+    };
+
+    gen_core::RouteRecord {
+        route_id: variant.id(),
         family: "flux2",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // dev is guidance-distilled (embedded scalar, no negative pass); klein runs a
-            // classifier-free negative pass when guidance > 1.
-            supports_negative_prompt: !variant.uses_embedded_guidance(),
-            supports_guidance: true,
-            // txt2img only in this slice — the mlx edit/Reference surface is deferred.
-            conditioning: vec![],
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy `flow_match_euler`
-            // scheduler alias is retained and falls back to the native schedule via the N3 path.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::menu_with_aliases(
-                candle_gen::curated_scheduler_names(),
-                &["flow_match_euler"],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    text_encoder_name,
+                    Some(512),
+                )],
+                encoder_contract: Some(variant.encoder_contract()),
+                max_prompt_tokens: None,
+                supports_caption_overflow_policy: false,
+                // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and
+                // strict control descriptors remain false and fail closed before loading weights.
+                supports_prompt_enhancement: variant.is_dev(),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // dev is guidance-distilled (embedded scalar, no negative pass); klein runs a
+                // classifier-free negative pass when guidance > 1.
+                supports_negative_prompt: !variant.uses_embedded_guidance(),
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy
+                // `flow_match_euler` scheduler alias is retained and falls back to the native
+                // schedule via the N3 path.
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["flow_match_euler"],
+                ),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                // FLUX.2 uses the empirical-mu shifted flow-match schedule.
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("flux2_mmdit")
+                    .with_low_res_start()
+                    .with_pag(variant.pag_capability()),
             ),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            // Both quantize on-the-fly (CPU-stage → quantize-onto-GPU): dev folds the 32B DiT + Mistral
-            // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
-            // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // FLUX.2 uses the empirical-mu shifted flow-match schedule.
-            requires_sigma_shift: true,
-            supports_sequential_offload: true,
-            // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
-            // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
-            // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
-            // flag from the sources, so it cannot be set ahead of the wiring or left behind it.
-            supports_preview: true,
-            // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and strict
-            // control descriptors remain false and fail closed before loading weights.
-            supports_prompt_enhancement: variant.is_dev(),
-            pag: Some(variant.pag_capability()),
-            supports_low_res_start: true,
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux2_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(128),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        [text_encoder_name],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["flux2_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux2_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: Some(variant.default_guidance()),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// The txt2img descriptor for `variant`, computed from `route_base`.
+fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
+    route_base(variant).compute_descriptor()
 }
 
 /// FLUX.2-klein-9b txt2img descriptor (the surface sc-3695 wired).
@@ -2290,57 +2394,18 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // Link-time self-registration into gen-core's model registry — one per txt2img variant.
-candle_gen::register_generators! {
-    pub(crate) const KLEIN_REGISTRATION = descriptor_klein => load_klein
-}
-candle_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
-}
-
-/// Add all Candle FLUX.2 providers to an explicit media registry builder.
+/// Add all Candle FLUX.2 providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(KLEIN_REGISTRATION)
-        .register_generator(DEV_REGISTRATION)
-        .register_render_plan(KLEIN_RENDER_PLAN)
-        .register_render_plan(DEV_RENDER_PLAN)
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: sc20686_observer::PRODUCT_ROUTE_ID,
-            parent_provider_id: Some(config::FLUX2_KLEIN_9B_ID),
-            descriptor: || edit_provider::edit_report_descriptor(Flux2Variant::Klein9b),
-            render_plan: Some(gen_core::RenderPlanRegistration {
-                provider_id: sc20686_observer::PRODUCT_ROUTE_ID,
-                compile: |spec, req| {
-                    edit_provider::compile_edit_feature_route(Flux2Variant::Klein9b, spec, req)
-                },
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: config::FLUX2_DEV_EDIT_ID,
-            parent_provider_id: Some(config::FLUX2_DEV_ID),
-            descriptor: || edit_provider::edit_report_descriptor(Flux2Variant::Dev),
-            render_plan: Some(gen_core::RenderPlanRegistration {
-                provider_id: config::FLUX2_DEV_EDIT_ID,
-                compile: |spec, req| {
-                    edit_provider::compile_edit_feature_route(Flux2Variant::Dev, spec, req)
-                },
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: config::FLUX2_DEV_CONTROL_ID,
-            parent_provider_id: Some(config::FLUX2_DEV_ID),
-            descriptor: control_provider::control_report_descriptor,
-            render_plan: Some(gen_core::RenderPlanRegistration {
-                provider_id: config::FLUX2_DEV_CONTROL_ID,
-                compile: control_provider::compile_control_feature_route,
-            }),
-        })
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: config::FLUX2_DEV_CONTROL_ID,
-            provider_id: config::FLUX2_DEV_ID,
-        })
+    registry
+        .register_route(route_base(Flux2Variant::Klein9b))
+        .register_route(route_base(Flux2Variant::Dev))
+        .register_route(edit_provider::route_edit(Flux2Variant::Klein9b))
+        .register_route(edit_provider::route_edit(Flux2Variant::Dev))
+        .register_route(control_provider::route_control())
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
                 gen_core::CheckpointBackendBindingRegistration {
@@ -2365,12 +2430,7 @@ pub fn register_providers(
                 },
             ],
             ..gen_core::FLUX2_CHECKPOINT_ADAPTER
-        });
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
-        .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
-    registry
+        })
 }
 
 /// Register only weights-free memory-contract surfaces; safe on every build platform.
@@ -2384,12 +2444,14 @@ pub fn register_memory_contract_surfaces(
             provider_id: config::FLUX2_KLEIN_9B_ID,
             contract: memory_strategy::klein_provider_contract,
         })
+        .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
         .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: config::FLUX2_DEV_ID,
             contract: memory_strategy::provider_contract,
         })
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR)
 }
 
 const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -2404,7 +2466,6 @@ const KLEIN_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: config::FLUX2_DEV_ID,
@@ -2412,7 +2473,6 @@ const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: memory_strategy::registered_begin_request,
     };
 
-#[cfg(feature = "cuda")]
 const KLEIN_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: config::FLUX2_KLEIN_9B_ID,
@@ -2426,6 +2486,25 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 }
 
 #[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 5);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
+}
+
+#[cfg(test)]
 mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
@@ -2435,7 +2514,16 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+        assert_eq!(
+            explicit,
+            [
+                "flux2_klein_9b",
+                "flux2_dev",
+                "flux2_klein_9b_edit",
+                "flux2_dev_edit",
+                "flux2_dev_control",
+            ]
+        );
         assert_eq!(
             registry.provider_encoder_contract(super::config::FLUX2_DEV_ID),
             Some(super::config::DEV_ENCODER_CONTRACT)
@@ -2492,7 +2580,10 @@ mod explicit_registry_tests {
             height: 512,
             steps: Some(4),
             seed: Some(42),
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -3709,13 +3800,16 @@ mod tests {
             height: 1024,
             steps: Some(8),
             sampler: Some("euler".into()),
-            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
-            pag: Some(gen_core::PagConfig {
-                scale: 1.5,
-                start: Some(0.0),
-                stop: Some(0.625),
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.5,
+                    start: Some(0.0),
+                    stop: Some(0.625),
+                    ..Default::default()
+                }),
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         let plan = compile_base_plan(Flux2Variant::Klein9b, &req).unwrap();

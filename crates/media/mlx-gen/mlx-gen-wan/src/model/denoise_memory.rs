@@ -64,7 +64,12 @@ pub(crate) fn dense_denoise_facts(
         AdapterResidencyMode::Folded
     };
     let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
-    let trim = req.trim_first_frames.unwrap_or(0) as usize;
+    let trim = req
+        .extensions
+        .wan
+        .as_ref()
+        .and_then(|w| w.trim_first_frames)
+        .unwrap_or(0) as usize;
     let unsized_adapters = || {
         Error::Msg(format!(
             "{route}: cannot size every additive adapter for the estimate"

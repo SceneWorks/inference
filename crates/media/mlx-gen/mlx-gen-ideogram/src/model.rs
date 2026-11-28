@@ -11,6 +11,15 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core::{
+    AdapterInstallPolicy, AdapterSurface, ConditioningSurface, FamilyDriverSpec,
+    LatentCodecDeclaration, ModelBinding, OutputSurface, Pass0ConditioningRequirement,
+    PreviewSupport, ProductLimits, ResidencyPhaseKind, ResidencyPhaseNode, ResidencySurface,
+    RouteBindings, RouteDefaults, RouteRecord, RouteStructure, SamplingSurface,
+    SeedAndBatchSemantics, SeedScheme, SizeFloor, StepSupport, TextEncoderDeclaration,
+    TextEncoderSurface, UpsamplerSurface, WeightPlanDeclaration, WeightSourceKind,
+    FLUX2_PACKED_LATENT_SPACE,
+};
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
@@ -38,73 +47,156 @@ const MAX_COUNT: u32 = 8;
 /// Max aspect ratio (long:short) — the reference supports up to 6:1.
 const MAX_ASPECT: u32 = 6;
 
-/// Ideogram 4's identity + capabilities — constructible without loading weights (registry
-/// introspection / capability advertisement).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Ideogram 4 Quality (`REG-1`, `AP5`).
+pub fn route_quality() -> RouteRecord {
+    RouteRecord {
+        route_id: MODEL_ID,
         family: "ideogram",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Asymmetric CFG runs a separate *unconditional* DiT — the "negative" is a fixed
-            // trained model, not a user negative prompt — so `guidance` is offered but a negative
-            // prompt is not.
-            supports_negative_prompt: false,
-            supports_guidance: true,
-            // Edit (sc-6303/6330): img2img / Remix via a source `Reference`, and mask inpaint via a
-            // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
-            // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
-            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
-            // User LoRA/LoKr adapters apply onto the **conditional** DiT via the shared strict
-            // loader (`apply_ideogram_adapters` — the same seam the bundled TurboTime LoRA uses;
-            // asymmetric CFG then amplifies the adapter's direction, matching how single-DiT
-            // Ideogram community LoRAs are trained). Applied after any Q4/Q8 quantize; on turbo
-            // they stack after the bundled TurboTime LoRA.
-            supports_lora: true,
-            supports_lokr: true,
-            // Bespoke-by-architecture (epic 7114, sc-7120, task 7184): Ideogram is NOT routed through
-            // the unified curated-sampler framework. Its `LogitNormalSchedule` is an INVERTED, clamped
-            // logit-normal time grid (no `σ = 0` terminal), so the FLOW `x0 = x − σ·v` estimate the
-            // multistep/2nd-order solvers (heun / dpmpp_2m / uni_pc) require is meaningless; it uses a
-            // per-step CFG guidance schedule (POLISH_GUIDANCE on the final steps) and an inpaint
-            // mask-blend interleaved BETWEEN Euler steps (no post-step hook in `run_flow_sampler`).
-            // Advertising the curated menu would expose solvers that produce broken output — so the
-            // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
-            samplers: Vec::new(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            mac_only: true,
-            // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
-            // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
-            // (F-176). Under `Sequential` the Qwen3-VL text encoder is encoded, materialized, then
-            // dropped before the two DiTs + VAE load — bounding peak unified memory to
-            // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
-            // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
-            supports_sequential_offload: true,
-            supports_preview: true,
+        mac_only: true,
+        structure: RouteStructure {
+            text_encoders: TextEncoderSurface {
+                encoders: vec![TextEncoderDeclaration::new(
+                    "qwen3_vl_8b",
+                    Some(crate::config::MAX_TEXT_TOKENS as u32),
+                )],
+                ..Default::default()
+            },
+            conditioning: ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference, ConditioningKind::Mask],
+                control_kinds: None,
+                pass0_requirement: Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: SamplingSurface {
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: ModelBinding::family_driver(FamilyDriverSpec::new(
+                crate::pipeline::ideogram_euler_driver_support("ideogram_4"),
+            )),
+            latent_codec: LatentCodecDeclaration {
+                codec_id: Some("flux2_ae"),
+                output_latent_space: Some(&FLUX2_PACKED_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(128),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: AdapterSurface::lora_and_lokr(AdapterInstallPolicy::ForwardResidual),
+            residency: ResidencySurface {
+                lifetime_graph: vec![
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_vl_8b"],
+                        true,
+                    ),
+                    ResidencyPhaseNode::new(
+                        ResidencyPhaseKind::Denoise,
+                        ["ideogram4_cond_dit", "ideogram4_uncond_dit"],
+                        false,
+                    ),
+                    ResidencyPhaseNode::new(ResidencyPhaseKind::Decode, ["flux2_ae"], false),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: WeightPlanDeclaration {
+                source_kind: WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: OutputSurface {
+                preview: PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: SizeFloor::RangeChecked,
+            supported_steps: StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: SeedAndBatchSemantics {
+            seed_scheme: SeedScheme::BackendGlobalSeeded,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: None,
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((crate::config::DEFAULT_WIDTH, crate::config::DEFAULT_HEIGHT)),
+            ..Default::default()
+        },
+        bindings: RouteBindings::generator(descriptor, |spec| load(spec).map_err(Into::into))
+            .with_footprint(component_footprint)
+            .with_memory_registration(QUALITY_MEMORY_REGISTRATION)
+            .with_memory_fixture(
+                mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                |spec| {
+                    crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+                },
+            )
+            .with_memory_behavior_registration(QUALITY_MEMORY_BEHAVIOR),
     }
 }
 
-/// Ideogram 4 **turbo** identity + capabilities (issue #488). Same surface as [`descriptor`] except
-/// it is **CFG-free** — the TurboTime LoRA distilled the guided velocity into a single DiT, so
-/// `guidance` is not offered (no unconditional branch). Few-step (`DEFAULT_TURBO_STEPS`), single DiT.
+/// Primary typed route declaration for Ideogram 4 Turbo (`REG-1`, `AP5`).
+pub fn route_turbo() -> RouteRecord {
+    let mut route = route_quality();
+    route.route_id = MODEL_ID_TURBO;
+    route.structure.sampling.supports_guidance = false;
+    route.structure.denoiser = ModelBinding::family_driver(FamilyDriverSpec::new(
+        crate::pipeline::ideogram_euler_driver_support("ideogram_4_turbo"),
+    ));
+    route.structure.residency.lifetime_graph[1].components = vec!["ideogram4_cond_dit"];
+    route.defaults.steps = Some(DEFAULT_TURBO_STEPS);
+    route.defaults.guidance = None;
+    route.bindings = RouteBindings::generator(descriptor_turbo, |spec| {
+        load_turbo(spec).map_err(Into::into)
+    })
+    .with_footprint(component_footprint)
+    .with_memory_registration(TURBO_MEMORY_REGISTRATION)
+    .with_memory_fixture(
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+        |spec| crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_TURBO, spec),
+    )
+    .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Ideogram 4's identity + capabilities, computed from `route_quality`.
+pub fn descriptor() -> ModelDescriptor {
+    route_quality().compute_descriptor()
+}
+
+/// Ideogram 4 **turbo** identity + capabilities, computed from `route_turbo`.
 pub fn descriptor_turbo() -> ModelDescriptor {
-    let mut d = descriptor();
-    d.id = MODEL_ID_TURBO;
-    // CFG-free: there is no unconditional DiT to mix against, so guidance is inert. (negative-prompt
-    // and true_cfg were already off.)
-    d.capabilities.supports_guidance = false;
-    d
+    route_turbo().compute_descriptor()
 }
 
 /// A loaded Ideogram 4 generator: the cached descriptor + the turbo flag + the component-residency
@@ -436,7 +528,7 @@ impl Ideogram4 {
 
         self.residency.run(
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: tokenize + Qwen3-VL encode → prompt embeds. Seed-independent; under
             // `Sequential` the shared seam materializes the embeds + DROPS the TE before the DiT/VAE
@@ -478,9 +570,9 @@ impl Ideogram4 {
                         req.width,
                         steps,
                         edit_init.as_ref().map(|e| e.strength),
-                        req.use_pid.then_some(req.pid_capture_sigma).flatten(),
+                        req.use_pid().then_some(req.pid_capture_sigma()).flatten(),
                     )
-                    .map_or((0.0, 0), |(sigma, from)| (sigma, from));
+                    .unwrap_or((0.0, 0));
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy_owned.pid.as_ref(),
                     req,
@@ -644,15 +736,6 @@ pub(crate) fn component_footprint(
         &["transformer", "unconditional_transformer"],
         &["vae"],
     )
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const QUALITY_REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
-    footprint = component_footprint
 }
 
 /// Memory-strategy + weights-free behavior registrations (sc-22732), one pair per route.

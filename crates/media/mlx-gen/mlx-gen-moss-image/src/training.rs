@@ -1370,18 +1370,18 @@ impl LoadedTrainer {
         progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<()> {
         for (i, (prompt, context)) in prompts.iter().enumerate() {
-            let request = mlx_gen::GenerationRequest {
+            let mut request = mlx_gen::GenerationRequest {
                 prompt: prompt.clone(),
                 width,
                 height,
                 steps: Some(c.sample_steps),
                 guidance: Some(c.sample_guidance_scale),
-                moss_image: Some(MossImageOptions {
-                    uncond_skip_layers: Some(Vec::new()),
-                    ..Default::default()
-                }),
                 ..Default::default()
             };
+            request.extensions.moss_image_mut().options = Some(MossImageOptions {
+                uncond_skip_layers: Some(Vec::new()),
+                ..Default::default()
+            });
             let resolved = MossImageResolved::resolve(self.variant, &request)?;
             let (latent_w, latent_h) = (width / 16, height / 16);
             let values = crate::pipeline::normal(

@@ -1,10 +1,7 @@
 //! The padded shape shared by native execution and pre-load curated video admission.
 
 use super::*;
-use mlx_gen::gen_core::{
-    self, ProviderRegistryBuilder, VideoPhaseLayout, VideoPlanLayout, VideoPlanRegistration,
-    VideoReferenceLayout,
-};
+use mlx_gen::gen_core::{self, VideoPhaseLayout, VideoPlanLayout, VideoReferenceLayout};
 
 pub(super) struct VideoDimensions {
     pub(super) frames: usize,
@@ -21,7 +18,13 @@ pub(super) fn video_dimensions(
 ) -> Result<VideoDimensions> {
     let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
     let stride = provider_vae_stride(vae);
-    let trim_out = req.trim_first_frames.unwrap_or(0) as usize * stride.0;
+    let trim_out = req
+        .extensions
+        .wan
+        .as_ref()
+        .and_then(|w| w.trim_first_frames)
+        .unwrap_or(0) as usize
+        * stride.0;
     let gen_frames = frames
         .checked_add(trim_out)
         .filter(|f| *f <= i32::MAX as usize)
@@ -150,7 +153,7 @@ pub(super) fn video_layout(
     })
 }
 
-fn compile(
+pub(super) fn compile_for(
     desc: ModelDescriptor,
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -174,20 +177,4 @@ fn compile(
     }
     let quant = resolve_load_time_quant(desc.id, &cfg, spec.quantize)?;
     Ok(Some(video_layout(&desc, &cfg, req, quant)?))
-}
-
-pub(crate) fn register_video_plans(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
-    registry
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: |s, r| compile(descriptor(), s, r),
-        })
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID_T2V_14B,
-            compile: |s, r| compile(descriptor_t2v_14b(), s, r),
-        })
-        .register_video_plan(VideoPlanRegistration {
-            provider_id: MODEL_ID_I2V_14B,
-            compile: |s, r| compile(descriptor_i2v_14b(), s, r),
-        })
 }

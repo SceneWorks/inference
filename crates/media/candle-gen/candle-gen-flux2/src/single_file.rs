@@ -92,7 +92,7 @@ impl<'a> Flux2BflToDiffusersMapping<'a> {
         Self { cfg, dev: false }
     }
 
-    pub(crate) const fn for_dev(cfg: &'a Flux2Config) -> Self {
+    pub const fn for_dev(cfg: &'a Flux2Config) -> Self {
         Self { cfg, dev: true }
     }
 

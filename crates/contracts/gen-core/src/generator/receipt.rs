@@ -11,49 +11,6 @@ impl Generator for ReceiptGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         self.inner.descriptor()
     }
-    fn generate_moss_image_edit(
-        &self,
-        request: &GenerationRequest,
-        inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> Result<crate::moss_image::MossImageAdvancedOutput> {
-        self.scope.with_prepared(|| {
-            self.inner
-                .generate_moss_image_edit(request, inputs, progress)
-        })
-    }
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        request: &GenerationRequest,
-        inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> Result<CompletedMossImageEdit> {
-        self.scope.with_prepared(|| {
-            self.inner
-                .generate_moss_image_edit_with_execution_report(request, inputs, progress)
-        })
-    }
-    fn moss_image_edit_request_peak(
-        &self,
-        request: &GenerationRequest,
-        inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-    ) -> Result<u64> {
-        self.inner.moss_image_edit_request_peak(request, inputs)
-    }
-    fn moss_image_edit_execution_report(
-        &self,
-    ) -> Option<crate::moss_image_edit::MossImageEditExecutionReport> {
-        self.inner.moss_image_edit_execution_report()
-    }
-    fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
-        self.inner.veda_execution_report()
-    }
-    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
-        self.inner.moss_image_execution_report()
-    }
-    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
-        self.inner.moss_image_owned_weight_bytes()
-    }
     fn retained_weight_bytes(&self) -> Option<u64> {
         self.inner.retained_weight_bytes()
     }
@@ -91,9 +48,6 @@ impl Generator for ReceiptGenerator {
     fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
         self.inner.retained_component_state()
     }
-    fn adapter_apply_reports(&self) -> Vec<crate::AdapterApplyReport> {
-        self.inner.adapter_apply_reports()
-    }
     fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
         self.inner
             .checkpoint_weight_facts()
@@ -112,11 +66,14 @@ impl Generator for ReceiptGenerator {
         self.inner
             .predicted_memory_peak_from_base(base_predicted_peak_bytes)
     }
-    fn veda_workspace_bound(
+    fn request_memory_peak(&self, req: &GenerationRequest) -> Result<Option<u64>> {
+        self.inner.request_memory_peak(req)
+    }
+    fn request_workspace_bound(
         &self,
-        req: crate::veda::workspace::Request<'_>,
-    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
-        self.inner.veda_workspace_bound(req)
+        req: &GenerationRequest,
+    ) -> Result<Option<RequestWorkspaceBound>> {
+        self.inner.request_workspace_bound(req)
     }
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         self.inner.memory_strategy_safety_check(context)

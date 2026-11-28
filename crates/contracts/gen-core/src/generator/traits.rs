@@ -9,78 +9,36 @@ pub struct GeneratorComponentResidency {
     pub reference_encoder: bool,
 }
 
+/// Typed problem-bounded workspace residency returned by [`Generator::request_workspace_bound`]
+/// (`PIPE-12`), replacing family-named workspace getters on [`Generator`].
+#[derive(Clone, Debug)]
+pub enum RequestWorkspaceBound {
+    /// Learned sparse-attention workspace bound (e.g. Veda).
+    SparseAttention(crate::veda::workspace::WorkspaceBound),
+}
+
+impl RequestWorkspaceBound {
+    /// Borrow the inner sparse-attention workspace bound, if this is [`Self::SparseAttention`].
+    pub fn as_sparse_attention(&self) -> Option<&crate::veda::workspace::WorkspaceBound> {
+        match self {
+            Self::SparseAttention(bound) => Some(bound),
+        }
+    }
+
+    /// Extract the inner sparse-attention workspace bound, if this is [`Self::SparseAttention`].
+    pub fn into_sparse_attention(self) -> Option<crate::veda::workspace::WorkspaceBound> {
+        match self {
+            Self::SparseAttention(bound) => Some(bound),
+        }
+    }
+}
+
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
 /// `on_progress` streams step/decode progress.
 pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
-
-    /// Native MOSS edit entry point available through catalog-loaded trait objects.
-    fn generate_moss_image_edit(
-        &self,
-        _request: &GenerationRequest,
-        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-        _progress: &mut dyn FnMut(Progress),
-    ) -> Result<crate::moss_image::MossImageAdvancedOutput> {
-        Err(Error::Unsupported(
-            "provider has no native MOSS edit path".into(),
-        ))
-    }
-
-    /// Native edit with a completed, provider-resolved execution identity. Existing providers
-    /// retain their edit behavior and explicitly report missing replay facts until they adopt the
-    /// new contract. The identity is returned with the output, never read from stale shared state.
-    fn generate_moss_image_edit_with_execution_report(
-        &self,
-        request: &GenerationRequest,
-        inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-        progress: &mut dyn FnMut(Progress),
-    ) -> Result<CompletedMossImageEdit> {
-        let output = self.generate_moss_image_edit(request, inputs, progress)?;
-        CompletedMossImageEdit::new(
-            output,
-            ExecutionIdentity::provider_default(),
-            self.descriptor(),
-        )
-    }
-    /// Complete structural edit peak, including reference encoding and request-local K/V.
-    fn moss_image_edit_request_peak(
-        &self,
-        _request: &GenerationRequest,
-        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
-    ) -> Result<u64> {
-        Err(Error::Unsupported(
-            "provider has no native MOSS edit admission".into(),
-        ))
-    }
-    /// Last completed edit; cleared on every attempt, including failures and cancellation.
-    fn moss_image_edit_execution_report(
-        &self,
-    ) -> Option<crate::moss_image_edit::MossImageEditExecutionReport> {
-        None
-    }
-
-    /// Observed sparse-attention outcome of the most recent request, when adopted.
-    fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
-        None
-    }
-
-    /// Actual last successful MOSS execution. Providers clear this under their lifecycle lock
-    /// before every attempt and publish only after all outputs and a final cancellation check.
-    /// Callers must serialize generation and receipt retrieval together; concurrent attempts may
-    /// clear/replace the last-completed receipt. None never implies successful MOSS execution.
-    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
-        None
-    }
-
-    /// MOSS-owned materialized weight buffers retained by this provider, excluding workspace,
-    /// allocator slack, source payloads and other providers. This metadata-only getter never
-    /// evaluates tensors. Call within the serialized cache transaction; warm admission may credit
-    /// at most this value bounded by the current committed snapshot. None grants no extra credit.
-    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
-        None
-    }
 
     /// Device bytes of weights this provider keeps loaded **between** requests and releases before
     /// any request that does not reuse them — a warm set it holds only after checking that it fits.
@@ -102,16 +60,6 @@ pub trait Generator {
     /// within the serialized cache transaction. Missing information grants no retained credit.
     fn retained_component_state(&self) -> Result<Option<GeneratorComponentResidency>> {
         Ok(None)
-    }
-
-    /// Actual per-adapter install outcomes from the most recent successful generation.
-    ///
-    /// Most providers either reject an adapter atomically or have no partial-install surface, so the
-    /// compatibility default is empty. Providers that can accept part of a file override this and
-    /// publish their engine-owned result after [`generate`](Self::generate); consumers must not
-    /// predict the outcome by inspecting an adapter header.
-    fn adapter_apply_reports(&self) -> Vec<crate::AdapterApplyReport> {
-        Vec::new()
     }
 
     /// The **three correlated facts** about the checkpoint this generator loaded (sc-21484): what
@@ -167,12 +115,19 @@ pub trait Generator {
         )
     }
 
-    /// Optional problem-bounded sparse residency. Disabled/absent settings return None without
-    /// loading predictors or allocating device state. Worker admission calls this per queued job.
-    fn veda_workspace_bound(
+    /// Optional complete structural memory peak for a specific request (including reference
+    /// encoding and request-local KV caches). Returns `Ok(None)` when not applicable.
+    fn request_memory_peak(&self, _req: &GenerationRequest) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Optional problem-bounded request workspace residency (e.g. sparse-attention predictor
+    /// workspace). Disabled/absent settings return `Ok(None)` without loading predictors or
+    /// allocating device state. Worker admission calls this per queued job.
+    fn request_workspace_bound(
         &self,
-        _req: crate::veda::workspace::Request<'_>,
-    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
+        _req: &GenerationRequest,
+    ) -> Result<Option<RequestWorkspaceBound>> {
         Ok(None)
     }
 

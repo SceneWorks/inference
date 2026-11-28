@@ -48,9 +48,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
-    Progress, StepSupport, WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes, Progress, StepSupport,
+    WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -261,38 +261,99 @@ const MAX_FRAMES: u32 = 64;
 /// Upper bound on requested denoise `steps` (guards a pathological value pinning the GPU).
 const MAX_STEPS: u32 = 200;
 
-/// SVD-XT img2vid descriptor — image→video via a single `Reference`, a frame-wise guidance ramp
-/// (`req.guidance` overrides the ceiling), no negative prompt / sampler / scheduler / LoRA / quant.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::SVD_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle SVD-XT (`REG-1`, `AP5`).
+pub(crate) fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "svd",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::Reference],
-            // Unified curated SAMPLER menu (epic 7114 P4, sc-7125, decision 3b: sampler-only, NO
-            // scheduler axis — SVD keeps its native Karras EDM σ schedule). SVD is EDM v-prediction;
-            // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
-            samplers: candle_gen::curated_sampler_names(),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::RequiresReference,
+                supports_negative_prompt: false,
+                modules: vec!["clip_vit_h_14"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "svd_xt_unet",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("svd_temporal_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::SVD_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::ConditioningEncode,
+                        ["clip_vit_h_14", "svd_temporal_vae"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["svd_xt_unet"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["svd_temporal_vae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
             min_size: 256,
             max_size: 1024,
-            max_count: 1,
-            // SVD-XT's engine bound, advertised rather than hidden (sc-19559) — the candle twin
-            // of `mlx-gen-svd`'s declaration, from this lane's own `MAX_STEPS` (both 200).
+            size_floor: gen_core::SizeFloor::RangeChecked,
             supported_steps: StepSupport::Range {
                 min: 1,
                 max: MAX_STEPS,
             },
-            supports_sequential_offload: true,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(config::DEFAULT_STEPS),
+            guidance: Some(3.0),
+            sampler: Some("euler"),
+            dimensions: Some((1024, 576)),
             ..Default::default()
         },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_footprint(component_footprint)
+            .with_video_plan(gen_core::VideoPlanRegistration {
+                provider_id: MODEL_ID,
+                compile: compile_video_plan,
+            })
+            .with_memory_registration(memory_strategy::MEMORY_REGISTRATION)
+            .with_resident_only_memory_registration(memory_strategy::RESIDENT_ONLY_WITNESS),
     }
+}
+
+/// SVD-XT img2vid descriptor — computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// The lazy candle SVD generator. Components (image encoder + VAE + UNet) are loaded on first
@@ -367,20 +428,22 @@ impl SvdParams {
         }
         // `params.fps` is the MOTION-conditioning cadence (from `conditioning_fps`), distinct from
         // `req.fps` (the output/playback cadence applied at return time).
-        if let Some(cfps) = req.conditioning_fps {
-            params.fps = cfps;
+        if let Some(svd) = req.extensions.svd.as_ref() {
+            if let Some(cfps) = svd.conditioning_fps {
+                params.fps = cfps;
+            }
+            if let Some(m) = svd.motion_bucket_id {
+                params.motion_bucket_id = m;
+            }
+            if let Some(n) = svd.noise_aug_strength {
+                params.noise_aug_strength = n;
+            }
+            if let Some(c) = svd.decode_chunk_size {
+                params.decode_chunk_size = c as usize;
+            }
         }
         if let Some(g) = req.guidance {
             params.max_guidance_scale = g;
-        }
-        if let Some(m) = req.motion_bucket_id {
-            params.motion_bucket_id = m;
-        }
-        if let Some(n) = req.noise_aug_strength {
-            params.noise_aug_strength = n;
-        }
-        if let Some(c) = req.decode_chunk_size {
-            params.decode_chunk_size = c as usize;
         }
         params
     }
@@ -1012,23 +1075,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(load_generator(spec)?))
 }
 
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
-}
-
-/// Add the Candle SVD provider to an explicit media registry builder.
+/// Add the Candle SVD provider to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(
-        registry
-            .register_generator(REGISTRATION)
-            .register_video_plan(gen_core::VideoPlanRegistration {
-                provider_id: MODEL_ID,
-                compile: compile_video_plan,
-            }),
-    )
+    registry.register_route(route())
 }
 
 /// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.

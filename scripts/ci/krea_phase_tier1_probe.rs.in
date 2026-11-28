@@ -1,8 +1,8 @@
 // Compiled only inside the disposable, explicitly dispatched comparison checkouts.
 use super::*;
 use gen_core::{
-    AdapterKind, GenerationPhase, ImportedModelOperation, ImportedModelSource, LoadSpec,
-    PhaseAdapter, PinnedWeightsFile, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    AdapterKind, FeatureParams, GenerationPhase, ImportedModelOperation, ImportedModelSource,
+    LoadSpec, PhaseAdapter, PidParams, PinnedWeightsFile, WeightsSource, BASE_SNAPSHOT_COMPONENT,
 };
 use serde_json::json;
 use std::cell::RefCell;
@@ -93,23 +93,26 @@ fn request(selected: bool) -> GenerationRequest {
         height: 256,
         seed: Some(SEED),
         sampler: Some("dpmpp_2m_sde".into()),
-        phases: Some(vec![
-            GenerationPhase {
-                steps: 2,
-                guidance: Some(0.0),
-                adapters: vec![],
-            },
-            GenerationPhase {
-                steps: 3,
-                guidance: Some(2.0),
-                adapters: middle,
-            },
-            GenerationPhase {
-                steps: 2,
-                guidance: Some(0.0),
-                adapters: vec![],
-            },
-        ]),
+        features: FeatureParams {
+            phases: Some(vec![
+                GenerationPhase {
+                    steps: 2,
+                    guidance: Some(0.0),
+                    adapters: vec![],
+                },
+                GenerationPhase {
+                    steps: 3,
+                    guidance: Some(2.0),
+                    adapters: middle,
+                },
+                GenerationPhase {
+                    steps: 2,
+                    guidance: Some(0.0),
+                    adapters: vec![],
+                },
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -135,9 +138,9 @@ fn verify_route(registry: &gen_core::ProviderRegistry, root: &Path) -> Result<()
     let mut req = request(true);
     descriptor.capabilities.validate_request(PROVIDER, &req)?;
     crate::validate_phases(PROVIDER, &req)?;
-    req.use_pid = true;
+    req.features.pid = Some(PidParams::enabled());
     invalid(crate::validate_phases(PROVIDER, &req).unwrap_err(), "PiD");
-    req.use_pid = false;
+    req.features.pid = None;
     invalid(
         crate::validate_phases(crate::KREA_2_TURBO_ID, &req).unwrap_err(),
         PROVIDER,
@@ -311,7 +314,7 @@ fn run(
     req: &GenerationRequest,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<()>> {
-    let requested = req.phases.as_deref().unwrap();
+    let requested = req.features.phases.as_deref().unwrap();
     let resolved =
         crate::multiphase::resolve_phases(requested, RAW_GUIDANCE, spec.adapters.len(), PROVIDER)?;
     let mut invalid_phases = requested.to_vec();
@@ -393,7 +396,7 @@ fn run(
     assert_eq!(plan.denoise_spans(), [0..2, 2..5, 5..7]);
     assert_eq!(plan.sampler(), "dpmpp_2m_sde");
     let mut bad = req.clone();
-    bad.phases.as_mut().unwrap()[0].adapters.push(PhaseAdapter {
+    bad.features.phases.as_mut().unwrap()[0].adapters.push(PhaseAdapter {
         adapter: spec.adapters.len(),
         weight: None,
     });

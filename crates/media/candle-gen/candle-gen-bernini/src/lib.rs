@@ -148,19 +148,18 @@ pub use vit_preprocess::{
     pack_patches, preprocess_image, smart_resize, smart_video_nframes, IMAGE_MEAN, IMAGE_STD,
 };
 
-/// Add all Candle Bernini providers to an explicit media registry builder.
+/// Add all Candle Bernini providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(pipeline::RENDERER_REGISTRATION)
-        .register_generator(bernini::FULL_REGISTRATION);
-    // Exactly one of this and `register_memory_contract_surfaces` runs in the catalog build (LTX
-    // has the same shape): the catalog calls this one always and the surfaces one only on
-    // `cfg(not(cuda))`. Registering the memory surface from both would be a duplicate-id error.
-    #[cfg(any(feature = "cuda", test))]
-    let registry = memory_strategy::register_memory_strategy(registry);
+    // Exactly one of this (memory bindings gated on `cfg(any(feature = "cuda", test))`) and
+    // `register_memory_contract_surfaces` runs in the catalog build (LTX has the same shape): the
+    // catalog calls this one always and the surfaces one only on `cfg(not(cuda))`.
     registry
+        .register_route(pipeline::route_renderer())
+        .register_route(bernini::route_full())
 }
 
 /// Register Bernini's weights-free memory-contract declarations in the catalog-only registry.
@@ -176,6 +175,25 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Bernini provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 2);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -196,10 +214,14 @@ mod explicit_registry_tests {
     /// Bernini surface with no lifecycle fixtures at all.
     #[test]
     fn catalog_only_surface_registers_both_lifecycle_behaviors() {
+        let mut renderer = super::pipeline::route_renderer();
+        renderer.bindings.memory = Default::default();
+        let mut full = super::bernini::route_full();
+        full.bindings.memory = Default::default();
         let catalog_only = super::register_memory_contract_surfaces(
             candle_gen::gen_core::ProviderRegistryBuilder::new()
-                .register_generator(super::pipeline::RENDERER_REGISTRATION)
-                .register_generator(super::bernini::FULL_REGISTRATION),
+                .register_route(renderer)
+                .register_route(full),
         )
         .build()
         .unwrap();

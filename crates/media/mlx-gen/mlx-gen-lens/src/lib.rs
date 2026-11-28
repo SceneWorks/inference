@@ -114,40 +114,8 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: registry::MODEL_ID_TURBO,
-            compile: |spec, req| registry::compile_base(registry::MODEL_ID_TURBO, spec, req),
-        })
-        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
-            provider_id: registry::MODEL_ID_BASE,
-            compile: |spec, req| registry::compile_base(registry::MODEL_ID_BASE, spec, req),
-        })
-        .register_generator(registry::TURBO_REGISTRATION)
-        .register_generator(registry::BASE_REGISTRATION)
-        .register_memory_strategy(registry::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: registry::MODEL_ID_TURBO,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    registry::MODEL_ID_TURBO,
-                    spec,
-                )
-            },
-        })
-        .register_memory_behavior(registry::TURBO_MEMORY_BEHAVIOR)
-        .register_memory_strategy(registry::BASE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
-            provider_id: registry::MODEL_ID_BASE,
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract(
-                    registry::MODEL_ID_BASE,
-                    spec,
-                )
-            },
-        })
-        .register_memory_behavior(registry::BASE_MEMORY_BEHAVIOR)
+        .register_route(registry::route_turbo())
+        .register_route(registry::route_base())
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -172,6 +140,7 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["lens_turbo", "lens"]);
         assert_eq!(explicit_trainers, ["lens"]);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
         let preview_ids: Vec<_> = registry
             .generators()
             .filter_map(|registration| {
@@ -215,7 +184,10 @@ mod explicit_registry_tests {
                 height: 1024,
                 steps: Some(4),
                 seed: Some(91),
-                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                features: mlx_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

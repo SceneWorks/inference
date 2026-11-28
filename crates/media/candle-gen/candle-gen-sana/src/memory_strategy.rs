@@ -748,7 +748,7 @@ impl Binding {
                 reference_count: req.memory_reference_count(),
             },
             memory: req.memory,
-            use_pid: req.use_pid,
+            use_pid: req.use_pid(),
             public_identity: digest.finalize().into(),
         }
     }

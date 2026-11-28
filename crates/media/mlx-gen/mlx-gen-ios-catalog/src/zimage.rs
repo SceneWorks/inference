@@ -491,7 +491,7 @@ pub(crate) mod tests {
         let IosWork::Generate(req) = &mut candidate.work else {
             unreachable!()
         };
-        req.use_pid = true;
+        req.features.pid = Some(mlx_gen::gen_core::PidParams::enabled());
         let refused = crate::ios_admission::validate_actual(&registry, &candidate)
             .expect_err("use_pid must be refused");
         assert_eq!(
@@ -502,8 +502,8 @@ pub(crate) mod tests {
         let IosWork::Generate(req) = &mut candidate.work else {
             unreachable!()
         };
-        req.use_pid = false;
-        req.pag = Some(mlx_gen::gen_core::PagConfig {
+        req.features.pid = None;
+        req.features.pag = Some(mlx_gen::gen_core::PagConfig {
             scale: 0.0,
             ..Default::default()
         });
@@ -512,7 +512,7 @@ pub(crate) mod tests {
         let IosWork::Generate(req) = &mut candidate.work else {
             unreachable!()
         };
-        req.pag = Some(mlx_gen::gen_core::PagConfig {
+        req.features.pag = Some(mlx_gen::gen_core::PagConfig {
             scale: 1.2,
             ..Default::default()
         });

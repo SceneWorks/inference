@@ -78,7 +78,15 @@ impl Wan {
         // delivered video). The reference (mlx_video generate_wan.py) documents trim as a 14B
         // first-frame-artifact fix and, run this way, trims its own pinned frame off — a degenerate
         // outcome, not a supported mode. Reject, mirroring the 14B's trim×I2V rejection.
-        if req.trim_first_frames.unwrap_or(0) > 0 && image_conditioned {
+        if req
+            .extensions
+            .wan
+            .as_ref()
+            .and_then(|w| w.trim_first_frames)
+            .unwrap_or(0)
+            > 0
+            && image_conditioned
+        {
             return Err(Error::Msg(
                 "wan2_2_ti2v_5b: trim_first_frames is not supported with Reference/Keyframe \
                  conditioning (the pinned frame would be trimmed off, and keyframe positions \

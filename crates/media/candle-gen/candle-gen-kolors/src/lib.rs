@@ -39,6 +39,7 @@ mod pipeline;
 // the SDXL four-channel latent space (one byte-identical VAE file, `scaling_factor` 0.13025) and
 // projects through `candle_gen_sdxl::preview` rather than restating the fit.
 pub mod preview;
+mod route_wrappers;
 mod sampler;
 pub use sampler::{KolorsLeadingEulerDriver, KolorsLeadingEulerForward};
 mod tokenizer;
@@ -171,7 +172,7 @@ pub(crate) fn validate_low_res_start_kolors(
     spec: Option<&LoadSpec>,
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
-    let Some(low_res) = req.low_res_start.as_ref() else {
+    let Some(low_res) = req.features.low_res_start.as_ref() else {
         return Ok(());
     };
     if spec.is_some_and(|s| {
@@ -310,7 +311,7 @@ fn compile_kolors_for_mode(
         let mut sigmas =
             candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
         if let Some((_, raw_strength)) = raw_ref {
-            let start = if req.low_res_start.is_some() {
+            let start = if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(
                     sigmas.len().saturating_sub(1),
                     Some(raw_strength),
@@ -332,7 +333,7 @@ fn compile_kolors_for_mode(
     };
 
     let executed_steps = sigmas.len().saturating_sub(1);
-    if executed_steps == 0 && req.low_res_start.is_none() {
+    if executed_steps == 0 && req.features.low_res_start.is_none() {
         return Ok(None);
     }
     let guidance = req.guidance.unwrap_or(config::DEFAULT_GUIDANCE);
@@ -611,26 +612,204 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
-// Link-time self-registration into gen-core's model registry. Linking this crate makes
-// the explicit family and platform catalogs resolve the candle generator.
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
+/// Primary typed route declaration for Candle Kolors (`SW-6979`, `REG-1`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
+        family: "kolors",
+        backend: "candle",
+        modality: gen_core::Modality::Image,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "chatglm3_6b",
+                    Some(256),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // The registered generator accepts one Reference as a deterministic latent-init
+                // img2img. ControlNet-pose and IP-Adapter remain separate, already-wired bespoke
+                // providers.
+                kinds: vec![gen_core::ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &[config::DEFAULT_SAMPLER],
+                ),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["discrete"],
+                ),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("kolors_sdxl_unet").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("sdxl_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(4),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["chatglm3_6b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["kolors_sdxl_unet"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["sdxl_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
+            execution: gen_core::ExecutionSurface {
+                cfg_batching: gen_core::CfgBatchingDomain::Modes(
+                    crate::common::CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..gen_core::ExecutionSurface::default()
+            },
+            ..Default::default()
+        },
+        limits: gen_core::ProductLimits {
+            min_size: 512,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Range {
+                min: 1,
+                max: NUM_TRAIN_TIMESTEPS as u32,
+            },
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(config::DEFAULT_STEPS),
+            guidance: Some(config::DEFAULT_GUIDANCE),
+            sampler: Some(config::DEFAULT_SAMPLER),
+            schedule: Some("discrete"),
+            shift: None,
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load)
+            .with_render_plan(compile_kolors)
+            .with_memory_registration(memory_strategy::memory_registration())
+            .with_memory_fixture(
+                memory_strategy::surface_specs,
+                memory_strategy::weights_free_contract,
+            )
+            .with_memory_behavior_registration(memory_strategy::MEMORY_BEHAVIOR),
+    }
 }
 
-/// Add the Candle Kolors provider to an explicit media registry builder.
+fn route_ip_composed() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = memory_strategy::IP_PROVIDER_ID;
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresReference;
+    route.structure.conditioning.modules = vec!["kolors_ip_adapter"];
+    route.structure.weight_plan.requires_ip_adapter_overlay = true;
+    route.structure.denoiser =
+        gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("kolors_sdxl_unet"));
+    route.defaults.strength = Some(DEFAULT_IP_ADAPTER_SCALE);
+    route.bindings = gen_core::RouteBindings::default()
+        .with_composed_memory_registration(memory_strategy::IP_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            memory_strategy::surface_specs,
+            memory_strategy::ip_composed_contract,
+        )
+        .with_memory_behavior_registration(memory_strategy::IP_MEMORY_BEHAVIOR);
+    route
+}
+
+fn route_control_composed() -> gen_core::RouteRecord {
+    let mut route = route_base();
+    route.route_id = memory_strategy::CONTROL_PROVIDER_ID;
+    route.structure.conditioning.kinds = vec![gen_core::ConditioningKind::Control];
+    route.structure.conditioning.control_kinds = Some(gen_core::AcceptedControlKinds::Only(vec![
+        gen_core::ControlKind::Pose,
+    ]));
+    route.structure.conditioning.pass0_requirement =
+        gen_core::Pass0ConditioningRequirement::RequiresControl;
+    route.structure.conditioning.modules = vec!["kolors_controlnet_pose"];
+    route.structure.weight_plan.requires_control_overlay = true;
+    route.structure.denoiser =
+        gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new("kolors_sdxl_unet"));
+    route.defaults.strength = Some(DEFAULT_CONTROL_SCALE);
+    route.bindings = gen_core::RouteBindings::default()
+        .with_composed_memory_registration(memory_strategy::CONTROL_MEMORY_REGISTRATION)
+        .with_memory_fixture(
+            memory_strategy::surface_specs,
+            memory_strategy::control_composed_contract,
+        )
+        .with_memory_behavior_registration(memory_strategy::CONTROL_MEMORY_BEHAVIOR);
+    route
+}
+
+/// Add the Candle Kolors provider to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(REGISTRATION)
-        .register_render_plan(gen_core::RenderPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: compile_kolors,
-        })
-        .register_trainer(training::TRAINER_REGISTRATION);
-    // Unconditional (no `cfg(feature = "cuda")`): the memory seams below construct on any platform
-    // and open no device, so a selector can price Kolors before load on CPU catalogs too.
-    register_memory_contract_surfaces(registry)
+    // Unconditional (no `cfg(feature = "cuda")`): the memory seams construct on any platform and
+    // open no device, so a selector can price Kolors before load on CPU catalogs too.
+    registry
+        .register_route(route_base())
+        .register_route(route_wrappers::route_ip_adapter())
+        .register_route(route_wrappers::route_control())
+        .register_route(route_ip_composed())
+        .register_route(route_control_composed())
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Register every Kolors memory route's weights-free contract and behavior surface.
@@ -676,6 +855,25 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 }
 
 #[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 5);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
+}
+
+#[cfg(test)]
 mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
@@ -685,7 +883,7 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["kolors"]);
+        assert_eq!(explicit, ["kolors", "kolors_ip_adapter", "kolors_control"]);
         let trainers: Vec<String> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
@@ -866,7 +1064,7 @@ mod tests {
                 width: 512,
                 height: 512,
                 steps: Some(10),
-                sampler,
+                sampler: sampler.map(Into::into),
                 conditioning: vec![Conditioning::Reference {
                     image: Image {
                         width: 8,
@@ -977,7 +1175,10 @@ mod tests {
             guidance: Some(5.0),
             sampler: Some("euler".into()),
             scheduler: Some("karras".into()),
-            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan = registry
@@ -1006,7 +1207,10 @@ mod tests {
                 },
                 strength: Some(0.5),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         let img2img_plan = registry
@@ -1102,7 +1306,10 @@ mod tests {
                 },
                 strength: Some(0.05),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         assert!(g.validate(&small_strength_req).is_ok());
@@ -1123,7 +1330,10 @@ mod tests {
                 },
                 strength: Some(1.5),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         assert!(matches!(
@@ -1146,7 +1356,10 @@ mod tests {
                 },
                 strength: Some(1.0),
             }],
-            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..req.clone()
         };
         assert!(matches!(
@@ -1162,21 +1375,33 @@ mod tests {
         // and illegal phase-0 geometries (`scale: Some(0.3)` or phase-0 dimensions below `min_size`).
         for bad_low_res_req in [
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
-                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
             GenerationRequest {
                 width: 256,
                 height: 256,
-                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                    ..Default::default()
+                },
                 ..req.clone()
             },
         ] {

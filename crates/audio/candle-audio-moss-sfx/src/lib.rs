@@ -76,12 +76,13 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::Pro
     components: &[model::COMPONENT_KEY],
 }];
 
-/// Add the MOSS-SoundEffect generator to an explicit audio registry builder (catalog
-/// composition).
+/// Add the MOSS-SoundEffect generator to an explicit audio registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry.register_route(model::route())
 }
 
 /// Build the complete explicit MOSS-SoundEffect provider catalog (this crate's own surface).

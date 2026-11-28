@@ -285,6 +285,8 @@ fn variant_name(out: &GenerationOutput) -> &'static str {
         GenerationOutput::Video { .. } => "GenerationOutput::Video",
         GenerationOutput::Audio(_) => "GenerationOutput::Audio",
         GenerationOutput::Interleaved { .. } => "GenerationOutput::Interleaved",
+        GenerationOutput::Vector(_) => "GenerationOutput::Vector",
+        GenerationOutput::Latents { .. } => "GenerationOutput::Latents",
     }
 }
 

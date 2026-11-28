@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    self, AdapterSpec, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -249,7 +249,7 @@ impl Generator for ZImageBaseGenerator {
                         .into(),
                 ));
             }
-            if req.use_pid {
+            if req.use_pid() {
                 return Err(gen_core::Error::Unsupported(
                     "z_image: PiD decode is not supported under sequential residency; use the \
                      native VAE route or resident policy"
@@ -282,7 +282,7 @@ impl Generator for ZImageBaseGenerator {
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let start_step = match &reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, *strength)?
                 } else {
                     pipeline::init_time_step(steps, *strength)
@@ -330,57 +330,112 @@ pub fn base_pag_capability() -> gen_core::PagCapability {
     }
 }
 
-/// Base Z-Image's identity + capabilities — constructible without loading weights. Unlike Turbo, the
-/// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported. Two
-/// backend-correct deviations from `mlx-gen-z-image::model_base`: `backend = "candle"` and
-/// `mac_only = false`.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle base Z-Image (`REG-1`, `AP5`).
+pub(crate) fn route_base() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "z-image",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Base is undistilled → full classifier-free guidance + negative prompting (the model
-            // card's headline capabilities), unlike the guidance-distilled Turbo.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // img2img: `render_base` VAE-encodes a single `Reference` image → partial-noise init at the
-            // requested strength → real-CFG denoise of the reduced schedule tail (sc-8646, the candle
-            // sibling of `mlx-gen-z-image::model_base`'s `Reference` route). ControlNet is a separate
-            // variant (Fun-ControlNet, [`crate::control`]); multi-image would be `MultiReference` — both
-            // unadvertised here, so the capability floor keeps those shapes on the Python path.
-            conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr merge into the dense DiT at load (sc-5166), shared with Turbo.
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated unified-framework integrator menu (epic 7114). An unset `req.sampler` is the
-            // curated Euler over the static shift=6.0 schedule; an unset `req.scheduler` is the
-            // byte-exact shift=6.0 σ table.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            // On-the-fly Q4/Q8 not wired on the candle base path yet (rejected at load, not dropped).
-            supported_quants: &[],
-            supports_sequential_offload: true,
-            // Per-step latent previews (epic 16948, sc-16957). Both base render lanes — the resident
-            // `render_base` and the staged `render_base_sequential` — hand `run_flow_sampler` a
-            // projector hook, as does the base half of the name-driven Fun-ControlNet provider. The
-            // CFG blend happens inside the predict closure, so the previewed latent is always the
-            // single conditional trajectory. Reuses the epic-16624 Z-Image fit ([`crate::preview`]).
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(base_pag_capability()),
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3_4b", None)],
+                encoder_contract: Some(crate::ENCODER_CONTRACT),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                supports_guidance: true,
+                supports_true_cfg: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("z_image_base_dit")
+                    .with_low_res_start()
+                    .with_pag(base_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(16),
+                ..Default::default()
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_4b"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["z_image_base_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(BASE_DEFAULT_STEPS as u32),
+            guidance: Some(4.0),
+            sampler: Some("euler"),
+            shift: Some(6.0),
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// Base Z-Image's identity + capabilities — computed from `route_base`.
+pub fn descriptor() -> ModelDescriptor {
+    route_base().compute_descriptor()
 }
 
 /// Construct the (lazy) candle **base** Z-Image generator from a [`LoadSpec`]. `spec.weights` must be a
@@ -453,6 +508,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 // The explicit `z_image` registration has a distinct id from `z_image_turbo`.
+#[cfg(test)]
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
 #[cfg(test)]
@@ -633,10 +689,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
-                scale: 1.5,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 1.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         let resolved = desc
@@ -651,10 +710,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
-                scale: 0.0,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -664,10 +726,13 @@ mod tests {
 
         let bad_scale = GenerationRequest {
             prompt: "a test".into(),
-            pag: Some(PagConfig {
-                scale: 15.5,
+            features: candle_gen::gen_core::FeatureParams {
+                pag: Some(PagConfig {
+                    scale: 15.5,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(desc

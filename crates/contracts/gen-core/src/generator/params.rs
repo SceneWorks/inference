@@ -349,7 +349,7 @@ impl Default for ConversationTurn {
     }
 }
 
-/// One phase of a [multi-phase denoise](GenerationRequest::phases) (epic 13879, sc-13884): a
+/// One phase of a [multi-phase denoise](crate::FeatureParams::phases) (epic 13879, sc-13884): a
 /// contiguous slice of the ONE shared global sigma schedule, run with this phase's own guidance and
 /// active adapter stack. The latent flows continuously from the previous phase — a phase does **not**
 /// restart the schedule, it resumes at the sigma the prior phase reached (that shared boundary is the

@@ -79,7 +79,11 @@ pub fn edit_request(request: &GenerationRequest) -> Result<GenerationRequest> {
     let edited = gen_core_moss_image_policy::apply_edit_defaults(&policy_request)
         .map_err(|error| Error::Unsupported(error.message().into()))?;
     let mut request = request.clone();
-    request.moss_image = edited.moss_image.map(Into::into);
+    let ext = request
+        .extensions
+        .moss_image
+        .get_or_insert_with(gen_core::MossImageExtension::default);
+    ext.options = edited.moss_image.map(Into::into);
     request.steps = edited.steps;
     request.guidance = edited.guidance;
     request.scheduler_shift = edited.scheduler_shift;
@@ -220,13 +224,23 @@ mod tests {
             ),
             (Some(30), Some(4.0), Some(13), 640, 384)
         );
-        assert_eq!(edit.moss_image.unwrap().uncond_skip_layers, Some(vec![]));
-        assert!(r.moss_image.is_none());
+        assert_eq!(
+            edit.extensions
+                .moss_image
+                .unwrap()
+                .options
+                .unwrap()
+                .uncond_skip_layers,
+            Some(vec![])
+        );
+        assert!(r.extensions.moss_image.is_none());
         let mut invalid = r;
-        invalid.moss_image = Some(crate::moss_image::MossImageOptions {
-            acceleration: MossImageAcceleration::Dmd(Default::default()),
-            ..Default::default()
-        });
+        invalid.extensions.moss_image = Some(gen_core::MossImageExtension::from_options(
+            crate::moss_image::MossImageOptions {
+                acceleration: MossImageAcceleration::Dmd(Default::default()),
+                ..Default::default()
+            },
+        ));
         assert!(edit_request(&invalid).is_err());
         assert_eq!(reference_dimensions(999, 333, 512).unwrap(), [512, 176]);
         assert_eq!(reference_dimensions(8, 40, 512).unwrap(), [16, 48]);

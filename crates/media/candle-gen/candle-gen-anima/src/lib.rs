@@ -70,8 +70,8 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant,
+    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    Progress, Quant,
 };
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
@@ -85,48 +85,159 @@ const RES_MIN: u32 = 512;
 /// max_size), so the guard is unreachable via the normal path. See [`crate::rope`].
 pub(crate) const RES_MAX: u32 = 1536;
 
-/// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
-/// prompt); Base/Aesthetic run true classifier-free guidance.
-fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    let cfg_capable = true;
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.id(),
+/// Primary typed route declaration for a Candle Anima variant (`SW-6979`, `REG-1`).
+pub(crate) fn route_for(variant: Variant) -> gen_core::RouteRecord {
+    let bindings = match variant {
+        Variant::Base => gen_core::RouteBindings::generator(descriptor_base, load_base)
+            .with_render_plan(|spec, req| compile_variant_plan(Variant::Base, spec, req))
+            .with_memory_registration(memory_strategy::BASE_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                memory_strategy::weights_free_contract("anima_base", spec)
+            })
+            .with_memory_behavior_registration(BASE_MEMORY_BEHAVIOR),
+        Variant::Aesthetic => {
+            gen_core::RouteBindings::generator(descriptor_aesthetic, load_aesthetic)
+                .with_render_plan(|spec, req| compile_variant_plan(Variant::Aesthetic, spec, req))
+                .with_memory_registration(memory_strategy::AESTHETIC_MEMORY_REGISTRATION)
+                .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                    memory_strategy::weights_free_contract("anima_aesthetic", spec)
+                })
+                .with_memory_behavior_registration(AESTHETIC_MEMORY_BEHAVIOR)
+        }
+        Variant::Turbo => gen_core::RouteBindings::generator(descriptor_turbo, load_turbo)
+            .with_render_plan(|spec, req| compile_variant_plan(Variant::Turbo, spec, req))
+            .with_memory_registration(memory_strategy::TURBO_MEMORY_REGISTRATION)
+            .with_memory_fixture(gen_core::candle_memory_contract_surface_specs, |spec| {
+                memory_strategy::weights_free_contract("anima_turbo", spec)
+            })
+            .with_memory_behavior_registration(TURBO_MEMORY_BEHAVIOR),
+    };
+
+    gen_core::RouteRecord {
+        route_id: variant.id(),
         family: "anima",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supports_negative_prompt: cfg_capable,
-            supports_guidance: cfg_capable,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "qwen3_0_6b",
+                    Some(512),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                // Rectified-flow over the unified curated-sampler framework (epic 7114). The native
+                // default (req.sampler == None) is the recommended er_sde solver; the full curated
+                // menu is advertised.
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: true,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("cosmos_predict2_dit").with_low_res_start(),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("qwen_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+                pixel_stride: Some(RES_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
             // LoRA/LoKr injection is wired (the candle counterpart of MLX sc-10521): every trained
-            // adapter's 448 DiT + 60 conditioner targets fold at load, stacked + mixed, strict routing
-            // (`adapters::apply_anima_adapters`). Weight-level fold, validated bit-exact on CPU.
-            supports_lora: true,
-            supports_lokr: true,
-            // Rectified-flow over the unified curated-sampler framework (epic 7114). The native default
-            // (req.sampler == None) is the recommended er_sde solver; the full curated menu is advertised.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: RES_MIN,
-            max_size: RES_MAX,
-            max_count: MAX_COUNT,
-            // Q4 + Q8 (the candle counterpart of MLX sc-10517): the DiT packed-detects and runs the
-            // dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM); conditioner /
-            // Qwen3 TE / VAE stay dense bf16. A pre-packed tier is a real, loadable snapshot.
-            supported_quants: ANIMA_QUANTS,
-            requires_sigma_shift: true,
-            // Per-step latent previews: wired by sc-16953 for all three variants at once — they share
-            // one render lane and differ only in the DiT weights file — and advertised behind the
-            // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
-            // from this crate's shipped sources whether it actually emits.
-            supports_preview: true,
-            supports_low_res_start: true,
+            // adapter's 448 DiT + 60 conditioner targets fold at load, stacked + mixed, strict
+            // routing (`adapters::apply_anima_adapters`). Weight-level fold, validated bit-exact on
+            // CPU.
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::FusedMerge,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3_0_6b", "anima_conditioner"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["cosmos_predict2_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["qwen_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // Q4 + Q8 (the candle counterpart of MLX sc-10517): the DiT packed-detects and runs
+                // the dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM);
+                // conditioner / Qwen3 TE / VAE stay dense bf16.
+                supported_quants: ANIMA_QUANTS,
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                // Per-step latent previews: wired by sc-16953 for all three variants at once — they
+                // share one render lane and differ only in the DiT weights file — and advertised
+                // behind the source-verified bidirectional guard in `candle-gen-catalog` (sc-16951).
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: MAX_COUNT,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: Some(variant.default_guidance()),
+            sampler: Some(DEFAULT_SAMPLER),
+            schedule: None,
+            shift: Some(config::SIGMA_SHIFT),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// Build the descriptor for a variant, computed from `route_for`.
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_for(variant).compute_descriptor()
 }
 
 pub fn descriptor_base() -> ModelDescriptor {
@@ -244,14 +355,15 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
             frames: request.frames.unwrap_or(1),
             reference_count: request.image_reference_count(),
         };
-        let phases_present = request.phases.is_some();
+        let phases_present = request.features.phases.is_some();
         let has_phases = request
+            .features
             .phases
             .as_ref()
             .is_some_and(|phases| !phases.is_empty());
         if geometry != self.geometry
             || !request.conditioning.is_empty()
-            || request.use_pid != self.use_pid
+            || request.use_pid() != self.use_pid
             || phases_present != self.has_phases
             || has_phases != self.has_phases
         {
@@ -659,7 +771,7 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let sigmas = pipeline::resolved_sigmas(variant, req)?;
         low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
@@ -702,7 +814,7 @@ pub(crate) fn compile_variant_plan(
             "{id}: candle Anima is txt2img only (no control / IP-adapter)"
         )));
     }
-    if req.use_pid {
+    if req.use_pid() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: anima has no PiD decoder"
         )));
@@ -712,45 +824,19 @@ pub(crate) fn compile_variant_plan(
         .map(Some)
 }
 
-const BASE_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: "anima_base",
-    compile: |spec, req| compile_variant_plan(Variant::Base, spec, req),
-};
-const AESTHETIC_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: "anima_aesthetic",
-    compile: |spec, req| compile_variant_plan(Variant::Aesthetic, spec, req),
-};
-const TURBO_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
-    provider_id: "anima_turbo",
-    compile: |spec, req| compile_variant_plan(Variant::Turbo, spec, req),
-};
-
-// Link-time registration of all three variants.
-candle_gen::register_generators! {
-    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
-}
-candle_gen::register_generators! {
-    pub(crate) const AESTHETIC_REGISTRATION = descriptor_aesthetic => load_aesthetic
-}
-candle_gen::register_generators! {
-    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
-}
-
-/// Add all Candle Anima providers to an explicit media registry builder.
+/// Add all Candle Anima providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(BASE_REGISTRATION)
-        .register_render_plan(BASE_RENDER_PLAN)
-        .register_generator(AESTHETIC_REGISTRATION)
-        .register_render_plan(AESTHETIC_RENDER_PLAN)
-        .register_generator(TURBO_REGISTRATION)
-        .register_render_plan(TURBO_RENDER_PLAN)
-        .register_trainer(training::TRAINER_REGISTRATION);
     // Registration is unconditional: none of these surfaces needs a CUDA device to *construct*, and
     // gating them on `cuda` hid the whole memory-behavior seam from every CPU conformance config.
-    register_memory_contract_surfaces(registry)
+    registry
+        .register_route(route_for(Variant::Base))
+        .register_route(route_for(Variant::Aesthetic))
+        .register_route(route_for(Variant::Turbo))
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Register the weights-free contracts on non-CUDA catalog builds and the executable contracts on
@@ -810,6 +896,25 @@ const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 /// Build the complete explicit Candle Anima provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 3);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1273,17 +1378,17 @@ mod tests {
         scope.configure_request(&mut admitted).unwrap();
 
         let mut pid = exact();
-        pid.use_pid = true;
+        pid.features.pid = Some(candle_gen::gen_core::PidParams::enabled());
         assert!(scope.configure_request(&mut pid).is_err());
         let mut phases = exact();
-        phases.phases = Some(vec![GenerationPhase {
+        phases.features.phases = Some(vec![GenerationPhase {
             steps: 1,
             guidance: None,
             adapters: Vec::new(),
         }]);
         assert!(scope.configure_request(&mut phases).is_err());
         let mut empty_phases = exact();
-        empty_phases.phases = Some(Vec::new());
+        empty_phases.features.phases = Some(Vec::new());
         assert!(scope.configure_request(&mut empty_phases).is_err());
         let mut conditioning = exact();
         conditioning
@@ -1333,7 +1438,10 @@ mod tests {
                 height: 1024,
                 steps: Some(6),
                 seed: Some(19),
-                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let plan = registry

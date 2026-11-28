@@ -324,11 +324,7 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::REGISTRATION)
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+    registry.register_route(model::route())
 }
 
 /// Build the complete explicit MLX MiniMax-H3 provider catalog.
@@ -344,6 +340,7 @@ mod explicit_registry_tests {
         let registry = super::provider_registry().expect("registry");
         let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
         assert_eq!(ids, vec![super::MODEL_ID]);
+        assert_eq!(registry.route_conformance_errors(), Vec::<String>::new());
     }
 }
 

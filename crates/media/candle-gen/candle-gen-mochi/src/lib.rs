@@ -49,8 +49,8 @@ use std::{
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, RenderLoadBinding, VideoPlanLayout, WeightsSource,
+    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    Progress, Quant, RenderLoadBinding, VideoPlanLayout, WeightsSource,
 };
 
 pub use config::{MochiConfig, MochiVaeConfig};
@@ -83,41 +83,126 @@ pub(crate) const DEFAULT_GUIDANCE: f32 = 4.5;
 /// Mochi renders ~30 fps.
 pub(crate) const DEFAULT_FPS: u32 = 30;
 
-/// Stable identity + advertised capabilities for Mochi 1 (text-to-video, true CFG, no audio).
-///
-/// Mochi is **text-to-video only** in the base preview (no audio, no I2V). It is **not** distilled, so
-/// it exposes **true CFG** (negative prompt + `guidance` scale). Quant tiers ship as pre-quantized
-/// per-tier checkpoints (epic 1788 / A6) — the tier dir IS the quant selection — *not* on-the-fly
-/// requant, so [`Capabilities::supported_quants`] is empty and `load` rejects an on-the-fly
-/// `spec.quantize` (honouring one only when it matches the tier dir's manifest, [`tier`]).
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Candle Mochi 1 (`SW-6979`, `REG-1`).
+pub(crate) fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "mochi",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            // Not distilled → true classifier-free guidance over a [neg, pos] batch.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            supports_true_cfg: true,
-            // Text-to-video only in the base preview (I2V = a follow-on).
-            conditioning: Vec::new(),
-            // A single fixed flow-match Euler integrator is wired; no selectable sampler/scheduler axis.
-            samplers: Vec::new(),
-            // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
-            min_size: SIZE_MULTIPLE,
-            max_size: 1280,
-            max_count: 1,
-            // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT on-the-fly requant.
-            supported_quants: &[] as &[Quant],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new(
+                    "t5_xxl",
+                    Some(MAX_SEQUENCE_LENGTH as u32),
+                )],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: Vec::new(),
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                // Not distilled → true classifier-free guidance over a [neg, pos] batch.
+                supports_negative_prompt: true,
+                modules: vec![],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                guidance_methods: vec![],
+                supports_guidance: true,
+                supports_true_cfg: true,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "mochi_asymm_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("mochi_asymm_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: None,
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface::default(),
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["t5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["mochi_asymm_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["mochi_asymm_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT
+                // on-the-fly requant.
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::Unsupported,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: SIZE_MULTIPLE,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(64),
+            guidance: Some(DEFAULT_GUIDANCE),
+            sampler: None,
+            schedule: None,
+            shift: None,
+            strength: None,
+            dimensions: Some((848, 480)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load).with_video_plan(
+            gen_core::VideoPlanRegistration {
+                provider_id: MODEL_ID,
+                compile: compile_video_plan,
+            },
+        ),
     }
+}
+
+/// Stable identity + advertised capabilities for Mochi 1, computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// The lazy candle Mochi 1 generator. `spec.weights` is a `genmo/mochi-1-preview` diffusers snapshot
@@ -334,25 +419,37 @@ fn video_layout(
     )
 }
 
-candle_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load
-}
-
-/// Add the Candle Mochi 1 generator to an explicit media registry builder.
+/// Add the Candle Mochi 1 generator to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(REGISTRATION)
-        .register_video_plan(gen_core::VideoPlanRegistration {
-            provider_id: MODEL_ID,
-            compile: compile_video_plan,
-        })
+    registry.register_route(route())
 }
 
 /// Build the complete explicit Candle Mochi 1 provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod sw6979_route_conformance_tests {
+    #[test]
+    fn sw6979_route_records_pass_tier0_conformance() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 1);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+    }
 }
 
 #[cfg(test)]

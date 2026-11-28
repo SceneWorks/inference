@@ -284,7 +284,7 @@ fn main() -> Result<()> {
         seed: Some(seed),
         steps,
         guidance,
-        sampler,
+        sampler: sampler.map(Into::into),
         conditioning,
         ..Default::default()
     };

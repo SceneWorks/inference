@@ -143,8 +143,8 @@ mod ip_validate;
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, RenderPlan, RenderPlanRegistration, WeightsSource,
+    self, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, RenderPlan, WeightsSource,
 };
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
@@ -393,14 +393,14 @@ impl Generator for FluxGenerator {
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // PiD's Gemma caption encode is text conditioning, and its engine arrives with the
             // heavy bundle; an img2img `source_image` also runs its VAE encode inside
             // `render_residency` once the heavy bundle is resident. Both hold Conditioning open
             // until `render_residency` has finished their conditioning work.
             |text| {
-                if req.use_pid || req.source_image.is_some() {
+                if req.use_pid() || req.source_image.is_some() {
                     run.begin_conditioning()?;
                     self.pipe.encode_residency(text, &req.prompt)
                 } else {
@@ -473,7 +473,7 @@ fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core:
                 variant.model_id()
             )));
     }
-    if req.use_pid
+    if req.use_pid()
         && req.memory.is_some_and(|memory| {
             memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
         })
@@ -483,10 +483,10 @@ fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core:
             variant.model_id()
         )));
     }
-    if req.low_res_start.is_some() || req.source_image.is_some() {
+    if req.features.low_res_start.is_some() || req.source_image.is_some() {
         let sigmas = pipeline::base_schedule(variant, req)?;
         let executed_steps = sigmas.len().saturating_sub(1);
-        if let Some(spec) = &req.low_res_start {
+        if let Some(spec) = &req.features.low_res_start {
             spec.resolve_for_descriptor(
                 &descriptor_for(variant),
                 req,
@@ -595,7 +595,7 @@ fn validate_preload_pid(
     req: &GenerationRequest,
     variant: Variant,
 ) -> gen_core::Result<()> {
-    if !req.use_pid {
+    if !req.use_pid() {
         return Ok(());
     }
     if spec.pid.is_none() {
@@ -604,7 +604,7 @@ fn validate_preload_pid(
             variant.model_id()
         )));
     }
-    if req.pid_capture_sigma.is_some() {
+    if req.pid_capture_sigma().is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
             variant.model_id()
@@ -613,64 +613,158 @@ fn validate_preload_pid(
     Ok(())
 }
 
-const SCHNELL_RENDER_PLAN: RenderPlanRegistration = RenderPlanRegistration {
-    provider_id: FLUX1_SCHNELL_ID,
-    compile: compile_schnell_plan,
-};
+/// Primary typed route declaration for a Candle FLUX.1 base variant (`REG-1`, `AP5`).
+pub(crate) fn route_base(variant: Variant) -> gen_core::RouteRecord {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut bindings = match variant {
+        Variant::Schnell => gen_core::RouteBindings::generator(descriptor_schnell, load_schnell)
+            .with_render_plan(compile_schnell_plan),
+        Variant::Dev => gen_core::RouteBindings::generator(descriptor_dev, load_dev)
+            .with_render_plan(compile_dev_plan),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        bindings = match variant {
+            Variant::Schnell => bindings
+                .with_memory_registration(SCHNELL_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    registered_schnell_memory_contract,
+                )
+                .with_memory_behavior_registration(SCHNELL_MEMORY_BEHAVIOR),
+            Variant::Dev => bindings
+                .with_memory_registration(DEV_MEMORY_REGISTRATION)
+                .with_memory_fixture(
+                    gen_core::candle_memory_contract_surface_specs,
+                    registered_dev_memory_contract,
+                )
+                .with_memory_behavior_registration(DEV_MEMORY_BEHAVIOR),
+        };
+    }
 
-const DEV_RENDER_PLAN: RenderPlanRegistration = RenderPlanRegistration {
-    provider_id: FLUX1_DEV_ID,
-    compile: compile_dev_plan,
-};
-
-/// The descriptor for a FLUX.1 `variant` — the surface sc-3694 actually wires: txt2img only (no
-/// conditioning / LoRA / quantization advertised — those are the Python fallback's job until candle
-/// wires them), dev exposes guidance (schnell does not), no negative prompt / true-CFG. `backend` is
-/// `"candle"` and `mac_only` is `false` (the two backend-correct deviations from `mlx-gen-flux`).
-fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: variant.model_id(),
+    gen_core::RouteRecord {
+        route_id: variant.model_id(),
         family: "flux",
         backend: "candle",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            // Negative prompt / true-CFG ride the mlx Reference path (dev + reference = real CFG),
-            // which this txt2img slice does not wire — so neither is advertised on either variant.
-            supports_negative_prompt: false,
-            supports_guidance: variant.supports_guidance(),
-            // txt2img only in sc-3694 — Reference/IP-adapter lands later; an empty list means the
-            // shared `validate_request` rejects any conditioning and the worker keeps those shapes on
-            // the Python path.
-            conditioning: vec![],
-            // LoRA/LoKr apply as residuals over dense or packed FLUX projections. Q4/Q8 tiers remain
-            // prepacked snapshot choices rather than on-the-fly quantization.
-            supports_lora: true,
-            supports_lokr: true,
-            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the denoise routes
-            // through the shared driver, so the per-generation `sampler`/`scheduler` knob can select any
-            // curated integrator/schedule. The DEFAULT (None/None) reproduces the native flow-match
-            // Euler path (N1). FLUX had no legacy sampler/scheduler aliases, so no `menu_with_aliases`.
-            samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            supports_sequential_offload: true,
-            // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
-            // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
-            // latent through the reused epic-16624 fit. Both variants share one render lane, so both
-            // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
-            // sources and fails if the flag and the wiring ever disagree.
-            supports_preview: true,
-            pag: Some(variant.pag_capability()),
-            supports_low_res_start: true,
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![
+                    gen_core::TextEncoderDeclaration::new("clip_l", Some(77)),
+                    gen_core::TextEncoderDeclaration::new(
+                        "t5_xxl",
+                        Some(variant.t5_max_len() as u32),
+                    ),
+                ],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: false,
+                modules: vec![],
+                low_res_start_forbids_reference_conditioning: true,
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: candle_gen::curated_sampler_names(),
+                schedulers: candle_gen::curated_scheduler_names(),
+                guidance_methods: vec![],
+                supports_guidance: variant.supports_guidance(),
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("flux1_mmdit")
+                    .with_low_res_start()
+                    .with_pag(variant.pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(64),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["clip_l", "t5_xxl"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["flux1_mmdit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(variant.default_steps()),
+            guidance: variant
+                .supports_guidance()
+                .then_some(variant.default_guidance()),
+            sampler: Some("euler"),
+            schedule: None,
+            shift: variant.is_dev().then_some(1.15),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings,
     }
+}
+
+/// The descriptor for a FLUX.1 `variant`, computed from `route_base`.
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
+    route_base(variant).compute_descriptor()
 }
 
 /// FLUX.1 `schnell` descriptor (registry).
@@ -785,21 +879,21 @@ pub fn load_dev(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(Variant::Dev, spec)
 }
 
-// Link-time self-registration into gen-core's model registry — one descriptor per variant. Linking
-// the explicit family and platform catalogs resolve both candle generators
-// with no central match to edit.
-candle_gen::register_generators! {
-    pub(crate) const SCHNELL_REGISTRATION = descriptor_schnell => load_schnell
-}
-candle_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
+fn route_pulid_feature() -> gen_core::RouteRecord {
+    let mut route = ip_provider::route_ip(Variant::Dev);
+    route.route_id = "flux1_dev_pulid";
+    route.family = "pulid";
+    route.structure.conditioning.modules = vec!["pulid_idformer"];
+    route.structure.weight_plan.requires_ip_adapter_overlay = false;
+    route.structure.weight_plan.requires_identity_overlay = true;
+    route.bindings =
+        gen_core::RouteBindings::feature_route(Some(FLUX1_DEV_ID), pulid_feature_descriptor)
+            .with_render_plan(compile_pulid_feature_route);
+    route
 }
 
 fn pulid_feature_descriptor() -> ModelDescriptor {
-    let mut descriptor = ip_provider::ip_descriptor(Variant::Dev);
-    descriptor.id = "flux1_dev_pulid";
-    descriptor.family = "pulid";
-    descriptor
+    route_pulid_feature().compute_descriptor()
 }
 
 fn compile_pulid_feature_route(
@@ -822,58 +916,19 @@ fn compile_pulid_feature_route(
     compile_conditioned_plan(Variant::Dev, &descriptor, spec, req).map(Some)
 }
 
-/// Add all Candle FLUX.1 providers to an explicit media registry builder.
+/// Add all Candle FLUX.1 providers to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(SCHNELL_REGISTRATION)
-        .register_generator(DEV_REGISTRATION)
-        .register_render_plan(SCHNELL_RENDER_PLAN)
-        .register_render_plan(DEV_RENDER_PLAN)
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "flux1_dev_control",
-            parent_provider_id: Some(FLUX1_DEV_ID),
-            descriptor: control_provider::control_descriptor,
-            render_plan: Some(RenderPlanRegistration {
-                provider_id: "flux1_dev_control",
-                compile: control_provider::compile_control_feature_route,
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "flux1_dev_ip_adapter",
-            parent_provider_id: Some(FLUX1_DEV_ID),
-            descriptor: || ip_provider::ip_descriptor(Variant::Dev),
-            render_plan: Some(RenderPlanRegistration {
-                provider_id: "flux1_dev_ip_adapter",
-                compile: |spec, req| ip_provider::compile_ip_feature_route(Variant::Dev, spec, req),
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "flux1_schnell_ip_adapter",
-            parent_provider_id: Some(FLUX1_SCHNELL_ID),
-            descriptor: || ip_provider::ip_descriptor(Variant::Schnell),
-            render_plan: Some(RenderPlanRegistration {
-                provider_id: "flux1_schnell_ip_adapter",
-                compile: |spec, req| {
-                    ip_provider::compile_ip_feature_route(Variant::Schnell, spec, req)
-                },
-            }),
-        })
-        .register_feature_route(gen_core::FeatureRouteRegistration {
-            route_id: "flux1_dev_pulid",
-            parent_provider_id: Some(FLUX1_DEV_ID),
-            descriptor: pulid_feature_descriptor,
-            render_plan: Some(RenderPlanRegistration {
-                provider_id: "flux1_dev_pulid",
-                compile: compile_pulid_feature_route,
-            }),
-        });
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
-        .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
-        .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
     registry
+        .register_route(route_base(Variant::Schnell))
+        .register_route(route_base(Variant::Dev))
+        .register_route(control_provider::route_control())
+        .register_route(ip_provider::route_ip(Variant::Dev))
+        .register_route(ip_provider::route_ip(Variant::Schnell))
+        .register_route(route_pulid_feature())
 }
 
 /// Register only weights-free memory-contract surfaces; safe on every build platform.
@@ -887,12 +942,14 @@ pub fn register_memory_contract_surfaces(
             provider_id: FLUX1_SCHNELL_ID,
             contract: registered_schnell_memory_contract,
         })
+        .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
         .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: FLUX1_DEV_ID,
             contract: registered_dev_memory_contract,
         })
+        .register_memory_behavior(DEV_MEMORY_BEHAVIOR)
 }
 
 fn registered_schnell_memory_contract(
@@ -919,7 +976,6 @@ const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: FLUX1_SCHNELL_ID,
@@ -929,7 +985,6 @@ const SCHNELL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(feature = "cuda")]
 const DEV_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: FLUX1_DEV_ID,
@@ -954,7 +1009,144 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit, ["flux1_schnell", "flux1_dev"]);
+        assert_eq!(
+            explicit,
+            [
+                "flux1_schnell",
+                "flux1_dev",
+                "flux1_dev_control",
+                "flux1_dev_ip_adapter",
+                "flux1_schnell_ip_adapter",
+            ]
+        );
+    }
+
+    #[test]
+    fn route_records_preserve_exact_pre_migration_descriptor_and_capability_parity() {
+        use candle_gen::gen_core::{
+            AcceptedControlKinds, ConditioningKind, ControlKind, FeatureInapplicabilityCode,
+            Modality, SizeFloor, StepSupport, FLUX1_LATENT_SPACE,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(registry.route_records().len(), 6);
+        assert!(
+            registry.route_conformance_errors().is_empty(),
+            "route conformance errors: {:?}",
+            registry.route_conformance_errors()
+        );
+        assert!(
+            registry.descriptor_conformance_errors().is_empty(),
+            "descriptor conformance errors: {:?}",
+            registry.descriptor_conformance_errors()
+        );
+
+        let schnell = registry.generator_descriptor("flux1_schnell").unwrap();
+        assert_eq!(schnell.family, "flux");
+        assert_eq!(schnell.backend, "candle");
+        assert_eq!(schnell.modality, Modality::Image);
+        assert_eq!(
+            schnell.denoiser_output_latent_space,
+            Some(&FLUX1_LATENT_SPACE)
+        );
+        assert!(schnell.encoder_contract.is_none());
+        assert!(schnell.control_kinds.is_none());
+        assert!(schnell.required_components.is_empty());
+        assert!(!schnell.capabilities.supports_negative_prompt);
+        assert!(!schnell.capabilities.supports_guidance);
+        assert!(!schnell.capabilities.supports_true_cfg);
+        assert!(schnell.capabilities.conditioning.is_empty());
+        assert!(schnell.capabilities.supported_quants.is_empty());
+        assert!(schnell.capabilities.supports_lora);
+        assert!(schnell.capabilities.supports_lokr);
+        assert_eq!(
+            schnell.capabilities.samplers,
+            candle_gen::curated_sampler_names()
+        );
+        assert_eq!(
+            schnell.capabilities.schedulers,
+            candle_gen::curated_scheduler_names()
+        );
+        assert_eq!(schnell.capabilities.min_size, 256);
+        assert_eq!(schnell.capabilities.max_size, 2048);
+        assert_eq!(schnell.capabilities.max_count, 8);
+        assert_eq!(schnell.capabilities.size_floor, SizeFloor::RangeChecked);
+        assert_eq!(
+            schnell.capabilities.supported_steps,
+            StepSupport::Unconstrained
+        );
+        assert!(!schnell.capabilities.mac_only);
+        assert!(!schnell.capabilities.requires_sigma_shift);
+        assert!(schnell.capabilities.supports_sequential_offload);
+        assert!(schnell.capabilities.supports_preview);
+        assert!(schnell.capabilities.supports_low_res_start);
+        assert!(!schnell.capabilities.supports_phases);
+        assert_eq!(
+            schnell.capabilities.pag,
+            Some(super::Variant::Schnell.pag_capability())
+        );
+
+        let dev = registry.generator_descriptor("flux1_dev").unwrap();
+        assert!(dev.capabilities.supports_guidance);
+        assert!(dev.capabilities.supports_low_res_start);
+        assert_eq!(
+            dev.capabilities.pag,
+            Some(super::Variant::Dev.pag_capability())
+        );
+        assert_eq!(
+            registry.route_record("flux1_dev").unwrap().defaults.steps,
+            Some(25)
+        );
+        assert_eq!(
+            registry
+                .route_record("flux1_dev")
+                .unwrap()
+                .defaults
+                .guidance,
+            Some(3.5)
+        );
+
+        let ctrl_desc = registry
+            .route_record("flux1_dev_control")
+            .unwrap()
+            .compute_descriptor();
+        assert_eq!(
+            ctrl_desc.capabilities.conditioning,
+            vec![ConditioningKind::Control]
+        );
+        assert_eq!(
+            ctrl_desc.control_kinds,
+            Some(AcceptedControlKinds::Only(vec![
+                ControlKind::Pose,
+                ControlKind::Canny,
+                ControlKind::Depth,
+            ]))
+        );
+        assert_eq!(ctrl_desc.capabilities.min_size, super::SIZE_MULTIPLE);
+        assert_eq!(ctrl_desc.capabilities.max_size, u32::MAX);
+        assert_eq!(ctrl_desc.capabilities.max_count, 1);
+        assert!(!ctrl_desc.capabilities.supports_low_res_start);
+
+        let all = registry.all_route_feature_applicability();
+        assert!(all["flux1_dev"]["low_res_start"].applicable);
+        assert!(all["flux1_schnell"]["low_res_start"].applicable);
+        assert!(!all["flux1_dev_control"]["low_res_start"].applicable);
+        assert!(all["flux1_dev_control"]["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
+        for ref_route in [
+            "flux1_dev_ip_adapter",
+            "flux1_schnell_ip_adapter",
+            "flux1_dev_pulid",
+        ] {
+            assert!(!all[ref_route]["low_res_start"].applicable);
+            assert!(all[ref_route]["low_res_start"]
+                .reasons
+                .iter()
+                .any(|r| r.code
+                    == FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
+        }
     }
 }
 
@@ -1013,11 +1205,14 @@ mod tests {
             prompt: "a blue lamp".into(),
             width: 512,
             height: 512,
-            phases: Some(vec![gen_core::GenerationPhase {
-                steps: 4,
-                guidance: Some(3.5),
-                adapters: vec![],
-            }]),
+            features: candle_gen::gen_core::FeatureParams {
+                phases: Some(vec![gen_core::GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                }]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
@@ -1110,7 +1305,10 @@ mod tests {
                 assert!(registry.compile_render_plan(id, spec, &req).is_err());
             }
             let pid_req = GenerationRequest {
-                use_pid: true,
+                features: candle_gen::gen_core::FeatureParams {
+                    pid: Some(candle_gen::gen_core::PidParams::enabled()),
+                    ..Default::default()
+                },
                 ..req.clone()
             };
             let no_pid = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1120,7 +1318,10 @@ mod tests {
                 WeightsSource::Dir("/nonexistent/gemma".into()),
             );
             let early_capture = GenerationRequest {
-                pid_capture_sigma: Some(0.2),
+                features: candle_gen::gen_core::FeatureParams {
+                    pid: Some(candle_gen::gen_core::PidParams::with_capture_sigma(0.2)),
+                    ..Default::default()
+                },
                 ..pid_req
             };
             assert!(registry
@@ -1358,22 +1559,28 @@ mod tests {
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                pag: Some(PagConfig {
-                    scale: 1.5,
-                    layers: Some(vec![0, 28, 56]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 1.5,
+                        layers: Some(vec![0, 28, 56]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             })
             .is_ok());
         assert!(g
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                pag: Some(PagConfig {
-                    scale: 0.0,
-                    layers: Some(vec![57]),
+                features: candle_gen::gen_core::FeatureParams {
+                    pag: Some(PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![57]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             })
             .is_err());
@@ -1662,7 +1869,10 @@ mod execution_policy_tests {
             ..Default::default()
         };
         let active_req = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
 
@@ -1691,7 +1901,10 @@ mod execution_policy_tests {
             steps: Some(10),
             strength: Some(0.6),
             source_image: Some(src_img),
-            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..base_req.clone()
         };
         let img2img_plan = compile_base_plan(Variant::Dev, &img2img_ok).unwrap();
@@ -1699,7 +1912,10 @@ mod execution_policy_tests {
         assert_eq!(img2img_plan.denoise_spans(), vec![0..3, 3..4]);
 
         let img2img_bad_k = GenerationRequest {
-            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+                ..Default::default()
+            },
             ..img2img_ok
         };
         assert!(validate_base_request(Variant::Dev, &img2img_bad_k).is_err());
@@ -2046,9 +2262,12 @@ mod execution_policy_tests {
                 steps: Some(4),
                 seed: Some(42),
                 sampler: Some(sampler_name.into()),
-                low_res_start: Some(
-                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
-                ),
+                features: candle_gen::gen_core::FeatureParams {
+                    low_res_start: Some(
+                        LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                    ),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 

@@ -69,46 +69,136 @@ pub fn turbo_pag_capability() -> gen_core::PagCapability {
     }
 }
 
-/// Z-Image-turbo's identity + capabilities — constructible without loading weights (registry
-/// introspection). Values are conservative-but-real; sampler/scheduler lists fill in with the
-/// scheduler port.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: Some(crate::active_encoder_contract()),
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID,
+/// Primary typed route declaration for Z-Image-turbo (`REG-1`, `AP5`).
+pub(crate) fn route_turbo() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID,
         family: "z-image",
         backend: "mlx",
         modality: Modality::Image,
-        capabilities: Capabilities {
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Turbo is guidance-distilled: no CFG, no negative prompt.
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            // img2img reference; ControlNet is a separate variant (sc-2349).
-            conditioning: vec![ConditioningKind::Reference],
-            supports_lora: true,
-            supports_lokr: true,
-            // Curated unified-framework integrator menu (epic 7114 P3). Turbo is guidance-distilled to
-            // ~4 steps; an unset `req.sampler` is the curated Euler over the static-shift schedule.
-            samplers: curated_sampler_names(),
-            // Scheduler axis (epic 7114): the static-shift schedule is the byte-exact default (an unset
-            // `req.scheduler`); a curated name re-shapes the σ schedule over the same `shift=3.0`.
-            schedulers: curated_scheduler_names(),
-            min_size: 256,
-            max_size: 2048,
-            max_count: 8,
-            mac_only: true,
-            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
-            supports_sequential_offload: true,
-            supports_preview: true,
-            supports_low_res_start: true,
-            pag: Some(turbo_pag_capability()),
+        mac_only: true,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("qwen3", Some(512))],
+                encoder_contract: Some(crate::active_encoder_contract()),
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                // img2img reference; ControlNet is a separate variant (sc-2349).
+                kinds: vec![ConditioningKind::Reference],
+                control_kinds: None,
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: Vec::new(),
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: curated_sampler_names(),
+                schedulers: curated_scheduler_names(),
+                guidance_methods: Vec::new(),
+                supports_guidance: true,
+                supports_true_cfg: false,
+                supports_cfg_interval: false,
+                requires_sigma_shift: false,
+                supports_h3_image_sampler: false,
+            },
+            denoiser: gen_core::ModelBinding::family_model(
+                gen_core::FamilyModelSpec::new("z_image_dit")
+                    .with_low_res_start()
+                    .with_pag(turbo_pag_capability()),
+            ),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("flux1_ae"),
+                output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+                pixel_stride: Some(SIZE_MULTIPLE),
+                token_width: Some(16),
+                supports_diffusion_decoder: false,
+            },
+            upsamplers: gen_core::UpsamplerSurface {
+                components: vec!["pid_decoder"],
+                max_temporal_upsample_rounds: 0,
+            },
+            adapters: gen_core::AdapterSurface::lora_and_lokr(
+                gen_core::AdapterInstallPolicy::ForwardResidual,
+            ),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["qwen3"],
+                        true,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["z_image_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["flux1_ae"],
+                        false,
+                    ),
+                ],
+                supports_sequential_offload: true,
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[Quant::Q4, Quant::Q8],
+                component_precision_floors: &[],
+                required_components: &[],
+                requires_control_overlay: false,
+                requires_ip_adapter_overlay: false,
+                requires_identity_overlay: false,
+                ..Default::default()
+            },
+            output: gen_core::OutputSurface {
+                preview: gen_core::PreviewSupport::LatentProjection,
+                supports_hdr: false,
+                supports_alpha_output: false,
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 256,
+            max_size: 2048,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::BackendGlobalSeeded,
+            max_count: 8,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS),
+            guidance: Some(1.0),
+            sampler: Some("euler"),
+            schedule: Some("normal"),
+            shift: Some(SCHEDULE_SHIFT),
+            strength: None,
+            dimensions: Some((1024, 1024)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, |spec| {
+            load(spec).map_err(Into::into)
+        })
+        .with_footprint(component_footprint)
+        .with_render_plan(compile_turbo)
+        .with_activation_memory(ACTIVATION_MEMORY_REGISTRATION.anchor)
+        .with_memory_registration(MEMORY_REGISTRATION)
+        .with_memory_fixture(gen_core::mlx_memory_contract_surface_specs, |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        })
+        .with_memory_behavior_registration(MEMORY_BEHAVIOR_REGISTRATION),
     }
+}
+
+/// Z-Image-turbo's identity + capabilities — constructible without loading weights (registry
+/// introspection).
+pub fn descriptor() -> ModelDescriptor {
+    route_turbo().compute_descriptor()
 }
 
 /// A loaded Z-Image-turbo generator: the four model components assembled from a snapshot
@@ -714,7 +804,7 @@ impl ZImageTurbo {
         let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => {
-                if req.low_res_start.is_some() {
+                if req.features.low_res_start.is_some() {
                     gen_core::resolve_img2img_init_time_step(steps, strength)?
                 } else {
                     init_time_step(steps, strength)
@@ -752,7 +842,7 @@ impl ZImageTurbo {
             stage_residency,
             streamable,
             &req.cancel,
-            req.use_pid,
+            req.use_pid(),
             on_progress,
             // ── Phase A: prompt → cap_feats. txt2img runs the DiT in bf16 (the parity-proven path);
             // img2img matches the fork's f32 init latents, so keep cap f32. PARITY-BF16 (sc-2609):
@@ -914,7 +1004,7 @@ pub(crate) fn validate_request(
     caps: &Capabilities,
     req: &GenerationRequest,
 ) -> Result<()> {
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         if id == crate::model_control::MODEL_ID || id == crate::model_base_control::MODEL_ID {
             let (desc, shift, default_steps) = if id == crate::model_base_control::MODEL_ID {
                 (
@@ -974,7 +1064,7 @@ pub(crate) fn validate_request(
         )));
     }
 
-    if let Some(low_res) = &req.low_res_start {
+    if let Some(low_res) = &req.features.low_res_start {
         let (desc, shift, default_steps) = if id == crate::model_base::MODEL_ID {
             (
                 crate::model_base::descriptor(),
@@ -1038,7 +1128,7 @@ pub(crate) fn compile_trajectory_for(
                     desc.id, img.width, img.height
                 )));
             }
-            if req.low_res_start.is_some() {
+            if req.features.low_res_start.is_some() {
                 gen_core::resolve_img2img_init_time_step(steps, strength)?
             } else {
                 init_time_step(steps, strength)
@@ -1261,11 +1351,6 @@ pub(crate) fn component_footprint(
     )?;
     footprint.text_encoder = text_encoder;
     Ok(footprint)
-}
-
-mlx_gen::register_generators! {
-    pub(crate) const REGISTRATION = descriptor => load;
-    footprint = component_footprint
 }
 
 /// sc-16195 Apple-Silicon warm sweep: q4 peaked at 14.043 GiB at 1024². Rounded upward
@@ -1700,10 +1785,13 @@ mod tests {
 
         let active = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
-                scale: 1.2,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.2,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
@@ -1717,10 +1805,13 @@ mod tests {
 
         let noop = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
-                scale: 0.0,
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());
@@ -1728,11 +1819,14 @@ mod tests {
 
         let bad_layer = GenerationRequest {
             prompt: "a fox".into(),
-            pag: Some(gen_core::PagConfig {
-                scale: 1.0,
-                layers: Some(vec![30]),
+            features: mlx_gen::gen_core::FeatureParams {
+                pag: Some(gen_core::PagConfig {
+                    scale: 1.0,
+                    layers: Some(vec![30]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         assert!(validate_request(MODEL_ID, &d.capabilities, &bad_layer).is_err());

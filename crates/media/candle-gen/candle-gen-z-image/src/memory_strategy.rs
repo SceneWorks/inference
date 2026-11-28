@@ -20,7 +20,6 @@ use candle_gen::gen_core::{
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::VaeConfig;
 use gen_core::MemoryPhase;
-#[cfg(any(feature = "cuda", test))]
 use gen_core::MemoryRequestScope;
 #[cfg(test)]
 use gen_core::{GenerationMemory, GenerationRequest, MemoryGeometry, MemoryRunOutcome};
@@ -1131,7 +1130,6 @@ const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
 
 /// The control routes' profile: the same skeletons with a single-reference image-to-image behavior
 /// fixture.
-#[cfg(any(feature = "cuda", test))]
 const CONTROL_MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
     fixtures: gen_core::MemoryProfileFixtures::routes(&[gen_core::MemoryFixtureRoute::new(
         gen_core::MemoryFixtureMode::ImageToImage,
@@ -1236,7 +1234,6 @@ pub(crate) fn registered_safety_check(
     gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1250,7 +1247,6 @@ pub(crate) fn registered_valid_fixture(
     gen_core::standard_registered_valid_fixture(profile, spec, contract, strategy)
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_begin_request(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1267,7 +1263,6 @@ pub(crate) fn registered_begin_request(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_scope(
     provider_id: &'static str,
     _spec: &LoadSpec,

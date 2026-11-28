@@ -634,7 +634,9 @@ fn load_i2v_14b_reads_config_validates_and_wires_generate() {
     assert!(g.validate(&no_ref).is_err());
     // Rejects trim_first_frames (the conditioning `y` is built from num_frames).
     assert!(g
-        .validate(&with_ref(|r| r.trim_first_frames = Some(1)))
+        .validate(&with_ref(
+            |r| r.extensions.wan_mut().trim_first_frames = Some(1)
+        ))
         .is_err());
     // Still rejects sub-tile + bad frame counts.
     assert!(g.validate(&with_ref(|r| r.width = 8)).is_err());

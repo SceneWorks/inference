@@ -7,6 +7,7 @@ use super::*;
 /// Platform bundles add exactly the registrations they ship.
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
+    pub(super) route_records: Vec<crate::RouteRecord>,
     pub(super) generators: Vec<ModelRegistration>,
     pub(super) render_plans: Vec<crate::RenderPlanRegistration>,
     pub(super) video_plans: Vec<crate::VideoPlanRegistration>,
@@ -509,6 +510,110 @@ impl ProviderRegistryBuilder {
         Self::default()
     }
 
+    /// Register a route once from its primary [`crate::RouteRecord`] declaration (`REG-1`, `AP5`).
+    ///
+    /// Atomically fans out the route's generator factory (when present), pre-load render/video
+    /// plans, conditioned feature sub-route, encoder-contract alias, memory strategy, fixtures,
+    /// surface resolver, resident-only witness, memory behavior, activation memory anchor, and
+    /// reference-workspace pricer, while retaining the [`crate::RouteRecord`] itself for indexed
+    /// introspection, `HOOK-4` applicability derivation, and Tier 0 conformance.
+    pub fn register_route(mut self, route: crate::RouteRecord) -> Self {
+        let route_id = route.route_id;
+        if let Some(gen) = route.bindings.generator {
+            self.generators.push(ModelRegistration {
+                descriptor: gen.descriptor,
+                load: gen.load,
+                footprint: gen.footprint,
+            });
+            if let Some(compile) = route.bindings.render_plan {
+                self.render_plans.push(crate::RenderPlanRegistration {
+                    provider_id: route_id,
+                    compile,
+                });
+            }
+            if let Some(video_plan) = route.bindings.video_plan {
+                self.video_plans.push(video_plan);
+            }
+        }
+        if let Some(feature) = route.bindings.feature_route {
+            self.feature_routes.push(FeatureRouteRegistration {
+                route_id,
+                parent_provider_id: feature.parent_provider_id,
+                descriptor: feature.descriptor,
+                render_plan: route.bindings.render_plan.map(|compile| {
+                    crate::RenderPlanRegistration {
+                        provider_id: route_id,
+                        compile,
+                    }
+                }),
+            });
+        }
+        if let Some(provider_id) = route.bindings.encoder_contract_parent {
+            self.encoder_contract_routes
+                .push(EncoderContractRouteRegistration {
+                    route_id,
+                    provider_id,
+                });
+        }
+        if let Some((explicit_id, contract, safety_check)) = route.bindings.memory.contract {
+            let registration = MemoryRegistration {
+                provider_id: explicit_id.unwrap_or(route_id),
+                contract,
+                safety_check,
+            };
+            if route.bindings.memory.composed {
+                self = self.register_composed_memory_strategy(registration);
+            } else {
+                self.memory_strategy.push(registration);
+            }
+        }
+        if let Some((explicit_id, surface_specs, contract)) = route.bindings.memory.fixture {
+            self.memory_contract_fixture
+                .push(MemoryContractFixtureRegistration {
+                    provider_id: explicit_id.unwrap_or(route_id),
+                    contract,
+                    surface_specs,
+                });
+        }
+        if let Some((explicit_id, contract)) = route.bindings.memory.surface_resolver {
+            self.memory_contract_surface_resolver
+                .push(MemoryContractSurfaceResolverRegistration {
+                    provider_id: explicit_id.unwrap_or(route_id),
+                    contract,
+                });
+        }
+        if let Some((explicit_id, surface_specs, contract)) = route.bindings.memory.resident_only {
+            self.resident_only_memory_contract
+                .push(ResidentOnlyMemoryContractRegistration {
+                    provider_id: explicit_id.unwrap_or(route_id),
+                    contract,
+                    surface_specs,
+                });
+        }
+        if let Some((explicit_id, valid_fixtures, begin_request)) = route.bindings.memory.behavior {
+            self.memory_behavior.push(MemoryBehaviorRegistration {
+                provider_id: explicit_id.unwrap_or(route_id),
+                valid_fixtures,
+                begin_request,
+            });
+        }
+        if let Some(anchor) = route.bindings.activation_memory {
+            self.activation_memory.push(ActivationMemoryRegistration {
+                provider_id: route_id,
+                anchor,
+            });
+        }
+        if let Some(reference_workspace_bytes) = route.bindings.reference_workspace {
+            self.reference_workspace
+                .push(ReferenceWorkspaceRegistration {
+                    provider_id: route_id,
+                    reference_workspace_bytes,
+                });
+        }
+        self.route_records.push(route);
+        self
+    }
+
     builder_registration_method!(register_generator, generators, ModelRegistration);
     builder_registration_method!(
         register_render_plan,
@@ -644,210 +749,288 @@ impl ProviderRegistryBuilder {
 
     /// Validate per-kind id uniqueness and produce the immutable registry.
     pub fn build(self) -> Result<ProviderRegistry> {
-        macro_rules! ensure_unique {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        macro_rules! build_unique_index {
             ($field:ident, $kind:literal) => {{
-                let mut ids = std::collections::BTreeSet::new();
-                for registration in &self.$field {
+                let mut index = BTreeMap::new();
+                for (i, registration) in self.$field.iter().enumerate() {
                     let id = (registration.descriptor)().id;
-                    if !ids.insert(id) {
+                    if index.insert(id, i).is_some() {
                         return Err(Error::Msg(format!(
                             concat!("duplicate ", $kind, " id '{id}' in explicit registry"),
                             id = id
                         )));
                     }
                 }
+                index
             }};
         }
-        ensure_unique!(generators, "generator");
-        let mut plan_ids = std::collections::BTreeSet::new();
-        for provider_id in self
-            .render_plans
-            .iter()
-            .map(|p| p.provider_id)
-            .chain(self.video_plans.iter().map(|p| p.provider_id))
-        {
-            if !plan_ids.insert(provider_id)
-                || !self
-                    .generators
-                    .iter()
-                    .any(|provider| (provider.descriptor)().id == provider_id)
-            {
+
+        // Precompute and cache generator descriptors once at build time (`AP18`).
+        let mut generator_descriptors = Vec::with_capacity(self.generators.len());
+        let mut generator_index = BTreeMap::new();
+        for (i, registration) in self.generators.iter().enumerate() {
+            let descriptor = (registration.descriptor)();
+            let id = descriptor.id;
+            if generator_index.insert(id, i).is_some() {
                 return Err(Error::Msg(format!(
-                    "duplicate or unbound render-plan registration for {}",
-                    provider_id
+                    "duplicate generator id '{id}' in explicit registry"
                 )));
             }
+            generator_descriptors.push(descriptor);
         }
-        {
-            let mut feature_route_ids = std::collections::BTreeSet::new();
-            for route in &self.feature_routes {
-                if !is_registry_ident(route.route_id) || !feature_route_ids.insert(route.route_id) {
+
+        // Validate route_records uniqueness and descriptor parity (`REG-1`, `AP5`).
+        let mut route_record_index = BTreeMap::new();
+        for (i, route) in self.route_records.iter().enumerate() {
+            if !is_registry_ident(route.route_id) {
+                return Err(Error::Msg(format!(
+                    "route record id {:?} must be a non-empty lowercase registry identifier",
+                    route.route_id
+                )));
+            }
+            if route_record_index.insert(route.route_id, i).is_some() {
+                return Err(Error::Msg(format!(
+                    "duplicate route record id '{}' in explicit registry",
+                    route.route_id
+                )));
+            }
+            let computed = route.compute_descriptor();
+            if let Some(gen) = route.bindings.generator {
+                let static_desc = (gen.descriptor)();
+                if static_desc != computed {
                     return Err(Error::Msg(format!(
-                        "duplicate or malformed feature-route registration for '{}'",
+                        "route '{}' generator descriptor() diverges from RouteRecord::compute_descriptor()",
+                        route.route_id
+                    )));
+                }
+            }
+            if let Some(feature) = route.bindings.feature_route {
+                let mut static_desc = (feature.descriptor)();
+                static_desc.id = route.route_id;
+                if static_desc != computed {
+                    return Err(Error::Msg(format!(
+                        "route '{}' feature-route descriptor() diverges from RouteRecord::compute_descriptor()",
                         route.route_id
                     )));
                 }
             }
         }
-        {
-            let mut route_ids = std::collections::BTreeSet::new();
-            for registration in &self.encoder_contract_routes {
-                if !is_registry_ident(registration.route_id) {
-                    return Err(Error::Msg(
-                        "encoder-contract route id must be a non-empty lowercase registry identifier"
-                            .to_owned(),
-                    ));
-                }
-                if !route_ids.insert(registration.route_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate encoder-contract route id '{}'",
-                        registration.route_id
-                    )));
-                }
+
+        let mut plan_ids = BTreeSet::new();
+        let mut render_plan_index = BTreeMap::new();
+        for (i, plan) in self.render_plans.iter().enumerate() {
+            if !plan_ids.insert(plan.provider_id) || !generator_index.contains_key(plan.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate or unbound render-plan registration for {}",
+                    plan.provider_id
+                )));
             }
-            for registration in &self.encoder_contract_routes {
-                if self
-                    .generators
-                    .iter()
-                    .any(|generator| (generator.descriptor)().id == registration.route_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "encoder-contract route '{}' shadows a registered generator",
-                        registration.route_id
-                    )));
-                }
-                let Some(descriptor) = self
-                    .generators
-                    .iter()
-                    .map(|generator| (generator.descriptor)())
-                    .find(|descriptor| descriptor.id == registration.provider_id)
-                else {
-                    return Err(Error::Msg(format!(
-                        "encoder-contract route '{}' targets unregistered generator '{}'",
-                        registration.route_id, registration.provider_id
-                    )));
-                };
-                if descriptor.encoder_contract.is_none() {
-                    return Err(Error::Msg(format!(
-                        "encoder-contract route '{}' targets generator '{}' with no encoder contract",
-                        registration.route_id, registration.provider_id
-                    )));
-                }
+            render_plan_index.insert(plan.provider_id, i);
+        }
+        let mut video_plan_index = BTreeMap::new();
+        for (i, plan) in self.video_plans.iter().enumerate() {
+            if !plan_ids.insert(plan.provider_id) || !generator_index.contains_key(plan.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate or unbound render-plan registration for {}",
+                    plan.provider_id
+                )));
+            }
+            video_plan_index.insert(plan.provider_id, i);
+        }
+
+        let mut feature_route_index = BTreeMap::new();
+        for (i, route) in self.feature_routes.iter().enumerate() {
+            if !is_registry_ident(route.route_id)
+                || feature_route_index.insert(route.route_id, i).is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate or malformed feature-route registration for '{}'",
+                    route.route_id
+                )));
             }
         }
+
+        let mut encoder_contract_route_index = BTreeMap::new();
+        for (i, registration) in self.encoder_contract_routes.iter().enumerate() {
+            if !is_registry_ident(registration.route_id) {
+                return Err(Error::Msg(
+                    "encoder-contract route id must be a non-empty lowercase registry identifier"
+                        .to_owned(),
+                ));
+            }
+            if encoder_contract_route_index
+                .insert(registration.route_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate encoder-contract route id '{}'",
+                    registration.route_id
+                )));
+            }
+        }
+        for registration in &self.encoder_contract_routes {
+            if generator_index.contains_key(registration.route_id) {
+                return Err(Error::Msg(format!(
+                    "encoder-contract route '{}' shadows a registered generator",
+                    registration.route_id
+                )));
+            }
+            let Some(&gen_idx) = generator_index.get(registration.provider_id) else {
+                return Err(Error::Msg(format!(
+                    "encoder-contract route '{}' targets unregistered generator '{}'",
+                    registration.route_id, registration.provider_id
+                )));
+            };
+            if generator_descriptors[gen_idx].encoder_contract.is_none() {
+                return Err(Error::Msg(format!(
+                    "encoder-contract route '{}' targets generator '{}' with no encoder contract",
+                    registration.route_id, registration.provider_id
+                )));
+            }
+        }
+
         let imported_models =
             validate_checkpoint_adapters(&self.checkpoint_adapters, &self.generators)?;
-        {
-            let mut ids = std::collections::BTreeSet::new();
-            for registration in &self.reference_workspace {
-                if !ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate reference-workspace provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if !self
-                    .generators
-                    .iter()
-                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "reference-workspace registration '{}' has no matching generator",
-                        registration.provider_id
-                    )));
-                }
+
+        let mut reference_workspace_index = BTreeMap::new();
+        for (i, registration) in self.reference_workspace.iter().enumerate() {
+            if reference_workspace_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate reference-workspace provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if !generator_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "reference-workspace registration '{}' has no matching generator",
+                    registration.provider_id
+                )));
+            }
+        }
+
+        let mut activation_memory_index = BTreeMap::new();
+        for (i, registration) in self.activation_memory.iter().enumerate() {
+            if activation_memory_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate activation-memory provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if !generator_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "activation-memory registration '{}' has no matching generator",
+                    registration.provider_id
+                )));
+            }
+            if registration.anchor.bytes_1024 == 0 {
+                return Err(Error::Msg(format!(
+                    "activation-memory registration '{}' is zero — omit unmeasured routes",
+                    registration.provider_id
+                )));
+            }
+        }
+
+        let mut memory_strategy_index = BTreeMap::new();
+        let mut composed_ids = BTreeSet::new();
+        for id in &self.composed_memory_strategy_ids {
+            if !composed_ids.insert(*id) {
+                return Err(Error::Msg(format!(
+                    "duplicate composed memory-strategy route id '{id}'"
+                )));
+            }
+        }
+        for (i, registration) in self.memory_strategy.iter().enumerate() {
+            if memory_strategy_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate memory-strategy provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if !generator_index.contains_key(registration.provider_id)
+                && !composed_ids.contains(registration.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "memory-strategy contract '{}' has no matching generator registration",
+                    registration.provider_id
+                )));
+            }
+        }
+
+        let mut memory_contract_fixture_index = BTreeMap::new();
+        for (i, registration) in self.memory_contract_fixture.iter().enumerate() {
+            if memory_contract_fixture_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate memory-contract fixture provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if !memory_strategy_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "memory-contract fixture '{}' has no matching memory strategy",
+                    registration.provider_id
+                )));
+            }
+        }
+        let mut memory_contract_surface_resolver_index = BTreeMap::new();
+        for (i, registration) in self.memory_contract_surface_resolver.iter().enumerate() {
+            if memory_contract_surface_resolver_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate memory-contract surface resolver provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if !memory_contract_fixture_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "memory-contract surface resolver '{}' has no matching contract-surface fixture",
+                    registration.provider_id
+                )));
+            }
+        }
+        let mut resident_only_memory_contract_index = BTreeMap::new();
+        for (i, registration) in self.resident_only_memory_contract.iter().enumerate() {
+            if resident_only_memory_contract_index
+                .insert(registration.provider_id, i)
+                .is_some()
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate resident-only memory-contract witness provider id '{}'",
+                    registration.provider_id
+                )));
+            }
+            if memory_contract_fixture_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
+                    registration.provider_id
+                )));
+            }
+            if !memory_strategy_index.contains_key(registration.provider_id) {
+                return Err(Error::Msg(format!(
+                    "resident-only memory-contract witness '{}' has no matching memory strategy",
+                    registration.provider_id
+                )));
             }
         }
         {
-            let mut ids = std::collections::BTreeSet::new();
-            for registration in &self.activation_memory {
-                if !ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate activation-memory provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if !self
-                    .generators
-                    .iter()
-                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "activation-memory registration '{}' has no matching generator",
-                        registration.provider_id
-                    )));
-                }
-                if registration.anchor.bytes_1024 == 0 {
-                    return Err(Error::Msg(format!(
-                        "activation-memory registration '{}' is zero — omit unmeasured routes",
-                        registration.provider_id
-                    )));
-                }
-            }
-        }
-        {
-            let mut ids = std::collections::BTreeSet::new();
-            for registration in &self.memory_contract_fixture {
-                if !ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate memory-contract fixture provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if !self
-                    .memory_strategy
-                    .iter()
-                    .any(|memory| memory.provider_id == registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "memory-contract fixture '{}' has no matching memory strategy",
-                        registration.provider_id
-                    )));
-                }
-            }
-            let mut resolver_ids = std::collections::BTreeSet::new();
-            for registration in &self.memory_contract_surface_resolver {
-                if !resolver_ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate memory-contract surface resolver provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if !ids.contains(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "memory-contract surface resolver '{}' has no matching contract-surface fixture",
-                        registration.provider_id
-                    )));
-                }
-            }
-            let mut resident_only_ids = std::collections::BTreeSet::new();
-            for registration in &self.resident_only_memory_contract {
-                if !resident_only_ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate resident-only memory-contract witness provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if ids.contains(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
-                        registration.provider_id
-                    )));
-                }
-                if !self
-                    .memory_strategy
-                    .iter()
-                    .any(|memory| memory.provider_id == registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "resident-only memory-contract witness '{}' has no matching memory strategy",
-                        registration.provider_id
-                    )));
-                }
-            }
-        }
-        {
-            let mut ids = std::collections::BTreeSet::new();
+            let mut ids = BTreeSet::new();
             for registration in &self.memory_behavior {
                 if !ids.insert(registration.provider_id) {
                     return Err(Error::Msg(format!(
@@ -855,11 +1038,7 @@ impl ProviderRegistryBuilder {
                         registration.provider_id
                     )));
                 }
-                if !self
-                    .memory_strategy
-                    .iter()
-                    .any(|memory| memory.provider_id == registration.provider_id)
-                {
+                if !memory_strategy_index.contains_key(registration.provider_id) {
                     return Err(Error::Msg(format!(
                         "memory-behavior registration '{}' has no matching memory strategy",
                         registration.provider_id
@@ -867,76 +1046,70 @@ impl ProviderRegistryBuilder {
                 }
             }
         }
-        {
-            let mut ids = std::collections::BTreeSet::new();
-            let mut composed_ids = std::collections::BTreeSet::new();
-            for id in &self.composed_memory_strategy_ids {
-                if !composed_ids.insert(*id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate composed memory-strategy route id '{id}'"
-                    )));
-                }
-            }
-            for registration in &self.memory_strategy {
-                if !ids.insert(registration.provider_id) {
-                    return Err(Error::Msg(format!(
-                        "duplicate memory-strategy provider id '{}'",
-                        registration.provider_id
-                    )));
-                }
-                if !self
-                    .generators
-                    .iter()
-                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
-                    && !composed_ids.contains(registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "memory-strategy contract '{}' has no matching generator registration",
-                        registration.provider_id
-                    )));
-                }
-            }
-        }
-        ensure_unique!(transforms, "transform");
-        ensure_unique!(audio_transforms, "audio transform");
-        ensure_unique!(trainers, "trainer");
-        ensure_unique!(captioners, "captioner");
-        ensure_unique!(transcribers, "transcriber");
-        ensure_unique!(image_embedders, "image embedder");
-        ensure_unique!(text_embedders, "text embedder");
-        ensure_unique!(voice_embedders, "voice embedder");
-        ensure_unique!(audio_embedders, "audio embedder");
+
+        let transform_index = build_unique_index!(transforms, "transform");
+        let audio_transform_index = build_unique_index!(audio_transforms, "audio transform");
+        let trainer_index = build_unique_index!(trainers, "trainer");
+        let captioner_index = build_unique_index!(captioners, "captioner");
+        let transcriber_index = build_unique_index!(transcribers, "transcriber");
+        let image_embedder_index = build_unique_index!(image_embedders, "image embedder");
+        let text_embedder_index = build_unique_index!(text_embedders, "text embedder");
+        let voice_embedder_index = build_unique_index!(voice_embedders, "voice embedder");
+        let audio_embedder_index = build_unique_index!(audio_embedders, "audio embedder");
         let checkpoint_codecs =
             CheckpointCodecRegistry::new(self.checkpoint_codecs.iter().copied())?;
 
         Ok(ProviderRegistry {
+            route_records: self.route_records.into_boxed_slice(),
+            route_record_index,
             generators: self.generators.into_boxed_slice(),
+            generator_descriptors: generator_descriptors.into_boxed_slice(),
+            generator_index,
             render_plans: self.render_plans.into_boxed_slice(),
+            render_plan_index,
             video_plans: self.video_plans.into_boxed_slice(),
+            video_plan_index,
             feature_routes: self.feature_routes.into_boxed_slice(),
+            feature_route_index,
             checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
             checkpoint_codecs,
             imported_models: imported_models.into_boxed_slice(),
             encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
+            encoder_contract_route_index,
             memory_strategy: self.memory_strategy.into_boxed_slice(),
+            memory_strategy_index,
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
+            memory_contract_fixture_index,
             memory_contract_surface_resolver: self
                 .memory_contract_surface_resolver
                 .into_boxed_slice(),
+            memory_contract_surface_resolver_index,
             resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
+            resident_only_memory_contract_index,
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
+            activation_memory_index,
             reference_workspace: self.reference_workspace.into_boxed_slice(),
+            reference_workspace_index,
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
+            transform_index,
             audio_transforms: self.audio_transforms.into_boxed_slice(),
+            audio_transform_index,
             trainers: self.trainers.into_boxed_slice(),
+            trainer_index,
             captioners: self.captioners.into_boxed_slice(),
+            captioner_index,
             transcribers: self.transcribers.into_boxed_slice(),
+            transcriber_index,
             image_embedders: self.image_embedders.into_boxed_slice(),
+            image_embedder_index,
             text_embedders: self.text_embedders.into_boxed_slice(),
+            text_embedder_index,
             voice_embedders: self.voice_embedders.into_boxed_slice(),
+            voice_embedder_index,
             audio_embedders: self.audio_embedders.into_boxed_slice(),
+            audio_embedder_index,
             rejected_quants: self.rejected_quants.into_boxed_slice(),
         })
     }

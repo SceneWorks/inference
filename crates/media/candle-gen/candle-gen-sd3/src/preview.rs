@@ -504,13 +504,16 @@ mod tests {
             width: 1024,
             height: 768,
             steps: Some(10),
-            low_res_start: Some(candle_gen::gen_core::LowResStartSpec::new(3, Some(0.5))),
             source_image: Some(candle_gen::gen_core::Image {
                 width: 1200,
                 height: 700,
                 pixels: vec![90u8; 1200 * 700 * 3],
             }),
             strength: Some(0.4),
+            features: candle_gen::gen_core::FeatureParams {
+                low_res_start: Some(candle_gen::gen_core::LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let plan =

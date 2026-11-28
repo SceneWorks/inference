@@ -90,19 +90,13 @@ pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;
 
-/// Add the Candle Scail2 provider to an explicit media registry builder.
+/// Add the Candle Scail2 provider to an explicit media registry builder via one-call
+/// [`ProviderRegistryBuilder::register_route`](candle_gen::gen_core::ProviderRegistryBuilder::register_route)
+/// (`SW-6979`, `REG-1`).
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
-        .register_generator(pipeline::REGISTRATION)
-        .register_video_plan(candle_gen::gen_core::VideoPlanRegistration {
-            provider_id: pipeline::MODEL_ID,
-            compile: pipeline::compile_video_plan,
-        });
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry);
-    registry
+    registry.register_route(pipeline::route())
 }
 
 /// Add SCAIL-2's Resident-only memory registration without constructing weights.

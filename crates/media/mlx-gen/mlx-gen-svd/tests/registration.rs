@@ -169,12 +169,18 @@ fn svd_request_knobs_drive_generation() {
         steps: Some(2),
         fps: Some(7),
         seed: Some(7),
-        motion_bucket_id: Some(motion),
-        decode_chunk_size: chunk,
         conditioning: vec![Conditioning::Reference {
             image: gradient_image(48, 48),
             strength: None,
         }],
+        extensions: mlx_gen::gen_core::FamilyExtensions {
+            svd: Some(mlx_gen::gen_core::SvdExtension {
+                motion_bucket_id: Some(motion),
+                decode_chunk_size: chunk,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -224,13 +230,19 @@ fn svd_output_fps_decoupled_from_conditioning_fps() {
             height: 256,
             frames: Some(3),
             steps: Some(2),
-            fps: Some(12),                    // output/playback cadence
-            conditioning_fps: Some(cond_fps), // motion-conditioning cadence
+            fps: Some(12), // motion-conditioning cadence
             seed: Some(7),
             conditioning: vec![Conditioning::Reference {
                 image: gradient_image(48, 48),
                 strength: None,
             }],
+            extensions: mlx_gen::gen_core::FamilyExtensions {
+                svd: Some(mlx_gen::gen_core::SvdExtension {
+                    conditioning_fps: Some(cond_fps),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         match gen.generate(&req, &mut |_| {}).expect("generate") {

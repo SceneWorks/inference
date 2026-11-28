@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    self, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -543,31 +543,94 @@ impl Generator for WanVaceGenerator {
     }
 }
 
-/// Wan-VACE descriptor — CFG (guidance + negative prompt), UniPC/Euler samplers, a `ControlClip` (the
-/// universal VACE form the worker builds per mode) + optional `Reference` images. LoRA / quant deferred.
-pub fn descriptor() -> ModelDescriptor {
-    ModelDescriptor {
-        encoder_contract: None,
-        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
-        control_kinds: None,
-        required_components: &[],
-        id: MODEL_ID_VACE,
+/// Primary typed route declaration for Candle Wan-VACE (`REG-1`, `AP5`).
+pub(crate) fn route() -> gen_core::RouteRecord {
+    gen_core::RouteRecord {
+        route_id: MODEL_ID_VACE,
         family: "wan",
         backend: "candle",
         modality: Modality::Video,
-        capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
-            conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
-            // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
-            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
-            min_size: 16,
-            max_size: 1280,
-            max_count: 1,
-            supported_quants: &[] as &[Quant],
+        mac_only: false,
+        structure: gen_core::RouteStructure {
+            text_encoders: gen_core::TextEncoderSurface {
+                encoders: vec![gen_core::TextEncoderDeclaration::new("umt5_xxl", Some(512))],
+                ..Default::default()
+            },
+            conditioning: gen_core::ConditioningSurface {
+                kinds: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
+                pass0_requirement: gen_core::Pass0ConditioningRequirement::NoiseStartSupported,
+                supports_negative_prompt: true,
+                modules: vec!["vace_control"],
+                ..Default::default()
+            },
+            sampling: gen_core::SamplingSurface {
+                samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
+                supports_guidance: true,
+                ..Default::default()
+            },
+            denoiser: gen_core::ModelBinding::family_model(gen_core::FamilyModelSpec::new(
+                "wan_vace_14b_dit",
+            )),
+            latent_codec: gen_core::LatentCodecDeclaration {
+                codec_id: Some("wan_z16_video_vae"),
+                output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
+                ..Default::default()
+            },
+            adapters: gen_core::AdapterSurface::unsupported(),
+            residency: gen_core::ResidencySurface {
+                lifetime_graph: vec![
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::PromptEncode,
+                        ["umt5_xxl"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Denoise,
+                        ["wan_vace_14b_dit"],
+                        false,
+                    ),
+                    gen_core::ResidencyPhaseNode::new(
+                        gen_core::ResidencyPhaseKind::Decode,
+                        ["wan_z16_video_vae"],
+                        false,
+                    ),
+                ],
+                ..Default::default()
+            },
+            weight_plan: gen_core::WeightPlanDeclaration {
+                source_kind: gen_core::WeightSourceKind::SnapshotDirectory,
+                supported_quants: &[] as &[Quant],
+                ..Default::default()
+            },
             ..Default::default()
         },
+        limits: gen_core::ProductLimits {
+            min_size: 16,
+            max_size: 1280,
+            size_floor: gen_core::SizeFloor::RangeChecked,
+            supported_steps: gen_core::StepSupport::Unconstrained,
+            max_audio_duration_secs: None,
+        },
+        seed_and_batch: gen_core::SeedAndBatchSemantics {
+            seed_scheme: gen_core::SeedScheme::DeterministicOffset,
+            max_count: 1,
+            supports_prompt_batch: false,
+        },
+        defaults: gen_core::RouteDefaults {
+            steps: Some(DEFAULT_STEPS_VACE),
+            guidance: Some(DEFAULT_GUIDANCE_VACE),
+            sampler: Some("uni_pc"),
+            shift: Some(VACE_FLOW_SHIFT as f32),
+            dimensions: Some((832, 480)),
+            ..Default::default()
+        },
+        bindings: gen_core::RouteBindings::generator(descriptor, load),
     }
+}
+
+/// Wan-VACE descriptor — computed from `route`.
+pub fn descriptor() -> ModelDescriptor {
+    route().compute_descriptor()
 }
 
 /// Construct a lazy candle Wan-VACE generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing
@@ -609,10 +672,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         components: Mutex::new(None),
         i2v_memory,
     }))
-}
-
-candle_gen::register_generators! {
-    pub(crate) const VACE_REGISTRATION = descriptor => load
 }
 
 #[cfg(test)]

@@ -1827,14 +1827,14 @@ impl RequestBinding {
                 reference_count: request.memory_reference_count(),
             },
             memory: request.memory,
-            use_pid: request.use_pid,
+            use_pid: request.use_pid(),
             prompt: request.prompt.clone(),
             negative_prompt: request.negative_prompt.clone(),
             seed: request.seed,
             steps: request.steps,
             guidance_bits: request.guidance.map(f32::to_bits),
-            sampler: request.sampler.clone(),
-            scheduler: request.scheduler.clone(),
+            sampler: request.sampler.as_deref().map(str::to_owned),
+            scheduler: request.scheduler.as_deref().map(str::to_owned),
             strength_bits: request.strength.map(f32::to_bits),
         }
     }

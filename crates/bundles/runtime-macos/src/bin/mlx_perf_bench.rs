@@ -1362,6 +1362,18 @@ fn fingerprint_output(
                     .to_owned(),
             );
         }
+        GenerationOutput::Vector(_) => {
+            return Err(
+                "image/video P6 matrix unexpectedly produced vector output; no case requests it"
+                    .to_owned(),
+            );
+        }
+        GenerationOutput::Latents { .. } => {
+            return Err(
+                "image/video P6 matrix unexpectedly produced latent output; no case requests it"
+                    .to_owned(),
+            );
+        }
     };
     if payload_bytes == 0 || items == 0 {
         return Err("generation returned an empty output".to_owned());
