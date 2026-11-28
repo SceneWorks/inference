@@ -949,8 +949,8 @@ impl IrisDiT {
     ) -> Result<(Tensor, Tensor)> {
         let mx = blk.mod_img.chunks(core_img)?;
         let my = blk.mod_txt.chunks(core_txt)?;
-        let hx = modulate(&blk.norm_x1.forward(x)?, &mx[0], &mx[1])?;
-        let hy = modulate(&blk.norm_y1.forward(y)?, &my[0], &my[1])?;
+        let hx = blk.norm_x1.rms_modulate(x, &mx[0], &mx[1])?;
+        let hy = blk.norm_y1.rms_modulate(y, &my[0], &my[1])?;
         let (qx, kx, vx) = blk.qkv_x.project(&hx, heads, kv_heads)?;
         let (qy, ky, vy) = blk.qkv_y.project(&hy, heads, kv_heads)?;
         let qx = rope_img.apply(&blk.q_norm_x.forward(&qx)?)?;
@@ -967,7 +967,7 @@ impl IrisDiT {
         let out_x = mul(&out_x, &sigmoid(&blk.gate_x.forward(&hx)?)?)?;
         let attn_x = blk.proj_x.forward(&out_x)?;
         let mut x = add(x, &mul(&mx[2], &blk.attn_post_norm_x.forward(&attn_x)?)?)?;
-        let mlp_in = modulate(&blk.norm_x2.forward(&x)?, &mx[3], &mx[4])?;
+        let mlp_in = blk.norm_x2.rms_modulate(&x, &mx[3], &mx[4])?;
         x = add(
             &x,
             &mul(
@@ -981,7 +981,7 @@ impl IrisDiT {
         let out_y = mul(&out_y, &sigmoid(&text.gate.forward(&hy)?)?)?;
         let attn_y = text.proj.forward(&out_y)?;
         let mut y = add(y, &mul(&my[2], &text.attn_post_norm.forward(&attn_y)?)?)?;
-        let mlp_in = modulate(&text.norm2.forward(&y)?, &my[3], &my[4])?;
+        let mlp_in = text.norm2.rms_modulate(&y, &my[3], &my[4])?;
         y = add(
             &y,
             &mul(
@@ -1007,7 +1007,7 @@ impl IrisDiT {
         let m = blk.modulation.chunks(core)?;
         let n_txt = y.dim(1)?;
         let tokens = cat(&[y, x], 1)?;
-        let h = modulate(&blk.norm1.forward(&tokens)?, &m[0], &m[1])?;
+        let h = blk.norm1.rms_modulate(&tokens, &m[0], &m[1])?;
         let (q, k, v) = blk.qkv.project(&h, heads, kv_heads)?;
         let q = blk.q_norm.forward(&q)?;
         let k = blk.k_norm.forward(&k)?;
@@ -1027,7 +1027,7 @@ impl IrisDiT {
         let tokens = add(&tokens, &mul(&m[2], &attn)?)?;
         let mlp = blk
             .mlp
-            .forward(&modulate(&blk.norm2.forward(&tokens)?, &m[3], &m[4])?)?;
+            .forward(&blk.norm2.rms_modulate(&tokens, &m[3], &m[4])?)?;
         let tokens = add(&tokens, &mul(&m[5], &blk.mlp_post_norm.forward(&mlp)?)?)?;
         if !blk.text_out {
             return Ok((tokens, y.clone()));

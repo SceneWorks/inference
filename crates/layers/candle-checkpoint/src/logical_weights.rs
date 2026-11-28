@@ -303,6 +303,24 @@ pub fn plan_logical_weights(
     .map_err(|e| CandleError::Msg(e.to_string()))
 }
 
+/// [`plan_logical_weights`] for a native single file whose **W4A8** projections are served by
+/// `W4A8Linear` instead of the plan (SW-6135): see
+/// [`gen_core::checkpoint_codec::plan_safetensors_delegating_w4a8`]. Open the reader with
+/// [`LogicalWeightReader::open_with_capability_delegated`] and the returned delegation's keys.
+pub fn plan_logical_weights_delegating_w4a8(
+    path: &Path,
+    mapping: &dyn LogicalKeyMapping,
+    residency: &dyn CodecResidencyPolicy,
+) -> Result<(LogicalWeightPlan, gen_core::w4a8_int8::W4A8Delegation)> {
+    gen_core::checkpoint_codec::plan_safetensors_delegating_w4a8(
+        path,
+        mapping,
+        baseline_codec_registry(),
+        residency,
+    )
+    .map_err(|e| CandleError::Msg(e.to_string()))
+}
+
 /// One decoded logical tensor.
 pub enum LogicalTensor {
     /// Original, padded E4M3 matrix and contiguous swizzled E8M0 block-scale surface.
@@ -583,10 +601,42 @@ impl LogicalWeightReader {
         device: &Device,
         capability: NativeExecutionCapability,
     ) -> Result<Self> {
+        Self::open_with_capability_delegated(
+            path,
+            plan,
+            device,
+            capability,
+            &std::collections::BTreeSet::new(),
+        )
+    }
+
+    /// [`Self::open_with_capability`] for a plan compiled by [`plan_logical_weights_delegating_w4a8`]:
+    /// `delegated` names the physical keys of the W4A8 projections served outside the plan. They
+    /// must all still be on disk, and they are excluded from the plan-surface comparison — every
+    /// other tensor is held to exactly the same equality as an undelegated open.
+    pub fn open_with_capability_delegated(
+        path: &Path,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+        delegated: &std::collections::BTreeSet<String>,
+    ) -> Result<Self> {
         // SAFETY: the provider-provisioned checkpoint must remain unmodified while mapped.
         let st = unsafe { MmapedSafetensors::new(path)? };
         let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
         on_disk.sort_unstable();
+        let delegated_missing = delegated
+            .iter()
+            .filter(|key| on_disk.binary_search(key).is_err())
+            .count();
+        if delegated_missing > 0 {
+            return Err(CandleError::Msg(format!(
+                "logical weight read of {}: {delegated_missing} delegated W4A8 tensor(s) missing \
+                 since planning; refusing to load a different checkpoint",
+                path.display(),
+            )));
+        }
+        on_disk.retain(|name| !delegated.contains(name));
         let mut planned: Vec<&str> = plan.all_physical_keys().collect();
         planned.sort_unstable();
         // A transformed tensor contributes one plan entry per logical output, all naming the same

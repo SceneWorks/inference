@@ -110,8 +110,31 @@ mod reference_training_attention;
 pub mod training_attention;
 pub use fused_attention::{
     attention_path_counts, flash_attention_enabled, set_flash_attention_enabled,
-    take_attention_path_counts, AttentionKernel, AttentionPathCounts, FlashRefusal,
+    take_attention_path_counts, with_int8_attention, with_int8_attention_config,
+    with_int8_attention_if, AttentionKernel, AttentionPathCounts, FlashRefusal,
+    Int8AttentionConfig, Int8Refusal, Int8RefusalCounts, KCentering, PvPrecision,
 };
+// SW-6137: the opt-in Sol-Attn sparse kernel.
+pub use fused_attention::{
+    with_sol_attention, SolConfig, SolRefusalCounts, SolRouteRefusal, SolSelection,
+};
+// SW-6132: the shared, job-level lossy-attention opt-ins (INT8 / Sol-Attn) for every model.
+pub use fused_attention::{
+    lossy_attention, set_lossy_attention, LossyAttentionOptIns, LossyAttentionRefusal,
+};
+
+// The media fused-kernel path seam (SW-6126, SW-F287): every fused media kernel's switch
+// (`CANDLE_MEDIA_FUSED_KERNELS` over a per-kernel variable) and its fused-vs-reference counters
+// with typed reasons. Lives in candle-quant-kernels (the lowest crate every kernel shares) and is
+// re-exported here for the providers; see its module docs for the recipe a new kernel follows.
+pub use candle_quant_kernels::fused_path;
+// The fused video-VAE norm + SiLU + temporal pad (SW-6133): Wan's channel-L2 and LTX's pixel-RMS
+// norm with SiLU, written straight into the padded causal-conv input (path `vae_norm_silu_pad`).
+pub use candle_quant_kernels::vae_norm_silu_pad;
+
+// The shared AdaLN modulation (SW-6127): the composable `modulate` every DiT shares, and the
+// fused `norm(x) · (1 + scale) + shift` (`adaln`) with its bit-identical reference chain.
+pub mod modulate;
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The

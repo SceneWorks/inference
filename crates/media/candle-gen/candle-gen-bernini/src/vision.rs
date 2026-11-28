@@ -22,11 +22,24 @@
 //! block masks are handed to the candle graph. Validated near-bit (f32) against the same synthetic
 //! `tests/fixtures/vision_tower_golden.safetensors` the MLX lane asserts.
 
-use candle_gen::candle_core::{DType, Tensor, D};
+use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::{ops::softmax_last_dim, Linear, Module, VarBuilder};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::nn::{lin_bias, rms_norm};
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// The vision tower's 2-D RoPE apply: HF half-split pairs on `[seq, heads, head_dim]` (as a
+/// batch-1 BSHD view), full-width `[seq, head_dim]` tables already in the activation dtype.
+const VISION_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bshd).with_math(RopeMath::Native);
+
+/// `t·cos + rotate_half(t)·sin` on `t` `[seq, heads, head_dim]` with `cos`/`sin` `[seq, head_dim]`
+/// broadcast over the heads — the shared [`candle_gen::rope::apply_rope`] with [`VISION_ROPE`]
+/// (SW-6129; fused on CUDA, elsewhere the shared reference chain, op for op the former inline
+/// closure — pinned by `vision_rope_shared_route_matches_former`).
+fn vision_rope(t: &Tensor, cos: &Tensor, sin: &Tensor) -> CResult<Tensor> {
+    Ok(candle_gen::rope::apply_rope(&t.unsqueeze(0)?, cos, sin, &VISION_ROPE)?.squeeze(0)?)
+}
 
 const RMS_EPS: f64 = 1e-6;
 const ROPE_THETA: f64 = 10000.0;
@@ -127,15 +140,6 @@ impl VisionConfig {
     }
 }
 
-/// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
-fn rotate_half(x: &Tensor) -> CResult<Tensor> {
-    let d = x.dim(D::Minus1)?;
-    let half = d / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, d - half)?;
-    Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
-}
-
 /// One vision block: pre-norm windowed/full attention + pre-norm SwiGLU MLP, both residual.
 struct Block {
     norm1: Tensor,
@@ -179,14 +183,13 @@ impl Block {
         let k = qkv.narrow(1, 1, 1)?.reshape((seq, nh, hd))?;
         let v = qkv.narrow(1, 2, 1)?.reshape((seq, nh, hd))?;
 
-        // 2-D RoPE, cos/sin broadcast over the head axis ([seq,1,head_dim]).
-        let cos = cos.reshape((seq, 1, hd))?;
-        let sin = sin.reshape((seq, 1, hd))?;
-        let rope = |t: &Tensor| -> CResult<Tensor> {
-            Ok((t.broadcast_mul(&cos)? + rotate_half(t)?.broadcast_mul(&sin)?)?)
-        };
-        let q = rope(&q)?.permute((1, 0, 2))?.contiguous()?; // [nh, seq, hd]
-        let k = rope(&k)?.permute((1, 0, 2))?.contiguous()?;
+        // 2-D RoPE, cos/sin `[seq, head_dim]` broadcast over the head axis.
+        let q = vision_rope(&q, cos, sin)?
+            .permute((1, 0, 2))?
+            .contiguous()?; // [nh, seq, hd]
+        let k = vision_rope(&k, cos, sin)?
+            .permute((1, 0, 2))?
+            .contiguous()?;
         let v = v.permute((1, 0, 2))?.contiguous()?;
 
         let scale = (hd as f64).powf(-0.5);
@@ -545,7 +548,89 @@ pub fn split_vit_features(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::candle_core::{DType, Device};
+    use candle_gen::candle_core::{DType, Device, D};
+
+    /// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis (the former
+    /// private helper of the vision RoPE, kept as the test oracle).
+    fn rotate_half(x: &Tensor) -> CResult<Tensor> {
+        let d = x.dim(D::Minus1)?;
+        let half = d / 2;
+        let x1 = x.narrow(D::Minus1, 0, half)?;
+        let x2 = x.narrow(D::Minus1, half, d - half)?;
+        Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
+    }
+
+    /// The pre-SW-6129 inline vision RoPE closure, verbatim.
+    fn former_rope(t: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let (seq, hd) = cos.dims2().unwrap();
+        let cos = cos.reshape((seq, 1, hd)).unwrap();
+        let sin = sin.reshape((seq, 1, hd)).unwrap();
+        (t.broadcast_mul(&cos).unwrap() + rotate_half(t).unwrap().broadcast_mul(&sin).unwrap())
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The tower's table form: `emb = cat(rope, rope)` `[seq, head_dim]`, cos/sin in the activation
+    /// dtype.
+    fn vision_tables(seq: usize, hd: usize, dt: DType, dev: &Device) -> (Tensor, Tensor) {
+        let rope = (Tensor::randn(0f32, 1.0, (seq, hd / 2), dev).unwrap() * 20.0).unwrap();
+        let emb = Tensor::cat(&[&rope, &rope], 1).unwrap();
+        (
+            emb.cos().unwrap().to_dtype(dt).unwrap(),
+            emb.sin().unwrap().to_dtype(dt).unwrap(),
+        )
+    }
+
+    /// SW-6129: the shared vision RoPE route is bit-identical to the former private chain on CPU.
+    #[test]
+    fn vision_rope_shared_route_matches_former() {
+        let dev = Device::Cpu;
+        let (seq, h, hd) = (24, 4, 80);
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let (cos, sin) = vision_tables(seq, hd, dt, &dev);
+            let t = Tensor::randn(0f32, 1.0, (seq, h, hd), &dev).unwrap();
+            let t = t.to_dtype(dt).unwrap();
+            let got = vision_rope(&t, &cos, &sin).unwrap();
+            assert_eq!(got.dims(), t.dims());
+            assert_eq!(bits(&got), bits(&former_rope(&t, &cos, &sin)), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: the vision RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // Qwen2.5-VL vision tower: 16 heads x 80 over a 1024-patch image.
+        let (seq, h, hd) = (1024, 16, 80);
+        let (cos, sin) = vision_tables(seq, hd, DType::BF16, &dev);
+        let t = Tensor::randn(0f32, 1.0, (seq, h, hd), &dev).unwrap();
+        let t = t.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = vision_rope(&t, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = vision_rope(&t, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former_rope(&t, &cos, &sin)));
+    }
 
     /// split_vit_features chunks by per-grid merged-token count.
     #[test]

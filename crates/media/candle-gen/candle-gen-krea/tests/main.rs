@@ -43,6 +43,12 @@ mod img2img_real_weights;
 #[path = "imported_cuda_smoke.rs"]
 mod imported_cuda_smoke;
 
+#[path = "int8_attention_real_weights.rs"]
+mod int8_attention_real_weights;
+
+#[path = "lossy_attention_job_real_weights.rs"]
+mod lossy_attention_job_real_weights;
+
 #[path = "nvfp4_adapters_real_weights.rs"]
 mod nvfp4_adapters_real_weights;
 
@@ -66,3 +72,6 @@ mod trainer_e2e;
 
 #[path = "trainer_weights_free.rs"]
 mod trainer_weights_free;
+
+#[path = "w4a8_krea_dit_gpu.rs"]
+mod w4a8_krea_dit_gpu;

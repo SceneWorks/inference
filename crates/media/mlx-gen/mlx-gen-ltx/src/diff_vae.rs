@@ -1076,8 +1076,11 @@ fn rotate_axis(x: &Array, inv: &Array, axis: usize) -> Result<Array> {
     let ang = multiply(&pos, &inv.reshape(&[1, half])?)?.reshape(&ang_shape)?;
     let (cos, sin) = (ang.cos()?, ang.sin()?);
 
-    let re = subtract(&multiply(&xe, &cos)?, &multiply(&xo, &sin)?)?;
-    let ro = add(&multiply(&xe, &sin)?, &multiply(&xo, &cos)?)?;
+    // The pair rotation is the shared eager kernel `nn::rope_rotate_eager` (SW-6140): the same
+    // `xe·cos − xo·sin`, `xo·cos + xe·sin` chain as the private copy (IEEE addition commutes). The
+    // per-axis angles above are this VAE's own layout (positions along one of three axes of a
+    // rank-6 tile), which no shared table layout or `fast::rope` expresses.
+    let (re, ro) = mlx_gen::nn::rope_rotate_eager(&xe, &xo, &cos, &sin)?;
     let stacked = concatenate_axis(
         &[
             &re.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half, 1])?,
@@ -1302,12 +1305,10 @@ impl DiffusionBlock {
     }
 }
 
-/// `x * (1 + scale) + shift` (upstream `layers.modulate`).
+/// `x * (1 + scale) + shift` (upstream `layers.modulate`), strong-f32 `1`: the shared eager
+/// [`mlx_gen::nn::modulate_eager`] (SW-6140), the same three-op chain as this crate's private copy.
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(
-        &multiply(x, &add(scale, Array::from_f32(1.0))?)?,
-        shift,
-    )?)
+    mlx_gen::nn::modulate_eager(x, scale, shift, false)
 }
 
 /// `Linear` + channels-last pixel shuffle (upstream `LinearPixelShuffleUpsample`).

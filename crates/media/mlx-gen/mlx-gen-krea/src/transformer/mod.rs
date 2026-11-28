@@ -1568,13 +1568,10 @@ impl Krea2Transformer {
         let m = mlx_rs::ops::add(t, &self.final_sstable)?; // [b, 2, hidden] (t broadcasts 1→2)
         let parts = split(&m, 2, 1)?;
         let (scale, shift) = (&parts[0], &parts[1]); // each [b, 1, hidden]
-        let normed = mlx_rs::ops::add(
-            &multiply(
-                &self.final_norm.forward(x)?,
-                &mlx_rs::ops::add(scale, Array::from_f32(1.0))?,
-            )?,
-            shift,
-        )?;
+                                                     // Strong-f32 `1`: the shared eager `nn::modulate_eager` (SW-6140), the same three-op chain
+                                                     // as the inline affine it replaced.
+        let normed =
+            mlx_gen::nn::modulate_eager(&self.final_norm.forward(x)?, scale, shift, false)?;
         self.final_linear.forward_with_phase(&normed, adapters)
     }
 

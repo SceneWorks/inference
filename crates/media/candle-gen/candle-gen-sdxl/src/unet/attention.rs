@@ -130,6 +130,14 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
     unimplemented!("flash-attn has no backward in candle; the trainable UNet uses the math path")
 }
 
+/// Whether the shared router's pick for a native-dtype (f16/bf16) cross / self-attention call keeps
+/// the operands as they are and goes through the shared helper: any fused kernel (FlashAttention,
+/// or an opted-in INT8 QK / Sol-Attn route — [`candle_gen::AttentionKernel::is_fused`]). Only the
+/// materialized route takes the f32-upcast fallback. Testing `== Flash` here would turn an INT8
+/// opt-in into "flash lost, INT8 never run" (the upcast operands are f32, which INT8 refuses).
+fn takes_native_fused_path(kernel: candle_gen::AttentionKernel) -> bool {
+    kernel.is_fused()
+}
 #[derive(Debug)]
 pub struct CrossAttention {
     training_pack: Option<FrozenProjectionPack>,
@@ -290,17 +298,19 @@ impl CrossAttention {
     }
 
     /// The shared fused attention for the native-dtype (f16/bf16) operands, when the shared router
-    /// selects it (SW-6130): the kernel keeps its scores and softmax in f32 internally, so the f32
-    /// upcast below — which exists for the materialized path's numerics — has nothing to add. `None`
-    /// (CPU, Metal, f32, a non-flash build, the toggle off, a training step) keeps that path.
+    /// selects a fused kernel (SW-6130): FlashAttention, or the opted-in INT8 QK kernel (SW-6131 /
+    /// SW-6132; f32 operands — Kolors' packed UNet — run at bf16 inside the shared dispatch). Each
+    /// keeps its scores and softmax in f32 internally, so the f32 upcast below — which exists for
+    /// the materialized path's numerics — has nothing to add. `None` (CPU, Metal, no fused kernel
+    /// compiled or eligible, the toggle off, a training step) keeps that path.
     fn fused_attention(
         &self,
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
     ) -> Result<Option<Tensor>> {
-        // Skip even the reshapes where the kernel cannot run.
-        if !candle_gen::fused_attention::FLASH_ATTN_COMPILED || !query.device().is_cuda() {
+        // Skip even the reshapes where no fused kernel can run (they are all CUDA kernels).
+        if !query.device().is_cuda() {
             return Ok(None);
         }
         let (batch_heads, query_len, dim) = query.dims3()?;
@@ -309,9 +319,9 @@ impl CrossAttention {
         let q = query.reshape((batch, self.heads, query_len, dim))?;
         let k = key.reshape((batch, self.heads, key_len, dim))?;
         let v = value.reshape((batch, self.heads, key_len, dim))?;
-        if candle_gen::fused_attention::route_attention_kernel(&q, &k, &v, None)
-            != candle_gen::AttentionKernel::Flash
-        {
+        if !takes_native_fused_path(candle_gen::fused_attention::route_attention_kernel(
+            &q, &k, &v, None,
+        )) {
             return Ok(None);
         }
         Ok(Some(
@@ -1510,5 +1520,80 @@ mod packed_tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::attention::packed_tests::spatial_transformer_packed_detect_and_forward");
+    }
+}
+
+/// The native-dtype fused route of the UNet attention (PR #1530 review): pure routing, no attention
+/// compute, so it runs in normal CI.
+#[cfg(test)]
+mod fused_route_tests {
+    use super::takes_native_fused_path;
+    use candle_core::DType;
+    use candle_gen::fused_attention::{
+        int8_eligibility, int8_operand_adapt, int8_route, sol_eligibility, sol_operand_adapt,
+        FlashGate, FlashOperand, FlashRefusal, Int8Device, SolConfig, SolRouteRefusal,
+    };
+    use candle_gen::AttentionKernel;
+
+    /// The gate a CUDA inference call passes (flash enabled, untracked, no training scope).
+    const OPEN: FlashGate = FlashGate {
+        materialized: false,
+        enabled: true,
+        grad_tracked: false,
+    };
+
+    /// An SDXL 1024² f16 UNet call on sm_120 with INT8 opted in: the self-attention (4096 tokens)
+    /// and the text cross-attention (77 tokens) of a 64-wide, 10-head block are both INT8-eligible,
+    /// and that route keeps the native-dtype shared-helper path instead of the f32-upcast fallback
+    /// (before the fix the call lost flash and ran the materialized path). Sol-Attn takes the
+    /// self-attention with its 64-wide heads zero-padded to 128, and Kolors' f32 packed UNet takes
+    /// INT8 at bf16.
+    #[test]
+    fn an_int8_route_keeps_the_native_dtype_shared_helper_path() {
+        static Q: [usize; 4] = [2, 10, 4096, 64];
+        static Q_ST: [usize; 4] = [10 * 4096 * 64, 4096 * 64, 64, 1];
+        static TEXT: [usize; 4] = [2, 10, 77, 64];
+        static TEXT_ST: [usize; 4] = [10 * 77 * 64, 77 * 64, 64, 1];
+        let op = |dtype, dims: &'static [usize; 4], strides: &'static [usize]| FlashOperand {
+            dtype,
+            dims,
+            strides,
+        };
+        let sm120 = Int8Device::Cuda(Some(120));
+        for dtype in [DType::F16, DType::BF16] {
+            let (q, text) = (op(dtype, &Q, &Q_ST), op(dtype, &TEXT, &TEXT_ST));
+            for (k, v) in [(q, q), (text, text)] {
+                let routed = int8_route(true, OPEN, || {
+                    int8_eligibility(true, sm120, true, q, k, v, false)
+                });
+                assert_eq!(routed, Some(Ok(())), "{dtype:?} {:?}", k.dims);
+            }
+            // Sol-Attn: the self-attention, its 64-wide heads zero-padded to 128; never the
+            // 77-token cross-attention.
+            let sol = SolConfig::top_k(0.25);
+            assert_eq!(
+                sol_eligibility(true, sm120, true, q, q, q, false, &sol),
+                Ok(())
+            );
+            assert_eq!(
+                sol_eligibility(true, sm120, true, q, text, text, false, &sol),
+                Err(SolRouteRefusal::CrossAttention)
+            );
+            assert_eq!(sol_operand_adapt(dtype, 64).pad_head_dim, Some(128));
+            assert!(int8_operand_adapt(dtype, 64).is_identity());
+        }
+        // Kolors' packed UNet runs this attention at f32: INT8 takes it at bf16.
+        let f32_q = op(DType::F32, &Q, &Q_ST);
+        assert_eq!(
+            int8_eligibility(true, sm120, true, f32_q, f32_q, f32_q, false),
+            Ok(())
+        );
+        assert!(int8_operand_adapt(DType::F32, 64).cast_f32);
+        assert!(takes_native_fused_path(AttentionKernel::Int8));
+        assert!(takes_native_fused_path(AttentionKernel::Sol));
+        assert!(takes_native_fused_path(AttentionKernel::Flash));
+        assert!(!takes_native_fused_path(AttentionKernel::Budgeted(
+            FlashRefusal::Disabled
+        )));
     }
 }

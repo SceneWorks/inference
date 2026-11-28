@@ -13,6 +13,7 @@ use candle_gen::block_window::BlockPlan;
 #[cfg(test)]
 use candle_gen::gen_core::attention_budget::AttentionBudget;
 use candle_gen::gen_core::attention_budget::AttentionPlan;
+use candle_gen::modulate::{adaln_chain_scale_only, adaln_scale_only, AdaLn, AdaLnChain};
 use candle_gen::quant::{AdaptLinear, PackedWeightSidecars};
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear, lora_linear_no_bias, LoraHost, LoraLinear};
@@ -20,9 +21,22 @@ use candle_gen::train::projection::FrozenProjectionPack;
 use candle_nn::{RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::preprocess::{prepare_inputs, PreparedInputs};
 use candle_transformers::models::z_image::transformer::{
-    apply_rotary_emb, create_coordinate_grid, patchify, unpatchify, Config, LayerNormNoParams,
-    RopeEmbedder, ADALN_EMBED_DIM, FREQUENCY_EMBEDDING_SIZE, MAX_PERIOD,
+    create_coordinate_grid, patchify, unpatchify, Config, RopeEmbedder, ADALN_EMBED_DIM,
+    FREQUENCY_EMBEDDING_SIZE, MAX_PERIOD,
 };
+
+/// Z-Image's DiT RoPE (candle-transformers' `z_image::apply_rotary_emb`): complex-interleaved pairs on
+/// `[B, S, H, D]`, half tables `[S, D/2]` already in the compute dtype, rotated in that dtype.
+pub(crate) const Z_IMAGE_ROPE: candle_gen::rope::RopeSpec =
+    candle_gen::rope::RopeSpec::interleaved(candle_gen::rope::RopeLayout::Bshd)
+        .with_math(candle_gen::rope::RopeMath::Native);
+
+/// Apply Z-Image's RoPE to a `[B, S, H, D]` q or k: the shared [`candle_gen::rope::apply_rope`] with
+/// [`Z_IMAGE_ROPE`] (SW-6129) — the fused strided kernel on CUDA, elsewhere the shared reference
+/// chain, op for op candle-transformers' `apply_rotary_emb` (`z_image_rope_route_tests`).
+fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    candle_gen::rope::apply_rope(x, cos, sin, &Z_IMAGE_ROPE)
+}
 
 /// Load one projection in a streamed block. Packed triples must resolve through the prepared
 /// device-format cache; dense tensors keep the exact historical `VarBuilder` path.
@@ -88,6 +102,21 @@ impl Execution {
         match self {
             Self::Differentiable => rms_diff(norm, input),
             Self::Inference => __model_proof_output!(norm.forward(input)),
+        }
+    }
+
+    /// `rms(norm, input) · (1 + scale)` (`scale` the raw modulation chunk). Inference on a
+    /// contiguous `input` (where `RmsNorm::forward` is candle's `ops::rms_norm`) is the shared
+    /// fused scale-only AdaLN (SW-6129, [`AdaLn::rms`] with the norm weight), bit-identical to that
+    /// norm then `broadcast_mul(scale + 1)`; training (`rms_diff`) and a non-contiguous input keep
+    /// the chain.
+    fn rms_scale(self, norm: &RmsNorm, input: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Inference if input.is_contiguous() => {
+                let spec = AdaLn::rms(norm.eps()).with_weight(norm.weight());
+                __model_proof_output!(adaln_scale_only(input, &spec, scale))
+            }
+            _ => self.rms(norm, input)?.broadcast_mul(&(scale + 1.0)?),
         }
     }
 
@@ -572,8 +601,19 @@ impl FeedForward {
     }
 }
 
+/// The final layer's param-free LayerNorm eps (candle-transformers' `LayerNormNoParams::new(1e-6)`).
+const FINAL_NORM_EPS: f64 = 1e-6;
+
+/// The final layer's `LayerNormNoParams(x) · (1 + scale)` — candle-transformers' param-free
+/// LayerNorm (f32 internal: `sum_keepdim / n` mean, centre, `sqr().sum_keepdim / n`, `+ eps`,
+/// `sqrt`, divide, cast back — the composable LayerNorm chain) then the scale-only modulation,
+/// as the shared fused AdaLN (SW-6129, [`AdaLnChain::layer`]): bit-identical to that chain,
+/// which it runs everywhere else (and for the trainer's gradient-tracked operands).
+fn final_norm_scale(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    adaln_chain_scale_only(x, &AdaLnChain::layer(FINAL_NORM_EPS), scale)
+}
+
 struct FinalLayer {
-    norm_final: LayerNormNoParams,
     linear: AdaptLinear,
     adaln_silu: AdaptLinear,
 }
@@ -585,23 +625,17 @@ impl FinalLayer {
         vb: VarBuilder,
         execution: Execution,
     ) -> Result<Self> {
-        let norm_final = LayerNormNoParams::new(1e-6);
         let linear = frozen_projection(hidden_size, out_channels, &vb, "linear", execution)?;
         let adaln_dim = hidden_size.min(ADALN_EMBED_DIM);
         // The stock builds this at `adaLN_modulation.1` (index `.0` is a param-free SiLU).
         let adaln_silu =
             frozen_projection(adaln_dim, hidden_size, &vb, "adaLN_modulation.1", execution)?;
-        Ok(Self {
-            norm_final,
-            linear,
-            adaln_silu,
-        })
+        Ok(Self { linear, adaln_silu })
     }
 
     fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
-        let scale = self.adaln_silu.forward(&c.silu()?)?;
-        let scale = (scale + 1.0)?.unsqueeze(1)?;
-        let x = self.norm_final.forward(x)?.broadcast_mul(&scale)?;
+        let scale = self.adaln_silu.forward(&c.silu()?)?.unsqueeze(1)?;
+        let x = final_norm_scale(x, &scale)?;
         self.linear.forward(&x)
     }
 
@@ -832,11 +866,9 @@ impl ZImageTransformerBlock {
 
             let gate_msa = gate_msa.tanh()?;
             let gate_mlp = gate_mlp.tanh()?;
-            let scale_msa = (scale_msa + 1.0)?;
-            let scale_mlp = (scale_mlp + 1.0)?;
-
-            let normed = self.execution.rms(&self.attention_norm1, x)?;
-            let scaled = normed.broadcast_mul(&scale_msa)?;
+            let scaled = self
+                .execution
+                .rms_scale(&self.attention_norm1, x, scale_msa)?;
             let attn_out = self.attention.forward_with_attention_plan_and_pag(
                 &scaled,
                 attn_mask,
@@ -848,8 +880,7 @@ impl ZImageTransformerBlock {
             let attn_out = self.execution.rms(&self.attention_norm2, &attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
-            let normed = self.execution.rms(&self.ffn_norm1, &x)?;
-            let scaled = normed.broadcast_mul(&scale_mlp)?;
+            let scaled = self.execution.rms_scale(&self.ffn_norm1, &x, scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.execution.rms(&self.ffn_norm2, &ffn_out)?;
             Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
@@ -3035,5 +3066,192 @@ mod key_padding_tests {
         println!("
 MODEL_INFERENCE_BODY_COMPLETED dit::key_padding_tests::cuda_trimmed_caption_block_matches_the_masked_block");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod z_image_rope_route_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_transformers::models::z_image::transformer::apply_rotary_emb as former;
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The real `RopeEmbedder` tables (Z-Image's axes 32/48/48, theta 256) in `dtype` for `s` tokens.
+    fn tables(s: usize, dtype: DType, dev: &Device) -> (Tensor, Tensor) {
+        let rope =
+            RopeEmbedder::new(256.0, vec![32, 48, 48], vec![1536, 512, 512], dev, dtype).unwrap();
+        let ids: Vec<u32> = (0..s as u32)
+            .flat_map(|i| [i % 7, i / 16, i % 16])
+            .collect();
+        let ids = Tensor::from_vec(ids, (s, 3), dev).unwrap();
+        rope.forward(&ids).unwrap()
+    }
+
+    /// SW-6129: the shared route is bit-identical to candle-transformers' `apply_rotary_emb` (the
+    /// former call) on CPU, f32 / bf16 / f16.
+    #[test]
+    fn shared_rope_matches_the_former_candle_transformers_apply() {
+        let dev = Device::Cpu;
+        let (s, h, d) = (40, 3, 128);
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let (cos, sin) = tables(s, dt, &dev);
+            let x = Tensor::randn(0f32, 1.0, (2, s, h, d), &dev).unwrap();
+            let x = x.to_dtype(dt).unwrap();
+            let got = apply_rotary_emb(&x, &cos, &sin).unwrap();
+            assert_eq!(bits(&got), bits(&former(&x, &cos, &sin).unwrap()), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: Z-Image's RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to candle-transformers' `apply_rotary_emb`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        // Z-Image 1024^2: 4096 image + 512 caption tokens, 30 heads x 128.
+        let (s, h, d) = (4096 + 512, 30, 128);
+        let (cos, sin) = tables(s, DType::BF16, &dev);
+        let x = Tensor::randn(0f32, 1.0, (1, s, h, d), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = apply_rotary_emb(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (1, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = apply_rotary_emb(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
+    }
+}
+
+/// SW-6129: the modulated block's scale-only sites and the final layer are the shared fused AdaLN.
+#[cfg(test)]
+mod adaln_route_tests {
+    use super::*;
+    use candle_transformers::models::z_image::transformer::LayerNormNoParams;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Z-Image width (3840): `x [2, 40, D]`, a `[2, 1, 4·D]` modulation (chunk views), a RmsNorm.
+    fn operands(dtype: DType, dev: &Device) -> (Tensor, Tensor, RmsNorm) {
+        let d = 3840;
+        let x = values(&[2, 40, d], 1, 3.0, 0.3, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let m = values(&[2, 1, 4 * d], 2, 0.5, 0.0, dev)
+            .to_dtype(dtype)
+            .unwrap();
+        let w = values(&[d], 3, 0.4, 1.0, dev).to_dtype(dtype).unwrap();
+        (x, m, RmsNorm::new(w, 1e-5))
+    }
+
+    /// Both sites equal their former chains: `norm.forward(x) · (chunk + 1)` and
+    /// `LayerNormNoParams(1e-6).forward(x) · (scale + 1)`.
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn fused_scale_only_sites_match_the_former_chains() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let (x, m, norm) = operands(dtype, &Device::Cpu);
+            let chunks = m.chunk(4, D::Minus1).unwrap();
+            let got = __model_proof_output!(Execution::Inference.rms_scale(&norm, &x, &chunks[0]))
+                .unwrap();
+            let want = norm
+                .forward(&x)
+                .unwrap()
+                .broadcast_mul(&(&chunks[0] + 1.0).unwrap())
+                .unwrap();
+            assert_eq!(bits(&got), bits(&want), "block {dtype:?}");
+            let got = final_norm_scale(&x, &chunks[1]).unwrap();
+            let want = LayerNormNoParams::new(1e-6)
+                .forward(&x)
+                .unwrap()
+                .broadcast_mul(&(&chunks[1] + 1.0).unwrap())
+                .unwrap();
+            assert_eq!(bits(&got), bits(&want), "final {dtype:?}");
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains");
+    }
+
+    /// CUDA bf16: both sites take the fused AdaLN and are bit-identical to the same calls with the
+    /// kernel switch off.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        let (x, m, norm) = operands(DType::BF16, &dev);
+        let chunks = m.chunk(4, D::Minus1).unwrap();
+        let run = || {
+            let a = __model_proof_output!(Execution::Inference.rms_scale(&norm, &x, &chunks[0]))
+                .unwrap();
+            let b = final_norm_scale(&x, &chunks[1]).unwrap();
+            Tensor::cat(&[a, b], 0).unwrap()
+        };
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let on = run();
+        let c_on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((c_on.fused, c_on.reference_total()), (CALLS, 0), "{c_on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let off = run();
+        let c_off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(c_off.reference_for("disabled"), CALLS, "{c_off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (a, b) = (bits(&on), bits(&off));
+        let mismatches = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+        println!(
+            "z-image adaln (bf16, D=3840): {mismatches} of {} differ; on {c_on}, off {c_off}",
+            a.len()
+        );
+        assert_eq!(mismatches, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

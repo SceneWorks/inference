@@ -13,13 +13,18 @@
 //! PiD captions are ≤300 tokens ≪ the 4096 sliding window, so every layer is plain full-causal — a
 //! single causal (+ optional padding) mask suffices.
 
-use candle_gen::candle_core::{DType, Device, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::quant::{linear_from_weights, QLinear};
 use candle_gen::{Result, Weights};
 
 use crate::nn::rms;
 use candle_gen::attention::repeat_kv;
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
+
+/// Gemma-2's RoPE: HF half-split pairs on `[B, H, L, D]`, full-width `[L, D]` tables, rotated in the
+/// activation dtype.
+const GEMMA2_ROPE: RopeSpec = RopeSpec::split_half(RopeLayout::Bhsd).with_math(RopeMath::Native);
 
 /// Gemma-2 decoder configuration.
 #[derive(Debug, Clone)]
@@ -194,22 +199,12 @@ fn rope_tables(head_dim: i32, seq: i32, theta: f32, device: &Device) -> Result<(
     ))
 }
 
-/// `rotate_half(x) = cat(-x[..,h:], x[..,:h])` for `[B,H,L,D]`.
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
-    let d = x.dim(D::Minus1)?;
-    let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-    let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-    Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
-}
-
 /// `x·cos + rotate_half(x)·sin` with `cos`/`sin` `[L, D]` broadcast over `[B,H,L,D]`.
+///
+/// SW-6129: the shared [`candle_gen::rope::apply_rope`] with [`GEMMA2_ROPE`] — fused on CUDA, elsewhere
+/// the shared reference chain, op for op this function's former body (`rope_route_tests`).
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (l, d) = cos.dims2()?;
-    let cos = cos.reshape((1, 1, l, d))?;
-    let sin = sin.reshape((1, 1, l, d))?;
-    let xc = x.broadcast_mul(&cos)?;
-    let xs = rotate_half(x)?.broadcast_mul(&sin)?;
-    Ok((xc + xs)?)
+    Ok(candle_gen::rope::apply_rope(x, cos, sin, &GEMMA2_ROPE)?)
 }
 
 struct Attention {
@@ -523,5 +518,85 @@ mod tests {
                 .to_string();
             assert!(error.contains("never both"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rope_route_tests {
+    use super::*;
+    use candle_gen::candle_core::D;
+
+    /// `rotate_half(x) = cat(-x[..,h:], x[..,:h])` for `[B,H,L,D]` (the former private helper, kept as
+    /// the oracle's).
+    fn rotate_half(x: &Tensor) -> Result<Tensor> {
+        let d = x.dim(D::Minus1)?;
+        let x1 = x.narrow(D::Minus1, 0, d / 2)?;
+        let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
+        Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
+    }
+
+    /// The pre-SW-6129 `apply_rope`, verbatim (the oracle).
+    fn former(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (l, d) = cos.dims2()?;
+        let cos = cos.reshape((1, 1, l, d))?;
+        let sin = sin.reshape((1, 1, l, d))?;
+        let xc = x.broadcast_mul(&cos)?;
+        let xs = rotate_half(x)?.broadcast_mul(&sin)?;
+        Ok((xc + xs)?)
+    }
+    fn bits(t: &Tensor) -> Vec<u32> {
+        let v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        v.to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// SW-6129: the shared route is bit-identical to the former private chain on CPU over the real
+    /// `rope_tables`, f32 / bf16 / f16.
+    #[test]
+    fn shared_rope_matches_the_former_private_chain() {
+        let dev = Device::Cpu;
+        let (cos, sin) = rope_tables(256, 23, 10000.0, &dev).unwrap();
+        let x32 = Tensor::randn(0f32, 1.0, (2, 4, 23, 256), &dev).unwrap();
+        for dt in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dt).unwrap();
+            let (c, sn) = (cos.to_dtype(dt).unwrap(), sin.to_dtype(dt).unwrap());
+            let got = apply_rope(&x, &c, &sn).unwrap();
+            assert_eq!(bits(&got), bits(&former(&x, &c, &sn).unwrap()), "{dt:?}");
+        }
+    }
+
+    /// CUDA bf16 smoke: the Gemma-2 RoPE route takes the fused kernel, bit-identical to the shared
+    /// reference (switch off) and to the former private chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_rope_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::rope::ROPE_PATH;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _rope = ROPE_PATH.guard(Some(true));
+        const CALLS: u64 = 1;
+        // Gemma-2 2B (Sana's text encoder): 8 heads x 256 over a 300-token prompt.
+        let (cos, sin) = rope_tables(256, 300, 10000.0, &dev).unwrap();
+        let (cos, sin) = (
+            cos.to_dtype(DType::BF16).unwrap(),
+            sin.to_dtype(DType::BF16).unwrap(),
+        );
+        let x = Tensor::randn(0f32, 1.0, (1, 8, 300, 256), &dev).unwrap();
+        let x = x.to_dtype(DType::BF16).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        let start = ROPE_PATH.thread_counts();
+        let on = apply_rope(&x, &cos, &sin).unwrap();
+        let c = ROPE_PATH.thread_counts().since(&start);
+        assert_eq!((c.fused, c.reference_total()), (CALLS, 0), "{c}");
+        ROPE_PATH.set_enabled(Some(false));
+        let off = apply_rope(&x, &cos, &sin).unwrap();
+        ROPE_PATH.set_enabled(Some(true));
+        assert_eq!(bits(&on), bits(&off));
+        assert_eq!(bits(&on), bits(&former(&x, &cos, &sin).unwrap()));
     }
 }

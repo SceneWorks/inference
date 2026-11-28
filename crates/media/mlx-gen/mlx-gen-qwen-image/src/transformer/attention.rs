@@ -6,7 +6,7 @@
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::ops::{concatenate_axis, split, split_sections};
+use mlx_rs::ops::{concatenate_axis, split_sections};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
@@ -286,22 +286,18 @@ pub(crate) fn pag_joint_segments(
 }
 
 /// Interleaved complex RoPE: pairs `(x_2i, x_2i+1)` rotated by `(cos_i, sin_i)`. `x`:
-/// `[B, seq, heads, head_dim]`; `cos`/`sin`: `[seq, head_dim/2]`.
+/// `[B, seq, heads, head_dim]`; `cos`/`sin`: `[seq, head_dim/2]`. The shared
+/// [`mlx_gen::qkv::apply_rope`] (SW-6140): the same core `rope_rotate` glue kernel (sc-27453) over
+/// the same `[1, seq, 1, head_dim/2]` table broadcast, no casts, as this crate's private copy.
 fn apply_rope_qwen(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let (b, seq, heads, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-    let x5 = x.reshape(&[b, seq, heads, half, 2])?;
-    let parts = split(&x5, 2, 4)?; // even/odd lanes, each [B,seq,heads,half,1]
-    let xr = parts[0].reshape(&[b, seq, heads, half])?;
-    let xi = parts[1].reshape(&[b, seq, heads, half])?;
-    let cos = cos.reshape(&[1, seq, 1, half])?;
-    let sin = sin.reshape(&[1, seq, 1, half])?;
-    // The complex rotation is core's fused `rope_rotate` glue (sc-27453): this crate's private copy
-    // added `real·sin + imag·cos` in the other order, which is bit-identical.
-    let (out_r, out_i) = mlx_gen::nn::rope_rotate(&xr, &xi, &cos, &sin)?;
-    let stacked = concatenate_axis(&[&out_r.expand_dims(4)?, &out_i.expand_dims(4)?], 4)?;
-    Ok(stacked.reshape(&[b, seq, heads, hd])?)
+    mlx_gen::qkv::apply_rope(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )
 }
 
 #[cfg(test)]

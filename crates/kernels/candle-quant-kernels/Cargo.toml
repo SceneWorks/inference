@@ -10,6 +10,11 @@ categories = ["science"]
 
 [dependencies]
 sceneworks-gen-core = { workspace = true }
+# The workspace's one process-switch implementation (`core_llm::switch::ProcessSwitch`), which the
+# media fused-kernel path seam (`fused_path`, SW-6126) builds its per-kernel switches on.
+core-llm = { workspace = true }
+# The one-per-kernel warning when a fused kernel cannot run on the device (`fused_path`).
+tracing = "0.1"
 # Same workspace candle pin as candle-gen / candle-llm, so the whole stack resolves ONE candle build.
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
@@ -21,7 +26,7 @@ half = { version = "2" }
 float8 = { version = "0.7", optional = true }
 
 [features]
-model-inference-proof = ["candle-core/model-inference-proof"]
+model-inference-proof = ["candle-core/model-inference-proof", "core-llm/model-inference-proof"]
 # CPU by default: the codec, capability floors and quant helpers are pure host/candle code.
 default = []
 # NVIDIA CUDA backend. All device code (the cuBLASLt handle, the nvrtc fused quantizer, the

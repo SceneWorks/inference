@@ -65,6 +65,9 @@ clause for every term assigned to a licence family.
   [known holes](licensing/sc-16665-checkpoint-licence-evidence.md#known-holes--the-rows-sc-16665-deliberately-did-not-write)
   section is the authoritative list of checkpoints that were left without a row rather than given a
   guessed one.
+- **[Third-party kernel sources (SW-F287 E10)](licensing/third-party-kernel-sources.md)** — the
+  manifest of nvrtc / Metal kernel sources ported from other projects (comfy-kitchen, thu-ml
+  SageAttention, ...), with upstream revision, license and in-tree attribution.
 
 ## Native H3 ConvRot INT8 checkpoints (sc-26683)
 
@@ -127,10 +130,14 @@ typecheck and device execution remain distinct evidence. SceneWorks catalog
 admission and its consumer pin are paired changes, not implied by this inference
 implementation. Asymmetric W4A8 remains a separate slice; table-driven AdaLN is below.
 
-The manual lane's broad CUDA package-test step sets `IRIS_DIST_SHARE_DEVICE=1`:
-Iris' real multi-process fixtures explicitly share the lane's one visible card,
-rather than requesting absent `cuda:1`/`cuda:2`/`cuda:3` devices and failing before
-rendezvous. Their separate missing-device test still exercises both the explicit
+Iris' real multi-process fixtures (`candle-gen-iris` `train_distributed`) opt
+into `dist.world.share_device` themselves whenever the process sees fewer CUDA
+devices than local ranks (every single-GPU runner, including the exhaustive
+`model-test-suites` CUDA lane), so they share the one visible card rather than
+requesting absent `cuda:1`/`cuda:2`/`cuda:3` devices and failing before
+rendezvous; with enough cards each rank keeps its own. The manual lane's broad
+CUDA package-test step also sets `IRIS_DIST_SHARE_DEVICE=1`, which forces
+sharing. Their separate missing-device test still exercises both the explicit
 refusal and opt-in-sharing paths. This does not skip scenarios or relax numeric
 assertions.
 

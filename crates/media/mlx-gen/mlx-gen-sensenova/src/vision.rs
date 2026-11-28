@@ -11,7 +11,7 @@
 //! equivalent), while `dense_embedding` is a genuine strided conv. The 2D RoPE here is the
 //! **interleaved** (`x[0::2]`/`x[1::2]`) variant — distinct from the backbone's half-split RoPE.
 
-use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, matmul, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv2d, gelu_exact};
@@ -140,14 +140,19 @@ fn rope_1d_interleaved(x: &Array, positions: &[i32], theta: f32) -> Result<Array
     let pos = Array::from_slice(&pos, &[n, 1]);
     let inv = Array::from_slice(&inv_freq, &[1, half]);
     let freqs = matmul(&pos, &inv)?; // [N, half]
-    let cos = freqs.cos()?.reshape(&[n, half, 1])?;
-    let sin = freqs.sin()?.reshape(&[n, half, 1])?;
+    let (cos, sin) = (freqs.cos()?, freqs.sin()?);
 
-    let xr = x.reshape(&[n, half, 2])?;
-    let parts = split(&xr, 2, 2)?; // x1 = [...,0], x2 = [...,1], each [N, half, 1]
-    let (x1, x2) = (&parts[0], &parts[1]);
-    let rot1 = subtract(&multiply(x1, &cos)?, &multiply(x2, &sin)?)?;
-    let rot2 = add(&multiply(x1, &sin)?, &multiply(x2, &cos)?)?;
-    let out = concatenate_axis(&[&rot1, &rot2], 2)?; // [N, half, 2] interleaved
+    // The rotation is the shared eager cos/sin route (SW-6140): `x` viewed as one token-major
+    // stream `[1, N, 1, part]`, adjacent pairs rotated by `(cos, sin)[N, half]` — the same
+    // `x1·cos − x2·sin`, `x2·cos + x1·sin` chain (IEEE sums commute) as this crate's private copy,
+    // no casts. Positions are explicit per patch, so there is no fused `fast::rope` route.
+    let out = mlx_gen::qkv::apply_rope_eager(
+        &x.reshape(&[1, n, 1, part])?,
+        mlx_gen::qkv::RopeTables::new(&cos, &sin),
+        mlx_gen::qkv::RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )?;
     Ok(out.reshape(&[n, part])?)
 }

@@ -144,8 +144,9 @@ pub fn sdpa_planned(
         return differentiable_sdpa(q, k, v, scale, plan);
     }
     let force_materialized = force_materialized_attention();
-    // The shared router's decision (toggle, autograd, eligibility). The flash branch below calls
-    // the shared helper, which re-derives the same decision and counts the call.
+    // The shared router's decision (toggle, autograd, eligibility, the INT8 / Sol-Attn opt-ins).
+    // The fused branch below (flash, INT8 or Sol-Attn) calls the shared helper, which re-derives
+    // the same decision and counts the call.
     let kernel = if force_materialized {
         candle_gen::AttentionKernel::Budgeted(candle_gen::FlashRefusal::Materialized)
     } else {
@@ -156,7 +157,7 @@ pub fn sdpa_planned(
         route = if materialized {
             "materialized-query-chunked"
         } else {
-            "flash"
+            kernel.name()
         },
         forced = force_materialized,
         ?kernel,

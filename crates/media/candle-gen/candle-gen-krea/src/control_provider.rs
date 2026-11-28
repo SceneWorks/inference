@@ -725,6 +725,15 @@ pub(crate) fn load_control_native_dit(
                 .logical_plan()
                 .is_some_and(|plan| plan.has_encoded_weights());
             let native_nvfp4 = weights.is_native_nvfp4();
+            if weights.is_native_w4a8() {
+                // SW-6135: the control trunk is the composable `KreaTrainDit`, whose projections
+                // are dense/LoRA leaves; a packed W4A8 projection has no dense form to give it.
+                return Err(CandleError::Unsupported(
+                    "Krea pose control does not run on the W4A8 tier; select the bf16, q8, q4 or \
+                     INT8-ConvRot tier for control"
+                        .into(),
+                ));
+            }
             if native_nvfp4 && matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
                 return Err(CandleError::Msg(
                     "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),

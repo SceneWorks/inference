@@ -29,8 +29,9 @@ use candle_gen::gen_core::checkpoint_codec::{
     LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, MXFP8_CODEC, NVFP4_CODEC,
 };
 use candle_gen::gen_core::checkpoint_facts::CheckpointWeightFacts;
+use candle_gen::gen_core::w4a8_int8::W4A8Delegation;
 use candle_gen::logical_weights::{
-    plan_logical_weights, CandleCodecResidency, LogicalTensor, LogicalWeightReader,
+    plan_logical_weights_delegating_w4a8, CandleCodecResidency, LogicalTensor, LogicalWeightReader,
 };
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
@@ -41,8 +42,8 @@ use candle_gen::quant::stored_ggml::{
     qtensor_from_stored, stored_block_geometry, validate_stored, StoredGgmlRefusal,
 };
 use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Fallback,
-    Nvfp4Linear, Nvfp4Regime, PackedConfig, PackedWeightSidecars,
+    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, AdaptLinear, Int8Context,
+    Nvfp4Fallback, Nvfp4Linear, Nvfp4Regime, PackedConfig, PackedWeightSidecars,
 };
 
 use crate::native_mapping::{DeclaredLogicalShapes, KreaNativeToDiffusersMapping};
@@ -114,6 +115,66 @@ pub struct Weights {
     /// The source codec plan for encoded directory shards and component files, or the family-mapped
     /// plan for a native single-file DiT. Plain snapshots can use the mmap directly.
     logical: Option<LogicalWeightReader>,
+    /// A native single file's **W4A8** projections (SW-6135), split out of [`logical`](Self::logical)
+    /// before planning ([`plan_logical_weights_delegating_w4a8`]) and served whole by
+    /// `W4A8Linear` through [`linear_detect`]. `None` for every source without one.
+    w4a8: Option<NativeW4A8>,
+}
+
+/// The delegated W4A8 half of a native file: the validated projections and the shared per-model
+/// resources (one cuBLASLt INT8 handle for the whole trunk, never one per projection).
+struct NativeW4A8 {
+    delegation: W4A8Delegation,
+    resources: std::sync::Arc<candle_gen::weights::ProjectionResources>,
+}
+
+/// The raw-storage view `W4A8Linear::from_weights` reads one delegated projection through: physical
+/// native keys, `I8` codes carried as their exact bytes in `U8` (Candle has no signed-byte dtype),
+/// every other operand at its stored dtype. The same contract as
+/// `candle_gen::Weights::from_files_native_int8`, over Krea's lazy mmap instead of an eager map.
+struct W4A8Operands<'a> {
+    w: &'a Weights,
+    resources: &'a candle_gen::weights::ProjectionResources,
+}
+
+impl candle_gen::CandleWeightSource for W4A8Operands<'_> {
+    fn contains(&self, key: &str) -> bool {
+        self.w.st.get(key).is_ok()
+    }
+
+    fn require(&self, key: &str) -> candle_gen::Result<Tensor> {
+        let view = self.w.st.get(key)?;
+        if view.dtype() == ::safetensors::Dtype::I8 {
+            Ok(Tensor::from_raw_buffer(
+                view.data(),
+                DType::U8,
+                view.shape(),
+                &self.w.device,
+            )?)
+        } else {
+            Ok(self.w.st.load(key, &self.w.device)?)
+        }
+    }
+
+    fn native_linear(&self, _base: &str, _bias: bool) -> candle_gen::Result<Option<Linear>> {
+        Ok(None)
+    }
+
+    fn projection_resources(&self) -> &candle_gen::weights::ProjectionResources {
+        self.resources
+    }
+
+    fn host_packed_target(&self) -> Option<&Device> {
+        None
+    }
+
+    fn int8_context(&self, device: &Device) -> candle_gen::Result<Int8Context> {
+        Ok(self.resources.int8_context(device)?)
+    }
+
+    fn convrot_rotation(&self, group: usize, device: &Device) -> candle_gen::Result<Tensor> {
+        Ok(self.resources.convrot_rotation(group, device)?)
+    }
 }
 
 impl Weights {
@@ -202,6 +263,7 @@ impl Weights {
             plain_int8: false,
             native_nvfp4: false,
             logical,
+            w4a8: None,
         })
     }
 
@@ -230,6 +292,7 @@ impl Weights {
             plain_int8: false,
             native_nvfp4: false,
             logical,
+            w4a8: None,
         })
     }
 
@@ -362,15 +425,34 @@ impl Weights {
         let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
         let native_prefix = detect_native_prefix(&st);
         let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
-        let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
-            .map_err(|error| Error::Msg(error.to_string()))?;
+        // SW-6135: W4A8 projections are delegated out of the plan before it compiles (the codec
+        // registry has no W4A8 row by design, SW-6134) and served by `W4A8Linear`. Every other
+        // tensor plans exactly as in a file without them.
+        let (logical_plan, delegation) =
+            plan_logical_weights_delegating_w4a8(pinned_source.loader_path(), &mapping, &residency)
+                .map_err(|error| Error::Msg(error.to_string()))?;
+        // A delegated projection must still be an architecture tensor: the plan's mapping refuses a
+        // foreign key, and the delegated keys never reach it, so check them against it here.
+        for base in delegation.projections.keys() {
+            let weight = format!("{base}.weight");
+            if candle_gen::gen_core::checkpoint_codec::LogicalKeyMapping::logical_key(
+                &mapping, &weight,
+            )
+            .is_none()
+            {
+                return Err(Error::Msg(format!(
+                    "krea native W4A8: `{weight}` is not a Krea DiT projection"
+                )));
+            }
+        }
         // Only dense masters need CPU staging for an explicitly requested GGML conversion.
         // Codec-declared checkpoints retain their source representation on the compute device.
-        let device = if stage_dense_on_cpu && !logical_plan.has_encoded_weights() {
-            &Device::Cpu
-        } else {
-            device
-        };
+        let device =
+            if stage_dense_on_cpu && !logical_plan.has_encoded_weights() && delegation.is_empty() {
+                &Device::Cpu
+            } else {
+                device
+            };
         let plain_int8 = logical_plan.tensors.iter().any(|t| {
             t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
         });
@@ -396,19 +478,29 @@ impl Weights {
                 "krea native checkpoint mixes plain int8 and NVFP4 projection formats".into(),
             ));
         }
+        if native_nvfp4 && !delegation.is_empty() {
+            return Err(Error::Msg(
+                "krea native checkpoint mixes NVFP4 and W4A8 projection formats".into(),
+            ));
+        }
         // The shared reader over the same pinned bytes: opening it re-verifies the on-disk tensor
         // surface against the plan, so source drift between planning and reading refuses here —
         // before any generator construction begins.
         // The capability the facts are validated against is rendered from the *same* residency
         // policy that priced the plan (sc-21484), so a forced-packed test route and a real
         // `sm_120` probe stay consistent, and a dense-only host cannot produce a native row.
-        let logical = LogicalWeightReader::open_with_capability(
+        let logical = LogicalWeightReader::open_with_capability_delegated(
             pinned_source.loader_path(),
             logical_plan,
             device,
             residency.native_execution_capability(),
+            &delegation.keys,
         )
         .map_err(|error| Error::Msg(error.to_string()))?;
+        let w4a8 = (!delegation.is_empty()).then(|| NativeW4A8 {
+            delegation,
+            resources: Default::default(),
+        });
         let result = Self {
             st: st.into(),
             pinned_source: Some(pinned_source.clone()),
@@ -423,6 +515,7 @@ impl Weights {
             plain_int8,
             native_nvfp4,
             logical: Some(logical),
+            w4a8,
         };
         pinned_source
             .ensure_unchanged()
@@ -591,7 +684,22 @@ impl Weights {
     /// from a run that executed it as packed W4A4 or as dense BF16. `Ok(None)` when the source has
     /// no encoded rows or family plan; `Err` when the pinned file changed under the load,
     /// so facts are never reported about bytes that are gone.
+    ///
+    /// # A native W4A8 file reports `Ok(None)` (SW-6135)
+    ///
+    /// Its W4A8 projections are delegated out of the codec plan (the registry has no W4A8 row by
+    /// design, SW-6134) and materialize through `W4A8Linear`, never through the reader. The
+    /// reader's facts would therefore describe only the undelegated remainder — a source inventory
+    /// without the packed projections and a resident-byte total without any W4A8 operand — while
+    /// the source binding ties that partial inventory to the *whole* file. The facts contract's
+    /// inventory is plan-derived per codec row and has no truthful place for a delegated half, so
+    /// this source shape answers `None`: the same "this source shape does not answer these
+    /// questions" the MLX q4/q8 packed tiers (whose projections are likewise served outside any
+    /// plan) report, never a misleading partial set.
     pub fn checkpoint_weight_facts(&self) -> Result<Option<CheckpointWeightFacts>> {
+        if self.w4a8.is_some() {
+            return Ok(None);
+        }
         let Some(logical) = self.logical.as_ref() else {
             return Ok(None);
         };
@@ -609,6 +717,9 @@ impl Weights {
 
     /// Reuse the floor probe's cuBLASLt handle in the checkpoint reader.
     pub fn with_int8_context(mut self, context: Int8Context) -> Self {
+        if let Some(w4a8) = self.w4a8.as_ref() {
+            w4a8.resources.set_int8_context(context.clone());
+        }
         if let Some(reader) = self.logical.as_mut() {
             reader.set_int8_context(context);
         }
@@ -674,6 +785,78 @@ impl Weights {
 
     pub fn is_native_nvfp4(&self) -> bool {
         self.native_nvfp4
+    }
+
+    /// Whether this native checkpoint carries packed **W4A8** projections (SW-6135), the native
+    /// W4A8 tier. Its delegated projections construct through `W4A8Linear` only.
+    pub fn is_native_w4a8(&self) -> bool {
+        self.w4a8.is_some()
+    }
+
+    /// The physical keys the delegated W4A8 projections own (descriptor + operands), empty for a
+    /// source without them. The native key-surface validation adds these to the plan's own surface.
+    pub fn w4a8_delegated_keys(&self) -> impl Iterator<Item = &str> {
+        self.w4a8
+            .iter()
+            .flat_map(|w| w.delegation.keys.iter().map(String::as_str))
+    }
+
+    /// The W4A8 projections' resident bytes (packed codes plus companions; no dense shadow).
+    pub fn w4a8_resident_bytes(&self) -> u64 {
+        self.w4a8
+            .as_ref()
+            .map_or(0, |w| w.delegation.resident_bytes())
+    }
+
+    /// The **native** physical base when the diffusers `weight_key` (`{base}.weight`) names a
+    /// delegated W4A8 projection.
+    fn w4a8_base(&self, weight_key: &str) -> Option<String> {
+        let w4a8 = self.w4a8.as_ref()?;
+        let resolved = self.resolve(weight_key);
+        let base = resolved.strip_suffix(".weight")?;
+        w4a8.delegation
+            .projections
+            .contains_key(base)
+            .then(|| base.to_owned())
+    }
+
+    /// Refuse a dense read of a delegated W4A8 weight: its stored `I8 [out, in/2]` grid is packed
+    /// int4 codebook codes in the rotated basis, so any float cast would be silently wrong weights.
+    fn refuse_w4a8_dense_read(&self, name: &str) -> Result<()> {
+        if self.w4a8_base(name).is_some() {
+            return Err(Error::Msg(format!(
+                "krea: `{name}` is a packed W4A8 projection; it constructs through `linear_detect` \
+                 (`W4A8Linear`) and has no dense form to read, fold a diff-patch into, or requantize"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build one delegated W4A8 projection (`native_base` is the physical base) on this weight
+    /// set's device, under the retained file pin, with the trunk's shared INT8 handle.
+    fn w4a8_projection(&self, native_base: &str, bias: bool) -> Result<AdaptLinear> {
+        let w4a8 = self
+            .w4a8
+            .as_ref()
+            .expect("w4a8_base resolved, so the delegation is present");
+        let operands = W4A8Operands {
+            w: self,
+            resources: &w4a8.resources,
+        };
+        let linear = self.read_source_unchanged(|| {
+            candle_gen::quant::W4A8Linear::from_weights(&operands, native_base, bias).map_err(
+                |error| match error {
+                    candle_gen::CandleError::Candle(inner) => inner,
+                    other => Error::Msg(other.to_string()),
+                },
+            )
+        })?;
+        let linear = linear.ok_or_else(|| {
+            Error::Msg(format!(
+                "krea native W4A8: `{native_base}` was delegated but carries no W4A8 descriptor"
+            ))
+        })?;
+        Ok(AdaptLinear::from_w4a8(linear))
     }
 
     /// Whether this checkpoint is **native-mmdit-keyed** — its tensors are stored under the reference
@@ -758,6 +941,7 @@ impl Weights {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
         }
+        self.refuse_w4a8_dense_read(name)?;
         if !self.native_keys {
             if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
                 return self
@@ -819,6 +1003,7 @@ impl Weights {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(DType::F32);
         }
+        self.refuse_w4a8_dense_read(name)?;
         if !self.native_keys {
             if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
                 return self
@@ -937,6 +1122,12 @@ impl Weights {
                 return Some(tensor.shape.clone());
             }
         }
+        // A delegated W4A8 weight stores `[out, in/2]` packed codes; its logical shape is the
+        // descriptor's validated geometry.
+        if let Some(base) = self.w4a8_base(name) {
+            let geometry = self.w4a8.as_ref()?.delegation.geometry(&base)?;
+            return Some(vec![geometry.out_features, geometry.in_features]);
+        }
         let view = self.st.get(&self.resolve(name)).ok()?;
         Some(view.shape().to_vec())
     }
@@ -1050,6 +1241,7 @@ impl Weights {
     /// The resulting merged weight is installed in the overlay, so [`linear_detect`] then loads it
     /// dense (the packed base stays packed for untargeted projections).
     pub(crate) fn get_cpu_merge_base(&self, weight_key: &str) -> Result<Tensor> {
+        self.refuse_w4a8_dense_read(weight_key)?;
         // Resolve the diffusers key to its on-disk name — identity except on a native-keyed INT8-ConvRot
         // checkpoint (sc-9300), where a dense baseline weight a diff-patch folds into (e.g.
         // `text_fusion.projector` → `txtfusion.projector.weight`) would otherwise 404. On the MLX-packed
@@ -1091,6 +1283,7 @@ impl Weights {
     /// [`get_cpu_merge_base`](Self::get_cpu_merge_base) already uses, minus the CPU pin (spike:
     /// packed-base pose-control lane).
     pub(crate) fn get_dense_or_dequant(&self, weight_key: &str) -> Result<Tensor> {
+        self.refuse_w4a8_dense_read(weight_key)?;
         // An adapter-merged dense weight in the overlay wins (mirrors `get`'s overlay-first read).
         if self.overlay.contains_key(weight_key) {
             return self.get(weight_key);
@@ -1350,6 +1543,11 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     // (1) An adapter-merged dense weight in the overlay wins — load it dense (adapter compose).
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
+    }
+    // A native W4A8 tier's delegated projection (SW-6135): packed int4 codebook weight + int8
+    // activation through `W4A8Linear`. LoRA/LoKr ride on it as additive residuals.
+    if let Some(native_base) = w.w4a8_base(&weight_key) {
+        return Ok(QLinear::Adapt(w.w4a8_projection(&native_base, bias)?));
     }
     if w.logical
         .as_ref()
@@ -1676,6 +1874,157 @@ mod tests {
 
     /// The Krea MLX tier's group size (64) — the one carried from `config.json`.
     const G: usize = 64;
+
+    /// SW-6135: a native file carrying a real W4A8 projection plans with that projection delegated
+    /// out of the codec plan, accounts for its five tensors in the key surface, reports the
+    /// descriptor's logical shape, and refuses every dense read of the packed weight by name.
+    #[test]
+    fn native_w4a8_projection_is_delegated_out_of_the_plan() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, path, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let w = Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        assert!(w.is_native_w4a8());
+        assert!(!w.is_native_nvfp4() && !w.is_plain_int8() && !w.is_convrot());
+        let delegated: Vec<&str> = w.w4a8_delegated_keys().collect();
+        assert_eq!(delegated.len(), 5, "{delegated:?}");
+        assert!(delegated
+            .iter()
+            .all(|k| k.starts_with("model.diffusion_model.blocks.0.attn.wk.")));
+        let plan = w.logical_plan().expect("native files compile a plan");
+        assert!(
+            plan.all_physical_keys().all(|k| !delegated.contains(&k)),
+            "no delegated tensor reaches the codec plan"
+        );
+        let key = "transformer_blocks.0.attn.to_k.weight";
+        assert_eq!(
+            w.shape(key),
+            Some(vec![16, 256]),
+            "the logical, not the stored, shape"
+        );
+        assert!(w.contains(key));
+        for err in [
+            w.get(key).unwrap_err(),
+            w.get_f32(key).unwrap_err(),
+            w.get_cpu_merge_base(key).unwrap_err(),
+            w.get_dense_or_dequant(key).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("packed W4A8 projection"), "{err}");
+        }
+        assert!(w.w4a8_resident_bytes() > 0);
+        // The undelegated rest of the trunk still reads densely.
+        w.get("transformer_blocks.0.attn.to_q.weight")?;
+        crate::convert::validate_native_key_surface_for_test(&w, &cfg)
+    }
+
+    /// Without CUDA there is no W4A8 forward at all: constructing the projection refuses (no
+    /// floating fallback), rather than reading the packed codes as a dense weight.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn native_w4a8_projection_refuses_without_cuda() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, path, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let w = Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .unwrap();
+        let err = linear_detect(&w, "transformer_blocks.0.attn.to_k", false)
+            .err()
+            .expect("W4A8 has no CPU forward");
+        assert!(err.to_string().contains("CUDA"), "{err}");
+    }
+
+    /// SW-6135 review (PR #1526): a native W4A8 file publishes **no** checkpoint facts rather than
+    /// a partial inventory. Its delegated projections never reach the codec plan or the reader's
+    /// accounting, so the reader's own facts would list only the dense remainder and measure no
+    /// W4A8 operand — yet bind that partial set to the whole file. The contract cannot carry a
+    /// delegated half truthfully, so the accessor answers `None`, exactly as the MLX q4/q8 packed
+    /// tiers (projections likewise served outside any plan) do; the generator's sink therefore
+    /// stays empty. Pure metadata/accounting over tiny synthetic safetensors — no model compute.
+    ///
+    /// Mutation: drop the `w4a8.is_some()` guard in `checkpoint_weight_facts` and the `None`
+    /// assertion goes red (the reader's partial facts — asserted present below — leak through).
+    #[test]
+    fn native_w4a8_file_reports_no_checkpoint_facts_instead_of_a_partial_inventory() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Control: the same tiny native trunk without the W4A8 projection does publish facts.
+        let (_dense_root, dense_path, dense_cfg) =
+            crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let dense = Weights::from_native_file_for(
+            &dense_path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&dense_cfg),
+        )?;
+        dense.get("transformer_blocks.0.attn.to_q.weight")?;
+        assert!(dense.checkpoint_weight_facts()?.is_some());
+
+        let (_root, path, cfg) = crate::testfix::tiny_native_w4a8_fixture(&tmp);
+        let w = Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        assert!(w.is_native_w4a8());
+        w.get("transformer_blocks.0.attn.to_q.weight")?;
+        // The defect being guarded: the reader alone would hand out facts whose inventory omits
+        // every delegated tensor and whose resident total excludes every W4A8 operand.
+        let partial = w
+            .logical
+            .as_ref()
+            .expect("a native file has a reader")
+            .checkpoint_weight_facts()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        let delegated: Vec<&str> = w.w4a8_delegated_keys().collect();
+        assert_eq!(delegated.len(), 5);
+        let plan = w.logical_plan().expect("a native file has a plan");
+        assert!(
+            plan.all_physical_keys()
+                .all(|key| !delegated.contains(&key)),
+            "the reader's inventory cannot see the delegated projection"
+        );
+        assert_eq!(
+            partial.source().tensor_count,
+            plan.tensor_count(),
+            "the reader's inventory is exactly the undelegated plan"
+        );
+        assert!(
+            w.w4a8_resident_bytes() > 0,
+            "the delegated half holds real resident bytes the reader never measured"
+        );
+        assert!(
+            w.checkpoint_weight_facts()?.is_none(),
+            "a W4A8 file must not publish a partial inventory bound to the whole file"
+        );
+        let sink = candle_gen::gen_core::CheckpointFactsSink::new();
+        sink.publish_optional(w.checkpoint_weight_facts()?);
+        assert!(
+            sink.is_empty(),
+            "the generator's facts stay None for a W4A8 import"
+        );
+
+        // Consistency: an MLX q4 packed-tier component also answers None (no plan at all).
+        let (wq, s, b, _) = q4_packed(128, 256);
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("attn.to_out.0.weight".into(), wq);
+        map.insert("attn.to_out.0.scales".into(), s);
+        map.insert("attn.to_out.0.biases".into(), b);
+        let dir = tmp.path().join("q4_component");
+        write_component(&dir, map, true);
+        let packed = Weights::from_dir(&dir, &Device::Cpu, DType::F32)?;
+        assert!(packed.packed().is_some());
+        assert!(packed.checkpoint_weight_facts()?.is_none());
+        Ok(())
+    }
 
     /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
     #[test]

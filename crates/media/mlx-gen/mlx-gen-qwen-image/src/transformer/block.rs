@@ -20,14 +20,10 @@ const LN_EPS: f32 = 1e-6;
 const SITE_MODULATE: &str = "qwen_image::block::modulate";
 const SITE_GATED: &str = "qwen_image::block::gated";
 
-fn modulate_impl(
-    (x, scale, shift): (&Array, &Array, &Array),
-) -> std::result::Result<Array, Exception> {
-    add(
-        &multiply(x, &add(scale, Array::from_slice(&[1.0f32], &[1]))?)?,
-        shift,
-    )
-}
+/// The block's adaLN affine body: the shared strong-f32-`1` [`mlx_gen::nn::modulate_f32_one_impl`]
+/// (SW-6140) — the same three-op graph (an f32 `[1]` literal) this crate's private copy traced. The
+/// retained handle, site name and dispatch below stay this crate's own.
+use mlx_gen::nn::modulate_f32_one_impl as modulate_impl;
 
 fn gated_impl((x, gate, y): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
     add(x, &multiply(gate, y)?)
@@ -310,7 +306,6 @@ fn modulate_maybe_indexed(
         return modulate(x, mod_params);
     };
     let p = split(mod_params, 3, 1)?; // shift, scale, gate — each [2B, dim]
-    let one = Array::from_slice(&[1.0f32], &[1]);
     let index_expanded = index.expand_dims(2)?; // [B, seq, 1]
                                                 // `which(cond, a, b)` selects `a` where cond is non-zero, `b` where zero — so with the 0/1 index
                                                 // as cond, the `t 0` (cond) half goes to `a` and the real-`t` (noise) half to `b`. Equivalent to
@@ -324,7 +319,9 @@ fn modulate_maybe_indexed(
     let shift = pick(&p[0])?;
     let scale = pick(&p[1])?;
     let gate = pick(&p[2])?;
-    let out = add(&multiply(x, &add(&scale, &one)?)?, &shift)?;
+    // The per-token affine is the shared eager `nn::modulate_eager(.., one_matches_scale = false)`
+    // (SW-6140): the same strong-f32-`1` three-op chain as this crate's private copy.
+    let out = mlx_gen::nn::modulate_eager(x, &scale, &shift, false)?;
     Ok((out, gate))
 }
 

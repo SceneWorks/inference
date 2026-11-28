@@ -37,8 +37,23 @@
 //!   from a load-time device table of expert addresses — GGML (candle's own decode MMVQ, every
 //!   type it serves), dense, Q8_0-dequant and NVFP4 (the decode GEMV's core) banks.
 //!
+//! - [`fused_path`] — the media fused-kernel path seam (SW-6126): a per-kernel switch under the
+//!   media-wide `CANDLE_MEDIA_FUSED_KERNELS`, and per-kernel fused-vs-reference counters with typed
+//!   reasons, shared by every Candle media / audio fused kernel (the LLM decode leaves keep
+//!   `candle_layers::fused`).
+//! - [`act_quant`] — the fused per-tensor fp8 / int8 activation quantizer (SW-6126): amax → scale
+//!   → cast on the device, byte-identical to the op chain it replaces, scale kept on the device.
+//! - [`adaln`] — the fused AdaLN / RMS-AdaLN modulation (SW-6127): `norm(x) · (1 + scale) + shift`
+//!   in one launch, bit-identical to the candle norm + modulate chain (public as
+//!   `candle_gen::modulate`).
+//! - [`w4a8_gemm`] — the fused W4A8 GEMM (SW-6134): packed int4 weight codes decoded in shared
+//!   memory and multiplied on the `sm_80+` int8 tensor cores with the W4A8 epilogue in the same
+//!   launch, bit-identical to the dequant-tile + cuBLASLt IGEMM reference, with a typed refusal.
+//!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
+//! - [`vae_norm_silu_pad`] — the fused video-VAE norm + SiLU + temporal pad (SW-6133): Wan's
+//!   channel-L2 / LTX's pixel-RMS norm and SiLU written straight into the padded causal-conv input.
 //! - [`yue2_stable_conv`] — YuE2 VAE BF16 convolution leaves with fixed-order FP32 accumulation
 //!   and BF16 operands/output across full and tiled decoder shapes.
 //!
@@ -54,6 +69,9 @@ const _: fn() = || {
         __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
 };
 
+pub mod act_quant;
+pub mod adaln;
+pub mod adaln_chain;
 pub mod convrot;
 pub mod convrot_int8;
 pub mod cublaslt;
@@ -64,8 +82,10 @@ pub mod flux3_quant;
 #[cfg(feature = "cuda")]
 pub mod fp8_linear;
 pub mod fused_decode;
+pub mod fused_path;
 pub mod gated_delta;
 pub mod gdn_prep;
+pub mod media_rope;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -74,15 +94,24 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
+pub mod sage_attention;
 pub mod sm120_gate;
+pub mod sol_attention;
 pub mod training_attention;
+pub mod vae_norm_silu_pad;
 pub mod veda_int8;
 pub mod veda_score;
+pub mod w4a8_gemm;
 pub mod yue2_stable_conv;
 
+pub use act_quant::{
+    check_act_quant, ActQuantPlan, ActQuantRefusal, DeviceQuantized, Fp8ScaleRule, Int8Output,
+    ACT_QUANT_FP8_PATH, ACT_QUANT_INT8_PATH, ACT_QUANT_SRC,
+};
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
-    quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
+    quantize_activation_fp8_reference, quantize_activation_int8,
+    quantize_activation_int8_reference, quantize_weight_fp8, quantize_weight_int8,
     quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
     F8E4M3_MAX, FP8_COMPUTE_CAP_FLOOR, I8_MAX, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_K_ALIGN,
     NVFP4_N_ALIGN,
@@ -99,11 +128,13 @@ pub use fused_decode::{
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
 };
 pub use gated_delta::{
-    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing,
-    GatedDeltaState, GATED_DELTA_MAX_KEY_DIM, GATED_DELTA_SRC,
+    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step,
+    gated_delta_unavailable_label, GatedDeltaRing, GatedDeltaState, GATED_DELTA_MAX_KEY_DIM,
+    GATED_DELTA_SRC,
 };
 pub use gdn_prep::{
-    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_qkv, gdn_qkv_serves_key_dim, GDN_PREP_SRC,
+    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_prep_unavailable_label, gdn_qkv,
+    gdn_qkv_serves_key_dim, GDN_PREP_SRC,
 };
 pub use moe_gemv::{
     ggml_kernel, indexed_workspace_bytes, IndexedExperts, IndexedFormat, MoeGemvError,
@@ -126,14 +157,18 @@ pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 pub use nvfp4_weight::{
     nvfp4_refusal_for_compute_cap, nvfp4_shape_refusal, Nvfp4Refusal, Nvfp4Weight, NVFP4_CAPABILITY,
 };
+pub use nvrtc::{
+    cuda_grid_fits, nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource,
+    CUDA_GRID_X_MAX, CUDA_GRID_YZ_MAX,
+};
 #[cfg(feature = "cuda")]
 pub use nvrtc::{device_compute_cap, CompiledKernel};
-pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
-/// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
+/// primitives, the NVFP4 decode GEMV, the fused NVFP4 and fp8 / int8 activation quantizers, the length-aware
 /// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, Veda sparse attention, the
-/// frozen Veda tile scorer and streaming training attention.
+/// frozen Veda tile scorer, streaming training attention and the SW-F287 fused kernels (activation
+/// quantizers, W4A8 GEMM, video-VAE norm + SiLU + pad, INT8 QK and Sol-Attn attention).
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -143,9 +178,13 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    ACT_QUANT_SRC,
+    adaln::ADALN_SRC,
+    adaln_chain::ADALN_CHAIN_SRC,
     cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
+    w4a8_gemm::W4A8_GEMM_SRC,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     GATED_DELTA_SRC,
@@ -155,6 +194,10 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     veda_int8::SOURCE,
     veda_score::SOURCE,
     training_attention::SOURCE,
+    sage_attention::SOURCE,
+    sol_attention::SOURCE,
+    media_rope::MEDIA_ROPE_SRC,
+    vae_norm_silu_pad::VAE_NORM_SILU_PAD_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 

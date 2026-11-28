@@ -322,12 +322,21 @@ fn yarn_cos_sin_at(
 /// Apply the NeoX half-split rotation to `[B, H, L, d]` given `cos`/`sin` `[1, 1, L, d/2]`:
 /// `out = cat(first·cos − second·sin, second·cos + first·sin)` where `first`/`second` are the two
 /// halves of the head dim. Bit-identical to `transformers`' `_apply_rotary_emb`.
+///
+/// The shared eager cos/sin route [`mlx_gen::qkv::apply_rope_eager`] with
+/// `RopeStyle::HalvesPaired` (SW-6140): the same `first·cos − second·sin`, `second·cos + first·sin`
+/// chain over the same pre-broadcast half-width tables, no casts. YaRN's `mscale` multiplies the
+/// tables' amplitude, which `fast::rope` cannot express, so there is no fused route (see the module
+/// doc).
 fn apply_half_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let parts = split(x, 2, -1)?;
-    let (first, second) = (&parts[0], &parts[1]);
-    let out_first = subtract(&multiply(first, cos)?, &multiply(second, sin)?)?;
-    let out_second = add(&multiply(second, cos)?, &multiply(first, sin)?)?;
-    Ok(concatenate_axis(&[out_first, out_second], -1)?)
+    mlx_gen::qkv::apply_rope_eager(
+        x,
+        mlx_gen::qkv::RopeTables::new(cos, sin),
+        mlx_gen::qkv::RopeStyle::HalvesPaired,
+        mlx_gen::qkv::RotationAxes::HeadMajor,
+        None,
+        mlx_gen::qkv::RopeDtype::Promoted,
+    )
 }
 
 /// `repeat_kv`: expand `[B, kv, L, d]` to `[B, H, L, d]` by repeat-interleaving each KV head

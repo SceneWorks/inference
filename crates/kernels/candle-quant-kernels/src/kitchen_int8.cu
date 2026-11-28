@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org — derived from comfy-kitchen
+// `int8_linear.cu::quantize_int8_rowwise_convrot_kernel` (https://github.com/Comfy-Org/comfy-kitchen).
+// Apache-2.0; see the crate NOTICE.
 // sc-26683: Kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6 rowwise semantics.
 // The input is the ConvRot-rotated row. It may arrive already rounded to the source dtype (the S4
 // ConvRot INT8 codec, whose authority rotates in the Python/dense path) or as the pinned F32 FHT

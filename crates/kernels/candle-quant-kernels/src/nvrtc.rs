@@ -151,6 +151,44 @@ impl fmt::Display for KernelCompileError {
 
 impl std::error::Error for KernelCompileError {}
 
+/// CUDA's grid limit on `gridDim.x` (`2^31 - 1`, every architecture this seam compiles for).
+pub const CUDA_GRID_X_MAX: usize = i32::MAX as usize;
+
+/// CUDA's grid limit on `gridDim.y` and `gridDim.z`.
+pub const CUDA_GRID_YZ_MAX: usize = 65_535;
+
+#[cfg(test)]
+mod grid_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_grid_limit_is_cudas() {
+        let (x, yz) = (CUDA_GRID_X_MAX, CUDA_GRID_YZ_MAX);
+        assert_eq!((x, yz), (2_147_483_647, 65_535));
+        assert!(cuda_grid_fits([x, yz, yz]));
+        assert!(cuda_grid_fits([1, 1, 1]));
+        for bad in [
+            [x + 1, 1, 1],
+            [1, yz + 1, 1],
+            [1, 1, yz + 1],
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+        ] {
+            assert!(!cuda_grid_fits(bad), "{bad:?}");
+        }
+    }
+}
+
+/// Whether a `[x, y, z]` grid launches: every extent at least 1 and within CUDA's limits
+/// ([`CUDA_GRID_X_MAX`], [`CUDA_GRID_YZ_MAX`]). Pure: a kernel's envelope check calls it on every
+/// launch it will make, so an unlaunchable shape is refused before the kernel is selected.
+pub fn cuda_grid_fits([x, y, z]: [usize; 3]) -> bool {
+    (1..=CUDA_GRID_X_MAX).contains(&x)
+        && (1..=CUDA_GRID_YZ_MAX).contains(&y)
+        && (1..=CUDA_GRID_YZ_MAX).contains(&z)
+}
+
 /// The highest known nvrtc virtual architecture at or below `cap`, as a `--gpu-architecture`
 /// value; `None` below sm_70 (nvrtc's own default then applies).
 pub fn nvrtc_arch_for(cap: (i32, i32)) -> Option<&'static str> {

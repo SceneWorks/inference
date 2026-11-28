@@ -17,13 +17,14 @@
 
 use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{
-    add, concatenate_axis, divide, maximum, minimum, multiply, pad, split, subtract, sum_axes,
+    add, concatenate_axis, divide, maximum, minimum, multiply, pad, split, subtract,
 };
 use mlx_rs::Array;
 
 use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as VAE_MEAN, QWEN_WAN_Z16_STD as VAE_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::vae_norm_silu_pad::{self as norm_silu_pad, ChannelNorm, PadSpec, TemporalPad};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
@@ -44,19 +45,20 @@ const NUM_RES_BLOCKS: usize = 2;
 const TEMPORAL_UPSAMPLE: [bool; 3] = [true, true, false];
 const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
 
-/// `x / max(‖x‖₂ over C, 1e-12) · √C · γ` — channel-L2 norm over axis 1. `x` is any rank with the
-/// channel axis at index 1 (NCTHW or NCHW); `gamma` carries `C` elements in any shape.
+/// The z16 channel-L2 norm with weight `gamma` (the shared [`ChannelNorm::ChannelL2`]).
+fn channel_l2(gamma: &Array) -> ChannelNorm<'_> {
+    ChannelNorm::ChannelL2 {
+        gamma,
+        eps: NORM_EPS,
+    }
+}
+
+/// `x / max(‖x‖₂ over C, 1e-12) · √C · γ` — channel-L2 norm over axis 1 (precisely
+/// `x / sqrt(max(Σx², 1e-12)) · √C · γ`). `x` is any rank with the channel axis at index 1 (NCTHW
+/// or NCHW); `gamma` carries `C` elements in any shape. The op chain lives in
+/// [`ChannelNorm::apply`] so the fused conv input (SW-6142) divides by exactly this denominator.
 fn rms_norm_channels(x: &Array, gamma: &Array) -> Result<Array> {
-    let shape = x.shape();
-    let nd = shape.len();
-    let c = shape[1];
-    let sum_sq = sum_axes(&multiply(x, x)?, &[1], true)?;
-    let denom = maximum(&sum_sq, scalar(NORM_EPS))?.sqrt()?;
-    let normed = divide(x, &denom)?;
-    let scaled = multiply(&normed, scalar((c as f32).sqrt()))?;
-    let mut wshape = vec![1i32; nd];
-    wshape[1] = c;
-    Ok(multiply(&scaled, &gamma.reshape(&wshape)?)?)
+    channel_l2(gamma).apply(x)
 }
 
 /// Last `n` frames along the temporal axis (axis 2, NCTHW): the reference `x[:, :, -n:]`.
@@ -119,10 +121,78 @@ impl CausalConv3d {
                 None,
             )?;
         }
-        let x = x.transpose_axes(&[0, 2, 3, 4, 1])?; // NDHWC
-        let y = conv3d(&x, &self.w, Some(&self.b), (self.st, 1, 1), (0, 0, 0))?;
+        self.conv_ndhwc(&x.transpose_axes(&[0, 2, 3, 4, 1])?) // NDHWC
+    }
+
+    /// The conv on an already padded channels-last input; NCTHW (a view of the NDHWC result) out.
+    fn conv_ndhwc(&self, x_ndhwc: &Array) -> Result<Array> {
+        let y = conv3d(x_ndhwc, &self.w, Some(&self.b), (self.st, 1, 1), (0, 0, 0))?;
         Ok(y.transpose_axes(&[0, 4, 1, 2, 3])?) // NCTHW
     }
+
+    /// `self.forward(silu(norm(x)), cache_x)` with the norm, SiLU, cache concat, causal zero pad and
+    /// layout copy produced by the shared fused conv input when it serves (SW-6142,
+    /// [`norm_silu_pad::try_fused`]); otherwise exactly the eager chain. Also returns the last
+    /// `tail` activated frames (the chunked encoder's next cache slot), `None` when `tail == 0`.
+    fn forward_normed(
+        &self,
+        x: &Array,
+        norm: ChannelNorm<'_>,
+        cache_x: Option<&Array>,
+        tail: i32,
+    ) -> Result<(Array, Option<Array>)> {
+        let mut causal = self.kt - self.st;
+        let mut cache = None;
+        if let Some(cx) = cache_x {
+            if causal > 0 {
+                cache = Some(cx);
+                causal = (causal - cx.shape()[2]).max(0);
+            }
+        }
+        let spec = PadSpec {
+            temporal: TemporalPad::Zeros {
+                front: causal,
+                back: 0,
+            },
+            cache,
+            ph: self.ph,
+            pw: self.pw,
+        };
+        if let Some(fused) = norm_silu_pad::try_fused(x, &norm, &spec, tail)? {
+            return Ok((self.conv_ndhwc(&fused.ndhwc)?, fused.tail));
+        }
+        let act = silu(&norm.apply(x)?)?;
+        let tail = if tail > 0 {
+            Some(last_t(&act, tail)?)
+        } else {
+            None
+        };
+        Ok((self.forward(&act, cache_x)?, tail))
+    }
+}
+
+/// Run a cached conv over `silu(norm(x))`: feed the *previous* slot as left-context, then store
+/// this chunk's last activated frames. Mirrors the reference's `cache_x = x[:, :, -CACHE_T:]`
+/// (+ 1-frame prepend when short) dance, where `x` is the conv's (activated) input.
+fn cached_conv_normed(
+    conv: &CausalConv3d,
+    x: &Array,
+    norm: ChannelNorm<'_>,
+    cache: &mut FeatCache,
+) -> Result<Array> {
+    let idx = cache.idx;
+    let t = x.shape()[2];
+    let (y, tail) = conv.forward_normed(x, norm, cache.slots[idx].as_ref(), t.min(CACHE_T))?;
+    let mut cache_x =
+        tail.ok_or_else(|| Error::Msg("wan vae: cached conv produced no cache frames".into()))?;
+    if cache_x.shape()[2] < CACHE_T {
+        if let Some(prev) = &cache.slots[idx] {
+            cache_x = concatenate_axis(&[&last_t(prev, 1)?, &cache_x], 2)?;
+        }
+    }
+    cache.slots[idx] = Some(cache_x);
+    cache.idx += 1;
+    Ok(y)
 }
 
 /// Run a cached conv: feed the *previous* slot as left-context, then store this chunk's last frames.
@@ -182,12 +252,12 @@ impl ResidualBlock {
     /// Decode path (no cache).
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.shortcut(x)?;
-        let y = self
+        let (y, _) = self
             .conv1
-            .forward(&silu(&rms_norm_channels(x, &self.norm1)?)?, None)?;
-        let y = self
+            .forward_normed(x, channel_l2(&self.norm1), None, 0)?;
+        let (y, _) = self
             .conv2
-            .forward(&silu(&rms_norm_channels(&y, &self.norm2)?)?, None)?;
+            .forward_normed(&y, channel_l2(&self.norm2), None, 0)?;
         Ok(add(&y, &h)?)
     }
 
@@ -196,11 +266,9 @@ impl ResidualBlock {
     /// The encoder is always single-pass, so the block releases its dead buffers mid-block.
     fn forward_cached(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
         let h = self.shortcut(x)?;
-        let y = silu(&rms_norm_channels(x, &self.norm1)?)?;
-        let y = cached_conv(&self.conv1, &y, cache)?;
+        let y = cached_conv_normed(&self.conv1, x, channel_l2(&self.norm1), cache)?;
         DeadStageBuffers::Release.materialize_with_cache(&y, cache)?;
-        let y = silu(&rms_norm_channels(&y, &self.norm2)?)?;
-        let y = cached_conv(&self.conv2, &y, cache)?;
+        let y = cached_conv_normed(&self.conv2, &y, channel_l2(&self.norm2), cache)?;
         Ok(add(&y, &h)?)
     }
 }
@@ -461,8 +529,10 @@ impl Decoder3d {
                 dead.materialize(&x)?;
             }
         }
-        let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
-        self.head_conv.forward(&x, None)
+        let (out, _) = self
+            .head_conv
+            .forward_normed(&x, channel_l2(&self.head_norm), None, 0)?;
+        Ok(out)
     }
 }
 
@@ -539,8 +609,7 @@ impl Encoder3d {
         dead.materialize_with_cache(&x, cache)?;
         x = self.middle.2.forward_cached(&x, cache)?;
         dead.materialize_with_cache(&x, cache)?;
-        let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
-        let out = cached_conv(&self.head_conv, &x, cache)?;
+        let out = cached_conv_normed(&self.head_conv, &x, channel_l2(&self.head_norm), cache)?;
         dead.materialize_with_cache(&out, cache)?;
         Ok(out)
     }
@@ -1374,5 +1443,145 @@ mod tests {
         );
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED vae::tests::encode_leaves_mlx_cache_empty");
+    }
+
+    /// SW-6142: the shared fused conv input `pad(silu(norm(x)))` over every Wan z16 conv-input
+    /// geometry (decode residual/head convs at each width and layout; the chunked encoder's first
+    /// chunk, a cached chunk, the 1-frame-cache case and an offset cache view; bf16/f16 inputs; the
+    /// eps clamp) against the reference op chain, at E2's declared tolerance with bit identity
+    /// reported. **Mutation control**: the kernel with the causal pad on the wrong temporal side
+    /// (back instead of front) must fail parity on every causal case.
+    #[test]
+    #[ignore = "MLX compute: SW-6142 fused_norm_silu_pad (Wan z16 geometries) vs the reference chain + wrong-side mutation; exhaustive suite, not ordinary CI"]
+    fn fused_norm_silu_pad_matches_the_reference_chain() {
+        use mlx_gen::vae_norm_silu_pad::{parity, NormSiluPadRoute};
+        let reports = parity::run_all(&parity::wan_cases(), NormSiluPadRoute::Metal).unwrap();
+        let bitwise = reports.iter().filter(|r| r.bitwise()).count();
+        println!(
+            "SW6142_WAN_PARITY cases={} bitwise={bitwise}",
+            reports.len()
+        );
+        for report in &reports {
+            assert!(report.within_tolerance(), "{}", report.line());
+        }
+        let mutations: Vec<_> = parity::mutation_cases()
+            .into_iter()
+            .filter(|case| case.name.starts_with("wan_"))
+            .collect();
+        assert!(!mutations.is_empty());
+        for case in &mutations {
+            let c = parity::run_mutation(case).unwrap();
+            println!(
+                "SW6142_WAN_MUTATION case={} mismatches={} max_abs={:.3e}",
+                case.name, c.mismatches, c.max_abs
+            );
+            assert!(
+                !c.bitwise() && c.max_abs > 1e-2,
+                "{}: the causal pad on the wrong temporal side must fail parity",
+                case.name
+            );
+        }
+    }
+
+    /// Reads two equal-length f32 vectors' PSNR over the `[-1, 1]` range (peak-to-peak 2).
+    fn psnr_db(got: &[f32], want: &[f32]) -> f64 {
+        let mse = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum::<f64>()
+            / want.len().max(1) as f64;
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (4.0 / mse).log10()
+        }
+    }
+
+    /// SW-6142 Wan VAE decode/encode parity on the production topology at width 16 (synthetic f32
+    /// weights): the single-pass decode and the chunked encode (2 chunks: the first-chunk zero pad
+    /// and the cached-frame chunk) on the Metal and compiled routes against the reference route.
+    /// Every norm→SiLU→conv site takes the selected route (route counters), and each fused output is
+    /// ≥ 50 dB PSNR from the reference (bit identity reported; the kernel itself is gated bitwise
+    /// by `mlx_gen::vae_norm_silu_pad`'s registered tests). Sized: latent [1,16,2,8,8], clip
+    /// [1,3,5,32,32]; well under 256 MiB.
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn fused_norm_silu_pad_decode_and_encode_match_the_reference_route() {
+        use mlx_gen::vae_norm_silu_pad::{parity, thread_counts, NormSiluPadRoute, RouteGuard};
+        let vae = crate::encode_footprint_harness::synthetic_z16(16);
+        let key = mlx_rs::random::key(6142).unwrap();
+        let latent =
+            mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, Some(&key)).unwrap();
+        let clip =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, 5, 32, 32], Some(&key)).unwrap();
+        mlx_rs::transforms::eval([&latent, &clip]).unwrap();
+
+        // Every residual block runs two normed convs, the head one.
+        let decoder_res = vae
+            .decoder
+            .upsamples
+            .iter()
+            .filter(|layer| matches!(layer, UpLayer::Res(_)))
+            .count() as u64;
+        let decode_sites = 2 * (decoder_res + 2) + 1;
+        let (_, encoder) = vae.encoder.as_ref().unwrap();
+        let encoder_res = encoder
+            .downsamples
+            .iter()
+            .filter(|layer| matches!(layer, DownLayer::Res(_)))
+            .count() as u64;
+        let chunks = 2u64; // T = 5: frame 0, then frames 1..5.
+        let encode_sites = chunks * (2 * (encoder_res + 2) + 1);
+
+        let run = |route: NormSiluPadRoute| {
+            let _route = RouteGuard::set(route);
+            let start = thread_counts();
+            let decoded = vae.decode(&latent).unwrap();
+            let encoded = vae.encode(&clip).unwrap();
+            mlx_rs::transforms::eval([&decoded, &encoded]).unwrap();
+            (
+                parity::host_f32(&decoded).unwrap(),
+                parity::host_f32(&encoded).unwrap(),
+                thread_counts().since(&start),
+            )
+        };
+        let (ref_dec, ref_enc, counts) = run(NormSiluPadRoute::Reference);
+        assert_eq!(
+            (
+                counts.reference,
+                counts.metal,
+                counts.compiled,
+                counts.refused
+            ),
+            (decode_sites + encode_sites, 0, 0, 0)
+        );
+        for route in [NormSiluPadRoute::Metal, NormSiluPadRoute::Compiled] {
+            let (dec, enc, counts) = run(route);
+            let served = if route == NormSiluPadRoute::Metal {
+                counts.metal
+            } else {
+                counts.compiled
+            };
+            assert_eq!(
+                (served, counts.reference, counts.refused),
+                (decode_sites + encode_sites, 0, 0),
+                "{route:?}: every norm→SiLU→conv site takes the route ({counts:?})"
+            );
+            let (dec_db, enc_db) = (psnr_db(&dec, &ref_dec), psnr_db(&enc, &ref_enc));
+            println!(
+                "SW6142_WAN_SYNTHETIC route={} decode_psnr_db={dec_db:.2} decode_bitwise={} \
+                 encode_psnr_db={enc_db:.2} encode_bitwise={}",
+                route.label(),
+                dec == ref_dec,
+                enc == ref_enc
+            );
+            assert!(
+                dec_db >= 50.0 && enc_db >= 50.0,
+                "{route:?}: decode {dec_db:.2} dB / encode {enc_db:.2} dB below 50 dB"
+            );
+        }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tests::fused_norm_silu_pad_decode_and_encode_match_the_reference_route");
     }
 }

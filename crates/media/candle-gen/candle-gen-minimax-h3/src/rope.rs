@@ -40,6 +40,7 @@
 //! not "fix" either rotary into an f32 rotation; it would be a different model.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::rope::{RopeLayout, RopeMath, RopeSpec};
 use candle_gen::{CandleError, Result};
 
 /// Precomputed `(cos, sin)` tables for one token grid.
@@ -219,25 +220,20 @@ impl Rope3d {
         }
         // Reference-faithful narrow, NOT a missed upcast: `cos.to(query.dtype)` at
         // `autoencoder_kl_minimax_h3.py:319-320`.
-        let cos_t = tables.cos.to_dtype(t.dtype())?;
-        let sin_t = tables.sin.to_dtype(t.dtype())?;
-
-        let half = self.apply_dim / 2;
-        let rotate = |x: &Tensor| -> Result<Tensor> {
-            let x1 = x.narrow(3, 0, half)?;
-            let x2 = x.narrow(3, half, half)?;
-            Ok(Tensor::cat(&[&x2.neg()?, &x1], 3)?)
-        };
-
-        let head = t.narrow(3, 0, self.apply_dim)?.contiguous()?;
-        let rotated = head
-            .broadcast_mul(&cos_t)?
-            .add(&rotate(&head)?.broadcast_mul(&sin_t)?)?;
-        if self.apply_dim == d {
-            return Ok(rotated);
-        }
-        let tail = t.narrow(3, self.apply_dim, d - self.apply_dim)?;
-        Ok(Tensor::cat(&[&rotated, &tail], 3)?)
+        // The rotation is the shared `candle_gen::rope::apply_rope` (SW-6129): split-half pairs,
+        // `[B, S, H, D]`, `apply_dim` leading lanes, native math over the `[1, N, 1, apply_dim]`
+        // tables — the fused strided kernel on CUDA, and elsewhere the shared chain, bit-identical
+        // to the `head·cos + rotate(head)·sin` chain + untouched tail this method carried
+        // (`tests::apply_matches_the_former_private_chain` pins it).
+        let spec = RopeSpec::split_half(RopeLayout::Bshd)
+            .with_rotary_dim(self.apply_dim)
+            .with_math(RopeMath::Native);
+        Ok(candle_gen::rope::apply_rope(
+            t,
+            &tables.cos,
+            &tables.sin,
+            &spec,
+        )?)
     }
 }
 

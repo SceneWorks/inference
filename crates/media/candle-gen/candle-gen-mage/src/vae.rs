@@ -62,6 +62,23 @@ fn layer_norm_channels(
     y.to_dtype(x.dtype())?.permute((0, 3, 1, 2))
 }
 
+/// `layer_norm_channels(x, None, None) · (1 + scale) + shift` for an NCHW `x` and `[B, C, 1, 1]`
+/// modulation — the shared fused AdaLN (SW-6129). The channel LayerNorm is the f32
+/// `mean_keepdim` / sub / `sqr` / `mean_keepdim` / `affine(1, eps)` / `sqrt` / div chain over the
+/// channels-last view, cast back: `AdaLnChain::layer(NORM_EPS)` op for op on the `[B, H·W, C]`
+/// tokens (the same elements, the same per-pixel order), modulated per sample in `x`'s dtype. The
+/// result is laid back out as NCHW (contiguous, as the elementwise modulate produced it).
+fn channel_ln_modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    let (b, c, h, w) = x.dims4()?;
+    let tokens = x.permute((0, 2, 3, 1))?.reshape((b, h * w, c))?;
+    let row = |t: &Tensor| t.reshape((b, 1, c));
+    let spec = candle_gen::modulate::AdaLnChain::layer(NORM_EPS);
+    candle_gen::modulate::adaln_chain(&tokens, &spec, &row(scale)?, &row(shift)?)?
+        .reshape((b, h, w, c))?
+        .permute((0, 3, 1, 2))?
+        .contiguous()
+}
+
 fn group_norm_32(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let (b, c, h, w) = x.dims4()?;
     let groups = 32usize;
@@ -100,6 +117,21 @@ impl AffineNorm {
     }
     fn layer(&self, x: &Tensor) -> Result<Tensor> {
         layer_norm_channels(x, Some(&self.weight), Some(&self.bias))
+    }
+
+    /// This affine channel LayerNorm over a channels-last `[B, N, C]` `x` (what
+    /// `layer(x.unsqueeze(2).permute(0, 3, 1, 2)).permute(0, 2, 3, 1).squeeze(2)` computes: the f32
+    /// chain, `· weight + bias` in f32, cast back) then `· (1 + scale) + shift` — the shared fused
+    /// AdaLN (SW-6129), `AdaLnChain::layer(NORM_EPS)` with the f32 weight and bias, op for op.
+    fn ln_modulate_tokens(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+        let (w, b) = (
+            self.weight.to_dtype(DType::F32)?,
+            self.bias.to_dtype(DType::F32)?,
+        );
+        let spec = candle_gen::modulate::AdaLnChain::layer(NORM_EPS)
+            .with_weight(&w)
+            .with_bias(&b);
+        candle_gen::modulate::adaln_chain(x, &spec, scale, shift)
     }
 }
 
@@ -268,8 +300,7 @@ impl DiCoCore {
         let p = __model_proof_output!(self.adaln.forward(&conditioning.silu()?))?;
         let chunks = p.chunk(6, 1)?;
         let e = |i: usize| chunks[i].reshape((chunks[i].dim(0)?, 384, 1, 1));
-        let h = layer_norm_channels(x, None, None)?;
-        let h = h.broadcast_mul(&(e(1)? + 1.)?)?.broadcast_add(&e(0)?)?;
+        let h = channel_ln_modulate(x, &e(1)?, &e(0)?)?;
         let h = __model_proof_output!(self
             .c2
             .forward(&__model_proof_output!(self.c1.forward(&h))?))?
@@ -279,8 +310,7 @@ impl DiCoCore {
             .forward(&h.mean_keepdim((2, 3))?))?)?;
         let h = __model_proof_output!(self.c3.forward(&h.broadcast_mul(&ca)?))?;
         let x = (x + h.broadcast_mul(&e(2)?)?)?;
-        let h = layer_norm_channels(&x, None, None)?;
-        let h = h.broadcast_mul(&(e(4)? + 1.)?)?.broadcast_add(&e(3)?)?;
+        let h = channel_ln_modulate(&x, &e(4)?, &e(3)?)?;
         let h = __model_proof_output!(self
             .c5
             .forward(&__model_proof_output!(self.c4.forward(&h))?.gelu_erf()?))?;
@@ -473,12 +503,7 @@ impl MlpBlock {
         let shift = p.narrow(D::Minus1, 0, d)?;
         let scale = p.narrow(D::Minus1, d, d)?;
         let gate = p.narrow(D::Minus1, 2 * d, d)?;
-        let h = self
-            .norm
-            .layer(&x.unsqueeze(2)?.permute((0, 3, 1, 2))?)?
-            .permute((0, 2, 3, 1))?
-            .squeeze(2)?;
-        let h = h.broadcast_mul(&(scale + 1.)?)?.broadcast_add(&shift)?;
+        let h = self.norm.ln_modulate_tokens(x, &scale, &shift)?;
         x + __model_proof_output!(self
             .l2
             .forward(&__model_proof_output!(self.l1.forward(&h))?.silu()?))?
@@ -774,5 +799,168 @@ mod tests {
         let integer_ramp = ((1f32 / 15.) * std::f32::consts::PI).cos();
         assert!((got[0][1][8] - inclusive).abs() < 1e-6);
         assert!((got[0][1][8] - integer_ramp).abs() > 1e-3);
+    }
+}
+
+/// SW-6129: the Mage-VAE decoder AdaLN sites are the shared fused composable-chain AdaLN.
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// CPU: the DConv-block channel AdaLN and the pixel-MLP token AdaLN are bit-identical to the
+    /// former `layer_norm_channels` + modulate chains, f32 / bf16 / f16, the decoder's 384 channels.
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn channel_and_token_adaln_match_the_former_chains() {
+        let dev = Device::Cpu;
+        let c = 384;
+        let x32 = values(&[2, c, 6, 5], 3, 3.0, 0.4, &dev);
+        let t32 = values(&[2, 7, c], 4, 3.0, 0.4, &dev);
+        let norm = AffineNorm {
+            weight: values(&[c], 8, 0.5, 1.0, &dev),
+            bias: values(&[c], 9, 0.5, 0.0, &dev),
+        };
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let e = |seed| {
+                values(&[2, c, 1, 1], seed, 0.5, 0.0, &dev)
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let (scale, shift) = (e(5), e(6));
+            let want = candle_gen::modulate::modulate(
+                &layer_norm_channels(&x, None, None).unwrap(),
+                &scale,
+                &shift,
+            )
+            .unwrap();
+            let got = channel_ln_modulate(&x, &scale, &shift).unwrap();
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(bits(&got), bits(&want), "channel {dtype:?}");
+
+            let t = t32.to_dtype(dtype).unwrap();
+            let n = AffineNorm {
+                weight: norm.weight.to_dtype(dtype).unwrap(),
+                bias: norm.bias.to_dtype(dtype).unwrap(),
+            };
+            let m = |seed| {
+                values(&[2, 7, c], seed, 0.5, 0.0, &dev)
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let (scale, shift) = (m(10), m(11));
+            let former = n
+                .layer(&t.unsqueeze(2).unwrap().permute((0, 3, 1, 2)).unwrap())
+                .unwrap()
+                .permute((0, 2, 3, 1))
+                .unwrap()
+                .squeeze(2)
+                .unwrap();
+            let want = candle_gen::modulate::modulate(&former, &scale, &shift).unwrap();
+            let got = __model_proof_output!(n.ln_modulate_tokens(&t, &scale, &shift)).unwrap();
+            assert_eq!(bits(&got), bits(&want), "tokens {dtype:?}");
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains");
+    }
+
+    /// SW-6129 CUDA smoke: the Mage-VAE DConv channel AdaLN (bf16 `[1, 384, 64, 64]`) and the
+    /// pixel-MLP token AdaLN (bf16 `[1, 4096, 384]`, f32 weight / bias) are fused (2 calls) and
+    /// bit-identical to the switch-off chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let c = 384;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let x = bf(values(&[1, c, 64, 64], 11, 3.0, 0.3, &dev));
+        let e = (
+            bf(values(&[1, c, 1, 1], 12, 0.5, 0.0, &dev)),
+            bf(values(&[1, c, 1, 1], 13, 0.5, 0.0, &dev)),
+        );
+        let t = bf(values(&[1, 4096, c], 14, 3.0, 0.3, &dev));
+        let m = (
+            bf(values(&[1, 4096, c], 15, 0.5, 0.0, &dev)),
+            bf(values(&[1, 4096, c], 16, 0.5, 0.0, &dev)),
+        );
+        let norm = AffineNorm {
+            weight: bf(values(&[c], 17, 0.5, 1.0, &dev)),
+            bias: bf(values(&[c], 18, 0.5, 0.0, &dev)),
+        };
+        assert_fused_and_bit_identical(
+            "mage-vae channel + token AdaLN (bf16, [1,384,64,64] + [1,4096,384])",
+            2,
+            &|| {
+                let a = channel_ln_modulate(&x, &e.0, &e.1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap();
+                let b = __model_proof_output!(norm.ln_modulate_tokens(&t, &m.0, &m.1))
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap();
+                Tensor::cat(&[&a, &b], 0).unwrap()
+            },
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical");
     }
 }

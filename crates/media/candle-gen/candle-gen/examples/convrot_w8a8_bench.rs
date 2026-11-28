@@ -12,6 +12,18 @@
 //!    activation quant INCLUDED, since it is per-forward in production)
 //! 5. `cublasLt-int8` — this crate's int8 IGEMM (int32 accumulate + scale fold; activation quant
 //!    INCLUDED)
+//! 6. `w4a8-ref` / `w4a8-fused` (SW-6134) — the full `W4A8Linear::forward` of a weight packed by the
+//!    offline packer (`gen_core::w4a8_int8::quantize_weight`): ConvRot FHT + kitchen int8
+//!    activation quant, then either the dequant-tile + cuBLASLt IGEMM reference or the fused
+//!    int4-weight int8-MMA GEMM (the `CANDLE_LLM_FUSED_KERNELS` switch selects the path; both are
+//!    bit-identical). `prep-ref` / `prep-fused` time that path's activation prep alone (the eager
+//!    candle-op FHT + `kitchen_int8` quantizer vs the fused FHT+quantizer kernel), so a path's GEMM
+//!    stage is its forward column minus its prep column.
+//!
+//! A second table reports **peak device memory** above the call's baseline (the stream-ordered
+//! pool's `USED_MEM_HIGH`) for one call of bf16, int8 (staged GEMM), and both W4A8 forwards, plus
+//! the resident weight bytes of bf16 vs W4A8 (packed codes + scales). Krea 2 Turbo projection
+//! shapes (hidden 6144, kv 1536, MLP 16384, 4096 tokens at 1024²) are included.
 //!
 //! ```text
 //! (vcvars) cargo run --release --example convrot_w8a8_bench -p candle-gen --features cuda
@@ -54,7 +66,28 @@ fn main() -> candle_gen::candle_core::Result<()> {
         ("zimage-ffn  ", 4096, 3840, 10240),
         ("flux2-joint ", 4096, 15360, 3840),
         ("small-batch ", 16, 3840, 3840),
+        ("krea-qo     ", 4096, 6144, 6144),
+        ("krea-kv     ", 4096, 6144, 1536),
+        ("krea-mlp-up ", 4096, 6144, 16384),
+        ("krea-mlp-dn ", 4096, 16384, 6144),
+        ("krea-decode ", 16, 6144, 6144),
     ];
+    use candle_gen::cuda_mempool::MemPool;
+    use candle_gen::quant::W4A8Linear;
+    use candle_layers::fused::set_fused_kernels;
+    let lt_arc = std::sync::Arc::new(CublasLt::new(&dev)?);
+    let pool = MemPool::device_current(0).expect("the CUDA device's current pool");
+    let peak = |f: &mut dyn FnMut() -> candle_gen::candle_core::Result<()>|
+        -> candle_gen::candle_core::Result<f64> {
+        dev.synchronize()?;
+        let base = pool.used().unwrap_or(0);
+        pool.reset_used_high_water();
+        f()?;
+        dev.synchronize()?;
+        Ok(pool.used_high().unwrap_or(0).saturating_sub(base) as f64 / 1048576.0)
+    };
+    let mut peaks = Vec::new();
+    let device_label = format!("sm_{}{}", cap.0, cap.1);
 
     let time = |f: &mut dyn FnMut() -> candle_gen::candle_core::Result<()>|
         -> candle_gen::candle_core::Result<f64> {
@@ -73,8 +106,20 @@ fn main() -> candle_gen::candle_core::Result<()> {
 
     println!("\n(ms/iter over 20, 3 warmup; TFLOP/s in parens)");
     println!(
-        "{:<13} {:>6} {:>6} {:>6}  {:>15} {:>15} {:>15} {:>15} {:>15}",
-        "shape", "M", "K", "N", "bf16", "dequant+mm", "mmq(q8_1)", "cublasLt-fp8", "cublasLt-int8"
+        "{:<13} {:>6} {:>6} {:>6}  {:>15} {:>15} {:>15} {:>15} {:>15} {:>15} {:>15} {:>9} {:>9}",
+        "shape",
+        "M",
+        "K",
+        "N",
+        "bf16",
+        "dequant+mm",
+        "mmq(q8_1)",
+        "cublasLt-fp8",
+        "cublasLt-int8",
+        "w4a8-ref",
+        "w4a8-fused",
+        "prep-ref",
+        "prep-fused"
     );
 
     for &(label, m, k, n) in shapes {
@@ -123,13 +168,74 @@ fn main() -> candle_gen::candle_core::Result<()> {
         let dev_x_i8 = lt.stage_int8(&qx_i8.q)?;
         let t_i8 = time(&mut || lt.matmul_int8_staged(&dev_w_i8, &dev_x_i8).map(|_| ()))?;
 
+        // 6. W4A8: the offline packer's output, the full native forward on each path.
+        let packed = candle_gen::gen_core::w4a8_int8::quantize_weight(
+            &w_cpu
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            n,
+            k,
+        )
+        .map_err(candle_gen::candle_core::Error::wrap)?;
+        let w4 = W4A8Linear::from_packed(&packed, None, lt_arc.clone())
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+        set_fused_kernels(Some(false));
+        let t_w4_ref = time(&mut || w4.forward(&x).map(|_| ()))?;
+        let p_w4_ref = peak(&mut || w4.forward(&x).map(|_| ()))?;
+        set_fused_kernels(Some(true));
+        let t_w4_fused = time(&mut || w4.forward(&x).map(|_| ()))?;
+        let p_w4_fused = peak(&mut || w4.forward(&x).map(|_| ()))?;
+        set_fused_kernels(None);
+        let t_prep = time(&mut || {
+            let r = candle_gen::quant::convrot::convrot_fht_f32(&x, 256)?;
+            lt_arc.quantize_kitchen_int8(&r, DType::BF16).map(|_| ())
+        })?;
+        let t_prep_fused = time(&mut || {
+            candle_quant_kernels::w4a8_gemm::w4a8_quantize_activation(&x)
+                .map(|_| ())
+                .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))
+        })?;
+        let p_bf16 = peak(&mut || x.matmul(&wt).map(|_| ()))?;
+        let p_i8 = peak(&mut || lt.matmul_int8_staged(&dev_w_i8, &dev_x_i8).map(|_| ()))?;
+        peaks.push((
+            label,
+            m,
+            k,
+            n,
+            p_bf16,
+            p_i8,
+            p_w4_ref,
+            p_w4_fused,
+            (n * k * 2) as f64 / 1048576.0,
+            w4.resident_bytes() as f64 / 1048576.0,
+        ));
+
         println!(
-            "{label} {m:>6} {k:>6} {n:>6}  {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1})",
+            "{label} {m:>6} {k:>6} {n:>6}  {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>7.3}({:>5.1}) {:>9.3} {:>9.3}",
             t_bf16, tf(t_bf16),
             t_dq, tf(t_dq),
             t_mmq, tf(t_mmq),
             t_fp8, tf(t_fp8),
             t_i8, tf(t_i8),
+            t_w4_ref, tf(t_w4_ref),
+            t_w4_fused, tf(t_w4_fused),
+            t_prep,
+            t_prep_fused,
+        );
+    }
+
+    println!(
+        "
+peak device MiB above baseline for one call (pool USED_MEM_HIGH), device {device_label};          resident weight MiB"
+    );
+    println!(
+        "{:<13} {:>6} {:>6} {:>6}  {:>9} {:>9} {:>9} {:>10}  {:>9} {:>9}",
+        "shape", "M", "K", "N", "bf16", "int8", "w4a8-ref", "w4a8-fused", "w bf16", "w w4a8"
+    );
+    for (label, m, k, n, pb, pi, pr, pf, wb, ww) in peaks {
+        println!(
+            "{label} {m:>6} {k:>6} {n:>6}  {pb:>9.1} {pi:>9.1} {pr:>9.1} {pf:>10.1}  {wb:>9.1} {ww:>9.1}"
         );
     }
     Ok(())

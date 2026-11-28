@@ -324,10 +324,9 @@ impl CoreBlock {
         let (c_shift, c_scale, c_gate) = (g(3)?, g(4)?, g(5)?);
 
         // Self-attention.
-        let x_mod = add(
-            &multiply(&ln(x, self.eps)?, &add(&scale_, scalar(1.0))?)?,
-            &shift,
-        )?;
+        // adaLN affines below: the shared eager `nn::modulate_eager` (strong-f32 `1`, SW-6140), the
+        // same three-op chain as the inline copies they replaced.
+        let x_mod = mlx_gen::nn::modulate_eager(&ln(x, self.eps)?, &scale_, &shift, false)?;
         let y = self.self_attn.self_attn(&x_mod, rope.0, rope.1, dt)?;
         let x = add(x, &multiply(&y, &gate)?)?;
 
@@ -336,10 +335,7 @@ impl CoreBlock {
         let x = add(&x, &self.cross_attn.cross_attn(&x_cross, context, dt)?)?;
 
         // Gated-GELU FFN.
-        let x_mod = add(
-            &multiply(&ln(&x, self.eps)?, &add(&c_scale, scalar(1.0))?)?,
-            &c_shift,
-        )?;
+        let x_mod = mlx_gen::nn::modulate_eager(&ln(&x, self.eps)?, &c_scale, &c_shift, false)?;
         let y = self
             .ffn_fc2
             .forward(&gelu_tanh(&self.ffn_fc1.forward(&cast(&x_mod, dt)?)?)?)?;
@@ -610,13 +606,8 @@ impl WanVaceTransformer {
         let p = split(&m, 2, 1)?;
         let shift = p[0].reshape(&[1, 1, dim])?;
         let scale_ = p[1].reshape(&[1, 1, dim])?;
-        let x_mod = add(
-            &multiply(
-                &ln(x, self.cfg.base.eps as f32)?,
-                &add(&scale_, scalar(1.0))?,
-            )?,
-            &shift,
-        )?;
+        let x_mod =
+            mlx_gen::nn::modulate_eager(&ln(x, self.cfg.base.eps as f32)?, &scale_, &shift, false)?;
         self.head.forward(&x_mod)
     }
 

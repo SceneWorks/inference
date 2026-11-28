@@ -1347,9 +1347,11 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "core-llm",
  "float8",
  "half",
  "sceneworks-gen-core",
+ "tracing",
 ]
 
 [[package]]

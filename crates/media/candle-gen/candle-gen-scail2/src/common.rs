@@ -62,7 +62,10 @@ pub(crate) fn ln_affine(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result<
         .broadcast_add(&b.to_dtype(DType::F32)?)
 }
 
-/// Non-affine LayerNorm (`WanLayerNorm(elementwise_affine=False)`) over the last dim, in f32.
+/// Non-affine LayerNorm (`WanLayerNorm(elementwise_affine=False)`) over the last dim, in f32. The
+/// inference sites run it inside the shared fused AdaLN (`model::scail_adaln`, SW-6129); this copy
+/// is the tests' oracle of that chain.
+#[cfg(test)]
 pub(crate) fn ln_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?;
     let mean = xf.mean_keepdim(D::Minus1)?;

@@ -146,7 +146,37 @@ pub(crate) enum KolorsUnet {
     },
 }
 
+/// Which UNet build serves a Kolors load ([`select_unet_build`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnetBuild {
+    /// The crate's stock [`KolorsUNet`] (candle-transformers attention): the byte-exact default.
+    StockDense,
+    /// The vendored SDXL UNet, whose attention routes through `candle-gen`'s shared helpers.
+    Vendored,
+}
+
+/// The UNet build a load takes: the vendored SDXL UNet for a packed tier or LoRA / LoKr adapters
+/// (as before), and — SW-6132 — whenever the job opted in to a lossy attention kernel
+/// (`candle_gen::fused_attention::requested_lossy_attention`), because only the vendored UNet's
+/// attention goes through the shared helpers those kernels act on. A dense snapshot without
+/// adapters and without an opt-in keeps the stock UNet, so the default numerics cannot move. Pure.
+pub(crate) fn select_unet_build(packed: bool, adapters: bool, lossy_attention: bool) -> UnetBuild {
+    if packed || adapters || lossy_attention {
+        UnetBuild::Vendored
+    } else {
+        UnetBuild::StockDense
+    }
+}
+
 impl KolorsUnet {
+    /// The build this UNet is ([`select_unet_build`]).
+    pub(crate) fn build(&self) -> UnetBuild {
+        match self {
+            Self::Dense(_) => UnetBuild::StockDense,
+            Self::Packed { .. } => UnetBuild::Vendored,
+        }
+    }
+
     /// Project the raw ChatGLM3 context `[B, S, 4096]` to the cross-attention width `[B, S, 2048]`.
     /// Step-invariant (prompt-only, not timestep), so the caller hoists it out of the denoise loop
     /// (sc-9040 / F-056) and feeds the result to [`Self::forward_projected`].
@@ -201,6 +231,13 @@ pub(crate) struct Components {
     vae_encoder: Arc<Mutex<Option<Arc<VaeMomentsEncoder>>>>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
     pid: Option<Arc<PidEngine>>,
+}
+
+impl Components {
+    /// The build of the cached UNet ([`select_unet_build`]).
+    pub(crate) fn unet_build(&self) -> UnetBuild {
+        self.unet.build()
+    }
 }
 
 impl Pipeline {
@@ -282,14 +319,32 @@ impl Pipeline {
         Ok((tokenizer, chatglm))
     }
 
+    /// The UNet build this load takes for the job now in force ([`select_unet_build`]): the
+    /// packed-tier probe of `unet/`, the load's adapters and the job's lossy-attention opt-ins.
+    pub(crate) fn unet_build(&self) -> Result<UnetBuild> {
+        Ok(select_unet_build(
+            detect_packed_unet(&self.root)?.is_some(),
+            !self.adapters.is_empty(),
+            candle_gen::fused_attention::requested_lossy_attention().any(),
+        ))
+    }
+
     /// Materialize only the denoise phase, preserving the packed/dense fork.
     fn load_unet(&self) -> Result<KolorsUnet> {
         self.ensure_load_seal()?;
         // UNet: a packed MLX tier (a `quantization` block in `unet/config.json`) builds the vendored,
         // packed-detecting SDXL UNet + the two Kolors deltas straight from the packed parts; a dense
-        // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression).
-        match detect_packed_unet(&self.root)? {
-            Some((unet_file, group_size)) => {
+        // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression) unless
+        // adapters or a lossy-attention opt-in need the vendored one ([`select_unet_build`]).
+        let packed = detect_packed_unet(&self.root)?;
+        let build = select_unet_build(
+            packed.is_some(),
+            !self.adapters.is_empty(),
+            candle_gen::fused_attention::requested_lossy_attention().any(),
+        );
+        candle_gen::execution::policy("kolors/unet_build", format!("{build:?}").into());
+        match (packed, build) {
+            (Some((unet_file, group_size)), _) => {
                 let vs = candle_gen::mmap_var_builder(&[unet_file], DType::F32, &self.device)?;
                 // The vendored UNet + the 5632 `add_embedding` (both packed-detecting via the shared
                 // `candle_gen::quant` seam); `sdxl_unet_config` is the canonical 3-block SDXL geometry
@@ -317,11 +372,11 @@ impl Pipeline {
                     encoder_hid_proj: Arc::new(encoder_hid_proj),
                 })
             }
-            None if self.adapters.is_empty() => Ok(KolorsUnet::Dense(Arc::new(KolorsUNet::new(
+            (None, UnetBuild::StockDense) => Ok(KolorsUnet::Dense(Arc::new(KolorsUNet::new(
                 self.f32_vb(&self.root.join("unet"))?,
                 false,
             )?))),
-            None => {
+            (None, UnetBuild::Vendored) => {
                 let vs = self.f32_vb(&self.root.join("unet"))?;
                 let vendored = load_vendored_unet_with_adapters(
                     &self.root,
@@ -1201,6 +1256,46 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// SW-6132: the stock dense UNet only for a dense snapshot without adapters and without a
+    /// lossy-attention opt-in (the default, byte-exact path); the vendored SDXL UNet — whose
+    /// attention goes through the shared helpers — for a packed tier, adapters, or an opt-in.
+    #[test]
+    fn a_lossy_attention_opt_in_selects_the_vendored_unet_and_the_default_stays_stock() {
+        assert_eq!(
+            select_unet_build(false, false, false),
+            UnetBuild::StockDense
+        );
+        assert_eq!(select_unet_build(false, false, true), UnetBuild::Vendored);
+        for (packed, adapters) in [(true, false), (false, true), (true, true)] {
+            for lossy in [false, true] {
+                assert_eq!(
+                    select_unet_build(packed, adapters, lossy),
+                    UnetBuild::Vendored,
+                    "packed={packed} adapters={adapters} lossy={lossy}"
+                );
+            }
+        }
+    }
+
+    /// The opt-ins a load reads (`requested_lossy_attention`: the job switch or, as here, an
+    /// engine option's thread scope, which shares its precedence rule) drive the UNet build, and
+    /// leaving the scope restores the stock build. Thread-local, so no process-wide switch flips.
+    #[test]
+    fn the_requested_opt_ins_drive_the_unet_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("unet")).unwrap();
+        let pipe = Pipeline::load(dir.path(), &Device::Cpu, None, Vec::new());
+        assert_eq!(pipe.unet_build().unwrap(), UnetBuild::StockDense);
+        let int8 = candle_gen::fused_attention::with_int8_attention(|| pipe.unet_build());
+        assert_eq!(int8.unwrap(), UnetBuild::Vendored);
+        let sol = candle_gen::fused_attention::with_sol_attention(
+            candle_gen::fused_attention::SolConfig::top_k(0.25),
+            || pipe.unet_build(),
+        );
+        assert_eq!(sol.unwrap(), UnetBuild::Vendored);
+        assert_eq!(pipe.unet_build().unwrap(), UnetBuild::StockDense);
+    }
 
     #[test]
     fn kolors_schedule_constants_match_the_canonical_candle_grid() {

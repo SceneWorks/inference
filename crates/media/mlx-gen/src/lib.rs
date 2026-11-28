@@ -137,6 +137,8 @@ pub mod transform {
 // every VAE that tiles a decode (Wan z16/z48, Qwen-Image). gen-core carries the pure geometry
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod memory_probe;
+// The video VAEs' fused `pad(silu(norm(x)))` conv input (SW-6142): Wan z16 + LTX.
+pub mod vae_norm_silu_pad;
 pub mod vae_tiling;
 pub mod video_execution;
 

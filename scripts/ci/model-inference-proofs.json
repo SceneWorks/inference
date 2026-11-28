@@ -100265,6 +100265,64 @@
     "package": "candle-gen-seedvr2",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production SeedVR2-3B (numz/SeedVR2_comfyUI, SEEDVR2_CKPT) VAE/DiT video upscale at bf16 on CUDA, synthetic 8-frame 256^2 -> 512^2 clip, the SW-6132 job-level lossy-attention switch off, int8 and sol (top-k 0.25); crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+    "required_environment": [
+      "SEEDVR2_CKPT"
+    ],
+    "device_witness": "The off clip counts no INT8 / Sol-Attn route or refusal; the job int8 clip counts INT8 QK calls on the selected CUDA device, and every call of each opt-in clip is the kernel or a counted refusal.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the INT8 / Sol-Attn call and refusal counts, wall time and PSNR vs the off clip (recorded); every frame non-constant; the switch is off after every clip.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Upscale the fixed clip with the job switch off, INT8 and Sol-Attn; check the route and refusal counts and the job-end reset, record PSNR, save the first frame of each."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-seedvr2/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::seedvr2_3b_job_level_lossy_attention_smoke",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-seedvr2",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "cuda_video_smoke::cuda_video_hd_tiling_smoke",
     "source": "crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs",
     "cargo_target_metadata": {
@@ -101939,6 +101997,71 @@
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::forced_spatial_tiling_matches_monolithic_with_acceptable_psnr",
+      "requirements": [
+        {
+          "slot": "svd-three-actual-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-svd",
+    "target": "real_weights_smoke",
+    "target_kind": "test",
+    "fqn": "svd_xt_job_level_lossy_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs",
+    "cargo_target_metadata": {
+      "name": "real_weights_smoke",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Production sequential SVD-XT condition encoder/UNet/video decoder (SVD_SNAPSHOT), fixed-seed 8-frame 512^2 x 10-step clip with the SW-6132 job-level lossy-attention switch off, int8, sol (top-k 0.25) and a top-k 1.0 Sol-Attn control (the f32 UNet with 64-wide heads: INT8 serves every call at bf16, Sol-Attn the self-attention at bf16 padded to 128, cross-attention a counted refusal, PSNR vs off recorded); crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
+    "required_environment": [
+      "SVD_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed clip with the job switch off, INT8, Sol-Attn top-k 0.25 and the top-k 1.0 Sol-Attn control; check every call is offered and counted, the f32 cast / head pad adaptation counts, the job-end reset, and that each clip is non-degenerate."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-svd/tests/real_weights_smoke.rs::svd_xt_job_level_lossy_attention_smoke",
       "requirements": [
         {
           "slot": "svd-three-actual-model-components",
@@ -142814,7 +142937,16 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "required_environment": [
+      "BOOGU_EDIT_DIR"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "BOOGU_EDIT_DIR",
+        "pin": "SceneWorks/boogu-image-mlx@a459e614d408bfdf57089c32cc3da706f5a017de/edit-q4"
+      }
+    ]
   },
   {
     "package": "mlx-gen-boogu",
@@ -231849,7 +231981,16 @@
         }
       ],
       "source_identity": "crates/media/mlx-gen/mlx-gen-scail2/tests/sequential_residency_real_weights.rs::sequential_residency_real_weights::scail2_staged_peak_stays_below_umt5_plus_dit_coresidence@11a39bb7dec55e0c063401dea24781684bcfe803155d71e4bf58376e0e53585c"
-    }
+    },
+    "required_environment": [
+      "SCAIL2_MODEL_DIR"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "SCAIL2_MODEL_DIR",
+        "pin": "SceneWorks/scail2-mlx@ce88cfdb1008f395e9c820e525e6db7b6695f7b3/q4"
+      }
+    ]
   },
   {
     "package": "mlx-gen-scail2",
@@ -271369,6 +271510,36 @@
   },
   {
     "package": "mlx-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "rope_modulate_block_bench_proof::rope_modulate_block_bench",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays (seeded random activations at FLUX.1 DiT-block and PID Gemma-2 TE attention geometry; no weights)",
+    "configuration_source": "body-local construction (crates/media/mlx-gen/examples/rope_modulate_block_bench.rs, included verbatim; ROPE_BENCH_WARMUP/ROPE_BENCH_ITERS defaults 3/20)",
+    "output_contract": "SW-6140 AC3 bench table (before/after median ms, MLX peak MiB, max rel diff, chip brand string) printed; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/tests/rope_modulate_block_bench_proof.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/tests/rope_modulate_block_bench_proof.rs::rope_modulate_block_bench_proof::rope_modulate_block_bench; source-defined seeded activations and RoPE tables, no external inputs",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen",
     "target": "mlx_gen",
     "target_kind": "lib",
     "fqn": "adapters::loader::tests::apply_specs_empty_is_noop",
@@ -295110,6 +295281,116 @@
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
+    "package": "candle-gen-lens",
+    "target": "candle_gen_lens",
+    "target_kind": "lib",
+    "fqn": "transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_lens",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Lens block RmsNorm gain and deterministic activations/modulation table on Device::Cpu; crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Block rms_modulate (learned RmsNorm) and NormOut layer_norm_modulate versus RmsNorm::forward + modulate and the former f32 LayerNorm + modulate, f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::fused_adaln_sites_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-lens",
+    "target": "candle_gen_lens",
+    "target_kind": "lib",
+    "fqn": "transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_lens",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Lens block RmsNorm gain with a deterministic bf16 stream and modulation table; crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of two Lens block rms_modulate calls (learned RmsNorm) and the NormOut layer_norm_modulate with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run two Lens block rms_modulate calls (learned RmsNorm) and the NormOut layer_norm_modulate on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-lens/src/transformer.rs::transformer::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-ltx",
     "target": "integration",
     "target_kind": "test",
@@ -313253,6 +313534,116 @@
     }
   },
   {
+    "package": "candle-gen-mage",
+    "target": "candle_gen_mage",
+    "target_kind": "lib",
+    "fqn": "vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_mage",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Mage-VAE AffineNorm weight/bias (384 channels) with deterministic channel and token activations/modulation on Device::Cpu; crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: channel_ln_modulate and AffineNorm::ln_modulate_tokens (learned affine norm) versus the former layer_norm_channels / AffineNorm::layer + modulate chains, f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::channel_and_token_adaln_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-mage",
+    "target": "candle_gen_mage",
+    "target_kind": "lib",
+    "fqn": "vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_mage",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Mage-VAE AffineNorm weight/bias (384 channels, bf16) with deterministic [1, 384, 64, 64] channel and [1, 4096, 384] token activations/modulation; crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Mage-VAE channel_ln_modulate and AffineNorm::ln_modulate_tokens with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Mage-VAE channel_ln_modulate and AffineNorm::ln_modulate_tokens on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-mage/src/vae.rs::vae::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-moss-image",
     "target": "integration",
     "target_kind": "test",
@@ -314427,6 +314818,116 @@
           ]
         }
       }
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic MOSS Norm weight (hidden 3072, f32 and activation-dtype) with deterministic activations/modulation on Device::Cpu; crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Norm::norm_modulate (learned norm) versus the former Norm::forward + promotion casts + modulate, f32 / bf16 / f16 streams, f32 and native weights, every modulation/output dtype, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::norm_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic MOSS Norm weight (hidden 3072, bf16 and f32) with a deterministic bf16 [1, 4352, 3072] stream and modulation; crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of MOSS Norm::norm_modulate with the bf16 and the f32 (FP32 island) weight with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run MOSS Norm::norm_modulate with the bf16 and the f32 (FP32 island) weight on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer.rs::transformer::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
     }
   },
   {
@@ -317213,6 +317714,116 @@
       "bespoke_acceptance/adapter_sample.png",
       "bespoke_acceptance/retained_export.json"
     ]
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "candle_gen_iris",
+    "target_kind": "lib",
+    "fqn": "nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Iris RmsNorm gain (hidden 3072) and deterministic activations/modulation rows on Device::Cpu; crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: rms_modulate on the learned RmsNorm versus the former RmsNorm::forward + modulate, f32 / bf16 / f16 x with f32 and bf16 modulation, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::rms_modulate_matches_the_former_norm_and_modulate",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "candle_gen_iris",
+    "target_kind": "lib",
+    "fqn": "nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_iris",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Iris RmsNorm gain (hidden 3072) with a deterministic bf16 [1, 4352, 3072] stream and f32 + bf16 modulation rows; crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Iris RmsNorm::rms_modulate with f32 and bf16 rows with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Iris RmsNorm::rms_modulate with f32 and bf16 rows on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/src/nn.rs::nn::sw6129_adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
   },
   {
     "package": "candle-gen-krea",
@@ -321540,6 +322151,116 @@
     }
   },
   {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic H3 DiT block RmsNorm gain at hidden 96 and 5376 with deterministic activations, modulation and per-token index on Device::Cpu; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: norm_modulate (learned RmsNorm) versus modulate(norm.forward(x)), f32 / bf16 / f16, at hidden 96 and 5376, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::norm_modulate_matches_the_former_chain",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic H3 DiT block RmsNorm gain at hidden 5376 with deterministic bf16 activations, modulation and per-token index; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of two H3 block norm_modulate calls (learned RmsNorm, per-row modulation) with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run two H3 block norm_modulate calls (learned RmsNorm, per-row modulation) on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "mlx-gen-minimax-h3",
     "target": "mlx_gen_minimax_h3",
     "target_kind": "lib",
@@ -321783,6 +322504,116 @@
     }
   },
   {
+    "package": "candle-gen-z-image",
+    "target": "candle_gen_z_image",
+    "target_kind": "lib",
+    "fqn": "dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_z_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Z-Image block RmsNorm gain and deterministic activations/modulation chunks on Device::Cpu; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body and original numerical assertions: Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale versus norm.forward(x) * (chunk + 1) and LayerNormNoParams(1e-6).forward(x) * (scale + 1), f32 / bf16 / f16, bit for bit"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::fused_scale_only_sites_match_the_former_chains",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-z-image",
+    "target": "candle_gen_z_image",
+    "target_kind": "lib",
+    "fqn": "dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_z_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic Z-Image block RmsNorm gain (D 3840) with deterministic bf16 activations and modulation chunks; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+    "required_environment": [],
+    "device_witness": "The learned norm call's bf16 output is observed on the selected CUDA device (MODEL_INFERENCE_DEVICE); the AdaLN path counters record every call fused with the kernel switch on and as disabled references with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count of Z-Image Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale with the fused AdaLN against the switch-off reference chain; it must be 0 (bit-identical).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Z-Image Execution::Inference.rms_scale (learned RmsNorm) and final_norm_scale on bf16 with the fused AdaLN switch on, then off; assert the path counters and bit identity."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::adaln_route_tests::cuda_bf16_adaln_route_is_fused_and_bit_identical",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-krea",
     "target": "candle_gen_krea",
     "target_kind": "lib",
@@ -321841,6 +322672,118 @@
     }
   },
   {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
+    "fqn": "transformer::block::tests::cuda_production_geometry_block_fused_adaln_matches_reference",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for one Krea 2 single-stream DiT block at production geometry (hidden 6144, GQA 48Q/12KV x 128, FFN narrowed to 1024, modulation table and raw norm scales std 0.3), the real t2i RoPE table for 512 caption + 64x64 image tokens (the 1024^2 joint sequence), bf16, B = 1 and 2.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_fused_adaln_matches_reference",
+    "required_environment": [],
+    "device_witness": "With the adaln_modulate switch on the bf16 block forward on the selected CUDA device records two fused AdaLN calls and no reference; with it off two disabled references.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. The fused-AdaLN and reference block outputs are bit-identical at B = 1 and 2, and the dropped-+1 mutation differs in more than half of the elements.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_fused_adaln_matches_reference/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run the bf16 block with the fused AdaLN off, on, and on with the +1 mutation, at B = 1 and 2; assert the path counters, bit identity, and that the mutation is caught."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_block_fused_adaln_matches_reference",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
+    "fqn": "transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for one Krea 2 gated attention at production geometry (hidden 6144, GQA 48Q/12KV x 128, norm_q/norm_k scales near 1 before the folded +1), the real t2i RoPE table for 512 caption + 64x64 image tokens (the 1024^2 joint sequence).",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+    "required_environment": [],
+    "device_witness": "The test observes the bf16 attention output on the selected CUDA device and counts two fused QK-RMSNorm+RoPE calls (q and k) with the kernel switch on and two disabled-reference calls with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the element mismatch count and max-abs difference of the attention output with the fused in-place QK-RMSNorm+RoPE against the reference rms_scale -> RoPE chain, bf16 and f32; both must be bit-identical (0 mismatches).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run the gated attention at bf16 and f32 twice each (fused QK-RMSNorm+RoPE switch on, then off) and compare outputs bit for bit; run the no-RoPE form once."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/transformer/block.rs::transformer::block::tests::cuda_production_geometry_attention_fused_qk_norm_rope_matches_reference",
+      "requirements": []
+    }
+  },
+  {
     "package": "candle-gen-wan",
     "target": "candle_gen_wan",
     "target_kind": "lib",
@@ -321895,6 +322838,1069 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs::transformer::tests::cuda_production_geometry_block_flash_matches_materialized",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 snapshot (KREA_TURBO_DIR) through the registered generator, KreaEngineOptions default (FlashAttention) vs int8_attention: Some(pv) for both P.V modes (16-bit, INT8); fixed seed 7, 1024^2 x 8 steps and 2048^2 x 4 steps; crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+    "required_environment": [],
+    "device_witness": "The renders count FlashAttention-2 calls (default engine) and one INT8 QK call per denoise block attention (int8 engine) on the selected CUDA device, and replay one captured production attention call on it.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines, PSNR int8 vs flash per size, and the captured-call cosine / rel-L2 of flash and of INT8 (K centering off/on/adaptive) against the f32 materialized reference; each mode's 1024^2 PSNR must be >= 35 dB and every captured INT8 cosine >= 0.999.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render each size with the default engine and the int8_attention engine in both P.V modes (flash, int8 16-bit P.V, int8 INT8 P.V, flash), compare PSNR and s/step, replay the captured attention call (both P.V modes) against the f32 reference, and time alternating DiT forwards of the three engines."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_attention_matches_flash_render",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 snapshot (KREA_TURBO_DIR) through the registered krea_2_turbo generator with no engine option, the SW-6132 job-level switch off vs set_lossy_attention(int8: Some(default 16-bit P.V)); fixed seed 7, 1024^2 x 8 steps; crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+    "required_environment": [],
+    "device_witness": "The off render counts FlashAttention-2 calls and no INT8 / Sol-Attn route or refusal; the job int8 render counts INT8 QK calls (at least one per step) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both renders, the INT8 call / refusal counts and the PSNR of the job-int8 render against the off render, which must be >= 35 dB; the switch is off after each render.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed image with the job switch off and with job-level INT8, check the route counts and the job-end reset, compare PSNR and s/step, save both images."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/lossy_attention_job_real_weights.rs::lossy_attention_job_real_weights::krea_turbo_job_level_int8_attention_smoke",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Krea 2 Turbo BF16 transformer weights (KREA_TURBO_DIR), one resident Krea2Transformer, random 128-token context and latent (timing only) at 1024^2 and 2048^2; crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+    "required_environment": [],
+    "device_witness": "Each timed forward counts its INT8 calls (zero with the option off) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the median synchronized DiT forward seconds of flash and of each INT8 P.V mode over 9 alternating rounds per size.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Alternate synchronized DiT forwards (flash, INT8 16-bit P.V, INT8 INT8 P.V) at 1024^2 and 2048^2 and report medians."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/int8_attention_real_weights.rs::int8_attention_real_weights::krea_turbo_int8_dit_step_time_ab",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production Wan2.2 T2V-A14B snapshot tier (WAN14B_SNAPSHOT, e.g. the SceneWorks q4 tier) through load_t2v_14b_with_options, Wan14bEngineOptions default (FlashAttention) vs sol_attention: Some(top_k(0.25)); fixed seed 42, 832x480 x 17 frames x 6 steps; crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+    "required_environment": [],
+    "device_witness": "The clips count FlashAttention-2 calls (default engine) and one Sol-Attn call per denoise self-attention (sol engine: 2 CFG forwards x 40 blocks x 6 steps, zero refusals) on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints s/step of both engines and the sol clip's PSNR against the flash clip (all frames; recorded, not gated: the sparse trajectory diverges from flash), asserts every sol frame keeps a pixel standard deviation of at least 8 (no degenerate decode) and saves the first and last frame of each clip.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Render the fixed-seed clip with the default engine and with the sol_attention engine (top-k 0.25), check the route counts, compare PSNR and s/step, save frames."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/sol_attention_real_weights.rs::sol_attention_real_weights::wan_t2v_a14b_sol_attention_smoke_against_flash",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian weights packed by gen_core::w4a8_int8::quantize_weight at edge-tile shapes and Krea 2 Turbo widths (k 6144, n 1536/6144, up to 4096 tokens), with and without bias.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+    "required_environment": [],
+    "device_witness": "The test counts two fused leaves (activation prep + GEMM) per fused forward and two disabled reference leaves per reference forward on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. The fused int4-weight int8-MMA path and the dequant-tile + cuBLASLt IGEMM path must agree bit for bit for bf16/f16/f32 outputs; asserts the fused GEMM uses no local memory.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run W4A8Linear::forward through the fused path and the reference path for every case and dtype and compare every output bit."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_fused_gemm_is_bit_identical_to_dequant_igemm",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian weights at Krea 2 Turbo projection shapes (6144->6144, 6144->1536, 6144->16384, 16384->6144) packed by gen_core::w4a8_int8::quantize_weight; 64 tokens; bias.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+    "required_environment": [],
+    "device_witness": "The test counts two fused leaves per forward on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Prints the cosine of W4A8Linear::forward vs the CPU dequant reference linear x*decode_dense(W)^T+b; each must be >= 0.999.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run W4A8Linear::forward on the four shapes and compare to the F32 CPU reference linear."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_matches_cpu_dequant_reference_on_dit_shapes",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+    "source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated Gaussian 96x1024 weight packed by gen_core::w4a8_int8::quantize_weight, written to a temporary safetensors file with gen_core::w4a8_int8::write_checkpoint.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+    "required_environment": [],
+    "device_witness": "The loaded and packer-built projections run on the selected CUDA device.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. Weights::from_files_native_int8 + W4A8Linear::from_weights must detect the projection and its output must equal W4A8Linear::from_packed bit for bit.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Write the checkpoint, load it through the native-file loader, run both projections and compare."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/quant/w4a8_int8.rs::quant::w4a8_int8::tests::w4a8_linear_gpu_checkpoint_round_trip_loads_and_matches",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Fixed-seed 1024x1024 8-step Krea 2 Turbo renders: the bf16 snapshot, the SW-6135 W4A8 tier (native single file over the bf16 base), loaded resident and again through the staged-residency shape (Sequential + DeferredMaterialization File load, staged request; DiT resident in the heavy phase), and the optional q8/q4/NVFP4 (resident and staged)/blanket-W4A8 rows; each staged render must match its resident twin; image PSNR vs bf16, s/step and device peak; both W4A8 renders must clear the declared 22 dB floor.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_fixed_seed_render_vs_bf16",
+      "requirements": [
+        {
+          "slot": "krea-selected-native-checkpoint",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-base-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-retained-file-batch-postchecked",
+          "role": "artifact-input",
+          "readers": [
+            "gen-core::LoadSpec::read_files_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "A real Krea 2 LoRA installed additively on the q8 snapshot trunk and on the SW-6135 W4A8 tier trunk (identical applied/skipped census), then four fixed-seed 1024x1024 renders (q8 and W4A8, with and without the LoRA) checked for the same result class.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/w4a8_krea_dit_gpu.rs::w4a8_krea_dit_gpu::w4a8_krea_dit_gpu_additive_lora_matches_q8_class",
+      "requirements": [
+        {
+          "slot": "krea-selected-native-checkpoint",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-base-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-native-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-actual-adapter-install",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-retained-file-batch-postchecked",
+          "role": "artifact-input",
+          "readers": [
+            "gen-core::LoadSpec::read_files_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+    "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic bf16 weights (256x512, 128x256) and random / outlier-heavy bf16 activations (64 and 3 rows) for Fp8Linear::new on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+    "required_environment": [],
+    "device_witness": "Each Fp8Linear dynamic E4M3 forward with the act_quant_fp8 switch on records one fused call and no reference; with it off one disabled reference; both outputs bit-identical.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; every case's fused and reference outputs are bit-identical.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Fp8Linear::forward fused and reference for every case; assert the path counters and bit-identical bf16 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_fp8_linear_matches_the_reference_and_reports_its_path",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+    "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic bf16 weights quantized per output channel (256x512, 128x256) and random / outlier-heavy bf16 activations (64 and 3 rows) for Int8Linear::from_per_channel_parts on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+    "required_environment": [],
+    "device_witness": "Each resident per-channel Int8Linear forward with the act_quant_int8 switch on records one fused call and no reference; with it off one disabled reference; both outputs bit-identical.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; every case's fused and reference outputs are bit-identical.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run Int8Linear::forward fused and reference for every case; assert the path counters and bit-identical bf16 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::fused_act_quant_int8_linear_matches_the_reference_and_reports_its_path",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen-wan",
+    "target": "mlx_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae::tests::fused_norm_silu_pad_decode_and_encode_match_the_reference_route",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays (seeded z16 topology at width 16, latent [1,16,2,8,8], clip [1,3,5,32,32])",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/vae.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/vae.rs::vae::tests::fused_norm_silu_pad_decode_and_encode_match_the_reference_route@3e654c9da17712537bb7795ddb6b463df28d6719d6f5bde2df2256595da6c4c0"
+    }
+  },
+  {
+    "package": "mlx-gen-wan",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "vae_norm_silu_pad_proof::wan_z16_vae_norm_silu_pad_decode_proof",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Wan 2.1 z16 VAE: vae.safetensors of SceneWorks/wan2.2-t2v-a14b-mlx@991eb255c544bbb2e1f1e07da4355c2f0a5337b7/q4 staged into the runner Hub cache (WAN_Z16_VAE_SNAPSHOT); seeded latent [1,16,4,60,60], clip [1,3,9,256,256] and source-generated Wan/LTX parity geometries",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes; their input receipts and in-scope MODEL_INFERENCE_DEVICE observations are forwarded, and the parent fails unless every child observed mlx-metal), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "cargo_features": [
+      "model-inference-proof",
+      "mlx-gen/test-support"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-wan/tests/vae_norm_silu_pad_proof.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/tests/vae_norm_silu_pad_proof.rs::vae_norm_silu_pad_proof::wan_z16_vae_norm_silu_pad_decode_proof@1e134228f2b644b1c816c9ca4e38edfffe132182885d527b53c783549a497b18",
+      "requirements": [
+        {
+          "slot": "wan-z16-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "wan-z16-vae-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "WAN_Z16_VAE_SNAPSHOT"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "WAN_Z16_VAE_SNAPSHOT",
+        "pin": "SceneWorks/wan2.2-t2v-a14b-mlx@991eb255c544bbb2e1f1e07da4355c2f0a5337b7/q4"
+      }
+    ]
+  },
+  {
+    "package": "mlx-gen-ltx",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "vae_norm_silu_pad_proof::ltx_vae_norm_silu_pad_decode_proof",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned LTX-2.3 video VAE: vae_decoder/vae_encoder.safetensors + embedded_config.json of SceneWorks/ltx-2.3-mlx@01df27d308466533aa09d251e3aebdcc627d07eb/q4 staged into the runner Hub cache (LTX_VAE_SNAPSHOT); seeded latent [1,128,3,12,16], clip [1,3,9,256,256] and source-generated LTX parity geometries",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "Exactly one successful libtest summary (per-route children run in their own processes; their input receipts and in-scope MODEL_INFERENCE_DEVICE observations are forwarded, and the parent fails unless every child observed mlx-metal), one late static actual-FQN BODY and the mlx-metal device; every measurement is printed before the asserts",
+    "cargo_features": [
+      "model-inference-proof",
+      "mlx-gen/test-support"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/tests/vae_norm_silu_pad_proof.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/tests/vae_norm_silu_pad_proof.rs::vae_norm_silu_pad_proof::ltx_vae_norm_silu_pad_decode_proof@cfac39637bcbf9d828fc3ca086f478be0ceeb0bff741b7979061fa9eeebd77d2",
+      "requirements": [
+        {
+          "slot": "ltx-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx-vae-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx-vae-embedded-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@29553"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "when": "external-present"
+        }
+      ]
+    },
+    "required_environment": [
+      "LTX_VAE_SNAPSHOT"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "LTX_VAE_SNAPSHOT",
+        "pin": "SceneWorks/ltx-2.3-mlx@01df27d308466533aa09d251e3aebdcc627d07eb/q4"
+      }
+    ]
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "candle_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+    "source": "crates/media/candle-gen/candle-gen-wan/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for two Wan VAE Resnet blocks (96->192 with 1x1 shortcut at 24x40, 192->192 at 18x30), random activations streamed over 5 frames, f32 and bf16, on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+    "required_environment": [],
+    "device_witness": "The test observes the Resnet outputs on the selected CUDA device and counts every ChanNorm->SiLU->CausalConv3d site through the fused kernel with the switch on (2 per frame) and through the op chain (disabled) with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set. f32 fused vs op chain rel-L2 <= 1e-5 (streamed, mixed fused/reference chunks sharing one feat_cache, single pass); a wrong-side causal pad must exceed 1e-2; bf16 fused rel-L2 vs the f32 block <= 1.05x the bf16 op chain's + 1e-4.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Stream both Resnets fused and on the op chain (f32 and bf16), mixed-path chunks, a fused single pass and the wrong-side-pad mutation; assert the path counters and the declared bounds."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_resnet_streaming_fused_norm_silu_pad_matches_op_chain",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-wan",
+    "target": "candle_gen_wan",
+    "target_kind": "lib",
+    "fqn": "vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+    "source": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_wan",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Production real Wan 2.x z16 VAE (the A14B VAE, $WAN_VAE16_SNAPSHOT/vae/diffusion_pytorch_model.safetensors) at bf16 and f32; a fixed host-generated standard-normal latent [1,16,5,60,104] (480x832x17 output).",
+    "configuration_source": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary: the fused decode output on the selected CUDA device; the path counters show every norm site fused with the switch on and none with it off.",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof. Per dtype: PSNR fused vs op chain >= 50 dB, the wrong-side-pad mutation < 50 dB, and the fused decode peak (CUDA pool USED_MEM_HIGH above baseline) below the op chain's; prints PSNR, peak MiB and decode ms.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Decode the fixed latent with the fused norm+SiLU+pad off, on, and on with the wrong-side-pad mutation, at bf16 and f32; assert PSNR, path counters and the lower decode peak."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-wan/src/vae16.rs::vae16::fused_norm_silu_pad_gate::cuda_real_z16_decode_fused_norm_silu_pad_gate",
+      "requirements": [
+        {
+          "slot": "wan-direct-actual-vae-file",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-ltx",
+    "target": "candle_gen_ltx",
+    "target_kind": "lib",
+    "fqn": "vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
+    "source": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_ltx",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Source-generated synthetic weights for LTX VAE DecResBlock and EncResBlock (128ch at 5x16x24, 256ch at 3x12x20), random f32 activations, on CUDA device 0.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
+    "required_environment": [],
+    "device_witness": "The test observes both block outputs on the selected CUDA device and counts both pixel-norm->SiLU->CausalConv3d sites per block through the fused kernel with the switch on and through the op chain (disabled) with it off.",
+    "output_contract": "Exactly one successful libtest summary, one late static actual-FQN BODY and exact actual CUDA device kind set; the f32 fused block output equals the op chain's exactly (max |d| = 0).",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Run each block with the fused kernel off and on; assert the path counters and identical f32 outputs."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-ltx/src/vae.rs::vae::fused_norm_silu_pad_tests::cuda_ltx_blocks_fused_norm_silu_pad_equal_op_chain",
       "requirements": []
     }
   }

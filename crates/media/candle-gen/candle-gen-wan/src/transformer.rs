@@ -14,6 +14,7 @@ use crate::config::TransformerConfig;
 use crate::gguf::{GgufDit, WeightSrc};
 use crate::quant::QLinear;
 use crate::rope::apply_rope;
+use candle_gen::modulate::{adaln_chain, AdaLnChain};
 
 /// Dense Linear loader — retained for the VACE model (`vace.rs`) and the training DiT (`dit_train.rs`),
 /// whose tiers are not packed. The inference DiT Linears route through [`qlinear`] (packed-detect).
@@ -30,6 +31,20 @@ pub(crate) fn ln_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xc = x.broadcast_sub(&mean)?;
     let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
     xc.broadcast_div(&(var + eps)?.sqrt()?)
+}
+
+/// The Wan AdaLN: [`ln_no_affine`] of the f32 stream `hf`, modulated in f32 by the f32 `scale` /
+/// `shift` (`[B,1,dim]` per sample or `[B,L,dim]` per token), cast to `dt` — the shared fused AdaLN
+/// over that exact composable chain (SW-6129): one launch on CUDA, the chain itself elsewhere.
+pub(crate) fn wan_adaln(
+    hf: &Tensor,
+    eps: f64,
+    scale: &Tensor,
+    shift: &Tensor,
+    dt: DType,
+) -> Result<Tensor> {
+    let spec = AdaLnChain::layer(eps).modulate_in(DType::F32).output(dt);
+    adaln_chain(hf, &spec, scale, shift)
 }
 
 /// RMSNorm over the last dim (qk-norm "across heads") with affine weight, in f32.
@@ -143,6 +158,48 @@ fn sdpa_budgeted(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
 ) -> Result<Tensor> {
     candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, None, softmax, budget)
+}
+
+thread_local! {
+    /// SW-6137: the `sol_attention` engine option of the render running on this thread (see
+    /// [`with_dit_sol_attention`]).
+    static DIT_SOL_ATTENTION: std::cell::Cell<Option<candle_gen::SolConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// SW-6137: run `f` (one render) with the `sol_attention` engine option set to `config` for every
+/// inference DiT block's **self-attention** on this thread; restores the previous value on exit and
+/// unwind. Inside, each block's self-attention runs in a
+/// [`candle_gen::fused_attention::enter_sol_attention`] scope, so an eligible call takes the opt-in,
+/// lossy Sol-Attn sparse kernel and anything else keeps FlashAttention / the budgeted path, counted in
+/// `candle_gen::AttentionPathCounts::sol_refusals`. The text cross-attention, the UMT5 encoder, the
+/// VAE and the training DiT (`dit_train.rs`, its own blocks, under the training scope anyway) are
+/// outside the scope. `None` (the default) is off.
+pub fn with_dit_sol_attention<T>(
+    config: Option<candle_gen::SolConfig>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<candle_gen::SolConfig>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIT_SOL_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIT_SOL_ATTENTION.replace(config));
+    f()
+}
+
+/// The `sol_attention` option of the render on this thread.
+pub fn dit_sol_attention() -> Option<candle_gen::SolConfig> {
+    DIT_SOL_ATTENTION.get()
+}
+
+/// One block's self-attention, inside the Sol-Attn scope when the render asked for it.
+fn self_attention_scope<T>(f: impl FnOnce() -> T) -> T {
+    match DIT_SOL_ATTENTION.get() {
+        Some(config) => candle_gen::with_sol_attention(config, f),
+        None => f(),
+    }
 }
 
 struct Attention {
@@ -553,11 +610,8 @@ impl Block {
 
         let hf = hidden.to_dtype(DType::F32)?;
         // 1. self-attention
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&(scale_msa + 1.0)?)?
-            .broadcast_add(&shift_msa)?
-            .to_dtype(dt)?;
-        let a = self.attn1.forward(&n, &n, Some((cos, sin)))?;
+        let n = wan_adaln(&hf, self.eps, &scale_msa, &shift_msa, dt)?;
+        let a = self_attention_scope(|| self.attn1.forward(&n, &n, Some((cos, sin))))?;
         let hf = (hf + a.to_dtype(DType::F32)?.broadcast_mul(&gate_msa)?)?;
 
         // 2. cross-attention (affine norm2, ungated)
@@ -570,10 +624,7 @@ impl Block {
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
         // 3. feed-forward
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&(c_scale + 1.0)?)?
-            .broadcast_add(&c_shift)?
-            .to_dtype(dt)?;
+        let n = wan_adaln(&hf, self.eps, &c_scale, &c_shift, dt)?;
         let f = self.ffn.forward(&n)?;
         let hf = (hf + f.to_dtype(DType::F32)?.broadcast_mul(&c_gate)?)?;
         hf.to_dtype(dt)
@@ -906,10 +957,7 @@ impl WanTransformer {
         let shift = head_mod.narrow(1, 0, 1)?;
         let scale = head_mod.narrow(1, 1, 1)?;
         let hf = hidden.to_dtype(DType::F32)?;
-        let normed = ln_no_affine(&hf, self.norm_out_eps)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?
-            .to_dtype(self.dtype)?;
+        let normed = wan_adaln(&hf, self.norm_out_eps, &scale, &shift, self.dtype)?;
         self.proj_out.forward(&normed) // [B,L,out_c*patch]
     }
 
@@ -978,10 +1026,7 @@ impl WanTransformer {
         let shift = head_mod.narrow(2, 0, 1)?.squeeze(2)?;
         let scale = head_mod.narrow(2, 1, 1)?.squeeze(2)?;
         let hidden = hidden.to_dtype(DType::F32)?;
-        let normed = ln_no_affine(&hidden, self.norm_out_eps)?
-            .broadcast_mul(&(scale + 1.0)?)?
-            .broadcast_add(&shift)?
-            .to_dtype(self.dtype)?;
+        let normed = wan_adaln(&hidden, self.norm_out_eps, &scale, &shift, self.dtype)?;
         let out = self.proj_out.forward(&normed)?;
         self.unpatchify_tokens(&out, grid)
     }
@@ -1675,5 +1720,136 @@ mod tests {
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cuda_production_geometry_block_flash_matches_materialized");
         Ok(())
+    }
+}
+
+/// SW-6129: the Wan AdaLN sites (blocks, head, VACE head) are the shared fused AdaLN over the
+/// exact former chain.
+#[cfg(test)]
+mod wan_adaln_route_tests {
+    use super::*;
+
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, dev: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, dev).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-SW-6129 site, verbatim: `modulate(&ln_no_affine(&hf, eps)?, scale, shift)?.to_dtype(dt)`.
+    fn former(hf: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor, dt: DType) -> Tensor {
+        let n = ln_no_affine(hf, eps).unwrap();
+        n.broadcast_mul(&(scale + 1.0).unwrap())
+            .unwrap()
+            .broadcast_add(shift)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+    }
+
+    /// The f32 stream from a `[B, S, dim]` hidden in `dt` and f32 modulation strided out of a
+    /// `[B, 6, dim]` table (per sample) or `[B, S, 6, dim]` (per token), as `forward_prepared` builds.
+    #[allow(clippy::type_complexity)]
+    fn operands(dim: usize, per_token: bool, dt: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
+        let (b, s) = (2usize, 37usize);
+        let hf = values(&[b, s, dim], 1, 3.0, 0.2, dev)
+            .to_dtype(dt)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let (scale, shift) = if per_token {
+            let mods = values(&[b, s, 6, dim], 2, 0.5, 0.0, dev);
+            let m = |i| mods.narrow(2, i, 1).unwrap().squeeze(2).unwrap();
+            (m(1), m(0))
+        } else {
+            let mods = values(&[b, 6, dim], 3, 0.5, 0.0, dev);
+            let m = |i| mods.narrow(1, i, 1).unwrap();
+            (m(1), m(0))
+        };
+        (hf, scale, shift)
+    }
+
+    /// CPU: bit-identical to the former site at Wan 1.3B / 14B widths, bf16 and f32 streams,
+    /// per-sample and per-token modulation.
+    #[test]
+    fn wan_adaln_matches_the_former_chain() {
+        for dim in [1536usize, 5120] {
+            for dt in [DType::BF16, DType::F32, DType::F16] {
+                for per_token in [false, true] {
+                    let (hf, scale, shift) = operands(dim, per_token, dt, &Device::Cpu);
+                    let got = wan_adaln(&hf, 1e-6, &scale, &shift, dt).unwrap();
+                    assert_eq!(got.dtype(), dt);
+                    assert_eq!(
+                        bits(&got),
+                        bits(&former(&hf, 1e-6, &scale, &shift, dt)),
+                        "dim={dim} {dt:?} per_token={per_token}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// CUDA bf16: every Wan AdaLN form takes the fused kernel and is bit-identical to the
+    /// switch-off reference (the former chain on the device).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        const CALLS: u64 = 2;
+        let dev = Device::new_cuda(0).unwrap();
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        for per_token in [false, true] {
+            let (hf, scale, shift) = operands(5120, per_token, DType::BF16, &dev);
+            let run = || {
+                Tensor::cat(
+                    &[
+                        wan_adaln(&hf, 1e-6, &scale, &shift, DType::BF16).unwrap(),
+                        wan_adaln(&hf, 1e-6, &shift, &scale, DType::BF16).unwrap(),
+                    ],
+                    0,
+                )
+                .unwrap()
+            };
+            ADALN_PATH.set_enabled(Some(true));
+            let start = ADALN_PATH.thread_counts();
+            let fused = run();
+            let on = ADALN_PATH.thread_counts().since(&start);
+            assert_eq!((on.fused, on.reference_total()), (CALLS, 0), "{on}");
+            ADALN_PATH.set_enabled(Some(false));
+            let start = ADALN_PATH.thread_counts();
+            let reference = run();
+            let off = ADALN_PATH.thread_counts().since(&start);
+            ADALN_PATH.set_enabled(Some(true));
+            assert_eq!(off.reference_for("disabled"), CALLS, "{off}");
+            let (f, r) = (bits(&fused), bits(&reference));
+            let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+            println!(
+                "wan adaln (bf16, dim 5120, per_token={per_token}): {mismatches} of {} differ; on {on}, off {off}",
+                f.len()
+            );
+            assert_eq!(mismatches, 0);
+        }
     }
 }

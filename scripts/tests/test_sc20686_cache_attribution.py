@@ -470,9 +470,11 @@ class AttributionTests(unittest.TestCase):
         self.assertIn("stage_residency: true", flux)
         self.assertLess(flux.index("save(&edited, &c.out)?"), flux.index("if campaign {", flux.index("let edited = result?")))
         wan14b = (root / paths[2]).read_text(encoding="utf-8")
-        self.assertIn("load_from_comfyui_experts_with_offload(", wan14b)
+        # The ComfyUI lane loads through the options-taking seam (it carries the engine options and
+        # the explicit offload policy alike), never the default-residency loader.
+        self.assertIn("load_from_comfyui_experts_with_options(", wan14b)
         self.assertNotIn("wan14b::load_from_comfyui_experts(\n", wan14b)
-        comfyui_call = wan14b.index("wan14b::load_from_comfyui_experts_with_offload(")
+        comfyui_call = wan14b.index("wan14b::load_from_comfyui_experts_with_options(")
         self.assertIn("offload,", wan14b[comfyui_call:comfyui_call + 500])
         for relative in (
             "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",

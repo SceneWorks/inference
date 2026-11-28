@@ -257,6 +257,7 @@ fn proj(
 
 /// Affine-free LayerNorm over the last axis, f32 (diffusers `norm1`/`norm2`/`norm_out` are all
 /// `elementwise_affine=False` — the adaLN modulation supplies the affine externally).
+#[cfg(test)]
 fn layer_norm_affine_free(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dt = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
@@ -277,11 +278,23 @@ fn rms_norm_last(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     normed.broadcast_mul(weight)
 }
 
-/// adaLN-single affine `norm · (1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`).
-/// `scale`/`shift` are `[B, 1, dim]`, `norm` is `[B, N, dim]` — broadcast over the token axis.
-fn modulate(norm: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-    let gained = norm.broadcast_mul(&(scale + 1.0)?)?;
-    gained.broadcast_add(shift)
+// adaLN-single affine `norm · (1 + scale) + shift` (diffusers `hidden * (1 + scale) + shift`).
+// `scale`/`shift` are `[B, 1, dim]`, `norm` is `[B, N, dim]` — broadcast over the token axis. The
+// shared composable modulate (SW-6129), the exact body of the private copy it replaced.
+#[cfg(test)]
+use candle_gen::modulate::modulate;
+
+/// The adaLN-single `LayerNorm(x) · (1 + scale) + shift` over `layer_norm_affine_free`'s chain
+/// (f32 `mean_keepdim` / sub / `sqr` / `mean_keepdim` / `+ eps` / `sqrt` / div, cast back, then
+/// modulated in `x`'s dtype): the shared fused AdaLN (SW-6129) — `AdaLnChain::layer(eps)` is that
+/// chain op for op, one launch on CUDA, the chain itself elsewhere.
+fn ln_modulate(x: &Tensor, eps: f64, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    candle_gen::modulate::adaln_chain(
+        x,
+        &candle_gen::modulate::AdaLnChain::layer(eps),
+        scale,
+        shift,
+    )
 }
 
 /// Sinusoidal timestep embedding (diffusers `Timesteps`, `flip_sin_to_cos=True` ⇒ `[cos | sin]`).
@@ -631,8 +644,7 @@ impl SanaBlock {
         let (shift_mlp, scale_mlp, gate_mlp) = (chunk(3)?, chunk(4)?, chunk(5)?);
 
         // 2. Self linear-attention.
-        let norm_h = layer_norm_affine_free(hidden, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_msa, &shift_msa)?;
+        let norm_h = ln_modulate(hidden, self.norm_eps, &scale_msa, &shift_msa)?;
         let attn_out = self.attn1.forward(&norm_h)?;
         let hidden = (hidden + gate_msa.broadcast_mul(&attn_out)?)?;
 
@@ -643,8 +655,7 @@ impl SanaBlock {
         let hidden = (cross + hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to NCHW [B,dim,H,W] → GLUMBConv → flatten → gate.
-        let norm_h = layer_norm_affine_free(&hidden, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_mlp, &shift_mlp)?;
+        let norm_h = ln_modulate(&hidden, self.norm_eps, &scale_mlp, &shift_mlp)?;
         // tokens [B,N,dim] → grid [B,H,W,dim] → NCHW [B,dim,H,W] (candle-native; MLX kept NHWC — same
         // spatial order, so the depthwise conv sees identical neighbourhoods).
         let grid = norm_h
@@ -1082,8 +1093,7 @@ impl SanaTransformer {
         let modg = ss.broadcast_add(&emb.reshape((b, 1, dim))?)?; // [B,2,dim]
         let shift = modg.narrow(1, 0, 1)?; // [B,1,dim]
         let scale = modg.narrow(1, 1, 1)?; // [B,1,dim]
-        let normed = layer_norm_affine_free(&hidden, cfg.norm_eps as f64)?;
-        let hidden = modulate(&normed, &scale, &shift)?;
+        let hidden = ln_modulate(&hidden, cfg.norm_eps as f64, &scale, &shift)?;
 
         let out = self.proj_out.forward(&hidden)?; // [B,N, p·p·out_channels]
                                                    // unpatchify: [B,ph,pw,p,p,oc] → permute(0,5,1,3,2,4) → [B,oc,ph·p,pw·p].
@@ -1786,6 +1796,118 @@ mod tests {
         #[cfg(feature = "model-inference-proof")]
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::gpu_trunk_forward_sana1600m"
+        );
+    }
+}
+
+/// SW-6129: the SANA adaLN-single sites are the shared fused composable-chain AdaLN.
+#[cfg(test)]
+mod sw6129_adaln_route_tests {
+    use super::*;
+
+    /// Deterministic xorshift values in `[-amp, amp) + bias` (no device RNG).
+    fn values(dims: &[usize], seed: u64, amp: f32, bias: f32, device: &Device) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut s = seed | 1;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * amp + bias
+            })
+            .collect();
+        Tensor::from_vec(v, dims, device).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Runs `run` with the fused AdaLN switch on, then off; asserts `calls` fused calls on, the
+    /// same number of `disabled` references off, and bitwise-identical outputs; prints `what`.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_and_bit_identical(what: &str, calls: u64, run: &dyn Fn() -> Tensor) {
+        use candle_gen::fused_path::media_fused_policy_guard;
+        use candle_gen::modulate::ADALN_PATH;
+        let _media = media_fused_policy_guard(Some(true));
+        let _kernel = ADALN_PATH.guard(Some(true));
+        ADALN_PATH.set_enabled(Some(true));
+        let start = ADALN_PATH.thread_counts();
+        let fused = run();
+        let on = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!((on.fused, on.reference_total()), (calls, 0), "{what}: {on}");
+        ADALN_PATH.set_enabled(Some(false));
+        let start = ADALN_PATH.thread_counts();
+        let reference = run();
+        let off = ADALN_PATH.thread_counts().since(&start);
+        assert_eq!(off.reference_for("disabled"), calls, "{what}: {off}");
+        ADALN_PATH.set_enabled(Some(true));
+        let (f, r) = (bits(&fused), bits(&reference));
+        let mismatches = f.iter().zip(&r).filter(|(a, b)| a != b).count();
+        println!(
+            "{what}: {mismatches} of {} elements differ; on {on}, off {off}",
+            f.len()
+        );
+        assert_eq!(mismatches, 0, "{what}");
+    }
+
+    /// CPU: bit-identical to the former `modulate(&layer_norm_affine_free(x, eps)?, ..)` for f32 /
+    /// bf16 / f16 at SANA-1.6B's width 2240, narrowed `[B, 1, D]` rows of the `[B, 6, D]` table.
+    #[test]
+    fn ln_modulate_matches_the_former_layer_norm_and_modulate() {
+        let dev = Device::Cpu;
+        let d = 2240;
+        let x32 = values(&[2, 16, d], 3, 3.0, 0.4, &dev);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let x = x32.to_dtype(dtype).unwrap();
+            let table = values(&[2, 6, d], 5, 0.5, 0.0, &dev)
+                .to_dtype(dtype)
+                .unwrap();
+            let (shift, scale) = (
+                table.narrow(1, 0, 1).unwrap(),
+                table.narrow(1, 1, 1).unwrap(),
+            );
+            let want =
+                modulate(&layer_norm_affine_free(&x, 1e-6).unwrap(), &scale, &shift).unwrap();
+            let got = ln_modulate(&x, 1e-6, &scale, &shift).unwrap();
+            assert_eq!(bits(&got), bits(&want), "{dtype:?}");
+        }
+    }
+
+    /// SW-6129 CUDA smoke: SANA `ln_modulate` (bf16, 1024^2 = 32x32 latent tokens, width 2240, and
+    /// the 4K 128x128 = 16384-token grid) is fused (2 calls) and bit-identical to the switch-off
+    /// chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "CUDA compute: run by the validation workflow, not CI"]
+    fn cuda_bf16_adaln_route_is_fused_and_bit_identical() {
+        let dev = Device::new_cuda(0).unwrap();
+        let d = 2240;
+        let bf = |t: Tensor| t.to_dtype(DType::BF16).unwrap();
+        let small = bf(values(&[1, 1024, d], 11, 3.0, 0.3, &dev));
+        let large = bf(values(&[1, 16384, d], 12, 3.0, 0.3, &dev));
+        let table = bf(values(&[1, 6, d], 13, 0.5, 0.0, &dev));
+        let (shift, scale) = (
+            table.narrow(1, 0, 1).unwrap(),
+            table.narrow(1, 1, 1).unwrap(),
+        );
+        assert_fused_and_bit_identical(
+            "sana ln_modulate (bf16, [1,1024,2240] + [1,16384,2240])",
+            2,
+            &|| {
+                let a = ln_modulate(&small, 1e-6, &scale, &shift).unwrap();
+                let b = ln_modulate(&large, 1e-6, &scale, &shift).unwrap();
+                Tensor::cat(&[&a, &b], 1).unwrap()
+            },
         );
     }
 }

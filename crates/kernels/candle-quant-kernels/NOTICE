@@ -1,0 +1,32 @@
+candle-quant-kernels
+Copyright 2026 Michael Trefry and the SceneWorks contributors
+
+This product is licensed under the Apache License, Version 2.0. A copy of the
+license is provided in the repository LICENSE file.
+
+Ported third-party sources (IN the shipped Rust crate)
+------------------------------------------------------
+
+  * comfy-kitchen                               (Apache License 2.0)
+    Copyright (c) 2025 Comfy Org (https://github.com/Comfy-Org/comfy-kitchen)
+
+    W4A8 (`asym_w4a8_int8`) and ConvRot INT8 arithmetic, pinned to
+    comfy-kitchen PR#90 (tree 06a261f8, head d908d589) and commit
+    f8b7e97a1418d2e529bd5405fbf86312be198ae6:
+
+      - src/w4a8_dequant.cu  — `dequant_int4_grouped_to_int8_kernel`
+        (`comfy_kitchen/backends/cuda/ops/w4a8_gemm.cu`, blob 21002ea10).
+      - src/w4a8_gemm.cu     — the fused W4A8 GEMM (SW-6134): new single-file
+        int8 tensor-core GEMM code around the same int4->int8 weight decode
+        (`w4a8_gemm.cu`, blob 21002ea10) and the int8 GEMM epilogue order of
+        `cutlass_gemm_int8.cu` (blob f7142fa41).
+      - src/kitchen_int8.cu  — the row-wise activation quantizer of
+        `int8_linear.cu::quantize_int8_rowwise_convrot_kernel` (blob 4c7d49e72).
+
+    Modified: rewritten as nvrtc-compiled single-file sources with no headers;
+    no upstream source file is copied verbatim.
+
+    The offline W4A8 packer that produces these operands lives in
+    sceneworks-gen-core (`src/w4a8_int8/pack.rs`, ported from comfy-kitchen
+    `backends/eager/w4a8_int8.py` and `tensor/w4a8_packed.py`); see that
+    crate's NOTICE.

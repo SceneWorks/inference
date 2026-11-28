@@ -188,6 +188,12 @@ pub fn validate_native_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()>
     validate_shapes(w, cfg)
 }
 
+/// [`validate_native_key_surface`] for sibling-module tests (the W4A8 loader fixture).
+#[cfg(test)]
+pub(crate) fn validate_native_key_surface_for_test(w: &Weights, cfg: &Krea2Config) -> Result<()> {
+    validate_native_key_surface(w, cfg)
+}
+
 /// Validate coverage and the exact allowed on-disk key surface independently of tensor dimensions.
 /// Kept separate so a tiny, real safetensors fixture can prove the plain-int8 companion accounting
 /// without allocating the multi-gigabyte tensors required by Krea's representative shape checks.
@@ -227,7 +233,12 @@ fn validate_native_key_surface(w: &Weights, cfg: &Krea2Config) -> Result<()> {
                 .to_owned(),
         ));
     };
-    let planned: BTreeSet<&str> = plan.all_physical_keys().collect();
+    // A native W4A8 tier's projections are delegated out of the plan to `W4A8Linear` (SW-6135);
+    // their descriptor + operands are accounted for by that delegation instead.
+    let planned: BTreeSet<&str> = plan
+        .all_physical_keys()
+        .chain(w.w4a8_delegated_keys())
+        .collect();
     let keys = w.keys();
     let on_disk: BTreeSet<&str> = keys.iter().map(|key| key.as_str()).collect();
     let absent: Vec<&str> = planned.difference(&on_disk).copied().take(8).collect();

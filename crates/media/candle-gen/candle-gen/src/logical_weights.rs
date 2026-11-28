@@ -126,6 +126,17 @@ pub fn plan_logical_weights(
     Ok(shared::plan_logical_weights(path, mapping, policy)?)
 }
 
+/// [`plan_logical_weights`] with the file's W4A8 projections delegated to `W4A8Linear` (SW-6135).
+pub fn plan_logical_weights_delegating_w4a8(
+    path: &Path,
+    mapping: &dyn LogicalKeyMapping,
+    policy: &dyn CodecResidencyPolicy,
+) -> crate::Result<(LogicalWeightPlan, gen_core::w4a8_int8::W4A8Delegation)> {
+    Ok(shared::plan_logical_weights_delegating_w4a8(
+        path, mapping, policy,
+    )?)
+}
+
 pub struct LogicalWeightReader(std::sync::Arc<shared::LogicalWeightReader>);
 
 impl std::ops::Deref for LogicalWeightReader {
@@ -169,6 +180,22 @@ impl LogicalWeightReader {
         Ok(Self(
             shared::LogicalWeightReader::open_with_capability(path, plan, device, capability)?
                 .into(),
+        ))
+    }
+
+    /// [`Self::open_with_capability`] excluding the `delegated` W4A8 keys from the surface check.
+    pub fn open_with_capability_delegated(
+        path: &Path,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+        delegated: &std::collections::BTreeSet<String>,
+    ) -> crate::Result<Self> {
+        Ok(Self(
+            shared::LogicalWeightReader::open_with_capability_delegated(
+                path, plan, device, capability, delegated,
+            )?
+            .into(),
         ))
     }
 
