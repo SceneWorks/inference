@@ -20,6 +20,8 @@ sceneworks-gen-core-family = { workspace = true }
 sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # The face-loss parity fixture pins its producer script's sha256 (sc-24831).
 sha2 = { workspace = true }
 tempfile = { workspace = true }

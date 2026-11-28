@@ -251,7 +251,7 @@ fn gemma_like(warmup: usize, iters: usize) -> Row {
     }
 }
 
-fn main() {
+pub fn main() {
     let warmup = env_usize("ROPE_BENCH_WARMUP", 3);
     let iters = env_usize("ROPE_BENCH_ITERS", 20);
     let rows = [flux_like(warmup, iters), gemma_like(warmup, iters)];

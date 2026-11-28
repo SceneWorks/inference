@@ -271384,6 +271384,36 @@
   },
   {
     "package": "mlx-gen",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "rope_modulate_block_bench_proof::rope_modulate_block_bench",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays (seeded random activations at FLUX.1 DiT-block and PID Gemma-2 TE attention geometry; no weights)",
+    "configuration_source": "body-local construction (crates/media/mlx-gen/examples/rope_modulate_block_bench.rs, included verbatim; ROPE_BENCH_WARMUP/ROPE_BENCH_ITERS defaults 3/20)",
+    "output_contract": "SW-6140 AC3 bench table (before/after median ms, MLX peak MiB, max rel diff, chip brand string) printed; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/tests/rope_modulate_block_bench_proof.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/mlx-gen/tests/rope_modulate_block_bench_proof.rs::rope_modulate_block_bench_proof::rope_modulate_block_bench; source-defined seeded activations and RoPE tables, no external inputs",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen",
     "target": "mlx_gen",
     "target_kind": "lib",
     "fqn": "adapters::loader::tests::apply_specs_empty_is_noop",
